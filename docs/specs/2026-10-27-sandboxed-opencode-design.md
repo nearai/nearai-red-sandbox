@@ -22,7 +22,7 @@ tool effects land.
 | Files in | Read-only inputs directory, copied in at boot by mvm. |
 | Files out | Only the guest's `/out`, copied to `sessions/<id>/out` before teardown. |
 | Lifecycle | One VM per opencode session, always destroyed when the session ends, including on crash or signal. |
-| mvm access | Shell out to `mvmctl`, built from source at `054ec4c3` (main, 2026-10-27). No mvm SDK in v1. |
+| mvm access | Shell out to `mvmctl` release v0.22.0, installed from the cosign-verified release tarball at `~/.local/mvm/v0.22.0`. No mvm SDK in v1. |
 | Backend seam | Launcher and plugin talk to a `Sandbox` interface, never to `mvmctl` directly. mvm is the only v1 backend. |
 | Language | TypeScript on bun for the launcher and plugin. Nix flake for the guest image. |
 
@@ -36,7 +36,7 @@ launcher
   2. starts opencode (pinned v2 version)
        |-- NEAR AI provider (key on host)
        '-- sandbox plugin
-             shell/read/write/edit/patch/glob/grep
+             shell/read/write/edit/glob/grep
                '-- mvmctl machine exec    ---> runs in guest, stdout/stderr/exit back
   3. on exit or signal:
        copy /out -> sessions/<id>/out     <--- /out only
@@ -48,7 +48,7 @@ launcher
 ```ts
 interface Sandbox {
   create(spec: { name: string; image: string; inputs?: string; memoryMiB: number; cpus: number }): Promise<void>
-  exec(argv: string[], opts: { stdin?: Uint8Array; timeoutMs: number; maxOutputBytes: number }):
+  exec(argv: string[], opts: { timeoutMs: number; maxOutputBytes: number }):
     Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array; truncated: boolean }>
   copyOut(guestDir: string, hostDir: string): Promise<void>
   remove(): Promise<void>
@@ -56,7 +56,51 @@ interface Sandbox {
 ```
 
 The v1 implementation, `MvmSandbox`, shells out to `mvmctl`. Every call is
-argv-based; nothing is passed through a host shell. A second backend (for
+argv-based; nothing is passed through a host shell.
+
+`mvmctl machine exec` constraints measured on v0.22.0 (probe 4) shape the
+implementation:
+
+- **A nonzero exit poisons the machine.** After any exec whose guest command
+  exits nonzero (`false`, `exit 3`), every later exec on that machine fails
+  with `machine input sequence N has no durable finish; refuse exec and
+  checkpoint until the ambiguous operation is recovered`, and a restart does
+  not clear it. So every exec runs inside a guest-side wrapper that always
+  exits 0 and reports the real status on stderr as a final line
+  `RTS_EXIT_<nonce> <status>`, with a fresh random nonce per call. The status
+  is information for the model, not a security property; a guest that forges
+  it only misleads itself.
+- **Killing the exec client from the host also poisons the machine.** Tool
+  time limits are enforced in the guest by the wrapper with
+  `timeout -s KILL <seconds>` (status 137 on expiry). The host keeps a
+  backstop timer at the limit plus 30 s; if it fires, the machine is treated
+  as lost and the session ends with `sandbox unavailable`.
+- **stdin is not passed through**; the guest command reads nothing. `exec`
+  is always spawned with stdin set to `/dev/null`. File content for `write`
+  and `edit` travels in argv as base64, in chunks of at most 48 KiB, each
+  appended in the guest with `base64 -d`. A 48 KiB random base64 argv was
+  measured to work; the host's own `ARG_MAX` refused 1 MiB.
+- **Large stdout is truncated silently.** An 8 MiB stdout arrived as
+  974,403 bytes with no error. The wrapper writes the command's stdout to a
+  guest temp file, reports its full size in the trailer, and emits only the
+  first `maxOutputBytes`, so `truncated` is computed from the reported size.
+- Any exec result containing the `no durable finish` error, or missing its
+  trailer, means the machine is unusable: `exec` reports `sandbox
+  unavailable` for that call and every later one.
+
+Other v0.22.0 behavior the implementation depends on (probe 5):
+
+- `machine create` accepts any string as `--image`, including an error
+  message, and only `machine start` rejects it. `MvmSandbox.create` accepts
+  only a digest-pinned reference matching
+  `^[a-z0-9./-]+@sha256:[0-9a-f]{64}$`.
+- `machine rm` prompts for confirmation; without `--yes` it prints `aborted`
+  and removes nothing. Teardown uses `rm --force --yes` and then confirms with
+  `machine ps` that no machine of that name remains.
+- `image inspect` has no `--digest-ref` in v0.22.0 (that flag is on `main`).
+  The digest comes from the `Resolved digest:` line of `image inspect
+  <full reference>`.
+- An alpine machine (1 vCPU, 512 MiB) boots in about 2 s on the HVF backend. A second backend (for
 example apple/container) would implement the same interface and must pass the
 same containment suite.
 
@@ -102,14 +146,14 @@ blocks.
 ### Sandbox plugin (`plugin/`)
 
 opencode v2.1.4 registers 20 built-in tools (measured, probe 2). The plugin
-keeps eight:
+keeps seven:
 
-- Sandboxed, `execute` replaced: `shell`, `read`, `write`, `edit`, `patch`,
-  `glob`, `grep`.
+- Sandboxed, `execute` replaced: `shell`, `read`, `write`, `edit`, `glob`,
+  `grep`.
 - Kept unchanged because it executes nothing: `question` (asks the operator in
   the opencode UI).
 
-It removes the other twelve, among them `webfetch` and `websearch` (host
+It removes the other thirteen, among them `patch` (see below), `webfetch` and `websearch` (host
 network), `opencode_worktree_create` / `_remove` (host git), `subagent`,
 `skill`, `opencode_session_*`, `opencode_models`, and the MCP resource tools.
 
@@ -122,7 +166,7 @@ network), `opencode_worktree_create` / `_remove` (host git), `subagent`,
   credentials configured, v2.1.4 still offers about 80 models from opencode's
   own hosted service; without this step a prompt could go there instead of
   NEAR AI.
-- After setup, `ctx.tool.list()` must equal the eight-tool list exactly and
+- After setup, `ctx.tool.list()` must equal the seven-tool list exactly and
   every remaining model must be NEAR AI. Anything else makes setup throw, the
   ready file is never written, and the launcher refuses the session.
 - A `tool` `execute.before` hook rejects any tool name outside the allowlist, a
@@ -133,21 +177,24 @@ Tool implementations, all on guest paths:
 
 | Tool | Guest-side implementation |
 |---|---|
-| `shell` | `sh -c <command>` in the guest. The only tool that gets a shell. |
-| `read` | Line-range read, path passed as an argv entry. |
-| `write` | Content sent on stdin, path as an argv entry. |
-| `edit` | A small exact-match replacement applier, inputs via stdin and argv. |
-| `patch` | The same applier, taking opencode's patch format on stdin. |
-| `glob` | `find`, pattern and root as argv entries. |
-| `grep` | `grep`, pattern and root as argv entries. |
+| `shell` | `sh -c <command>` in the guest, with `workdir` applied by `cd` inside the wrapper. The only tool whose input is run as a shell command. `background: true` is refused, since exec is synchronous. |
+| `read` | Bounded guest read (`head -c`), path as an argv entry. Line slicing and the `<line>: <content>` prefix are applied on the host. A directory returns one entry per line. Text only; images and PDFs are not returned. |
+| `write` | Content as base64 argv chunks, decoded and appended in the guest into a temp file that is then renamed over the target. Path as an argv entry. |
+| `edit` | Read the file from the guest, apply the exact-match replacement on the host (a pure function), and write it back as `write` does. Fails if `oldString` is missing, or matches more than once without `replaceAll`. |
+| `glob` | Guest `find <root> -type f` (bounded), then the pattern matched on the host with `Bun.Glob`. |
+| `grep` | Guest `grep -rn`, with `-F` for `literal`, `-i` when `caseSensitive` is false, and `--include` for `include`. Pattern and root as argv entries. Exit status 1 (no match) is reported as no matches, not an error. |
 
-The file tools never interpolate arguments into a shell string.
+The file tools never interpolate arguments into a shell string; their
+fixed scripts read operands from `"$1"`, `"$2"` and so on. `patch` is
+removed rather than sandboxed: implementing opencode's patch format is out of
+scope for v1, and `edit` and `write` cover the same ground.
 
 ### Guest image (`image/`)
 
 An mvm `mkGuest` Nix flake with `entrypoint.shell` (dev profile). The operator
-supplies the contents. The harness requires only `sh`, coreutils, `find`, and
-`grep` in the guest, plus a writable `/out`.
+supplies the contents. The harness requires `sh`, coreutils, `find`, `grep`,
+`timeout`, `base64`, and `tar` in the guest (busybox provides all of them, as
+in the alpine image used for the probes), plus a writable `/out` and `/tmp`.
 
 ## Error handling
 
@@ -155,8 +202,10 @@ Every failure ends in a refusal or a tool error. Nothing falls back to the host.
 
 - VM create fails: opencode is never started.
 - Allowlist mismatch at plugin setup: setup throws, the session does not start.
-- Tool call exceeds its time limit (configurable, default 120 s): the exec is
-  killed and the tool returns an error.
+- Tool call exceeds its time limit (configurable, default 120 s): the guest
+  wrapper's `timeout -s KILL` ends the command (status 137) and the tool
+  returns a timeout error. If the host backstop fires instead, the machine is
+  lost and the session ends.
 - VM dies mid-session: tool calls return `sandbox unavailable`. The plugin does
   not recreate the VM, since the session's state would be gone without notice.
 - Exec output is capped before it reaches the model, with a truncation marker.
@@ -235,12 +284,36 @@ Each is a short probe. None is assumed.
    servers added by another plugin after ours. The XDG isolation and the
    launcher-owned working directory mean no other plugin loads, and the plugin
    also checks that `ctx.mcp.list()` is empty before writing the ready file.
-4. `mvmctl machine exec` passes stdin through and returns the guest exit code.
-5. Dev-profile `machine create` / `exec` / `rm` works on the macOS HVF backend.
+4. Done 2026-10-27: `exec` returns the guest exit code and keeps stdout and
+   stderr separate, but does not pass stdin, poisons the machine on a nonzero
+   exit or a host-side client kill, and truncates large stdout silently. See
+   the constraints under the sandbox interface.
+5. Done 2026-10-27: dev-profile `machine create` / `start` / `exec` /
+   `rm --force --yes` work on the macOS HVF backend.
+
+## Host setup notes (measured 2026-10-27)
+
+- mvm v0.22.0 is installed from the release tarball, not the `curl | sh`
+  installer. Verification: sha256 matches `checksums-sha256.txt`, and
+  `cosign verify-blob` passes on both files with the certificate identity
+  pinned to `https://github.com/tinylabscom/mvm/.github/workflows/release.yml@refs/tags/v0.22.0`
+  and issuer `https://token.actions.githubusercontent.com`. The certificate's
+  commit, `b6b77f83`, is the `v0.22.0` tag commit.
+- The tarball's binaries carry no VM entitlements. `mvmctl env sign`
+  ad-hoc re-signs `mvmctl` (`com.apple.security.virtualization`) and
+  `mvm-hvf-supervisor` (`com.apple.security.hypervisor`); `mvmctl doctor`
+  fails until it has run.
+- A source build was abandoned: its bootstrap cross-compiles the guest runtime
+  and needs `cargo-zigbuild`, `zig`, and the `aarch64-unknown-linux-musl`
+  target.
+- mvm's git reader rejects `includeIf "hasconfig:..."` entries in the
+  operator's global git config. The launcher runs every `mvmctl` command with
+  `GIT_CONFIG_GLOBAL` pointing at an empty file; the operator's git config is
+  not modified.
 
 ## Dependencies requiring approval before install
 
-- mvm (`mvmctl`), built from source. Four advisories were published
+- mvm (`mvmctl`), release v0.22.0. Approved 2026-10-27. Four advisories were published
   2026-10-26, none with a patched version listed. Relevant here:
   GHSA-x85r-49ww-2pxq (medium), where a guest can grow host memory through the
   vsock device model. That is a denial-of-service on the host, not an escape,
