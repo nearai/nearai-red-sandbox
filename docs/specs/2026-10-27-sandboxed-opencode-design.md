@@ -22,7 +22,8 @@ tool effects land.
 | Files in | Read-only inputs directory, copied in at boot by mvm. |
 | Files out | Only the guest's `/out`, copied to `sessions/<id>/out` before teardown. |
 | Lifecycle | One VM per opencode session, always destroyed when the session ends, including on crash or signal. |
-| mvm access | Shell out to `mvmctl`. No mvm SDK in v1. |
+| mvm access | Shell out to `mvmctl`, built from source at `054ec4c3` (main, 2026-10-27). No mvm SDK in v1. |
+| Backend seam | Launcher and plugin talk to a `Sandbox` interface, never to `mvmctl` directly. mvm is the only v1 backend. |
 | Language | TypeScript on bun for the launcher and plugin. Nix flake for the guest image. |
 
 ## Architecture
@@ -41,6 +42,31 @@ launcher
        copy /out -> sessions/<id>/out     <--- /out only
        mvmctl machine rm rts-<session>
 ```
+
+### Sandbox interface (`sandbox/`)
+
+```ts
+interface Sandbox {
+  create(spec: { name: string; image: string; inputs?: string; memoryMiB: number; cpus: number }): Promise<void>
+  exec(argv: string[], opts: { stdin?: Uint8Array; timeoutMs: number; maxOutputBytes: number }):
+    Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array; truncated: boolean }>
+  copyOut(guestDir: string, hostDir: string): Promise<void>
+  remove(): Promise<void>
+}
+```
+
+The v1 implementation, `MvmSandbox`, shells out to `mvmctl`. Every call is
+argv-based; nothing is passed through a host shell. A second backend (for
+example apple/container) would implement the same interface and must pass the
+same containment suite.
+
+`copyOut` treats the guest as hostile. It archives `/out` inside the guest,
+streams the archive to the host, and extracts it with a host-side extractor
+that accepts only regular files and directories. It rejects symlinks,
+hardlinks, device nodes, absolute paths, and any path containing `..`, and
+caps total size and entry count. microsandbox's GHSA-4vq3-cjpp-v7fg (a guest
+symlink in `msb copy` writing arbitrary host files) is the class of bug this
+blocks.
 
 ### Launcher (`launcher/`)
 
@@ -100,6 +126,12 @@ Every failure ends in a refusal or a tool error. Nothing falls back to the host.
   not recreate the VM, since the session's state would be gone without notice.
 - Exec output is capped before it reaches the model, with a truncation marker.
 - `/out` export fails at teardown: reported, VM still removed.
+- `/out` archive contains a rejected entry: extraction stops, the partial host
+  directory is removed, and the rejection is reported.
+- Each VM gets a fixed memory cap (default 2 GiB). Because of
+  GHSA-x85r-49ww-2pxq (guest-driven host memory growth through vsock), the
+  launcher also samples the per-VM host process RSS and tears the session down
+  if it exceeds a configured ceiling.
 
 ## Audit
 
@@ -124,12 +156,16 @@ Written test-first.
    - After the VM is killed mid-session, the next tool call errors and nothing
      runs on the host.
    - After SIGINT, no `rts-*` machine remains and `/out` was exported.
+   - A guest `/out` containing a symlink to a host path, a hardlink, a `..`
+     entry, and an oversized file: none is written to the host, and the export
+     reports a rejection.
 3. Leak-detection check: replacing one tool's implementation with a stub that
    runs on the host must turn the containment suite red.
 
 ## Repository layout
 
 ```
+sandbox/         Sandbox interface, MvmSandbox, hostile-archive extractor
 launcher/        TypeScript CLI (bun): preflight, VM lifecycle, export, orphan sweep
 plugin/          opencode V2 plugin: tool transform, allowlist check, audit hooks
 image/           Nix mkGuest flake
