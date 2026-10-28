@@ -11,8 +11,8 @@ credentials stay outside the guest.
 ## Project status
 
 The implementation is under development. Live containment validation on macOS
-remains a release gate: the pinned guest image currently has a read-only root,
-preventing creation of `/in` and `/out`.
+remains a release gate. The pinned guest image is stored in a private Google
+Artifact Registry repository; see the launcher guide for access and setup.
 
 - [Design](docs/specs/2026-10-27-sandboxed-opencode-design.md)
 - [Implementation plan](docs/plans/2026-10-27-sandboxed-opencode.md)

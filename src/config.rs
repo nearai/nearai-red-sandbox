@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::mvm::is_image_ref;
 
-pub const DEFAULT_IMAGE: &str = "docker.io/library/alpine@sha256:e311ae748be7f56ae5cba304bc488f0786df68ee507513f654a5cc8597cffb42";
+pub const DEFAULT_IMAGE: &str = "us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images/guest@sha256:56406743ca98389029c795a9cd55f0d1f55e569d57226c10e6c4f6f340cf9ac1";
 pub const IRONWIRE_PROVIDER_ID: &str = "ironwire";
 pub const IRONWIRE_BASE_URL: &str = "http://127.0.0.1:8463/openai/v1";
 /// Sent as the API key when the provider needs none. IronWire strips the

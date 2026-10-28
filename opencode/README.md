@@ -184,19 +184,26 @@ policy and writes the matching readiness nonce.
 
 ## Recorded live validation status
 
-The latest recorded macOS containment run on 2026-10-28 had **12 passed and
-8 failed**. Six copy tests failed because the pinned guest's read-only root
-left `/in` and `/out` unavailable. The launcher SIGINT test failed on that
-same filesystem issue. The stopped-VM test omitted `--yes` and ignored
-the stop command's exit status; after correction, its focused live rerun passed.
+The latest recorded macOS containment run on 2026-10-28 had **17 passed and
+3 failed** using the derived guest image. The remaining failures were the
+byte-exact copy-out, oversized-file, and hardlink refusal tests.
 
 Containment remains unvalidated until those failures are resolved and the
 real suite passes. Unit tests, mocked browser callbacks, and local inference
 HTTP tests do not establish live Cloud sign-in or VM containment.
 
-The derived image in `guest/Dockerfile` was built with Colima for `linux/arm64`.
-Its `/in` and `/out` links and the launcher initialization script were checked
-with a read-only root and a writable `/tmp` in a container. mvm cannot pull
-directly from Colima's image store: publish the image to an accessible OCI
-registry, pin its registry manifest digest in the configuration, and run the
-real mvm suite before using it. The current default image is not yet replaced.
+The derived image in `guest/Dockerfile` was built with Colima for `linux/arm64`
+and published to the private Google Artifact Registry repository
+`us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images`. Its registry
+manifest digest is the default image pin in `src/config.rs`. Before the first
+launch on a machine, an authorized operator can cache the image in mvm:
+
+```sh
+MVM_OCI_BEARER_TOKEN_US_WEST1_DOCKER_PKG_DEV="$(gcloud auth print-access-token)" \
+  ~/.local/mvm/v0.22.0/mvmctl image pull \
+  us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images/guest@sha256:56406743ca98389029c795a9cd55f0d1f55e569d57226c10e6c4f6f340cf9ac1
+```
+
+The active Google Cloud identity needs Artifact Registry Reader access. The
+short-lived token is passed only to this explicit pull command; do not put it
+in the sandbox configuration or OpenCode environment.
