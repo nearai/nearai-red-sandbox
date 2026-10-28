@@ -1,6 +1,7 @@
 // MvmSandbox: the v1 Sandbox backend. Shells out to mvmctl v0.22.0 with
 // argv only; nothing goes through a host shell.
 
+import { DEFAULT_COPY_LIMITS, copyInVia, copyOutVia, type CopyLimits } from "./copy.ts"
 import { isPoisoned, newNonce, parseResult, wrapArgv } from "./protocol.ts"
 import { SandboxUnavailable, type CopyOutResult, type ExecOptions, type ExecResult, type Sandbox } from "./sandbox.ts"
 
@@ -90,11 +91,13 @@ export class MvmSandbox implements Sandbox {
   protected readonly run: Runner
   private deadReason: string | undefined
   private queue: Promise<unknown> = Promise.resolve()
+  private readonly copyLimits: CopyLimits
 
-  constructor(o: { name: string; run: Runner }) {
+  constructor(o: { name: string; run: Runner; copyLimits?: Partial<CopyLimits> }) {
     checkName(o.name)
     this.name = o.name
     this.run = o.run
+    this.copyLimits = { ...DEFAULT_COPY_LIMITS, ...o.copyLimits }
   }
 
   // For the plugin: the launcher created the machine; the plugin only uses it.
@@ -167,12 +170,13 @@ export class MvmSandbox implements Sandbox {
     return parsed
   }
 
-  async copyIn(_hostDir: string, _guestDir: string): Promise<void> {
-    throw new Error("not implemented")
+  copyIn(hostDir: string, guestDir: string): Promise<void> {
+    return copyInVia(this, hostDir, guestDir)
   }
 
-  async copyOut(_guestDir: string, _hostDir: string): Promise<CopyOutResult> {
-    throw new Error("not implemented")
+  // Treats the guest as hostile; see sandbox/copy.ts and sandbox/untar.ts.
+  copyOut(guestDir: string, hostDir: string): Promise<CopyOutResult> {
+    return copyOutVia(this, guestDir, hostDir, this.copyLimits)
   }
 
   async remove(): Promise<void> {

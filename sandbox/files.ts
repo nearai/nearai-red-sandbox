@@ -9,6 +9,8 @@ import { DEFAULTS } from "./defaults.ts"
 import { newNonce } from "./protocol.ts"
 import type { ExecResult, Sandbox } from "./sandbox.ts"
 
+type Exec = Pick<Sandbox, "exec">
+
 const CONTROL = { timeoutMs: 60_000, maxOutputBytes: 4096 }
 const decode = (b: Uint8Array) => new TextDecoder().decode(b)
 
@@ -48,7 +50,7 @@ function toBase64(data: Uint8Array): string {
   return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("base64")
 }
 
-export async function guestWrite(sb: Sandbox, path: string, data: Uint8Array): Promise<void> {
+export async function guestWrite(sb: Exec, path: string, data: Uint8Array): Promise<void> {
   const b64 = toBase64(data)
   const size = DEFAULTS.argvChunkChars // a multiple of 4, so each chunk decodes on its own
   const chunks: string[] = []
@@ -75,7 +77,7 @@ export type GuestReadResult =
   | { kind: "dir"; entries: string[]; truncated?: boolean }
   | { kind: "missing" }
 
-export async function guestRead(sb: Sandbox, path: string, maxBytes: number): Promise<GuestReadResult> {
+export async function guestRead(sb: Exec, path: string, maxBytes: number): Promise<GuestReadResult> {
   const r = await sb.exec(["sh", "-c", READ, "rts", path, String(maxBytes)], {
     timeoutMs: CONTROL.timeoutMs,
     maxOutputBytes: maxBytes + 64,
@@ -101,7 +103,7 @@ export async function guestRead(sb: Sandbox, path: string, maxBytes: number): Pr
   return { kind: "file", data, size, truncated: size > data.length }
 }
 
-export async function guestSha256(sb: Sandbox, path: string): Promise<string> {
+export async function guestSha256(sb: Exec, path: string): Promise<string> {
   const r = await sb.exec(["sh", "-c", SHA, "rts", path], CONTROL)
   if (r.exitCode !== 0) throw fail("sha256", path, r)
   const m = /^([0-9a-f]{64})\b/.exec(decode(r.stdout))
