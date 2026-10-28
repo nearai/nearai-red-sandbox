@@ -357,6 +357,18 @@ mod tests {
     }
 
     #[test]
+    fn a_pck_crl_with_a_broken_signature_is_refused() {
+        // The last byte sits inside the signature, so the CRL still parses.
+        let mut c = sample();
+        *c.pck_crl.last_mut().unwrap() ^= 0x01;
+        let e = verify_quote(QUOTE, &c, NOW).unwrap_err();
+        assert!(e.contains("Signature"), "{e}");
+        let mut c = sample();
+        *c.root_ca_crl.last_mut().unwrap() ^= 0x01;
+        assert!(verify_quote(QUOTE, &c, NOW).is_err());
+    }
+
+    #[test]
     fn an_sgx_quote_is_refused() {
         let e = verify_quote(SGX_QUOTE, &sample(), NOW).unwrap_err();
         assert!(e.contains("not a TDX quote"), "{e}");
