@@ -41,13 +41,13 @@ async function readCapped(stream: ReadableStream<Uint8Array>, cap: number): Prom
   return out
 }
 
-export function spawnRunner(mvmctl: string, emptyGitConfig: string): Runner {
+export function spawnRunner(mvmctl: string, emptyGitConfig: string, extraEnv: Record<string, string> = {}): Runner {
   return async (argv, o) => {
     const proc = Bun.spawn([mvmctl, ...argv], {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
-      env: { ...process.env, GIT_CONFIG_GLOBAL: emptyGitConfig },
+      env: { ...process.env, ...extraEnv, GIT_CONFIG_GLOBAL: emptyGitConfig },
     })
     let killed = false
     const timer = setTimeout(() => {

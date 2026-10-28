@@ -26,6 +26,9 @@ export type PluginOptions = {
   timeoutMs: number
   maxOutputBytes: number
   cwd?: string
+  // The operator's real HOME, for mvmctl's own state. opencode itself runs
+  // with HOME pointed at the session directory.
+  mvmHome?: string
 }
 
 const DESCRIPTIONS: Record<ToolName, string> = {
@@ -66,6 +69,7 @@ function checkOptions(o: any): PluginOptions {
     timeoutMs: int("timeoutMs"),
     maxOutputBytes: int("maxOutputBytes"),
     cwd: typeof o.cwd === "string" ? o.cwd : undefined,
+    mvmHome: typeof o.mvmHome === "string" && o.mvmHome !== "" ? o.mvmHome : undefined,
   }
 }
 
@@ -138,7 +142,7 @@ export async function setup(ctx: any) {
   await setupWith(ctx, (o) => {
     const leak = process.env.RTS_TEST_LEAK === "shell" ? ("shell" as const) : undefined
     if (leak) console.error("rts-sandbox: RTS_TEST_LEAK=shell is set; shell runs ON THE HOST (leak check only)")
-    const sb = MvmSandbox.attach(o.machine, spawnRunner(o.mvmctl, o.emptyGitConfig))
+    const sb = MvmSandbox.attach(o.machine, spawnRunner(o.mvmctl, o.emptyGitConfig, o.mvmHome ? { HOME: o.mvmHome } : {}))
     return makeTools(sb, { timeoutMs: o.timeoutMs, maxOutputBytes: o.maxOutputBytes, cwd: o.cwd, leak })
   })
 }
