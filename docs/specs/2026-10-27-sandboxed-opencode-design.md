@@ -53,7 +53,8 @@ interface Sandbox {
     Promise<{ exitCode: number; timedOut: boolean; stdout: Uint8Array; stderr: Uint8Array;
               stdoutBytes: number; stderrBytes: number; truncated: boolean }>
   copyIn(hostDir: string, guestDir: string): Promise<void>
-  copyOut(guestDir: string, hostDir: string): Promise<void>
+  copyOut(guestDir: string, hostDir: string):
+    Promise<{ status: "exported"; files: number; bytes: number } | { status: "nothing to export" }>
   remove(): Promise<void>
 }
 ```
