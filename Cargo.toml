@@ -24,6 +24,7 @@ serde_json = { version = "1.0.154", features = ["raw_value"] }
 # never default features, never `danger-allow-tcb-override`.
 dcap-qvl = { path = "vendor/dcap-qvl-0.7.0", version = "=0.7.0", default-features = false, features = ["std", "ring", "default-x509"] }
 hex = "0.4.3"
+ring = "0.17.14"
 sha2 = "0.11.1"
 ironwire_proxy = { git = "https://github.com/nearai/ironwire", rev = "bf8b90ba7b2e3b4da3011e1107a8a2068c8085bc" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }

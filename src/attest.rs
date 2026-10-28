@@ -2,4 +2,5 @@
 //! Intel PCS collateral.
 
 pub mod http;
+pub mod nras;
 pub mod tdx;

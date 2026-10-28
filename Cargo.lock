@@ -2795,6 +2795,7 @@ dependencies = [
  "keyring-core",
  "libc",
  "reqwest 0.12.28",
+ "ring",
  "secrecy",
  "serde",
  "serde_json",
