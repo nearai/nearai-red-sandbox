@@ -1,4 +1,6 @@
 pub mod bridge;
+pub mod auth;
+pub mod inference;
 pub mod config;
 pub mod copy;
 pub mod files;
@@ -9,6 +11,7 @@ pub mod session;
 pub mod sandbox;
 pub mod sys;
 pub mod tools;
+pub mod terminal;
 pub mod untar;
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
 //! Operator config for one session, read from a JSON file.
 //!
-//! Inference goes through IronWire by default: opencode talks to IronWire's
-//! OpenAI façade on loopback, and IronWire holds the NEAR AI key, so no
-//! provider credential ever reaches opencode's environment or config.
+//! By default the launcher signs in to NEAR AI Cloud and starts an embedded
+//! IronWire proxy. Explicit provider connection fields select an external
+//! endpoint instead. OpenCode receives only a placeholder key in embedded mode.
 
 use std::path::{Path, PathBuf};
 
@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::mvm::is_image_ref;
 
-pub const DEFAULT_IMAGE: &str = "docker.io/library/alpine@sha256:e311ae748be7f56ae5cba304bc488f0786df68ee507513f654a5cc8597cffb42";
+pub const DEFAULT_IMAGE: &str = "us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images/guest@sha256:56406743ca98389029c795a9cd55f0d1f55e569d57226c10e6c4f6f340cf9ac1";
 pub const IRONWIRE_PROVIDER_ID: &str = "ironwire";
 pub const IRONWIRE_BASE_URL: &str = "http://127.0.0.1:8463/openai/v1";
 /// Sent as the API key when the provider needs none. IronWire strips the
@@ -31,7 +31,9 @@ impl ProviderConfig {
     /// Host and port when the provider is on this machine's loopback.
     pub fn loopback(&self) -> Option<(String, u16, String)> {
         let rest = self.base_url.strip_prefix("http://")?;
-        let (authority, path) = rest.split_once('/').map_or((rest, String::new()), |(a, p)| (a, format!("/{p}")));
+        let (authority, path) = rest
+            .split_once('/')
+            .map_or((rest, String::new()), |(a, p)| (a, format!("/{p}")));
         let (host, port) = authority.rsplit_once(':')?;
         if host != "127.0.0.1" && host != "localhost" {
             return None;
@@ -52,12 +54,20 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { tool_timeout_ms: 120_000, max_output_bytes: 65_536, memory_mib: 2048, cpus: 2, host_rss_ceiling_mib: 3072, handshake_ms: 30_000 }
+        Self {
+            tool_timeout_ms: 120_000,
+            max_output_bytes: 65_536,
+            memory_mib: 2048,
+            cpus: 2,
+            host_rss_ceiling_mib: 3072,
+            handshake_ms: 30_000,
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorConfig {
+    pub embedded_inference: bool,
     pub image: String,
     pub inputs_dir: Option<PathBuf>,
     pub provider: ProviderConfig,
@@ -70,13 +80,13 @@ pub struct OperatorConfig {
     pub plugin_dir: PathBuf,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RawProvider {
     id: Option<String>,
     #[serde(rename = "baseURL")]
     base_url: Option<String>,
-    models: Vec<String>,
+    models: Option<Vec<String>>,
     api_key_env: Option<String>,
 }
 
@@ -98,6 +108,7 @@ struct RawLimits {
 struct Raw {
     image: Option<String>,
     inputs_dir: Option<String>,
+    #[serde(default)]
     provider: RawProvider,
     #[serde(default)]
     limits: RawLimits,
@@ -109,12 +120,76 @@ struct Raw {
 
 fn is_env_name(s: &str) -> bool {
     let mut b = s.bytes();
-    matches!(b.next(), Some(c) if c.is_ascii_uppercase() || c == b'_') && b.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+    matches!(b.next(), Some(c) if c.is_ascii_uppercase() || c == b'_')
+        && b.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+}
+
+fn reserved_credential_env(name: &str) -> bool {
+    // A direct provider may preserve exactly this variable when constructing
+    // OpenCode's environment. It must never be an execution/configuration
+    // control that could undo the session's isolated home or runtime policy.
+    [
+        "XDG_",
+        "OPENCODE_",
+        "RTS_",
+        "LC_",
+        "GIT_",
+        "NODE_",
+        "BUN_",
+        "LD_",
+        "DYLD_",
+        "NPM_CONFIG_",
+        "PYTHON",
+        "RUBY",
+        "PERL",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+        || matches!(
+            name,
+            "HOME"
+                | "PATH"
+                | "PWD"
+                | "OLDPWD"
+                | "USER"
+                | "LOGNAME"
+                | "SHELL"
+                | "ENV"
+                | "BASH_ENV"
+                | "ZDOTDIR"
+                | "FPATH"
+                | "CDPATH"
+                | "IFS"
+                | "PS4"
+                | "PROMPT_COMMAND"
+                | "TMPDIR"
+                | "TMP"
+                | "TEMP"
+                | "LANG"
+                | "LANGUAGE"
+                | "TZ"
+                | "TERM"
+                | "TERMINFO"
+                | "TERMINFO_DIRS"
+                | "HTTP_PROXY"
+                | "HTTPS_PROXY"
+                | "ALL_PROXY"
+                | "NO_PROXY"
+                | "SSL_CERT_FILE"
+                | "SSL_CERT_DIR"
+                | "CURL_CA_BUNDLE"
+                | "REQUESTS_CA_BUNDLE"
+                | "_"
+        )
 }
 
 fn positive<T: Copy + Default + PartialOrd>(v: Option<T>, d: T, k: &str) -> Result<T, String> {
     let v = v.unwrap_or(d);
-    if v <= T::default() { Err(format!("config: limits.{k} must be a positive integer")) } else { Ok(v) }
+    if v <= T::default() {
+        Err(format!("config: limits.{k} must be a positive integer"))
+    } else {
+        Ok(v)
+    }
 }
 
 /// Paths the config leaves out. `repo` is where this checkout lives.
@@ -125,17 +200,29 @@ pub struct Defaults {
 
 impl Defaults {
     pub fn from_env() -> Self {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-        let mvmctl = std::env::var_os("RTS_MVMCTL").map(PathBuf::from).unwrap_or_else(|| home.join(".local/mvm/v0.22.0/mvmctl"));
-        Self { repo: PathBuf::from(env!("CARGO_MANIFEST_DIR")), mvmctl }
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let mvmctl = std::env::var_os("RTS_MVMCTL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/mvm/v0.22.0/mvmctl"));
+        Self {
+            repo: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            mvmctl,
+        }
     }
 }
 
 pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<OperatorConfig, String> {
     let raw: Raw = serde_json::from_str(text).map_err(|e| format!("config: {e}"))?;
     let p = raw.provider;
+    let embedded_inference = p.id.is_none() && p.base_url.is_none() && p.api_key_env.is_none();
     let id = p.id.unwrap_or_else(|| IRONWIRE_PROVIDER_ID.into());
-    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
         return Err("config: provider.id must be lowercase letters, digits and dashes".into());
     }
     let base_url = p.base_url.unwrap_or_else(|| IRONWIRE_BASE_URL.into());
@@ -144,20 +231,40 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
     {
         return Err("config: provider.apiKeyEnv must be an environment variable name".into());
     }
-    if p.models.is_empty() || p.models.iter().any(String::is_empty) {
+    if p.api_key_env
+        .as_deref()
+        .is_some_and(reserved_credential_env)
+    {
+        return Err(
+            "config: provider.apiKeyEnv cannot name a reserved session or runtime variable".into(),
+        );
+    }
+    let models = p
+        .models
+        .unwrap_or_else(|| vec!["z-ai/glm-5.3-flash".into()]);
+    if models.is_empty() || models.iter().any(String::is_empty) {
         return Err("config: provider.models must be a non-empty list of model IDs".into());
     }
-    let provider = ProviderConfig { id, base_url, models: p.models, api_key_env: p.api_key_env };
+    let provider = ProviderConfig {
+        id,
+        base_url,
+        models,
+        api_key_env: p.api_key_env,
+    };
     // Plain http only to loopback: anything else would send prompts in the clear.
     if !provider.base_url.starts_with("https://") && provider.loopback().is_none() {
         return Err("config: provider.baseURL must be https, or http on 127.0.0.1 or localhost with a port (IronWire)".into());
     }
     if provider.api_key_env.is_none() && provider.loopback().is_none() {
-        return Err("config: provider.apiKeyEnv is required for a provider that is not on loopback".into());
+        return Err(
+            "config: provider.apiKeyEnv is required for a provider that is not on loopback".into(),
+        );
     }
     let image = raw.image.unwrap_or_else(|| DEFAULT_IMAGE.into());
     if !is_image_ref(&image) {
-        return Err("config: image must be a digest-pinned reference (name@sha256:<64 hex>)".into());
+        return Err(
+            "config: image must be a digest-pinned reference (name@sha256:<64 hex>)".into(),
+        );
     }
     let dl = Limits::default();
     let l = raw.limits;
@@ -166,7 +273,11 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
         max_output_bytes: positive(l.max_output_bytes, dl.max_output_bytes, "maxOutputBytes")?,
         memory_mib: positive(l.memory_mib, dl.memory_mib, "memoryMiB")?,
         cpus: positive(l.cpus, dl.cpus, "cpus")?,
-        host_rss_ceiling_mib: positive(l.host_rss_ceiling_mib, dl.host_rss_ceiling_mib, "hostRssCeilingMiB")?,
+        host_rss_ceiling_mib: positive(
+            l.host_rss_ceiling_mib,
+            dl.host_rss_ceiling_mib,
+            "hostRssCeilingMiB",
+        )?,
         handshake_ms: positive(l.handshake_ms, dl.handshake_ms, "handshakeMs")?,
     };
     let path = |v: Option<String>, k: &str| -> Result<Option<PathBuf>, String> {
@@ -177,19 +288,25 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
         }
     };
     Ok(OperatorConfig {
+        embedded_inference,
         image,
         inputs_dir: path(raw.inputs_dir, "inputsDir")?,
         provider,
         limits,
-        sessions_dir: path(raw.sessions_dir, "sessionsDir")?.unwrap_or_else(|| d.repo.join("sessions")),
-        opencode: raw.opencode.filter(|s| !s.is_empty()).unwrap_or_else(|| "opencode".into()),
+        sessions_dir: path(raw.sessions_dir, "sessionsDir")?
+            .unwrap_or_else(|| d.repo.join("sessions")),
+        opencode: raw
+            .opencode
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "opencode".into()),
         mvmctl: path(raw.mvmctl, "mvmctl")?.unwrap_or_else(|| d.mvmctl.clone()),
         plugin_dir: path(raw.plugin_dir, "pluginDir")?.unwrap_or_else(|| d.repo.join("plugin")),
     })
 }
 
 pub fn load_config(file: &Path, d: &Defaults) -> Result<OperatorConfig, String> {
-    let text = std::fs::read_to_string(file).map_err(|e| format!("config: cannot read {}: {e}", file.display()))?;
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| format!("config: cannot read {}: {e}", file.display()))?;
     let abs = std::path::absolute(file).map_err(|e| format!("config: {e}"))?;
     parse_config(&text, abs.parent().unwrap_or(Path::new("/")), d)
 }
@@ -199,7 +316,19 @@ mod tests {
     use super::*;
 
     fn d() -> Defaults {
-        Defaults { repo: "/repo".into(), mvmctl: "/home/op/.local/mvm/v0.22.0/mvmctl".into() }
+        Defaults {
+            repo: "/repo".into(),
+            mvmctl: "/home/op/.local/mvm/v0.22.0/mvmctl".into(),
+        }
+    }
+
+    #[test]
+    fn an_omitted_provider_uses_the_default_near_ai_model() {
+        let c = parse("{}").unwrap();
+        assert!(c.embedded_inference);
+        assert_eq!(c.provider.models, ["z-ai/glm-5.3-flash"]);
+        assert_eq!(c.inputs_dir, None);
+        assert_eq!(c.provider.api_key_env, None);
     }
     fn parse(t: &str) -> Result<OperatorConfig, String> {
         parse_config(t, Path::new("/cfg"), &d())
@@ -208,10 +337,14 @@ mod tests {
     #[test]
     fn a_minimal_config_routes_inference_through_ironwire() {
         let c = parse(r#"{ "provider": { "models": ["z-ai/glm-5.3-flash"] } }"#).unwrap();
+        assert!(c.embedded_inference);
         assert_eq!(c.provider.id, "ironwire");
         assert_eq!(c.provider.base_url, "http://127.0.0.1:8463/openai/v1");
         assert_eq!(c.provider.api_key_env, None);
-        assert_eq!(c.provider.loopback(), Some(("127.0.0.1".into(), 8463, "/openai/v1".into())));
+        assert_eq!(
+            c.provider.loopback(),
+            Some(("127.0.0.1".into(), 8463, "/openai/v1".into()))
+        );
         assert_eq!(c.image, DEFAULT_IMAGE);
         assert_eq!(c.limits, Limits::default());
         assert_eq!(c.sessions_dir, PathBuf::from("/repo/sessions"));
@@ -224,30 +357,122 @@ mod tests {
         let direct = r#"{ "provider": { "id": "nearai", "baseURL": "https://cloud-api.near.ai/v1", "models": ["m"] } }"#;
         assert!(parse(direct).unwrap_err().contains("apiKeyEnv is required"));
         let keyed = r#"{ "provider": { "id": "nearai", "baseURL": "https://cloud-api.near.ai/v1", "models": ["m"], "apiKeyEnv": "NEARAI_API_KEY" } }"#;
-        assert_eq!(parse(keyed).unwrap().provider.api_key_env.as_deref(), Some("NEARAI_API_KEY"));
+        assert_eq!(
+            parse(keyed).unwrap().provider.api_key_env.as_deref(),
+            Some("NEARAI_API_KEY")
+        );
+        assert!(!parse(keyed).unwrap().embedded_inference);
+    }
+
+    #[test]
+    fn an_explicit_external_loopback_provider_keeps_its_connection() {
+        let cfg = parse(
+            r#"{"provider":{"baseURL":"http://127.0.0.1:9999/openai/v1","models":["external"]}}"#,
+        )
+        .unwrap();
+        assert!(!cfg.embedded_inference);
+        assert_eq!(cfg.provider.base_url, "http://127.0.0.1:9999/openai/v1");
+        assert_eq!(cfg.provider.models, ["external"]);
+    }
+
+    #[test]
+    fn provider_credential_names_cannot_override_session_isolation_or_runtime() {
+        for name in [
+            "HOME",
+            "PATH",
+            "TMPDIR",
+            "XDG_CONFIG_HOME",
+            "OPENCODE_CONFIG_CONTENT",
+            "RTS_TEST_LEAK",
+            "LC_ALL",
+            "LANG",
+            "GIT_CONFIG_GLOBAL",
+            "BASH_ENV",
+            "ENV",
+            "NODE_OPTIONS",
+            "BUN_OPTIONS",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "HTTPS_PROXY",
+            "SSL_CERT_FILE",
+        ] {
+            let text = format!(
+                r#"{{"provider":{{"id":"external","baseURL":"https://example.invalid/v1","apiKeyEnv":"{name}"}}}}"#
+            );
+            assert!(
+                parse(&text).is_err(),
+                "accepted reserved credential name {name}"
+            );
+        }
+        for name in [
+            "NEARAI_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "MY_PROVIDER_TOKEN",
+            "K",
+        ] {
+            let text = format!(
+                r#"{{"provider":{{"id":"external","baseURL":"https://example.invalid/v1","apiKeyEnv":"{name}"}}}}"#
+            );
+            assert!(parse(&text).is_ok(), "rejected credential name {name}");
+        }
     }
 
     #[test]
     fn plain_http_is_refused_off_loopback() {
-        for url in ["http://10.0.0.5:8463/openai/v1", "http://127.0.0.1/openai/v1", "http://127.0.0.1.evil:80/v1", "ftp://x"] {
-            let t = format!(r#"{{ "provider": {{ "baseURL": "{url}", "models": ["m"], "apiKeyEnv": "K" }} }}"#);
+        for url in [
+            "http://10.0.0.5:8463/openai/v1",
+            "http://127.0.0.1/openai/v1",
+            "http://127.0.0.1.evil:80/v1",
+            "ftp://x",
+        ] {
+            let t = format!(
+                r#"{{ "provider": {{ "baseURL": "{url}", "models": ["m"], "apiKeyEnv": "K" }} }}"#
+            );
             assert!(parse(&t).unwrap_err().contains("baseURL"), "{url}");
         }
     }
 
     #[test]
     fn refusals_for_unpinned_images_bad_limits_and_unknown_keys() {
-        assert!(parse(r#"{ "image": "alpine:latest", "provider": { "models": ["m"] } }"#).unwrap_err().contains("digest-pinned"));
-        assert!(parse(r#"{ "provider": { "models": ["m"] }, "limits": { "cpus": 0 } }"#).unwrap_err().contains("limits.cpus"));
-        assert!(parse(r#"{ "provider": { "models": [] } }"#).unwrap_err().contains("models"));
-        assert!(parse(r#"{ "provider": { "models": ["m"] }, "mcp": {} }"#).unwrap_err().contains("unknown field"));
-        assert!(parse(r#"{ "provider": { "models": ["m"], "apiKeyEnv": "lower" } }"#).unwrap_err().contains("apiKeyEnv"));
-        assert!(parse(r#"{ "provider": { "id": "Bad_ID", "models": ["m"] } }"#).unwrap_err().contains("provider.id"));
+        assert!(
+            parse(r#"{ "image": "alpine:latest", "provider": { "models": ["m"] } }"#)
+                .unwrap_err()
+                .contains("digest-pinned")
+        );
+        assert!(
+            parse(r#"{ "provider": { "models": ["m"] }, "limits": { "cpus": 0 } }"#)
+                .unwrap_err()
+                .contains("limits.cpus")
+        );
+        assert!(
+            parse(r#"{ "provider": { "models": [] } }"#)
+                .unwrap_err()
+                .contains("models")
+        );
+        assert!(
+            parse(r#"{ "provider": { "models": ["m"] }, "mcp": {} }"#)
+                .unwrap_err()
+                .contains("unknown field")
+        );
+        assert!(
+            parse(r#"{ "provider": { "models": ["m"], "apiKeyEnv": "lower" } }"#)
+                .unwrap_err()
+                .contains("apiKeyEnv")
+        );
+        assert!(
+            parse(r#"{ "provider": { "id": "Bad_ID", "models": ["m"] } }"#)
+                .unwrap_err()
+                .contains("provider.id")
+        );
     }
 
     #[test]
     fn relative_paths_resolve_against_the_config_file() {
-        let c = parse(r#"{ "inputsDir": "./inputs", "sessionsDir": "out", "provider": { "models": ["m"] } }"#).unwrap();
+        let c = parse(
+            r#"{ "inputsDir": "./inputs", "sessionsDir": "out", "provider": { "models": ["m"] } }"#,
+        )
+        .unwrap();
         assert_eq!(c.inputs_dir, Some(PathBuf::from("/cfg/./inputs")));
         assert_eq!(c.sessions_dir, PathBuf::from("/cfg/out"));
     }

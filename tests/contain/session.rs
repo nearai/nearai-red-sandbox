@@ -121,7 +121,7 @@ fn a_project_opencode_json_with_an_mcp_server_is_refused_by_the_launcher_and_its
 
 #[test]
 #[ignore = "real mvm and opencode"]
-fn a_second_plugin_that_adds_a_stray_tool_makes_the_session_refuse() {
+fn a_second_plugin_stray_tool_is_removed_before_the_session_is_ready() {
     let (Some(h), Some(oc)) = (mvm(), opencode()) else { return };
     let m = fresh_machine(h);
     let s = session();
@@ -135,10 +135,12 @@ fn a_second_plugin_that_adds_a_stray_tool_makes_the_session_refuse() {
     .unwrap();
     let nonce = new_nonce();
     let file = configure(h, &s.p, &m.name, &nonce);
-    // Loads before ours, so our check sees it.
+    // Loads before ours, so the sandbox transform removes its tool.
     edit_config(&file, |c| c["plugin"].as_array_mut().unwrap().insert(0, json!([stray, {}])));
-    probe(&oc, &s.p);
-    assert!(!ready_holds(&s.p, &nonce));
+    let err = probe(&oc, &s.p);
+    assert!(ready_holds(&s.p, &nonce), "{err}");
+    let debug: Value = serde_json::from_str(&fs::read_to_string(s.p.runtime.join("debug.json")).unwrap()).unwrap();
+    assert_eq!(debug["tools"], json!(ALLOWED_TOOLS));
 }
 
 #[test]
@@ -185,7 +187,13 @@ fn lost_vm_after_machine_stop_tool_calls_fail_and_nothing_runs_on_the_host() {
     let s = session();
     let o = bridge_options(h, &m.name, &s.p.state_dir);
     assert_eq!(rts_tool(&o, "shell", json!({ "command": "echo up" })).1, "up");
-    h.run.run(&sv(&["machine", "stop", &m.name]), Duration::from_secs(120)).unwrap();
+    let stopped = h.run.run(&sv(&["machine", "stop", &m.name, "--yes"]), Duration::from_secs(120)).unwrap();
+    assert_eq!(stopped.code, Some(0), "{}", String::from_utf8_lossy(&stopped.stderr));
+    let listed = h.run.run(&sv(&["machine", "ps", "--json"]), Duration::from_secs(30)).unwrap();
+    assert_eq!(listed.code, Some(0), "{}", String::from_utf8_lossy(&listed.stderr));
+    let inventory: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let machine = inventory.as_array().unwrap().iter().find(|v| v["name"] == m.name).expect("stopped persistent machine is still listed");
+    assert_eq!(machine["status"], "stopped");
     let sentinel = format!("/tmp/rts-sentinel3-{}", random_hex(6));
     let a = rts_tool(&o, "shell", json!({ "command": format!("touch {sentinel}") }));
     let b = rts_tool(&o, "write", json!({ "path": sentinel, "content": "x" }));

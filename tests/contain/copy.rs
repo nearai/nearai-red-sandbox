@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use rts::copy::{CopyLimits, copy_out_via};
 use rts::files::{guest_sha256, guest_write};
 use rts::protocol::random_hex;
 use rts::sandbox::{CopyOutResult, Error, Exec, ExecOptions, Sandbox, sv};
@@ -40,7 +41,7 @@ fn copy_out_brings_guest_out_back_byte_exact() {
     let Some(h) = mvm() else { return };
     let m = fresh_machine(h);
     let root = tempdir("copy");
-    let blob = random(700 * 1024); // two read slices
+    let blob = random(700 * 1024); // spans multiple transport read slices
     guest_write(&*m, "/out/sub/blob", &blob).unwrap();
     guest_write(&*m, "/out/hello.txt", b"hi").unwrap();
     let dest = root.join("out");
@@ -64,6 +65,10 @@ fn a_missing_or_empty_out_is_nothing_to_export() {
 }
 
 fn hostile(plant: impl FnOnce(&Machine, &Path), reason: &str) {
+    hostile_with_limits(plant, reason, CopyLimits::default());
+}
+
+fn hostile_with_limits(plant: impl FnOnce(&Machine, &Path), reason: &str, copy_limits: CopyLimits) {
     let Some(h) = mvm() else { return };
     let m = fresh_machine(h);
     let root = tempdir("copy");
@@ -72,7 +77,7 @@ fn hostile(plant: impl FnOnce(&Machine, &Path), reason: &str) {
     m.exec(&sv(&["mkdir", "-p", "/out"]), &limits()).unwrap();
     plant(&m, &sentinel);
     let dest = root.join("out");
-    let err = m.copy_out("/out", &dest).unwrap_err();
+    let err = copy_out_via(&*m, "/out", &dest, &copy_limits).unwrap_err();
     assert!(matches!(err, Error::Rejected(_)), "{err}");
     assert!(err.to_string().contains(reason), "{err}");
     assert!(!dest.exists());
@@ -102,12 +107,15 @@ fn hostile_out_a_120_byte_file_name_is_refused() {
 #[test]
 #[ignore = "real mvm"]
 fn hostile_out_a_file_over_the_size_cap_is_refused() {
-    let big = (300u64 * 1024 * 1024).to_string();
-    hostile(
+    // /out and the packed archive share /tmp's RAM-backed filesystem.
+    // Exercise the size limit without exhausting the 512 MiB fixture VM.
+    let big = (2u64 * 1024 * 1024).to_string();
+    hostile_with_limits(
         |m, _| {
             let r = m.exec(&sv(&["sh", "-c", r#"head -c "$1" /dev/zero > /out/huge"#, "rts", &big]), &ExecOptions { timeout_ms: 300_000, ..limits() }).unwrap();
-            assert_eq!(r.exit_code, 0);
+            assert_eq!(r.exit_code, 0, "{}", String::from_utf8_lossy(&r.stderr));
         },
         "size cap",
+        CopyLimits { max_bytes: 1024 * 1024, max_entries: 100, ..CopyLimits::default() },
     );
 }

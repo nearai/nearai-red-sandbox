@@ -15,7 +15,7 @@ use rts::config::DEFAULT_IMAGE;
 use rts::mvm::{MvmSandbox, Runner, SpawnRunner};
 use rts::protocol::random_hex;
 use rts::sandbox::{CreateSpec, ExecOptions, Sandbox};
-use rts::session::OPENCODE_VERSION;
+use rts::session::{OPENCODE_VERSION, initialize_guest_storage};
 use serde_json::{Value, json};
 
 pub struct Harness {
@@ -91,6 +91,7 @@ pub fn fresh_machine(h: &Harness) -> Machine {
     let name = format!("rts-{}", random_hex(6));
     let m = Machine(MvmSandbox::new(&name, Box::new(h.run.clone())).unwrap());
     m.create(&CreateSpec { name: &name, image: &h.image, memory_mib: 512, cpus: 1 }).expect("machine create");
+    initialize_guest_storage(&m.0).expect("guest input/output storage");
     m
 }
 

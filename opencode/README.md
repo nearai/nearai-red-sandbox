@@ -3,9 +3,14 @@
 ## How a session runs
 
 ```
-cargo build --release
-./target/release/rts launch --config opencode/session.example.json
+RUSTFLAGS="-D warnings" CARGO_INCREMENTAL=0 cargo build --release
+./target/release/rts launch
 ```
+
+The default launch checks local prerequisites, uses a saved NEAR AI Cloud
+inference key or opens the default browser for GitHub sign-in, and starts
+a private embedded IronWire proxy. `rts login --provider google` signs in
+explicitly with Google. See [sign-in and account selection](../docs/authentication.md).
 
 `rts` is the Rust launcher (`src/session.rs`). It preflights, creates the
 microVM, writes the opencode config below, and starts opencode. opencode
@@ -14,24 +19,43 @@ sandboxed tool call spawns `rts tool <name>` (`src/bridge.rs`) with the
 request on stdin and returns its stdout. Exit 3 from `rts tool` means the
 machine is unavailable, and the call fails; nothing falls back to the host.
 
-Tests: `cargo test` (unit), `bun test tests/unit` (the plugin shim), and
-`cargo test --test contain -- --ignored --test-threads=1` on a host with
+On macOS, host-side tests and archive transport require GNU coreutils and
+GNU tar. BSD tar can add PAX metadata that the deliberately strict archive
+reader refuses. Install them and put their unprefixed commands first:
+
+```sh
+brew install coreutils gnu-tar
+export PATH="$(brew --prefix coreutils)/libexec/gnubin:$(brew --prefix gnu-tar)/libexec/gnubin:$PATH"
+```
+
+Tests: `RUSTFLAGS="-D warnings" CARGO_INCREMENTAL=0 cargo test` (unit),
+`bun test tests/unit` (the plugin shim), and
+`RUSTFLAGS="-D warnings" CARGO_INCREMENTAL=0 cargo test --test contain -- --ignored --test-threads=1` on a host with
 mvm and opencode 2.1.4 (real VMs; each test skips with the reason when
 either is missing).
 
-## Inference through IronWire
+## Inference through embedded IronWire
 
 By default opencode talks to [IronWire](https://github.com/nearai/ironwire)'s
-OpenAI façade on loopback, `http://127.0.0.1:8463/openai/v1`, as provider
-`ironwire`. IronWire holds the NEAR AI key and strips the inbound
+OpenAI façade on an ephemeral loopback port, as provider `ironwire`.
+The launcher supplies a dedicated inference key from native credential storage
+directly to IronWire in host memory. IronWire strips the inbound
 authorization header, so no provider credential is in opencode's config or
 environment; the generated config carries a placeholder API key. The
-session's inference also gets IronWire's ledger, spend caps and fallback.
+embedded proxy enables only the configured NEAR AI backend; credential
+discovery, subscription credential files, startup probes, and update checks
+are disabled. Per-model routing headers preserve the selected model ID.
 
-Preflight sends `GET <baseURL>/models` and refuses the session unless
-IronWire answers 200 and lists every configured model. If it does not, run
-`ironwire serve`, and check `ironwire status` shows the NEAR AI backend with
-a key.
+After local preflight and authentication, the session sends
+`GET <baseURL>/models` and refuses the session unless
+IronWire answers 200 and lists every configured model. The proxy stays alive
+through session teardown and then stops. There is no separate daemon to start.
+
+To use a separately managed IronWire daemon, explicitly set
+`provider.id` and `provider.baseURL` in the operator configuration. The old
+`http://127.0.0.1:8463/openai/v1` connection remains available in that external
+mode and bypasses browser sign-in. A provider with only `models` selects
+embedded inference; omitting the provider entirely selects the default model.
 
 A provider reached directly (for example `https://cloud-api.near.ai/v1`)
 still works: set `provider.id`, `provider.baseURL` (https) and
@@ -93,7 +117,7 @@ The launcher writes this to `<runtime>/xdg/config/opencode/opencode.json`
     "nonce": "<24 hex>",
     "readyFile": "<runtime>/ready",
     "auditFile": "sessions/<id>/tools.jsonl",
-    "provider": "ironwire",
+    "provider": "nearai-red-embedded",
     "rts": "/abs/path/to/rts",
     "bridge": {
       "machine": "rts-0123456789ab",
@@ -106,15 +130,15 @@ The launcher writes this to `<runtime>/xdg/config/opencode/opencode.json`
     }
   }]],
   "provider": {
-    "ironwire": {
+    "nearai-red-embedded": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "ironwire",
-      "options": { "baseURL": "http://127.0.0.1:8463/openai/v1", "apiKey": "ironwire-holds-the-key" },
-      "models": { "z-ai/glm-5.3-flash": { "name": "z-ai/glm-5.3-flash", "tool_call": true } }
+      "name": "nearai-red-embedded",
+      "options": { "baseURL": "http://127.0.0.1:<ephemeral-port>/openai/v1", "apiKey": "ironwire-holds-the-key" },
+      "models": { "z-ai/glm-5.3-flash": { "name": "z-ai/glm-5.3-flash", "tool_call": true, "headers": { "x-ironwire-route": "nearai:z-ai/glm-5.3-flash" } } }
     }
   },
-  "model": "ironwire/z-ai/glm-5.3-flash",
-  "enabled_providers": ["ironwire"],
+  "model": "nearai-red-embedded/z-ai/glm-5.3-flash",
+  "enabled_providers": ["nearai-red-embedded"],
   "share": "disabled"
 }
 ```
@@ -149,11 +173,42 @@ the ready file.
   descriptions in its transform, but that hook may overwrite the `shell` one.
   This affects only what the model is told, not where commands run.
 
-## Host RSS sampling
+## Host RSS sampling and input readiness
 
-The launcher looks for the per-machine `mvm-hvf-supervisor` PID in
-`mvmctl machine inspect <name>` output first and falls back to
-`pgrep -f "mvm-hvf-supervisor.*<name>"`, then samples `ps -o rss= -p <pid>`
-every 5 s. Which method works on v0.22.0 has not been recorded yet: it needs
-a run on the macOS host (the launcher logs the PID and the method that
-found it at the start of each session). Record the result here after the first live session.
+The launcher reads `vms/<machine>/hvf.pid` under `MVM_HOME` or
+`$HOME/.mvm`, confirms the executable is `mvm-hvf-supervisor`, then samples
+`ps -o rss= -p <pid>` every five seconds. Missing, changed, or unverifiable
+PID/RSS information refuses the session. OpenCode runs on a controlling PTY;
+operator input is forwarded only after the plugin verifies its tool/model/MCP
+policy and writes the matching readiness nonce.
+
+## Recorded live validation status
+
+The latest recorded macOS containment run on 2026-10-28 had **19 passed and
+1 failed** using the derived guest image. Byte-exact copy-out failed when
+mvm's control stream closed during a slice; smaller slices also failed in
+focused reproductions. The session fails closed, but exported data can be lost.
+
+Containment remains unvalidated until those failures are resolved and the
+real suite passes. Unit tests, mocked browser callbacks, and local inference
+HTTP tests do not establish live Cloud sign-in or VM containment.
+
+The derived image in `guest/Dockerfile` was built with Colima for `linux/arm64`
+and published to the public Google Artifact Registry repository
+`us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images`. Its registry
+manifest digest is the default image pin in `src/config.rs`. Before the first
+launch on a machine, an operator with Google Cloud registry access can cache
+the image in mvm:
+
+```sh
+MVM_OCI_BEARER_TOKEN_US_WEST1_DOCKER_PKG_DEV="$(gcloud auth print-access-token)" \
+  ~/.local/mvm/v0.22.0/mvmctl image pull \
+  us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images/guest@sha256:56406743ca98389029c795a9cd55f0d1f55e569d57226c10e6c4f6f340cf9ac1
+```
+
+The image is public and anonymous Docker pulls work. However, a fresh anonymous
+pull using mvm 0.22.0 failed when Artifact Registry returned a 302 redirect for
+a layer; mvm rejected the redirect. The authenticated pull above succeeded; it
+requires an identity with Artifact Registry Reader access. The short-lived
+token is passed only to this explicit pull command; do not put it in the
+sandbox configuration or OpenCode environment.

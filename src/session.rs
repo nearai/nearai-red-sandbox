@@ -19,8 +19,35 @@ use crate::mvm::{MvmSandbox, RunOutput, Runner, SpawnRunner, StateDir, list_mach
 use crate::protocol::{new_nonce, random_hex};
 use crate::sandbox::{CopyOutResult, CreateSpec, Exec, ExecOptions, Sandbox, sv};
 use crate::sys;
+use crate::terminal::Terminal;
 
 pub const OPENCODE_VERSION: &str = "2.1.4";
+
+const INIT_GUEST_STORAGE: &str = r#"set -eu
+tmp=$1; input=$2; output=$3
+refuse() { echo 'unexpected guest input/output layout' >&2; exit 1; }
+[ -d "$tmp" ] && [ ! -L "$tmp" ] || refuse
+[ -L "$input" ] && [ "$(readlink "$input")" = "$tmp/rts/in" ] || refuse
+[ -L "$output" ] && [ "$(readlink "$output")" = "$tmp/rts/out" ] || refuse
+for dir in "$tmp/rts" "$tmp/rts/in" "$tmp/rts/out"; do
+  [ ! -L "$dir" ] || refuse
+  if [ -e "$dir" ]; then [ -d "$dir" ] || refuse; fi
+done
+for dir in "$tmp/rts" "$tmp/rts/in" "$tmp/rts/out"; do
+  if [ ! -d "$dir" ]; then mkdir -- "$dir"; fi
+  [ -d "$dir" ] && [ ! -L "$dir" ] || refuse
+done"#;
+
+/// Prepare the writable input and output directories of a newly created guest.
+/// The image root is read-only and its exact links point into per-VM /tmp.
+/// Refuse other layouts before creating anything or copying operator inputs.
+pub fn initialize_guest_storage(sb: &dyn Exec) -> Result<(), String> {
+    let mk = sb.exec(&crate::files::script(INIT_GUEST_STORAGE, &["/tmp", "/in", "/out"]), &ExecOptions::new(30_000, 4096)).map_err(|e| e.to_string())?;
+    if mk.exit_code != 0 {
+        return Err(format!("could not initialize guest input/output storage: {}", String::from_utf8_lossy(&mk.stderr).trim()));
+    }
+    Ok(())
+}
 
 /// Runs a command on the host. A trait so tests can stand in for
 /// `opencode --version`, `ps` and `pgrep`.
@@ -42,7 +69,17 @@ impl Host for RealHost {
 // --- opencode config ---
 
 pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig) -> Value {
-    let models: serde_json::Map<String, Value> = p.models.iter().map(|m| (m.clone(), json!({ "name": m, "tool_call": true }))).collect();
+    let models: serde_json::Map<String, Value> = p.models.iter().map(|m| {
+        let model = if p.id == "nearai-red-embedded" {
+            // Invalid route values must fail closed rather than silently use a
+            // different backend or model. Embedded startup validates these IDs.
+            let route = crate::inference::route_header(m).unwrap_or_else(|_| "invalid".into());
+            json!({ "name": m, "tool_call": true, "headers": { "x-ironwire-route": route } })
+        } else {
+            json!({ "name": m, "tool_call": true })
+        };
+        (m.clone(), model)
+    }).collect();
     let api_key = match &p.api_key_env {
         Some(k) => format!("{{env:{k}}}"),
         None => PLACEHOLDER_API_KEY.to_string(),
@@ -150,10 +187,15 @@ pub struct Launch {
 }
 
 pub fn opencode_launch(p: &SessionPaths, opencode: &str, base_env: impl IntoIterator<Item = (String, String)>) -> Launch {
+    opencode_launch_with_key(p, opencode, base_env, None)
+}
+
+pub fn opencode_launch_with_key(p: &SessionPaths, opencode: &str, base_env: impl IntoIterator<Item = (String, String)>, direct_key: Option<&str>) -> Launch {
     let mut env: Vec<(String, String)> = base_env
         .into_iter()
-        // Nothing may point opencode at another config, home, or test seam.
-        .filter(|(k, _)| !(k.starts_with("OPENCODE_") || k.starts_with("RTS_TEST_") || k.starts_with("XDG_") || k == "HOME"))
+        // Only terminal/runtime essentials and the explicitly selected direct
+        // provider key pass to OpenCode. Host credentials stay on the host.
+        .filter(|(k, _)| matches!(k.as_str(), "PATH" | "TERM" | "COLORTERM" | "LANG" | "TMPDIR" | "USER" | "LOGNAME" | "SHELL" | "DISPLAY" | "WAYLAND_DISPLAY" | "NO_COLOR") || k.starts_with("LC_") || direct_key == Some(k.as_str()))
         .collect();
     for (k, v) in [
         ("HOME", &p.home),
@@ -258,13 +300,15 @@ fn join_paths(p: &[PathBuf]) -> String {
     p.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
 }
 
+/// A machine-name prefix is not proof that its session has died. Until the
+/// harness records verifiable ownership/liveness, preserve every discovered
+/// machine rather than deleting another launcher's active guest.
 pub fn sweep_orphans(run: &Arc<dyn Runner>, log: &mut dyn FnMut(&str)) -> Result<Vec<String>, String> {
     let names = list_machines(run.as_ref()).map_err(|e| e.to_string())?;
     for name in &names {
-        log(&format!("removing orphaned machine {name}"));
-        MvmSandbox::new(name, Box::new(run.clone())).and_then(|sb| sb.remove()).map_err(|e| e.to_string())?;
+        log(&format!("preserving machine {name}: session ownership and liveness are unverified; inspect it before manual cleanup"));
     }
-    Ok(names)
+    Ok(vec![])
 }
 
 // --- handshake ---
@@ -293,50 +337,51 @@ pub fn wait_for_ready(file: &Path, nonce: &str, deadline: Duration, poll: Durati
 
 // --- host RSS ceiling (GHSA-x85r-49ww-2pxq) ---
 
-fn digits_after(s: &str) -> Option<u32> {
-    let d: String = s.chars().skip_while(|c| !c.is_ascii_digit()).take_while(char::is_ascii_digit).collect();
-    d.parse().ok().filter(|&n| n > 0)
+/// mvm v0.22.0 writes this PID file; inspect has no PID and the supervisor
+/// receives its VM identity over stdin, so its argv cannot identify the VM.
+fn supervisor_pid_file(name: &str, env: &[(String, String)]) -> Result<PathBuf, String> {
+    let get = |key: &str| env.iter().find(|(k, v)| k == key && !v.is_empty()).map(|(_, v)| PathBuf::from(v));
+    let root = get("MVM_HOME").or_else(|| get("HOME").map(|h| h.join(".mvm")))
+        .ok_or_else(|| "cannot monitor HVF supervisor: neither HOME nor MVM_HOME is set".to_string())?;
+    Ok(root.join("vms").join(name).join("hvf.pid"))
 }
 
-/// The supervisor pid in `machine inspect` output: a line naming the
-/// supervisor and a pid, else the first `pid` key.
-pub fn supervisor_pid_in(text: &str) -> Option<u32> {
-    let lower = text.to_ascii_lowercase();
-    for line in lower.lines() {
-        if let (Some(s), true) = (line.find("supervisor"), line.contains("pid"))
-            && let Some(i) = line[s..].find("pid")
-            && let Some(n) = digits_after(&line[s + i + 3..].chars().take(12).collect::<String>())
-        {
-            return Some(n);
-        }
-    }
-    let mut rest = lower.as_str();
-    while let Some(i) = rest.find("pid") {
-        let after = rest[i + 3..].trim_start_matches(['"', ' ']);
-        if after.starts_with([':', '=']) {
-            return digits_after(&after[1..].chars().take(12).collect::<String>());
-        }
-        rest = &rest[i + 3..];
-    }
-    None
+struct Supervisor {
+    pid: u32,
+    pid_file: PathBuf,
 }
 
-pub fn find_supervisor_pid(run: &dyn Runner, host: &dyn Host, name: &str) -> Option<(u32, &'static str)> {
-    if let Ok(r) = run.run(&sv(&["machine", "inspect", name]), Duration::from_secs(30))
-        && r.code == Some(0)
-        && let Some(pid) = supervisor_pid_in(&String::from_utf8_lossy(&r.stdout))
-    {
-        return Some((pid, "machine inspect"));
+impl Supervisor {
+    fn discover(name: &str, env: &[(String, String)]) -> Result<Self, String> {
+        let pid_file = supervisor_pid_file(name, env)?;
+        let pid = fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&pid| pid > 0 && pid <= i32::MAX as u32)
+            .ok_or_else(|| format!("cannot monitor HVF supervisor: missing or invalid PID in {}", pid_file.display()))?;
+        Ok(Self { pid, pid_file })
     }
-    let r = host.run(&sv(&["pgrep", "-f", &format!("mvm-hvf-supervisor.*{name}")]), Duration::from_secs(30)).ok()?;
-    let pid: u32 = String::from_utf8_lossy(&r.stdout).split_whitespace().next()?.parse().ok()?;
-    (r.code == Some(0) && pid > 0).then_some((pid, "pgrep -f"))
+
+    fn sample(&self, host: &dyn Host, ceiling_mib: u64) -> Result<u64, String> {
+        let current = fs::read_to_string(&self.pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok());
+        if current != Some(self.pid) {
+            return Err("cannot monitor HVF supervisor: PID file changed or disappeared".into());
+        }
+        let rss = host_rss_mib(host, self.pid).ok_or_else(|| format!("cannot monitor HVF supervisor: PID {} is gone, has the wrong executable, or has no RSS sample", self.pid))?;
+        if rss > ceiling_mib {
+            return Err(format!("host RSS {rss} MiB over the {ceiling_mib} MiB ceiling (pid {} via {})", self.pid, self.pid_file.display()));
+        }
+        Ok(rss)
+    }
 }
 
 pub fn host_rss_mib(host: &dyn Host, pid: u32) -> Option<u64> {
-    let r = host.run(&sv(&["ps", "-o", "rss=", "-p", &pid.to_string()]), Duration::from_secs(30)).ok()?;
+    let command = host.run(&sv(&["ps", "-o", "comm=", "-p", &pid.to_string()]), Duration::from_secs(5)).ok()?;
+    let executable = String::from_utf8_lossy(&command.stdout);
+    if command.code != Some(0) || Path::new(executable.trim()).file_name()?.to_str()? != "mvm-hvf-supervisor" {
+        return None;
+    }
+    let r = host.run(&sv(&["ps", "-o", "rss=", "-p", &pid.to_string()]), Duration::from_secs(5)).ok()?;
     let kib: u64 = String::from_utf8_lossy(&r.stdout).trim().parse().ok()?;
-    (r.code == Some(0) && kib > 0).then_some(kib / 1024)
+    (r.code == Some(0) && kib > 0).then_some(kib.div_ceil(1024))
 }
 
 // --- the session ---
@@ -388,24 +433,27 @@ struct Live<'a> {
 impl Live<'_> {
     fn teardown(&mut self, why: &str) {
         self.log.log(&format!("teardown: {why}"));
-        if let Some(mut c) = self.child.take()
-            && c.try_wait().ok().flatten().is_none()
-        {
-            sys::send_signal(c.id() as i32, sys::SIGTERM);
+        if let Some(mut c) = self.child.take() {
+            // Terminal::spawn gives OpenCode its own session and process group.
+            // Stop descendants too, even if the group leader already exited.
+            sys::send_signal(-(c.id() as i32), sys::SIGTERM);
             let end = Instant::now() + Duration::from_secs(10);
             while c.try_wait().ok().flatten().is_none() && Instant::now() < end {
                 thread::sleep(Duration::from_millis(100));
             }
-            if c.try_wait().ok().flatten().is_none() {
-                let _ = c.kill();
-            }
+            sys::send_signal(-(c.id() as i32), sys::SIGKILL);
             let _ = c.wait();
             self.log.log("teardown: opencode stopped");
         }
         if !self.machine_attempted {
             return;
         }
-        if self.machine_created {
+        let state = StateDir(self.paths.state_dir.clone());
+        let quiesced = state.quiesce(Duration::from_secs(10));
+        if let Err(e) = &quiesced {
+            self.log.log(&format!("teardown: EXPORT SKIPPED: cannot quiesce tools: {e}"));
+        }
+        if self.machine_created && quiesced.is_ok() {
             // copyOut runs on the launcher's own handle, which is not yet marked removed.
             match self.sb.copy_out("/out", &self.paths.out_dir) {
                 Ok(CopyOutResult::Exported { files, bytes }) => {
@@ -461,7 +509,7 @@ pub fn run_session(cfg: &OperatorConfig, deps: Deps) -> i32 {
             1
         }
     };
-    // Stop every in-flight and later tool call before export and removal.
+    // Refuse later tool calls; teardown waits for the active exec lock before export.
     StateDir(p.state_dir.clone()).mark("session ended");
     live.teardown("session ended");
     code
@@ -498,10 +546,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         .map_err(|e| e.to_string())?;
     live.machine_created = true;
     live.log.log(&format!("created {}", p.machine));
-    let mk = live.sb.exec(&sv(&["mkdir", "-p", "/in", "/out"]), &ExecOptions::new(30_000, 4096)).map_err(|e| e.to_string())?;
-    if mk.exit_code != 0 {
-        return Err("could not create /in and /out in the guest".into());
-    }
+    initialize_guest_storage(live.sb)?;
     if let Some(inputs) = &cfg.inputs_dir {
         live.sb.copy_in(inputs, "/in").map_err(|e| e.to_string())?;
         live.log.log(&format!("copied {} to /in", inputs.display()));
@@ -509,6 +554,10 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     if let Some(why) = interrupted(live.log) {
         return Err(format!("{why} before opencode started"));
     }
+
+    let supervisor = Supervisor::discover(&p.machine, &deps.env)?;
+    supervisor.sample(deps.host.as_ref(), cfg.limits.host_rss_ceiling_mib)?;
+    live.log.log(&format!("sampling host RSS of pid {} (found via {})", supervisor.pid, supervisor.pid_file.display()));
 
     let nonce = new_nonce();
     let plugin_options = json!({
@@ -537,29 +586,37 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     if !found.is_empty() {
         return Err(format!("opencode would load config from: {}", join_paths(&found)));
     }
-    let launch = opencode_launch(p, &cfg.opencode, deps.env.iter().cloned());
-    let child = Command::new(&launch.argv[0])
+    let launch = opencode_launch_with_key(p, &cfg.opencode, deps.env.iter().cloned(), cfg.provider.api_key_env.as_deref());
+    let mut command = Command::new(&launch.argv[0]);
+    command
         .args(&launch.argv[1..])
         .current_dir(&launch.cwd)
         .env_clear()
-        .envs(launch.env.iter().map(|(k, v)| (k, v)))
-        .spawn()
+        .envs(launch.env.iter().map(|(k, v)| (k, v)));
+    let (child, mut terminal) = Terminal::spawn(&mut command)
         .map_err(|e| format!("starting {} failed: {e}", cfg.opencode))?;
     let child = live.child.insert(child);
 
     let mut signalled = None;
-    wait_for_ready(&p.ready_file, &nonce, Duration::from_millis(cfg.limits.handshake_ms), Duration::from_millis(100), &mut || {
+    let mut transport_error = None;
+    wait_for_ready(&p.ready_file, &nonce, Duration::from_millis(cfg.limits.handshake_ms), Duration::from_millis(10), &mut || {
+        // Output is visible during startup, but Terminal has no input path
+        // until the exact nonce has authenticated the plugin.
+        if transport_error.is_none() {
+            transport_error = terminal.pump().err().map(|e| format!("terminal relay failed: {e}"));
+        }
         if signalled.is_none() {
             signalled = interrupted(live.log);
         }
-        signalled.is_some() || child.try_wait().ok().flatten().is_some()
+        transport_error.is_some() || signalled.is_some() || child.try_wait().ok().flatten().is_some()
     })
-    .map_err(|e| signalled.clone().unwrap_or_else(|| format!("refusing the session: {e}")))?;
+    .map_err(|e| transport_error.or(signalled).unwrap_or_else(|| format!("refusing the session: {e}")))?;
+    terminal.enable_input().map_err(|e| format!("enabling terminal input failed: {e}"))?;
     live.log.log("plugin ready; session running");
 
-    let mut supervisor = None;
     let mut next_sample = Instant::now();
     loop {
+        terminal.pump().map_err(|e| format!("terminal relay failed: {e}"))?;
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             return Ok(status.code().unwrap_or(1));
         }
@@ -568,20 +625,9 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         }
         if Instant::now() >= next_sample {
             next_sample = Instant::now() + Duration::from_secs(5);
-            if supervisor.is_none() {
-                supervisor = find_supervisor_pid(run.as_ref(), deps.host.as_ref(), &p.machine);
-                if let Some((pid, how)) = supervisor {
-                    live.log.log(&format!("sampling host RSS of pid {pid} (found via {how})"));
-                }
-            }
-            if let Some((pid, how)) = supervisor
-                && let Some(rss) = host_rss_mib(deps.host.as_ref(), pid)
-                && rss > cfg.limits.host_rss_ceiling_mib
-            {
-                return Err(format!("host RSS {rss} MiB over the {} MiB ceiling (pid {pid} via {how})", cfg.limits.host_rss_ceiling_mib));
-            }
+            supervisor.sample(deps.host.as_ref(), cfg.limits.host_rss_ceiling_mib)?;
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -595,6 +641,97 @@ mod tests {
 
     fn provider() -> ProviderConfig {
         ProviderConfig { id: "ironwire".into(), base_url: "http://127.0.0.1:8463/openai/v1".into(), models: vec!["z-ai/glm-5.3-flash".into()], api_key_env: None }
+    }
+
+    /// Run the real initialization command against a miniature guest filesystem.
+    struct StorageGuest {
+        root: tempfile::TempDir,
+    }
+
+    impl StorageGuest {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir(root.path().join("tmp")).unwrap();
+            for name in ["in", "out"] {
+                std::os::unix::fs::symlink(root.path().join("tmp/rts").join(name), root.path().join(name)).unwrap();
+            }
+            Self { root }
+        }
+
+        fn path(&self, path: &str) -> PathBuf {
+            self.root.path().join(path)
+        }
+    }
+
+    impl Exec for StorageGuest {
+        fn exec(&self, argv: &[String], opts: &ExecOptions) -> crate::sandbox::Result<crate::sandbox::ExecResult> {
+            let argv = argv.iter().map(|arg| match arg.as_str() {
+                "/tmp" | "/in" | "/out" => self.path(&arg[1..]).to_string_lossy().into_owned(),
+                _ => arg.clone(),
+            }).collect::<Vec<_>>();
+            crate::testutil::HostShell::default().exec(&argv, opts)
+        }
+    }
+
+    #[test]
+    fn guest_storage_initializes_dangling_image_links_without_replacing_them() {
+        let guest = StorageGuest::new();
+        assert!(!guest.path("in").exists());
+        initialize_guest_storage(&guest).unwrap();
+        for name in ["in", "out"] {
+            let target = guest.path(&format!("tmp/rts/{name}"));
+            assert_eq!(fs::read_link(guest.path(name)).unwrap(), target);
+            assert!(target.is_dir());
+            fs::write(guest.path(name).join("probe"), name).unwrap();
+            assert_eq!(fs::read_to_string(target.join("probe")).unwrap(), name);
+        }
+        initialize_guest_storage(&guest).unwrap();
+        assert_eq!(fs::read_to_string(guest.path("in/probe")).unwrap(), "in");
+    }
+
+    #[test]
+    fn guest_storage_refuses_unexpected_image_links_and_plain_directories() {
+        for name in ["in", "out"] {
+            for redirect in [false, true] {
+                let guest = StorageGuest::new();
+                fs::create_dir_all(guest.path("tmp/rts/in")).unwrap();
+                fs::create_dir_all(guest.path("tmp/rts/out")).unwrap();
+                fs::remove_file(guest.path(name)).unwrap();
+                if redirect {
+                    fs::create_dir(guest.path("unexpected")).unwrap();
+                    std::os::unix::fs::symlink(guest.path("unexpected"), guest.path(name)).unwrap();
+                } else {
+                    fs::create_dir(guest.path(name)).unwrap();
+                }
+                assert!(initialize_guest_storage(&guest).is_err(), "accepted {name}, redirect={redirect}");
+            }
+        }
+    }
+
+    #[test]
+    fn guest_storage_refuses_redirected_or_non_directory_writable_components() {
+        for component in ["tmp", "tmp/rts", "tmp/rts/in", "tmp/rts/out"] {
+            for redirect in [false, true] {
+                let guest = StorageGuest::new();
+                let path = guest.path(component);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                if path.is_dir() {
+                    fs::remove_dir(&path).unwrap();
+                }
+                if redirect {
+                    fs::create_dir(guest.path("unexpected")).unwrap();
+                    std::os::unix::fs::symlink(guest.path("unexpected"), &path).unwrap();
+                } else {
+                    fs::write(&path, "occupied").unwrap();
+                }
+                assert!(initialize_guest_storage(&guest).is_err(), "accepted {component}, redirect={redirect}");
+                if redirect {
+                    assert!(fs::read_dir(guest.path("unexpected")).unwrap().next().is_none(), "wrote through {component}");
+                } else {
+                    assert_eq!(fs::read_to_string(&path).unwrap(), "occupied");
+                }
+            }
+        }
     }
 
     fn out(code: i32, stdout: &str, stderr: &str) -> RunOutput {
@@ -752,23 +889,17 @@ mod tests {
     }
 
     #[test]
-    fn the_orphan_sweep_removes_only_rts_machines() {
-        let gone = Arc::new(Mutex::new(false));
-        let g = gone.clone();
-        let f = Fake::new(move |a| match a.join(" ").as_str() {
-            "machine ps" if *g.lock().unwrap() => out(0, "keepme\n", ""),
+    fn the_orphan_sweep_preserves_machines_with_unverified_ownership_and_liveness() {
+        let f = Fake::new(|a| match a.join(" ").as_str() {
             "machine ps" => out(0, "rts-0123456789ab\nkeepme\nrts-xyz\n", ""),
-            s if s.starts_with("machine rm") => {
-                *g.lock().unwrap() = true;
-                out(0, "", "")
-            }
             _ => out(0, "", ""),
         });
         let run: Arc<dyn Runner> = f.clone();
-        let names = sweep_orphans(&run, &mut |_| {}).unwrap();
-        assert_eq!(names, ["rts-0123456789ab"]);
-        assert!(f.calls().contains(&"machine rm rts-0123456789ab --force --yes".to_string()));
-        assert!(!f.calls().iter().any(|c| c.contains("keepme")));
+        let mut messages = vec![];
+        let removed = sweep_orphans(&run, &mut |m| messages.push(m.to_string())).unwrap();
+        assert!(removed.is_empty());
+        assert!(!f.calls().iter().any(|c| c.starts_with("machine rm")), "an active session could own this VM");
+        assert!(messages.iter().any(|m| m.contains("rts-0123456789ab") && m.contains("unverified")));
     }
 
     #[test]
@@ -791,12 +922,70 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_pids_are_found_in_inspect_output() {
-        assert_eq!(supervisor_pid_in("name: rts-x\nsupervisor pid: 4242\npid: 1"), Some(4242));
-        assert_eq!(supervisor_pid_in("{\"name\":\"x\",\"pid\": 777}"), Some(777));
-        assert_eq!(supervisor_pid_in("Supervisor (pid 99) running"), Some(99));
-        assert_eq!(supervisor_pid_in("no process here"), None);
+    fn rss_sampling_refuses_a_pid_that_is_not_the_hvf_supervisor() {
+        let f = Fake::new(|a| match a.get(2).map(String::as_str) {
+            Some("comm=") => out(0, "/usr/bin/unrelated\n", ""),
+            Some("rss=") => out(0, "102400\n", ""),
+            _ => out(1, "", "unexpected ps invocation"),
+        });
+        assert_eq!(host_rss_mib(f.as_ref(), 42), None);
     }
+
+    #[test]
+    fn rss_monitor_uses_the_vm_pid_file_and_refuses_lost_or_over_limit_samples() {
+        let d = tempdir("rss-monitor");
+        let pid_file = d.join("vms/rts-0123456789ab/hvf.pid");
+        fs::create_dir_all(pid_file.parent().unwrap()).unwrap();
+        fs::write(&pid_file, "42\n").unwrap();
+        let env = vec![("MVM_HOME".into(), d.to_string_lossy().into_owned()), ("HOME".into(), "/unused".into())];
+        let supervisor = Supervisor::discover("rts-0123456789ab", &env).unwrap();
+        let healthy = Fake::new(|a| match a.get(2).map(String::as_str) {
+            Some("comm=") => out(0, "/opt/mvm/mvm-hvf-supervisor\n", ""),
+            Some("rss=") => out(0, "102401\n", ""),
+            _ => out(1, "", "unexpected ps invocation"),
+        });
+        assert_eq!(supervisor.sample(healthy.as_ref(), 101).unwrap(), 101);
+        assert!(supervisor.sample(healthy.as_ref(), 100).unwrap_err().contains("over the 100 MiB ceiling"));
+        let unreadable = Fake::new(|_| out(1, "", "process exited"));
+        assert!(supervisor.sample(unreadable.as_ref(), 101).is_err());
+        fs::write(&pid_file, "43\n").unwrap();
+        assert!(supervisor.sample(healthy.as_ref(), 101).unwrap_err().contains("PID file changed"));
+        fs::remove_file(&pid_file).unwrap();
+        assert!(supervisor.sample(healthy.as_ref(), 101).is_err());
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn teardown_waits_for_an_inflight_tool_before_export() {
+        use std::sync::mpsc;
+        let d = tempdir("quiesce");
+        let p = session_paths("0123456789ab", &d.join("sessions"), &d.join("runtime"));
+        prepare_session_dirs(&p).unwrap();
+        let lock = OpenOptions::new().create(true).truncate(false).write(true).open(p.state_dir.join("exec.lock")).unwrap();
+        lock.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (export_tx, export_rx) = mpsc::channel();
+        let f = Fake::new(move |a| {
+            if a.get(1).map(String::as_str) == Some("exec") {
+                export_tx.send(()).unwrap();
+                out(0, "NONE\n", &format!("\nRTS_EXIT_{} 0 5 0\n", a[8]))
+            } else { out(0, "", "") }
+        });
+        let worker = thread::spawn(move || {
+            let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
+            let sb = MvmSandbox::new(&p.machine, Box::new(f)).unwrap();
+            let mut live = Live { log: &log, sb: &sb, paths: &p, machine_attempted: true, machine_created: true, child: None };
+            started_tx.send(()).unwrap();
+            live.teardown("test");
+        });
+        started_rx.recv().unwrap();
+        let exported_while_locked = export_rx.recv_timeout(Duration::from_millis(150)).is_ok();
+        drop(lock);
+        worker.join().unwrap();
+        fs::remove_dir_all(d).unwrap();
+        assert!(!exported_while_locked, "export ran before the active tool released the exec lock");
+    }
+
 
     fn session_cfg(sessions: &Path, plugin: &Path, provider: ProviderConfig) -> OperatorConfig {
         let mut c = parse_config(r#"{ "provider": { "models": ["z-ai/glm-5.3-flash"] } }"#, Path::new("/"), &Defaults { repo: "/repo".into(), mvmctl: "/x/mvmctl".into() }).unwrap();
@@ -814,6 +1003,29 @@ mod tests {
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         assert!(!f.calls().iter().any(|c| c.starts_with("machine")), "{:?}", f.calls());
         fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_session_refuses_before_opencode_when_supervisor_cannot_be_monitored() {
+        let d = tempdir("rss-fail-closed");
+        let sessions = d.join("sessions");
+        let f = Fake::new(|a| match a.get(1).map(String::as_str) {
+            Some("exec") => out(0, "", &format!("\nRTS_EXIT_{} 0 0 0\n", a[8])),
+            _ => healthy(a),
+        });
+        let deps = Deps {
+            host: f.clone(), runner: Some(f.clone()),
+            env: vec![("MVM_HOME".into(), d.join("mvm").to_string_lossy().into_owned())],
+            rts: "/x/rts".into(),
+        };
+        let mut cfg = session_cfg(&sessions, &d, serve(MODELS_OK));
+        cfg.opencode = "/nonexistent-opencode-rss-test".into();
+        assert_eq!(run_session(&cfg, deps), 1);
+        let session = fs::read_dir(&sessions).unwrap().next().unwrap().unwrap().path();
+        let log = fs::read_to_string(session.join("launcher.log")).unwrap();
+        fs::remove_dir_all(d).unwrap();
+        assert!(log.contains("cannot monitor HVF supervisor"), "{log}");
+        assert!(!log.contains("starting /nonexistent"), "opencode was started without RSS protection");
     }
 
     #[test]
