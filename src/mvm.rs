@@ -35,6 +35,12 @@ pub trait Runner: Send + Sync {
     fn run(&self, argv: &[String], timeout: Duration) -> io::Result<RunOutput>;
 }
 
+impl<R: Runner + ?Sized> Runner for std::sync::Arc<R> {
+    fn run(&self, argv: &[String], timeout: Duration) -> io::Result<RunOutput> {
+        (**self).run(argv, timeout)
+    }
+}
+
 pub fn is_machine_name(name: &str) -> bool {
     name.len() == 16
         && name.starts_with("rts-")
@@ -76,42 +82,48 @@ pub struct SpawnRunner {
 
 impl Runner for SpawnRunner {
     fn run(&self, argv: &[String], timeout: Duration) -> io::Result<RunOutput> {
-        let mut child = Command::new(&self.mvmctl)
-            .args(argv)
-            .envs(&self.extra_env)
-            .env("GIT_CONFIG_GLOBAL", &self.empty_git_config)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Own process group, so a timeout kills mvmctl and anything it started.
-            .process_group(0)
-            .spawn()?;
-        let pgid = child.id() as i32;
-        let out = child.stdout.take().unwrap();
-        let err = child.stderr.take().unwrap();
-        let t_out = thread::spawn(move || read_capped(out, MAX_CAPTURE_BYTES));
-        let t_err = thread::spawn(move || read_capped(err, MAX_CAPTURE_BYTES));
-        let deadline = Instant::now() + timeout;
-        let mut killed = false;
-        let status = loop {
-            if let Some(s) = child.try_wait()? {
-                break s;
-            }
-            if Instant::now() >= deadline {
-                killed = true;
-                crate::sys::send_signal(-pgid, crate::sys::SIGKILL);
-                let _ = child.kill();
-                break child.wait()?;
-            }
-            thread::sleep(Duration::from_millis(20));
-        };
-        let stdout = t_out.join().unwrap_or_default();
-        let stderr = t_err.join().unwrap_or_default();
-        Ok(RunOutput { code: if killed { None } else { status.code() }, stdout, stderr, killed })
+        let mut cmd = Command::new(&self.mvmctl);
+        cmd.args(argv).envs(&self.extra_env).env("GIT_CONFIG_GLOBAL", &self.empty_git_config);
+        run_captured(cmd, timeout)
     }
 }
 
-fn tail(b: &[u8]) -> String {
+/// Run a host command with stdin from /dev/null in its own process group,
+/// capture at most 16 MiB of each stream, and kill the whole group at the
+/// deadline.
+pub fn run_captured(mut cmd: Command, timeout: Duration) -> io::Result<RunOutput> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Own process group, so a timeout kills the command and anything it started.
+        .process_group(0)
+        .spawn()?;
+    let pgid = child.id() as i32;
+    let out = child.stdout.take().unwrap();
+    let err = child.stderr.take().unwrap();
+    let t_out = thread::spawn(move || read_capped(out, MAX_CAPTURE_BYTES));
+    let t_err = thread::spawn(move || read_capped(err, MAX_CAPTURE_BYTES));
+    let deadline = Instant::now() + timeout;
+    let mut killed = false;
+    let status = loop {
+        if let Some(s) = child.try_wait()? {
+            break s;
+        }
+        if Instant::now() >= deadline {
+            killed = true;
+            crate::sys::send_signal(-pgid, crate::sys::SIGKILL);
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = t_out.join().unwrap_or_default();
+    let stderr = t_err.join().unwrap_or_default();
+    Ok(RunOutput { code: if killed { None } else { status.code() }, stdout, stderr, killed })
+}
+
+pub(crate) fn tail(b: &[u8]) -> String {
     let t = String::from_utf8_lossy(b);
     let lines: Vec<&str> = t.trim().lines().collect();
     let s = lines[lines.len().saturating_sub(3)..].join(" | ");

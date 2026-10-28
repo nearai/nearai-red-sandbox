@@ -1,0 +1,262 @@
+//! Operator config for one session, read from a JSON file.
+//!
+//! Inference goes through IronWire by default: opencode talks to IronWire's
+//! OpenAI façade on loopback, and IronWire holds the NEAR AI key, so no
+//! provider credential ever reaches opencode's environment or config.
+
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+use crate::mvm::is_image_ref;
+
+pub const DEFAULT_IMAGE: &str = "docker.io/library/alpine@sha256:e311ae748be7f56ae5cba304bc488f0786df68ee507513f654a5cc8597cffb42";
+pub const IRONWIRE_PROVIDER_ID: &str = "ironwire";
+pub const IRONWIRE_BASE_URL: &str = "http://127.0.0.1:8463/openai/v1";
+/// Sent as the API key when the provider needs none. IronWire strips the
+/// inbound authorization header and attaches its own credential.
+pub const PLACEHOLDER_API_KEY: &str = "ironwire-holds-the-key";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderConfig {
+    pub id: String,
+    pub base_url: String,
+    pub models: Vec<String>,
+    /// Environment variable holding the key, for a provider reached
+    /// directly. None for IronWire.
+    pub api_key_env: Option<String>,
+}
+
+impl ProviderConfig {
+    /// Host and port when the provider is on this machine's loopback.
+    pub fn loopback(&self) -> Option<(String, u16, String)> {
+        let rest = self.base_url.strip_prefix("http://")?;
+        let (authority, path) = rest.split_once('/').map_or((rest, String::new()), |(a, p)| (a, format!("/{p}")));
+        let (host, port) = authority.rsplit_once(':')?;
+        if host != "127.0.0.1" && host != "localhost" {
+            return None;
+        }
+        Some((host.to_string(), port.parse().ok()?, path))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub tool_timeout_ms: u64,
+    pub max_output_bytes: u64,
+    pub memory_mib: u32,
+    pub cpus: u32,
+    pub host_rss_ceiling_mib: u64,
+    pub handshake_ms: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self { tool_timeout_ms: 120_000, max_output_bytes: 65_536, memory_mib: 2048, cpus: 2, host_rss_ceiling_mib: 3072, handshake_ms: 30_000 }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorConfig {
+    pub image: String,
+    pub inputs_dir: Option<PathBuf>,
+    pub provider: ProviderConfig,
+    pub limits: Limits,
+    /// Where sessions/<id>/out and tools.jsonl go.
+    pub sessions_dir: PathBuf,
+    pub opencode: String,
+    pub mvmctl: PathBuf,
+    /// The opencode plugin shim (a directory holding package.json).
+    pub plugin_dir: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawProvider {
+    id: Option<String>,
+    #[serde(rename = "baseURL")]
+    base_url: Option<String>,
+    models: Vec<String>,
+    api_key_env: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawLimits {
+    tool_timeout_ms: Option<u64>,
+    max_output_bytes: Option<u64>,
+    #[serde(rename = "memoryMiB")]
+    memory_mib: Option<u32>,
+    cpus: Option<u32>,
+    #[serde(rename = "hostRssCeilingMiB")]
+    host_rss_ceiling_mib: Option<u64>,
+    handshake_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Raw {
+    image: Option<String>,
+    inputs_dir: Option<String>,
+    provider: RawProvider,
+    #[serde(default)]
+    limits: RawLimits,
+    sessions_dir: Option<String>,
+    opencode: Option<String>,
+    mvmctl: Option<String>,
+    plugin_dir: Option<String>,
+}
+
+fn is_env_name(s: &str) -> bool {
+    let mut b = s.bytes();
+    matches!(b.next(), Some(c) if c.is_ascii_uppercase() || c == b'_') && b.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+}
+
+fn positive<T: Copy + Default + PartialOrd>(v: Option<T>, d: T, k: &str) -> Result<T, String> {
+    let v = v.unwrap_or(d);
+    if v <= T::default() { Err(format!("config: limits.{k} must be a positive integer")) } else { Ok(v) }
+}
+
+/// Paths the config leaves out. `repo` is where this checkout lives.
+pub struct Defaults {
+    pub repo: PathBuf,
+    pub mvmctl: PathBuf,
+}
+
+impl Defaults {
+    pub fn from_env() -> Self {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let mvmctl = std::env::var_os("RTS_MVMCTL").map(PathBuf::from).unwrap_or_else(|| home.join(".local/mvm/v0.22.0/mvmctl"));
+        Self { repo: PathBuf::from(env!("CARGO_MANIFEST_DIR")), mvmctl }
+    }
+}
+
+pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<OperatorConfig, String> {
+    let raw: Raw = serde_json::from_str(text).map_err(|e| format!("config: {e}"))?;
+    let p = raw.provider;
+    let id = p.id.unwrap_or_else(|| IRONWIRE_PROVIDER_ID.into());
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+        return Err("config: provider.id must be lowercase letters, digits and dashes".into());
+    }
+    let base_url = p.base_url.unwrap_or_else(|| IRONWIRE_BASE_URL.into());
+    if let Some(k) = &p.api_key_env
+        && !is_env_name(k)
+    {
+        return Err("config: provider.apiKeyEnv must be an environment variable name".into());
+    }
+    if p.models.is_empty() || p.models.iter().any(String::is_empty) {
+        return Err("config: provider.models must be a non-empty list of model IDs".into());
+    }
+    let provider = ProviderConfig { id, base_url, models: p.models, api_key_env: p.api_key_env };
+    // Plain http only to loopback: anything else would send prompts in the clear.
+    if !provider.base_url.starts_with("https://") && provider.loopback().is_none() {
+        return Err("config: provider.baseURL must be https, or http on 127.0.0.1 or localhost with a port (IronWire)".into());
+    }
+    if provider.api_key_env.is_none() && provider.loopback().is_none() {
+        return Err("config: provider.apiKeyEnv is required for a provider that is not on loopback".into());
+    }
+    let image = raw.image.unwrap_or_else(|| DEFAULT_IMAGE.into());
+    if !is_image_ref(&image) {
+        return Err("config: image must be a digest-pinned reference (name@sha256:<64 hex>)".into());
+    }
+    let dl = Limits::default();
+    let l = raw.limits;
+    let limits = Limits {
+        tool_timeout_ms: positive(l.tool_timeout_ms, dl.tool_timeout_ms, "toolTimeoutMs")?,
+        max_output_bytes: positive(l.max_output_bytes, dl.max_output_bytes, "maxOutputBytes")?,
+        memory_mib: positive(l.memory_mib, dl.memory_mib, "memoryMiB")?,
+        cpus: positive(l.cpus, dl.cpus, "cpus")?,
+        host_rss_ceiling_mib: positive(l.host_rss_ceiling_mib, dl.host_rss_ceiling_mib, "hostRssCeilingMiB")?,
+        handshake_ms: positive(l.handshake_ms, dl.handshake_ms, "handshakeMs")?,
+    };
+    let path = |v: Option<String>, k: &str| -> Result<Option<PathBuf>, String> {
+        match v {
+            None => Ok(None),
+            Some(s) if s.is_empty() => Err(format!("config: {k} must be a path")),
+            Some(s) => Ok(Some(base_dir.join(s))),
+        }
+    };
+    Ok(OperatorConfig {
+        image,
+        inputs_dir: path(raw.inputs_dir, "inputsDir")?,
+        provider,
+        limits,
+        sessions_dir: path(raw.sessions_dir, "sessionsDir")?.unwrap_or_else(|| d.repo.join("sessions")),
+        opencode: raw.opencode.filter(|s| !s.is_empty()).unwrap_or_else(|| "opencode".into()),
+        mvmctl: path(raw.mvmctl, "mvmctl")?.unwrap_or_else(|| d.mvmctl.clone()),
+        plugin_dir: path(raw.plugin_dir, "pluginDir")?.unwrap_or_else(|| d.repo.join("plugin")),
+    })
+}
+
+pub fn load_config(file: &Path, d: &Defaults) -> Result<OperatorConfig, String> {
+    let text = std::fs::read_to_string(file).map_err(|e| format!("config: cannot read {}: {e}", file.display()))?;
+    let abs = std::path::absolute(file).map_err(|e| format!("config: {e}"))?;
+    parse_config(&text, abs.parent().unwrap_or(Path::new("/")), d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn d() -> Defaults {
+        Defaults { repo: "/repo".into(), mvmctl: "/home/op/.local/mvm/v0.22.0/mvmctl".into() }
+    }
+    fn parse(t: &str) -> Result<OperatorConfig, String> {
+        parse_config(t, Path::new("/cfg"), &d())
+    }
+
+    #[test]
+    fn a_minimal_config_routes_inference_through_ironwire() {
+        let c = parse(r#"{ "provider": { "models": ["z-ai/glm-5.3-flash"] } }"#).unwrap();
+        assert_eq!(c.provider.id, "ironwire");
+        assert_eq!(c.provider.base_url, "http://127.0.0.1:8463/openai/v1");
+        assert_eq!(c.provider.api_key_env, None);
+        assert_eq!(c.provider.loopback(), Some(("127.0.0.1".into(), 8463, "/openai/v1".into())));
+        assert_eq!(c.image, DEFAULT_IMAGE);
+        assert_eq!(c.limits, Limits::default());
+        assert_eq!(c.sessions_dir, PathBuf::from("/repo/sessions"));
+        assert_eq!(c.plugin_dir, PathBuf::from("/repo/plugin"));
+        assert_eq!(c.mvmctl, d().mvmctl);
+    }
+
+    #[test]
+    fn a_direct_https_provider_needs_a_key_variable() {
+        let direct = r#"{ "provider": { "id": "nearai", "baseURL": "https://cloud-api.near.ai/v1", "models": ["m"] } }"#;
+        assert!(parse(direct).unwrap_err().contains("apiKeyEnv is required"));
+        let keyed = r#"{ "provider": { "id": "nearai", "baseURL": "https://cloud-api.near.ai/v1", "models": ["m"], "apiKeyEnv": "NEARAI_API_KEY" } }"#;
+        assert_eq!(parse(keyed).unwrap().provider.api_key_env.as_deref(), Some("NEARAI_API_KEY"));
+    }
+
+    #[test]
+    fn plain_http_is_refused_off_loopback() {
+        for url in ["http://10.0.0.5:8463/openai/v1", "http://127.0.0.1/openai/v1", "http://127.0.0.1.evil:80/v1", "ftp://x"] {
+            let t = format!(r#"{{ "provider": {{ "baseURL": "{url}", "models": ["m"], "apiKeyEnv": "K" }} }}"#);
+            assert!(parse(&t).unwrap_err().contains("baseURL"), "{url}");
+        }
+    }
+
+    #[test]
+    fn refusals_for_unpinned_images_bad_limits_and_unknown_keys() {
+        assert!(parse(r#"{ "image": "alpine:latest", "provider": { "models": ["m"] } }"#).unwrap_err().contains("digest-pinned"));
+        assert!(parse(r#"{ "provider": { "models": ["m"] }, "limits": { "cpus": 0 } }"#).unwrap_err().contains("limits.cpus"));
+        assert!(parse(r#"{ "provider": { "models": [] } }"#).unwrap_err().contains("models"));
+        assert!(parse(r#"{ "provider": { "models": ["m"] }, "mcp": {} }"#).unwrap_err().contains("unknown field"));
+        assert!(parse(r#"{ "provider": { "models": ["m"], "apiKeyEnv": "lower" } }"#).unwrap_err().contains("apiKeyEnv"));
+        assert!(parse(r#"{ "provider": { "id": "Bad_ID", "models": ["m"] } }"#).unwrap_err().contains("provider.id"));
+    }
+
+    #[test]
+    fn relative_paths_resolve_against_the_config_file() {
+        let c = parse(r#"{ "inputsDir": "./inputs", "sessionsDir": "out", "provider": { "models": ["m"] } }"#).unwrap();
+        assert_eq!(c.inputs_dir, Some(PathBuf::from("/cfg/./inputs")));
+        assert_eq!(c.sessions_dir, PathBuf::from("/cfg/out"));
+    }
+
+    #[test]
+    fn the_example_config_parses() {
+        let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("opencode/session.example.json");
+        let c = load_config(&file, &d()).unwrap();
+        assert_eq!(c.provider.id, "ironwire");
+        assert!(c.provider.loopback().is_some());
+    }
+}
