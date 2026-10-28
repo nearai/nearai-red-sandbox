@@ -19,7 +19,7 @@ tool effects land.
 | Sandbox | mvm (`tinylabscom/mvm`, Apache-2.0), dev profile, `machine create` / `exec` / `rm` |
 | Inference | NEAR AI provider in the host opencode config. The key stays on the host; the VM never sees it. |
 | VM egress | None. mvm default-deny, no `--allow-host`. |
-| Files in | Read-only inputs directory, copied in at boot by mvm. |
+| Files in | An operator inputs directory, packed into a tar on the host and pushed in after boot as base64 argv chunks, extracted to `/in`. A copy, not a live mount. |
 | Files out | Only the guest's `/out`, copied to `sessions/<id>/out` before teardown. |
 | Lifecycle | One VM per opencode session, always destroyed when the session ends, including on crash or signal. |
 | mvm access | Shell out to `mvmctl` release v0.22.0, installed from the cosign-verified release tarball at `~/.local/mvm/v0.22.0`. No mvm SDK in v1. |
@@ -32,7 +32,7 @@ tool effects land.
 host (macOS)                                   mvm microVM (dev profile, no network)
 -------------------------------------          -------------------------------------
 launcher
-  1. mvmctl machine create rts-<session>  ---> boots image, inputs copied in read-only
+  1. mvmctl machine create/start rts-<s> ---> boots image; inputs pushed to /in
   2. starts opencode (pinned v2 version)
        |-- NEAR AI provider (key on host)
        '-- sandbox plugin
@@ -50,6 +50,7 @@ interface Sandbox {
   create(spec: { name: string; image: string; inputs?: string; memoryMiB: number; cpus: number }): Promise<void>
   exec(argv: string[], opts: { timeoutMs: number; maxOutputBytes: number }):
     Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array; truncated: boolean }>
+  copyIn(hostDir: string, guestDir: string): Promise<void>
   copyOut(guestDir: string, hostDir: string): Promise<void>
   remove(): Promise<void>
 }
@@ -104,8 +105,15 @@ Other v0.22.0 behavior the implementation depends on (probe 5):
 example apple/container) would implement the same interface and must pass the
 same containment suite.
 
+`copyIn` packs the host inputs directory into a tar on the host and pushes it
+as base64 argv chunks (the `write` path), then extracts it to `/in` in the
+guest. v0.22.0 `machine create` has no mount flag, so this replaces the
+boot-time mount the first draft assumed.
+
 `copyOut` treats the guest as hostile. It archives `/out` inside the guest,
-streams the archive to the host, and extracts it with a host-side extractor
+reads the archive back in base64 chunks of at most 512 KiB (under the silent
+stdout truncation measured near 950 KB), checks the reassembled size against
+the size the guest reported, and extracts it with a host-side extractor
 that accepts only regular files and directories. It rejects symlinks,
 hardlinks, device nodes, absolute paths, and any path containing `..`, and
 caps total size and entry count. microsandbox's GHSA-4vq3-cjpp-v7fg (a guest
@@ -119,7 +127,8 @@ blocks.
   missing.
 - Sweeps orphaned `rts-*` machines left by an earlier crash, before creating a
   new one.
-- Creates `rts-<session-id>` from the configured image with the inputs mount,
+- Creates and starts `rts-<session-id>` from the configured image, runs
+  `copyIn` for the inputs directory,
   then starts opencode with the machine name passed to the plugin as an option.
 - Runs opencode with `--standalone` (a private server per session). Without it,
   v2 attaches to the operator's shared background service, which loads the
@@ -132,7 +141,7 @@ blocks.
   directory, never the operator's project. opencode loads `opencode.json` and
   `AGENTS.md` from its working directory, and a project `opencode.json` can
   declare local MCP servers that opencode spawns as host processes (probe 3).
-  Operator inputs reach the VM through the inputs mount only.
+  Operator inputs reach the VM through `copyIn` only.
 - Plugin handshake: the launcher passes a random per-session nonce as a plugin
   option. After its allowlist checks pass, the plugin writes the nonce to a
   ready file. If the ready file does not appear with the right nonce before a
