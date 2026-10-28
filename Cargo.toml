@@ -16,7 +16,14 @@ path = "src/main.rs"
 [dependencies]
 base64 = "0.23.1"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+# TDX quote verification. Vendored unchanged from the crates.io tarball
+# dcap-qvl-0.7.0.crate, sha256
+# b992c9511adf7135ae7c63c023c9303a3615c0f38d7b39514dcc262f91c6adda;
+# approved by Zaki 2026-10-28 for exactly these features. Never `report`,
+# never default features, never `danger-allow-tcb-override`.
+dcap-qvl = { path = "vendor/dcap-qvl-0.7.0", version = "=0.7.0", default-features = false, features = ["std", "ring", "default-x509"] }
+hex = "0.4.3"
 sha2 = "0.11.1"
 ironwire_proxy = { git = "https://github.com/nearai/ironwire", rev = "bf8b90ba7b2e3b4da3011e1107a8a2068c8085bc" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
