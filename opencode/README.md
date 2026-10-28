@@ -1,5 +1,43 @@
 # opencode pin and generated config
 
+## How a session runs
+
+```
+cargo build --release
+./target/release/rts launch --config opencode/session.example.json
+```
+
+`rts` is the Rust launcher (`src/session.rs`). It preflights, creates the
+microVM, writes the opencode config below, and starts opencode. opencode
+loads plugins in-process as TypeScript, so `plugin/` stays a thin shim: each
+sandboxed tool call spawns `rts tool <name>` (`src/bridge.rs`) with the
+request on stdin and returns its stdout. Exit 3 from `rts tool` means the
+machine is unavailable, and the call fails; nothing falls back to the host.
+
+Tests: `cargo test` (unit), `bun test tests/unit` (the plugin shim), and
+`cargo test --test contain -- --ignored --test-threads=1` on a host with
+mvm and opencode 2.1.4 (real VMs; each test skips with the reason when
+either is missing).
+
+## Inference through IronWire
+
+By default opencode talks to [IronWire](https://github.com/nearai/ironwire)'s
+OpenAI façade on loopback, `http://127.0.0.1:8463/openai/v1`, as provider
+`ironwire`. IronWire holds the NEAR AI key and strips the inbound
+authorization header, so no provider credential is in opencode's config or
+environment; the generated config carries a placeholder API key. The
+session's inference also gets IronWire's ledger, spend caps and fallback.
+
+Preflight sends `GET <baseURL>/models` and refuses the session unless
+IronWire answers 200 and lists every configured model. If it does not, run
+`ironwire serve`, and check `ironwire status` shows the NEAR AI backend with
+a key.
+
+A provider reached directly (for example `https://cloud-api.near.ai/v1`)
+still works: set `provider.id`, `provider.baseURL` (https) and
+`provider.apiKeyEnv`, and the key is referenced as `{env:VAR}`. Plain http is
+accepted only to `127.0.0.1` or `localhost` with an explicit port.
+
 ## Pin
 
 opencode **v2.1.4** (`opencode --version` must print `2.1.4`; the launcher
@@ -55,26 +93,36 @@ The launcher writes this to `<runtime>/xdg/config/opencode/opencode.json`
     "nonce": "<24 hex>",
     "readyFile": "<runtime>/ready",
     "auditFile": "sessions/<id>/tools.jsonl",
-    "mvmctl": "~/.local/mvm/v0.22.0/mvmctl",
-    "emptyGitConfig": "<runtime>/empty.gitconfig",
-    "provider": "nearai",
-    "timeoutMs": 120000,
-    "maxOutputBytes": 65536,
-    "mvmHome": "<operator HOME>"
+    "provider": "ironwire",
+    "rts": "/abs/path/to/rts",
+    "bridge": {
+      "machine": "rts-0123456789ab",
+      "mvmctl": "~/.local/mvm/v0.22.0/mvmctl",
+      "emptyGitConfig": "<runtime>/empty.gitconfig",
+      "stateDir": "<runtime>/state",
+      "timeoutMs": 120000,
+      "maxOutputBytes": 65536,
+      "mvmHome": "<operator HOME>"
+    }
   }]],
   "provider": {
-    "nearai": {
+    "ironwire": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "nearai",
-      "options": { "baseURL": "https://cloud-api.near.ai/v1", "apiKey": "{env:NEARAI_API_KEY}" },
+      "name": "ironwire",
+      "options": { "baseURL": "http://127.0.0.1:8463/openai/v1", "apiKey": "ironwire-holds-the-key" },
       "models": { "z-ai/glm-5.3-flash": { "name": "z-ai/glm-5.3-flash", "tool_call": true } }
     }
   },
-  "model": "nearai/z-ai/glm-5.3-flash",
-  "enabled_providers": ["nearai"],
+  "model": "ironwire/z-ai/glm-5.3-flash",
+  "enabled_providers": ["ironwire"],
   "share": "disabled"
 }
 ```
+
+`bridge` is passed to `rts tool` unchanged. `stateDir` holds an exec lock,
+so one exec reaches the machine at a time across tool processes, and an
+`unavailable` marker: once a call finds the machine poisoned or lost, or the
+launcher starts teardown, every later call from any process is refused.
 
 There is deliberately no `mcp` key. The plugin also removes every MCP server
 in `ctx.mcp.transform` and checks `ctx.mcp.list()` is empty before it writes
@@ -90,8 +138,8 @@ the ready file.
   under the system temp dir rather than inside this repo or the operator's
   home. Preflight refuses if any ancestor of the work dir holds one of those
   names. Kept results still go to `sessions/<id>/`.
-- mvmctl, spawned by the plugin from inside opencode, gets the operator's
-  real `HOME` back (plugin option `mvmHome`) so it finds its own state.
+- mvmctl, spawned by `rts tool` from inside opencode, gets the operator's
+  real `HOME` back (bridge option `mvmHome`) so it finds its own state.
 - On macOS, opencode also reads a system config directory and MDM managed
   preferences (`/Library/Managed Preferences/.../ai.opencode.managed.plist`).
   The launcher cannot redirect those; the plugin's allowlist and model checks
