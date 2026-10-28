@@ -44,10 +44,14 @@ fn copy_out_brings_guest_out_back_byte_exact() {
     let blob = random(700 * 1024); // spans multiple transport read slices
     guest_write(&*m, "/out/sub/blob", &blob).unwrap();
     guest_write(&*m, "/out/hello.txt", b"hi").unwrap();
-    let dest = root.join("out");
-    assert_eq!(m.copy_out("/out", &dest).unwrap(), CopyOutResult::Exported { files: 2, bytes: blob.len() as u64 + 2 });
-    assert_eq!(fs::read(dest.join("sub/blob")).unwrap(), blob);
-    assert_eq!(fs::read_to_string(dest.join("hello.txt")).unwrap(), "hi");
+    // Repeat exports on the same VM: each export spans many transport
+    // frames, and a single lucky pass cannot establish reliability.
+    for round in 0..4 {
+        let dest = root.join(format!("out-{round}"));
+        assert_eq!(m.copy_out("/out", &dest).unwrap(), CopyOutResult::Exported { files: 2, bytes: blob.len() as u64 + 2 });
+        assert_eq!(fs::read(dest.join("sub/blob")).unwrap(), blob);
+        assert_eq!(fs::read_to_string(dest.join("hello.txt")).unwrap(), "hi");
+    }
     fs::remove_dir_all(root).unwrap();
 }
 

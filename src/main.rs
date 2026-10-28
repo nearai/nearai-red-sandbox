@@ -107,7 +107,7 @@ fn run_connected<G>(
 
 const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed and starts a private inference proxy.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in.";
 
-fn local_preflight(cfg: &config::OperatorConfig) -> Result<(), String> {
+fn local_preflight(cfg: &config::OperatorConfig, host: &dyn session::Host, env: &[(String, String)]) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
     let temp = tempfile::Builder::new()
         .prefix("rts-preflight-")
@@ -122,10 +122,11 @@ fn local_preflight(cfg: &config::OperatorConfig) -> Result<(), String> {
         .map_err(|_| "Cannot create preflight Git configuration")?;
     let work = temp.path().join("work");
     std::fs::create_dir(&work).map_err(|_| "Cannot create preflight work directory")?;
+    let supervisor = session::supervisor_path(env)?;
     let runner = rts::mvm::SpawnRunner {
         mvmctl: cfg.mvmctl.clone(),
         empty_git_config,
-        extra_env: Default::default(),
+        extra_env: session::mvm_environment(env, &supervisor),
     };
     // A pinned HTTPS placeholder skips the loopback-provider probe. Local
     // prerequisites must succeed before any native credential read or browser.
@@ -134,10 +135,11 @@ fn local_preflight(cfg: &config::OperatorConfig) -> Result<(), String> {
         ..cfg.provider.clone()
     };
     session::preflight(&session::PreflightInput {
-        host: &session::RealHost,
+        host,
         run: &runner,
         opencode: &cfg.opencode,
-        leak_seam_set: std::env::var_os("RTS_TEST_LEAK").is_some(),
+        leak_seam_set: env.iter().any(|(key, _)| key == "RTS_TEST_LEAK"),
+        supervisor_path: Some(&supervisor),
         work_dir: Some(&work),
         provider: &provider,
     })
@@ -155,9 +157,11 @@ fn launch(file: Option<&Path>, login: &auth::LoginOptions) -> Result<i32, String
         )?
     };
     let deps = session::Deps::real()?;
+    let preflight_env = deps.env.clone();
+    let preflight_host = deps.host.clone();
     run_connected(
         &mut cfg,
-        local_preflight,
+        |cfg| local_preflight(cfg, preflight_host.as_ref(), &preflight_env),
         |cfg| {
             let credential = auth::load_or_login(login)?;
             let inference = inference::start(credential.key, &cfg.provider.models)?;
@@ -235,6 +239,25 @@ mod tests {
             |_| panic!("must not start session"),
         );
         assert_eq!(result.unwrap_err(), "local dependencies missing");
+    }
+
+    #[test]
+    fn unpatched_supervisor_is_rejected_before_credentials_or_browser_login() {
+        struct StockSupervisor;
+        impl session::Host for StockSupervisor {
+            fn run(&self, argv: &[String], _: std::time::Duration) -> std::io::Result<rts::mvm::RunOutput> {
+                let stdout = if argv.last().map(String::as_str) == Some("--version") { "2.1.4\n" } else { "stock supervisor\n" };
+                Ok(rts::mvm::RunOutput { code: Some(0), stdout: stdout.as_bytes().to_vec(), ..Default::default() })
+            }
+        }
+        let env = vec![("HOME".into(), "/fake/operator".into())];
+        let result = run_connected::<()>(
+            &mut default_config(),
+            |cfg| local_preflight(cfg, &StockSupervisor, &env),
+            |_| panic!("must not read credentials or open browser login"),
+            |_| panic!("must not start session"),
+        );
+        assert!(result.unwrap_err().contains("rts-vsock-drain-v1"));
     }
 
     #[test]

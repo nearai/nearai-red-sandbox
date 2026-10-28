@@ -257,11 +257,42 @@ pub fn check_provider(p: &ProviderConfig) -> Result<(), String> {
     Ok(())
 }
 
+pub const SUPERVISOR_FIX_VERSION: &str = "rts-vsock-drain-v1";
+const SUPERVISOR_PROBE: &str = "--rts-vsock-drain-fix-version";
+const SUPERVISOR_INSTALL: &str = "Run scripts/build-patched-mvm-supervisor.sh to install the patched mvm v0.22.0 supervisor in ~/.local/share/nearai-red-sandbox/mvm-hvf-supervisor, or set MVM_HVF_SUPERVISOR_PATH to its absolute path";
+
+/// Resolve only the supplied operator environment, never ambient process state.
+/// An explicit override must be usable; an empty override cannot fall back.
+pub fn supervisor_path(env: &[(String, String)]) -> Result<PathBuf, String> {
+    let get = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+    let path = if let Some(path) = get("MVM_HVF_SUPERVISOR_PATH") {
+        PathBuf::from(path)
+    } else {
+        let home = get("HOME").filter(|v| !v.is_empty())
+            .ok_or_else(|| format!("Cannot locate patched HVF supervisor without HOME. {SUPERVISOR_INSTALL}"))?;
+        Path::new(home).join(".local/share/nearai-red-sandbox/mvm-hvf-supervisor")
+    };
+    if !path.is_absolute() {
+        return Err(format!("MVM_HVF_SUPERVISOR_PATH and HOME must select an absolute supervisor path. {SUPERVISOR_INSTALL}"));
+    }
+    Ok(path)
+}
+
+/// Use the exact probed supervisor for doctor and every VM lifecycle command.
+pub fn mvm_environment(env: &[(String, String)], supervisor: &Path) -> std::collections::HashMap<String, String> {
+    let mut result: std::collections::HashMap<String, String> = env.iter()
+        .filter(|(key, _)| matches!(key.as_str(), "HOME" | "MVM_HOME"))
+        .cloned().collect();
+    result.insert("MVM_HVF_SUPERVISOR_PATH".into(), supervisor.to_string_lossy().into_owned());
+    result
+}
+
 pub struct PreflightInput<'a> {
     pub host: &'a dyn Host,
     pub run: &'a dyn Runner,
     pub opencode: &'a str,
     pub leak_seam_set: bool,
+    pub supervisor_path: Option<&'a Path>,
     pub work_dir: Option<&'a Path>,
     pub provider: &'a ProviderConfig,
 }
@@ -281,6 +312,15 @@ pub fn preflight(o: &PreflightInput) -> Result<(), String> {
     let found = version_in(&out).unwrap_or(if out.trim().is_empty() { "nothing" } else { out.trim() });
     if found != OPENCODE_VERSION {
         return Err(format!("opencode {OPENCODE_VERSION} required, found {found}"));
+    }
+    let supervisor = o.supervisor_path.filter(|p| p.is_absolute()).and_then(Path::to_str)
+        .ok_or_else(|| format!("An absolute patched HVF supervisor path is required ({SUPERVISOR_FIX_VERSION}). {SUPERVISOR_INSTALL}"))?;
+    let probe = o.host.run(&sv(&[supervisor, SUPERVISOR_PROBE]), Duration::from_secs(5))
+        .map_err(|_| format!("Cannot verify patched HVF supervisor ({SUPERVISOR_FIX_VERSION}). {SUPERVISOR_INSTALL}"))?;
+    if probe.killed || probe.code != Some(0)
+        || !(probe.stdout == SUPERVISOR_FIX_VERSION.as_bytes() || probe.stdout == format!("{SUPERVISOR_FIX_VERSION}\n").as_bytes())
+    {
+        return Err(format!("HVF supervisor must report {SUPERVISOR_FIX_VERSION}; its copy-out fix could not be verified. {SUPERVISOR_INSTALL}"));
     }
     let doctor = o.run.run(&sv(&["doctor"]), Duration::from_secs(60)).map_err(|e| format!("mvmctl doctor failed: {e}"))?;
     if doctor.code != Some(0) {
@@ -483,12 +523,19 @@ pub fn run_session(cfg: &OperatorConfig, deps: Deps) -> i32 {
     }
     log.log(&format!("session {id}: results in {}, runtime in {}", p.session_dir.display(), p.runtime.display()));
 
+    let supervisor = match supervisor_path(&deps.env) {
+        Ok(path) => path,
+        Err(error) => {
+            log.log(&error);
+            return 1;
+        }
+    };
     let operator_home = deps.env.iter().find(|(k, _)| k == "HOME").map(|(_, v)| v.clone()).unwrap_or_default();
     let run: Arc<dyn Runner> = deps.runner.clone().unwrap_or_else(|| {
         Arc::new(SpawnRunner {
             mvmctl: cfg.mvmctl.clone(),
             empty_git_config: p.empty_git_config.clone(),
-            extra_env: [("HOME".to_string(), operator_home.clone())].into(),
+            extra_env: mvm_environment(&deps.env, &supervisor),
         })
     });
     // The launcher's handle does not share the state dir's marker: teardown
@@ -502,7 +549,7 @@ pub fn run_session(cfg: &OperatorConfig, deps: Deps) -> i32 {
     };
     sys::catch_termination_signals();
     let mut live = Live { log: &log, sb: &sb, paths: &p, machine_attempted: false, machine_created: false, child: None };
-    let code = match session_body(cfg, &deps, &run, &operator_home, &mut live) {
+    let code = match session_body(cfg, &deps, &run, &operator_home, &supervisor, &mut live) {
         Ok(code) => code,
         Err(e) => {
             log.log(&e);
@@ -523,7 +570,7 @@ fn interrupted(log: &Logger) -> Option<String> {
     })
 }
 
-fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operator_home: &str, live: &mut Live) -> Result<i32, String> {
+fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operator_home: &str, supervisor: &Path, live: &mut Live) -> Result<i32, String> {
     let p = live.paths;
     let leak_seam_set = deps.env.iter().any(|(k, _)| k == "RTS_TEST_LEAK");
     preflight(&PreflightInput {
@@ -531,6 +578,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         run: run.as_ref(),
         opencode: &cfg.opencode,
         leak_seam_set,
+        supervisor_path: Some(supervisor),
         work_dir: Some(&p.work),
         provider: &cfg.provider,
     })?;
@@ -812,7 +860,11 @@ mod tests {
     }
 
     fn healthy(argv: &[String]) -> RunOutput {
-        if argv.last().map(String::as_str) == Some("--version") { out(0, "2.1.4\n", "") } else { out(0, "", "") }
+        match argv.last().map(String::as_str) {
+            Some("--version") => out(0, "2.1.4\n", ""),
+            Some("--rts-vsock-drain-fix-version") => out(0, "rts-vsock-drain-v1\n", ""),
+            _ => out(0, "", ""),
+        }
     }
 
     /// A one-shot HTTP server on loopback answering with `response`.
@@ -837,10 +889,121 @@ mod tests {
     }
 
     fn pre(f: &Arc<Fake>, leak: bool, work: Option<&Path>, provider: &ProviderConfig) -> Result<(), String> {
-        preflight(&PreflightInput { host: f.as_ref(), run: f.as_ref(), opencode: "opencode", leak_seam_set: leak, work_dir: work, provider })
+        preflight(&PreflightInput { host: f.as_ref(), run: f.as_ref(), opencode: "opencode", leak_seam_set: leak, supervisor_path: Some(Path::new("/fake/mvm-hvf-supervisor")), work_dir: work, provider })
     }
 
     const MODELS_OK: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"object\":\"list\",\"data\":[{\"id\":\"z-ai/glm-5.3-flash\"}]}";
+
+    #[test]
+    fn preflight_refuses_an_unpatched_supervisor_before_doctor() {
+        let f = Fake::new(|a| if a.last().map(String::as_str) == Some(SUPERVISOR_PROBE) { out(0, "", "") } else { healthy(a) });
+        let external = ProviderConfig { base_url: "https://cloud-api.near.ai/v1".into(), ..provider() };
+        let error = pre(&f, false, None, &external).unwrap_err();
+        assert!(error.contains("rts-vsock-drain-v1"), "{error}");
+        assert!(!f.calls().iter().any(|a| a == "doctor"));
+    }
+
+    #[test]
+    fn supervisor_selection_uses_only_the_operator_environment_and_never_falls_back_from_an_override() {
+        let env = vec![("HOME".into(), "/operator home".into())];
+        let selected = supervisor_path(&env).unwrap();
+        assert_eq!(selected, Path::new("/operator home/.local/share/nearai-red-sandbox/mvm-hvf-supervisor"));
+        let mut explicit = env.clone();
+        explicit.push(("MVM_HVF_SUPERVISOR_PATH".into(), "/patched path/supervisor".into()));
+        assert_eq!(supervisor_path(&explicit).unwrap(), Path::new("/patched path/supervisor"));
+        explicit.last_mut().unwrap().1 = "relative/supervisor".into();
+        assert!(supervisor_path(&explicit).unwrap_err().contains("absolute"));
+        explicit.last_mut().unwrap().1.clear();
+        assert!(supervisor_path(&explicit).is_err());
+        assert!(supervisor_path(&[]).unwrap_err().contains("HOME"));
+        assert!(supervisor_path(&[("HOME".into(), "relative".into())]).is_err());
+        assert_eq!(supervisor_path(&[("MVM_HVF_SUPERVISOR_PATH".into(), "/explicit/supervisor".into())]).unwrap(), Path::new("/explicit/supervisor"));
+    }
+
+    #[test]
+    fn mvm_commands_receive_the_same_selected_supervisor_and_operator_home() {
+        let env = vec![("HOME".into(), "/operator".into()), ("MVM_HOME".into(), "/vm state".into()),
+            ("MVM_HVF_SUPERVISOR_PATH".into(), "/override with spaces/supervisor".into()), ("SECRET".into(), "do not forward".into())];
+        let selected = supervisor_path(&env).unwrap();
+        let passed = mvm_environment(&env, &selected);
+        assert_eq!(passed["MVM_HVF_SUPERVISOR_PATH"], selected.to_str().unwrap());
+        assert_eq!(passed["HOME"], "/operator");
+        assert_eq!(passed["MVM_HOME"], "/vm state");
+        assert!(!passed.contains_key("SECRET"));
+    }
+
+    #[test]
+    fn preflight_requires_the_exact_supervisor_marker_with_success_and_a_bounded_probe() {
+        struct ProbeHost { output: RunOutput, calls: Mutex<Vec<(Vec<String>, Duration)>> }
+        impl Host for ProbeHost {
+            fn run(&self, argv: &[String], timeout: Duration) -> io::Result<RunOutput> {
+                self.calls.lock().unwrap().push((argv.to_vec(), timeout));
+                Ok(if argv.last().map(String::as_str) == Some(SUPERVISOR_PROBE) { self.output.clone() } else { healthy(argv) })
+            }
+        }
+        let external = ProviderConfig { base_url: "https://cloud-api.near.ai/v1".into(), ..provider() };
+        let path = Path::new("/patched supervisor/with spaces;$shell");
+        for (output, valid) in [
+            (out(0, "rts-vsock-drain-v1", ""), true),
+            (out(0, "rts-vsock-drain-v1\n", ""), true),
+            (out(0, " rts-vsock-drain-v1\n", ""), false),
+            (out(0, "rts-vsock-drain-v1\nextra", ""), false),
+            (out(1, "rts-vsock-drain-v1\n", "secret diagnostic"), false),
+            (RunOutput { killed: true, ..out(0, "rts-vsock-drain-v1", "") }, false),
+        ] {
+            let host = ProbeHost { output, calls: Mutex::new(vec![]) };
+            let runner = Fake::new(healthy);
+            let result = preflight(&PreflightInput { host: &host, run: runner.as_ref(), opencode: "opencode", leak_seam_set: false,
+                supervisor_path: Some(path), work_dir: None, provider: &external });
+            let calls = host.calls.lock().unwrap();
+            assert_eq!(calls[1], (vec![path.to_str().unwrap().into(), SUPERVISOR_PROBE.into()], Duration::from_secs(5)));
+            if valid {
+                result.unwrap();
+                assert_eq!(runner.calls(), ["doctor"]);
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.contains("scripts/build-patched-mvm-supervisor.sh"), "{error}");
+                assert!(!error.contains("secret diagnostic"));
+                assert!(runner.calls().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn preflight_refuses_missing_relative_or_unexecutable_supervisors() {
+        let external = ProviderConfig { base_url: "https://cloud-api.near.ai/v1".into(), ..provider() };
+        for path in [None, Some(Path::new("relative/supervisor"))] {
+            let f = Fake::new(healthy);
+            let error = preflight(&PreflightInput { host: f.as_ref(), run: f.as_ref(), opencode: "opencode", leak_seam_set: false,
+                supervisor_path: path, work_dir: None, provider: &external }).unwrap_err();
+            assert!(error.contains("absolute"), "{error}");
+            assert_eq!(f.calls(), ["opencode --version"]);
+        }
+        struct MissingHost;
+        impl Host for MissingHost {
+            fn run(&self, argv: &[String], _: Duration) -> io::Result<RunOutput> {
+                if argv.last().map(String::as_str) == Some(SUPERVISOR_PROBE) {
+                    Err(io::Error::new(io::ErrorKind::NotFound, "private diagnostic"))
+                } else { Ok(healthy(argv)) }
+            }
+        }
+        let f = Fake::new(healthy);
+        let error = preflight(&PreflightInput { host: &MissingHost, run: f.as_ref(), opencode: "opencode", leak_seam_set: false,
+            supervisor_path: Some(Path::new("/missing/supervisor")), work_dir: None, provider: &external }).unwrap_err();
+        assert!(error.contains("rts-vsock-drain-v1") && !error.contains("private diagnostic"), "{error}");
+        assert!(f.calls().is_empty());
+    }
+
+    #[test]
+    fn external_sessions_refuse_an_unpatched_supervisor_before_any_vm_command() {
+        let d = tempdir("unpatched");
+        let f = Fake::new(|a| if a.last().map(String::as_str) == Some(SUPERVISOR_PROBE) { out(0, "stock", "") } else { healthy(a) });
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into() };
+        let external = ProviderConfig { base_url: "https://cloud-api.near.ai/v1".into(), ..provider() };
+        assert_eq!(run_session(&session_cfg(&d, &d, external), deps), 1);
+        assert_eq!(f.calls(), ["opencode --version", "/fake/home/.local/share/nearai-red-sandbox/mvm-hvf-supervisor --rts-vsock-drain-fix-version"]);
+        fs::remove_dir_all(d).unwrap();
+    }
 
     #[test]
     fn preflight_requires_opencode_2_1_4() {
@@ -999,7 +1162,7 @@ mod tests {
     fn a_session_refuses_before_any_vm_exists_when_opencode_is_the_wrong_version() {
         let d = tempdir("sess");
         let f = Fake::new(|a| if a.last().map(String::as_str) == Some("--version") { out(0, "1.0.0", "") } else { out(0, "", "") });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into() };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into() };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         assert!(!f.calls().iter().any(|c| c.starts_with("machine")), "{:?}", f.calls());
         fs::remove_dir_all(d).unwrap();
@@ -1015,7 +1178,7 @@ mod tests {
         });
         let deps = Deps {
             host: f.clone(), runner: Some(f.clone()),
-            env: vec![("MVM_HOME".into(), d.join("mvm").to_string_lossy().into_owned())],
+            env: vec![("HOME".into(), "/fake/home".into()), ("MVM_HOME".into(), d.join("mvm").to_string_lossy().into_owned())],
             rts: "/x/rts".into(),
         };
         let mut cfg = session_cfg(&sessions, &d, serve(MODELS_OK));
@@ -1035,7 +1198,7 @@ mod tests {
             s if s.starts_with("machine create") => out(1, "", "image pull failed"),
             _ => healthy(a),
         });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into() };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into() };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         let calls = f.calls();
         assert!(calls.iter().any(|c| c.starts_with("machine rm rts-") && c.ends_with(" --force --yes")), "{calls:?}");
