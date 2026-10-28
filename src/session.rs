@@ -523,6 +523,28 @@ fn interrupted(log: &Logger) -> Option<String> {
     })
 }
 
+/// The options opencode passes to the sandbox plugin (plugin/index.ts).
+pub fn plugin_options(p: &SessionPaths, cfg: &OperatorConfig, rts: &Path, nonce: &str, operator_home: &str) -> Value {
+    json!({
+        "machine": p.machine,
+        "nonce": nonce,
+        "readyFile": p.ready_file,
+        "auditFile": p.audit_file,
+        "provider": cfg.provider.id,
+        "models": cfg.provider.models,
+        "rts": rts,
+        "bridge": {
+            "machine": p.machine,
+            "mvmctl": cfg.mvmctl,
+            "emptyGitConfig": p.empty_git_config,
+            "stateDir": p.state_dir,
+            "timeoutMs": cfg.limits.tool_timeout_ms,
+            "maxOutputBytes": cfg.limits.max_output_bytes,
+            "mvmHome": operator_home,
+        },
+    })
+}
+
 fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operator_home: &str, live: &mut Live) -> Result<i32, String> {
     let p = live.paths;
     let leak_seam_set = deps.env.iter().any(|(k, _)| k == "RTS_TEST_LEAK");
@@ -560,23 +582,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     live.log.log(&format!("sampling host RSS of pid {} (found via {})", supervisor.pid, supervisor.pid_file.display()));
 
     let nonce = new_nonce();
-    let plugin_options = json!({
-        "machine": p.machine,
-        "nonce": nonce,
-        "readyFile": p.ready_file,
-        "auditFile": p.audit_file,
-        "provider": cfg.provider.id,
-        "rts": deps.rts,
-        "bridge": {
-            "machine": p.machine,
-            "mvmctl": cfg.mvmctl,
-            "emptyGitConfig": p.empty_git_config,
-            "stateDir": p.state_dir,
-            "timeoutMs": cfg.limits.tool_timeout_ms,
-            "maxOutputBytes": cfg.limits.max_output_bytes,
-            "mvmHome": operator_home,
-        },
-    });
+    let plugin_options = plugin_options(p, cfg, &deps.rts, &nonce, operator_home);
     write_opencode_config(&p.config_dir, &cfg.plugin_dir, &plugin_options, &cfg.provider)?;
     // opencode loads opencode.json, AGENTS.md and .opencode/ from its cwd.
     if fs::read_dir(&p.work).map_err(|e| e.to_string())?.next().is_some() {
@@ -638,6 +644,17 @@ mod tests {
     use crate::testutil::tempdir;
     use std::net::TcpListener;
     use std::sync::Mutex;
+
+    #[test]
+    fn plugin_options_carry_the_exact_model_allowlist() {
+        let mut cfg = parse_config("{}", Path::new("/cfg"), &Defaults { repo: "/r".into(), mvmctl: "/m".into() }).unwrap();
+        cfg.provider.models = vec!["m-one".into(), "m-two".into()];
+        let p = session_paths("0123456789ab", Path::new("/s"), Path::new("/rt"));
+        let o = plugin_options(&p, &cfg, Path::new("/x/rts"), &"ab".repeat(12), "/home/op");
+        assert_eq!(o["models"], serde_json::json!(["m-one", "m-two"]));
+        assert_eq!(o["provider"], serde_json::json!(cfg.provider.id));
+        assert_eq!(o["bridge"]["machine"], serde_json::json!("rts-0123456789ab"));
+    }
 
     fn provider() -> ProviderConfig {
         ProviderConfig { id: "ironwire".into(), base_url: "http://127.0.0.1:8463/openai/v1".into(), models: vec!["z-ai/glm-5.3-flash".into()], api_key_env: None }

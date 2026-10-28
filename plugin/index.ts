@@ -1,7 +1,8 @@
 // opencode V2 plugin (v2.1.4 promise API): replaces the six file and shell
 // tools with sandboxed implementations, removes every other tool, every
-// MCP server and every model outside the configured provider, then proves
-// it loaded by writing the launcher's nonce to the ready file.
+// MCP server and every model that is not an exact ID in the configured
+// provider's allowlist, then proves it loaded by writing the launcher's
+// nonce to the ready file.
 //
 // opencode loads plugins in-process as TypeScript, so this file stays a
 // thin shim: each sandboxed tool call spawns `rts tool <name>` (the Rust
@@ -28,6 +29,8 @@ export type PluginOptions = {
   readyFile: string
   auditFile: string
   provider: string
+  // Exact model IDs of `provider` that stay enabled; everything else is removed.
+  models: string[]
   // The rts binary, and the options it needs to reach this session's
   // machine (passed through to `rts tool` unchanged; see src/bridge.rs).
   rts: string
@@ -62,12 +65,17 @@ function checkOptions(o: any): PluginOptions {
   const bridge = o.bridge
   if (!bridge || typeof bridge !== "object" || Array.isArray(bridge)) throw new Error("rts-sandbox: option bridge is required")
   if (bridge.machine !== machine) throw new Error("rts-sandbox: bridge.machine must match machine")
+  const models = o.models
+  if (!Array.isArray(models) || models.length === 0 || models.some((m: unknown) => typeof m !== "string" || m === "")) {
+    throw new Error("rts-sandbox: option models must be a non-empty list of model IDs")
+  }
   return {
     machine,
     nonce,
     readyFile: str("readyFile"),
     auditFile: str("auditFile"),
     provider: str("provider"),
+    models: [...models],
     rts: str("rts"),
     bridge,
     debugFile: typeof o.debugFile === "string" && o.debugFile !== "" ? o.debugFile : undefined,
@@ -79,6 +87,7 @@ const listOf = (v: any): any[] => (Array.isArray(v) ? v : Array.isArray(v?.data)
 // Exposed so tests can inject a fake Sandbox implementation.
 export async function setupWith(ctx: any, makeImpl: (o: PluginOptions) => Record<ToolName, (input: any) => Promise<string>>) {
   const o = checkOptions(ctx.options)
+  const allowed = new Set(o.models)
   const impl = makeImpl(o)
 
   await ctx.tool.transform((editor: any) => {
@@ -101,7 +110,7 @@ export async function setupWith(ctx: any, makeImpl: (o: PluginOptions) => Record
     for (const [name] of [...editor.list()]) editor.remove(name)
   })
   await ctx.model.transform((editor: any) => {
-    for (const m of [...editor.list()]) if (m.providerID !== o.provider) editor.remove(m.providerID, m.id)
+    for (const m of [...editor.list()]) if (!(m.providerID === o.provider && allowed.has(m.id))) editor.remove(m.providerID, m.id)
   })
 
   // Second layer behind the transform, plus the audit log.
@@ -135,7 +144,16 @@ export async function setupWith(ctx: any, makeImpl: (o: PluginOptions) => Record
   const strays = listOf(await ctx.model.list()).filter((m: any) => m.providerID !== o.provider && m.enabled !== false)
   if (strays.length) throw new Error(`model outside provider ${o.provider}: ${strays.map((m: any) => `${m.providerID}/${m.id}`).join(", ")}`)
 
-  const providerModels = listOf(await ctx.model.list()).filter((m: any) => m.providerID === o.provider).length
+  const kept = listOf(await ctx.model.list()).filter((m: any) => m.providerID === o.provider && m.enabled !== false)
+  const keptIds = kept.map((m: any) => String(m.id))
+  const extraModels = keptIds.filter((id) => !allowed.has(id))
+  const missingModels = [...allowed].filter((id) => !keptIds.includes(id))
+  if (extraModels.length || missingModels.length) {
+    const parts = [...extraModels.map((id) => `${o.provider}/${id}`), ...missingModels.map((id) => `missing ${o.provider}/${id}`)]
+    throw new Error(`model allowlist mismatch: ${parts.join(", ")}`)
+  }
+
+  const providerModels = kept.length
   const verified = { tools: [...ids].sort(), mcp: servers, providerModels }
   console.error(`rts-sandbox: verified tools ${verified.tools.join(",")}; mcp none; ${providerModels} ${o.provider} models`)
   if (o.debugFile) await writeFile(o.debugFile, JSON.stringify(verified) + "\n", { mode: 0o600 })

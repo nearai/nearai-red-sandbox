@@ -143,6 +143,10 @@ fn local_preflight(cfg: &config::OperatorConfig) -> Result<(), String> {
     })
 }
 
+fn check_launch(cfg: &config::OperatorConfig) -> Result<(), String> {
+    config::require_real_models(&cfg.provider.models)
+}
+
 fn launch(file: Option<&Path>, login: &auth::LoginOptions) -> Result<i32, String> {
     let defaults = config::Defaults::from_env();
     let mut cfg = if let Some(file) = file {
@@ -154,6 +158,7 @@ fn launch(file: Option<&Path>, login: &auth::LoginOptions) -> Result<i32, String
             &defaults,
         )?
     };
+    check_launch(&cfg)?;
     let deps = session::Deps::real()?;
     run_connected(
         &mut cfg,
@@ -224,6 +229,15 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn launch_refuses_placeholder_models_before_credentials() {
+        let e = check_launch(&default_config()).unwrap_err();
+        assert!(e.contains("placeholder"), "{e}");
+        let mut cfg = default_config();
+        cfg.provider.models = vec!["real-model".into()];
+        assert!(check_launch(&cfg).is_ok());
     }
 
     #[test]
