@@ -1,0 +1,9 @@
+{
+  "name": "redteam-sandbox",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test tests/unit",
+    "contain": "bun test tests/contain"
+  }
+}
