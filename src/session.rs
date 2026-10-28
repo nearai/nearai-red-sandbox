@@ -23,6 +23,32 @@ use crate::terminal::Terminal;
 
 pub const OPENCODE_VERSION: &str = "2.1.4";
 
+const INIT_GUEST_STORAGE: &str = r#"set -eu
+tmp=$1; input=$2; output=$3
+refuse() { echo 'unexpected guest input/output layout' >&2; exit 1; }
+[ -d "$tmp" ] && [ ! -L "$tmp" ] || refuse
+[ -L "$input" ] && [ "$(readlink "$input")" = "$tmp/rts/in" ] || refuse
+[ -L "$output" ] && [ "$(readlink "$output")" = "$tmp/rts/out" ] || refuse
+for dir in "$tmp/rts" "$tmp/rts/in" "$tmp/rts/out"; do
+  [ ! -L "$dir" ] || refuse
+  if [ -e "$dir" ]; then [ -d "$dir" ] || refuse; fi
+done
+for dir in "$tmp/rts" "$tmp/rts/in" "$tmp/rts/out"; do
+  if [ ! -d "$dir" ]; then mkdir -- "$dir"; fi
+  [ -d "$dir" ] && [ ! -L "$dir" ] || refuse
+done"#;
+
+/// Prepare the writable input and output directories of a newly created guest.
+/// The image root is read-only and its exact links point into per-VM /tmp.
+/// Refuse other layouts before creating anything or copying operator inputs.
+pub fn initialize_guest_storage(sb: &dyn Exec) -> Result<(), String> {
+    let mk = sb.exec(&crate::files::script(INIT_GUEST_STORAGE, &["/tmp", "/in", "/out"]), &ExecOptions::new(30_000, 4096)).map_err(|e| e.to_string())?;
+    if mk.exit_code != 0 {
+        return Err(format!("could not initialize guest input/output storage: {}", String::from_utf8_lossy(&mk.stderr).trim()));
+    }
+    Ok(())
+}
+
 /// Runs a command on the host. A trait so tests can stand in for
 /// `opencode --version`, `ps` and `pgrep`.
 pub trait Host: Send + Sync {
@@ -520,10 +546,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         .map_err(|e| e.to_string())?;
     live.machine_created = true;
     live.log.log(&format!("created {}", p.machine));
-    let mk = live.sb.exec(&sv(&["mkdir", "-p", "/in", "/out"]), &ExecOptions::new(30_000, 4096)).map_err(|e| e.to_string())?;
-    if mk.exit_code != 0 {
-        return Err("could not create /in and /out in the guest".into());
-    }
+    initialize_guest_storage(live.sb)?;
     if let Some(inputs) = &cfg.inputs_dir {
         live.sb.copy_in(inputs, "/in").map_err(|e| e.to_string())?;
         live.log.log(&format!("copied {} to /in", inputs.display()));
@@ -618,6 +641,97 @@ mod tests {
 
     fn provider() -> ProviderConfig {
         ProviderConfig { id: "ironwire".into(), base_url: "http://127.0.0.1:8463/openai/v1".into(), models: vec!["z-ai/glm-5.3-flash".into()], api_key_env: None }
+    }
+
+    /// Run the real initialization command against a miniature guest filesystem.
+    struct StorageGuest {
+        root: tempfile::TempDir,
+    }
+
+    impl StorageGuest {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir(root.path().join("tmp")).unwrap();
+            for name in ["in", "out"] {
+                std::os::unix::fs::symlink(root.path().join("tmp/rts").join(name), root.path().join(name)).unwrap();
+            }
+            Self { root }
+        }
+
+        fn path(&self, path: &str) -> PathBuf {
+            self.root.path().join(path)
+        }
+    }
+
+    impl Exec for StorageGuest {
+        fn exec(&self, argv: &[String], opts: &ExecOptions) -> crate::sandbox::Result<crate::sandbox::ExecResult> {
+            let argv = argv.iter().map(|arg| match arg.as_str() {
+                "/tmp" | "/in" | "/out" => self.path(&arg[1..]).to_string_lossy().into_owned(),
+                _ => arg.clone(),
+            }).collect::<Vec<_>>();
+            crate::testutil::HostShell::default().exec(&argv, opts)
+        }
+    }
+
+    #[test]
+    fn guest_storage_initializes_dangling_image_links_without_replacing_them() {
+        let guest = StorageGuest::new();
+        assert!(!guest.path("in").exists());
+        initialize_guest_storage(&guest).unwrap();
+        for name in ["in", "out"] {
+            let target = guest.path(&format!("tmp/rts/{name}"));
+            assert_eq!(fs::read_link(guest.path(name)).unwrap(), target);
+            assert!(target.is_dir());
+            fs::write(guest.path(name).join("probe"), name).unwrap();
+            assert_eq!(fs::read_to_string(target.join("probe")).unwrap(), name);
+        }
+        initialize_guest_storage(&guest).unwrap();
+        assert_eq!(fs::read_to_string(guest.path("in/probe")).unwrap(), "in");
+    }
+
+    #[test]
+    fn guest_storage_refuses_unexpected_image_links_and_plain_directories() {
+        for name in ["in", "out"] {
+            for redirect in [false, true] {
+                let guest = StorageGuest::new();
+                fs::create_dir_all(guest.path("tmp/rts/in")).unwrap();
+                fs::create_dir_all(guest.path("tmp/rts/out")).unwrap();
+                fs::remove_file(guest.path(name)).unwrap();
+                if redirect {
+                    fs::create_dir(guest.path("unexpected")).unwrap();
+                    std::os::unix::fs::symlink(guest.path("unexpected"), guest.path(name)).unwrap();
+                } else {
+                    fs::create_dir(guest.path(name)).unwrap();
+                }
+                assert!(initialize_guest_storage(&guest).is_err(), "accepted {name}, redirect={redirect}");
+            }
+        }
+    }
+
+    #[test]
+    fn guest_storage_refuses_redirected_or_non_directory_writable_components() {
+        for component in ["tmp", "tmp/rts", "tmp/rts/in", "tmp/rts/out"] {
+            for redirect in [false, true] {
+                let guest = StorageGuest::new();
+                let path = guest.path(component);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                if path.is_dir() {
+                    fs::remove_dir(&path).unwrap();
+                }
+                if redirect {
+                    fs::create_dir(guest.path("unexpected")).unwrap();
+                    std::os::unix::fs::symlink(guest.path("unexpected"), &path).unwrap();
+                } else {
+                    fs::write(&path, "occupied").unwrap();
+                }
+                assert!(initialize_guest_storage(&guest).is_err(), "accepted {component}, redirect={redirect}");
+                if redirect {
+                    assert!(fs::read_dir(guest.path("unexpected")).unwrap().next().is_none(), "wrote through {component}");
+                } else {
+                    assert_eq!(fs::read_to_string(&path).unwrap(), "occupied");
+                }
+            }
+        }
     }
 
     fn out(code: i32, stdout: &str, stderr: &str) -> RunOutput {

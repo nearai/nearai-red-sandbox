@@ -193,3 +193,10 @@ the stop command's exit status; after correction, its focused live rerun passed.
 Containment remains unvalidated until those failures are resolved and the
 real suite passes. Unit tests, mocked browser callbacks, and local inference
 HTTP tests do not establish live Cloud sign-in or VM containment.
+
+The derived image in `guest/Dockerfile` was built with Colima for `linux/arm64`.
+Its `/in` and `/out` links and the launcher initialization script were checked
+with a read-only root and a writable `/tmp` in a container. mvm cannot pull
+directly from Colima's image store: publish the image to an accessible OCI
+registry, pin its registry manifest digest in the configuration, and run the
+real mvm suite before using it. The current default image is not yet replaced.
