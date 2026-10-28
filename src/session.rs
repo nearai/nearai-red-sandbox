@@ -393,17 +393,26 @@ pub struct Deps {
     pub env: Vec<(String, String)>,
     /// The `rts` binary the plugin shim spawns for each tool call.
     pub rts: PathBuf,
+    /// Chosen by the caller when it writes into sessions/<id>/ before the
+    /// session starts (attestation.json); None picks a fresh one.
+    pub session_id: Option<String>,
 }
 
 impl Deps {
-    pub fn real() -> Result<Self, String> {
+    pub fn real(session_id: String) -> Result<Self, String> {
         Ok(Self {
             host: Arc::new(RealHost),
             runner: None,
             env: std::env::vars().collect(),
             rts: std::env::current_exe().map_err(|e| format!("cannot locate the rts binary: {e}"))?,
+            session_id: Some(session_id),
         })
     }
+}
+
+/// 12 lowercase hex characters from the OS.
+pub fn new_session_id() -> String {
+    random_hex(6)
 }
 
 struct Logger {
@@ -473,7 +482,7 @@ impl Live<'_> {
 /// Run one session. Returns opencode's exit code, or 1 when the session
 /// was refused or failed.
 pub fn run_session(cfg: &OperatorConfig, deps: Deps) -> i32 {
-    let id = random_hex(6);
+    let id = deps.session_id.clone().unwrap_or_else(new_session_id);
     let runtime = std::env::temp_dir().join(format!("rts-{id}-{}", random_hex(4)));
     let p = session_paths(&id, &cfg.sessions_dir, &runtime);
     let log = Logger { id: id.clone(), file: p.log_file.clone() };
@@ -1016,10 +1025,31 @@ mod tests {
     fn a_session_refuses_before_any_vm_exists_when_opencode_is_the_wrong_version() {
         let d = tempdir("sess");
         let f = Fake::new(|a| if a.last().map(String::as_str) == Some("--version") { out(0, "1.0.0", "") } else { out(0, "", "") });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into() };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into(), session_id: None };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         assert!(!f.calls().iter().any(|c| c.starts_with("machine")), "{:?}", f.calls());
         fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_session_uses_the_id_its_caller_chose() {
+        let d = tempdir("sess-id");
+        let f = Fake::new(|a| if a.last().map(String::as_str) == Some("--version") { out(0, "1.0.0", "") } else { out(0, "", "") });
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into(), session_id: Some("0123456789ab".into()) };
+        assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
+        let log = fs::read_to_string(d.join("0123456789ab/launcher.log"));
+        let entries: Vec<_> = fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name()).collect();
+        fs::remove_dir_all(&d).unwrap();
+        assert!(log.unwrap().contains("session 0123456789ab"), "{entries:?}");
+        assert_eq!(entries, vec![std::ffi::OsString::from("0123456789ab")]);
+    }
+
+    #[test]
+    fn new_session_ids_are_twelve_lowercase_hex() {
+        let a = new_session_id();
+        assert_eq!(a.len(), 12);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{a}");
+        assert_ne!(a, new_session_id());
     }
 
     #[test]
@@ -1034,6 +1064,7 @@ mod tests {
             host: f.clone(), runner: Some(f.clone()),
             env: vec![("MVM_HOME".into(), d.join("mvm").to_string_lossy().into_owned())],
             rts: "/x/rts".into(),
+            session_id: None,
         };
         let mut cfg = session_cfg(&sessions, &d, serve(MODELS_OK));
         cfg.opencode = "/nonexistent-opencode-rss-test".into();
@@ -1052,7 +1083,7 @@ mod tests {
             s if s.starts_with("machine create") => out(1, "", "image pull failed"),
             _ => healthy(a),
         });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into() };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into(), session_id: None };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         let calls = f.calls();
         assert!(calls.iter().any(|c| c.starts_with("machine rm rts-") && c.ends_with(" --force --yes")), "{calls:?}");

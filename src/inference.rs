@@ -62,11 +62,14 @@ impl Drop for EmbeddedInference {
     }
 }
 
+/// NEAR AI Cloud's production API base.
+pub const NEAR_BASE_URL: &str = "https://cloud-api.near.ai/v1";
+
 /// Start only the NEAR AI backend, without credential discovery or probes.
 pub fn start(key: HostSecret, models: &[String]) -> Result<EmbeddedInference, String> {
     // Pin the endpoint explicitly: IronWire's environment-based URL override
     // is independent of its credential source.
-    start_with_endpoint(key, models, "https://cloud-api.near.ai/v1")
+    start_with_endpoint(key, models, NEAR_BASE_URL)
 }
 
 /// Value for each model's `x-ironwire-route` request header.

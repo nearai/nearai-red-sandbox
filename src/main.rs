@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use rts::{auth, bridge, config, inference, session};
+use rts::{attest, auth, bridge, config, inference, session};
 
 #[derive(Debug)]
 enum Action {
@@ -18,6 +18,7 @@ enum Action {
     Launch {
         file: Option<PathBuf>,
         login: auth::LoginOptions,
+        attest: attest::AttestOptions,
     },
 }
 
@@ -37,18 +38,32 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
     }
     let mut file = None;
     let mut login = auth::LoginOptions::default();
+    let mut attest = attest::AttestOptions::default();
     let mut seen = std::collections::HashSet::new();
     let mut flags = flags.iter();
     while let Some(&flag) = flags.next() {
+        let launch_only = matches!(
+            flag,
+            "--config" | "--allow-tcb-out-of-date" | "--compose-policy"
+        );
         if !matches!(
             flag,
-            "--config" | "--provider" | "--organization" | "--workspace"
-        ) || (flag == "--config" && *command != "launch")
+            "--config"
+                | "--provider"
+                | "--organization"
+                | "--workspace"
+                | "--allow-tcb-out-of-date"
+                | "--compose-policy"
+        ) || (launch_only && *command != "launch")
         {
             return Err(format!("Unknown option for {command}: {flag}"));
         }
         if !seen.insert(flag) {
             return Err(format!("Duplicate option: {flag}"));
+        }
+        if flag == "--allow-tcb-out-of-date" {
+            attest.allow_tcb_out_of_date = true;
+            continue;
         }
         let value = flags
             .next()
@@ -57,6 +72,13 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
             .ok_or_else(|| format!("{flag} needs a value"))?;
         match flag {
             "--config" => file = Some(PathBuf::from(value)),
+            "--compose-policy" => {
+                attest.compose_policy = match value {
+                    "pinned" => attest::ComposePolicy::Pinned,
+                    "mr-config-only" => attest::ComposePolicy::MrConfigOnly,
+                    _ => return Err("--compose-policy must be pinned or mr-config-only".into()),
+                }
+            }
             "--provider" => {
                 login.provider = match value {
                     "github" => auth::Provider::Github,
@@ -84,7 +106,11 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
     Ok(if *command == "login" {
         Action::Login(login)
     } else {
-        Action::Launch { file, login }
+        Action::Launch {
+            file,
+            login,
+            attest,
+        }
     })
 }
 
@@ -105,7 +131,7 @@ fn run_connected<G>(
     Ok(run(cfg))
 }
 
-const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed and starts a private inference proxy.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in.";
+const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in.";
 
 fn local_preflight(cfg: &config::OperatorConfig) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -147,7 +173,11 @@ fn check_launch(cfg: &config::OperatorConfig) -> Result<(), String> {
     config::require_real_models(&cfg.provider.models)
 }
 
-fn launch(file: Option<&Path>, login: &auth::LoginOptions) -> Result<i32, String> {
+fn launch(
+    file: Option<&Path>,
+    login: &auth::LoginOptions,
+    attest_options: attest::AttestOptions,
+) -> Result<i32, String> {
     let defaults = config::Defaults::from_env();
     let mut cfg = if let Some(file) = file {
         config::load_config(file, &defaults)?
@@ -159,12 +189,32 @@ fn launch(file: Option<&Path>, login: &auth::LoginOptions) -> Result<i32, String
         )?
     };
     check_launch(&cfg)?;
-    let deps = session::Deps::real()?;
+    let session_id = session::new_session_id();
+    let deps = session::Deps::real(session_id.clone())?;
     run_connected(
         &mut cfg,
         local_preflight,
+        // Runs on the main thread, outside any Tokio runtime: attestation
+        // uses blocking HTTP, and IronWire's runtime starts on its own thread
+        // only after attestation succeeds.
         |cfg| {
             let credential = auth::load_or_login(login)?;
+            let record = attest::record::AttestationRecord::create(
+                &cfg.sessions_dir,
+                &session_id,
+                &attest_options,
+            )?;
+            let attested = attest::Attestor::real(
+                credential.key.clone(),
+                &cfg.provider.models,
+                attest_options,
+            )
+            .and_then(|attestor| attestor.attest())
+            .map_err(|e| {
+                record.set_status("refused", &e);
+                format!("attestation failed: {e} (see {})", record.path().display())
+            })?;
+            record.verified(&attested)?;
             let inference = inference::start(credential.key, &cfg.provider.models)?;
             Ok((inference.provider(), inference))
         },
@@ -187,7 +237,11 @@ fn main() -> ExitCode {
         }
     };
     let result = match action {
-        Action::Launch { file, login } => launch(file.as_deref(), &login),
+        Action::Launch {
+            file,
+            login,
+            attest,
+        } => launch(file.as_deref(), &login, attest),
         Action::Login(options) => auth::login(&options).map(|_| {
             println!("Signed in to NEAR AI Cloud.");
             0
@@ -319,12 +373,18 @@ mod tests {
 
     #[test]
     fn default_launch_and_explicit_account_flags_parse_without_side_effects() {
-        let Action::Launch { file, login } = parse_args(&["launch"]).unwrap() else {
+        let Action::Launch {
+            file,
+            login,
+            attest,
+        } = parse_args(&["launch"]).unwrap()
+        else {
             panic!("not launch")
         };
         assert_eq!(file, None);
         assert_eq!(login.provider, Provider::Github);
-        let Action::Launch { file, login } = parse_args(&[
+        assert_eq!(attest, rts::attest::AttestOptions::default());
+        let Action::Launch { file, login, .. } = parse_args(&[
             "launch",
             "--workspace",
             "workspace-one",
@@ -342,6 +402,35 @@ mod tests {
         assert_eq!(login.provider, Provider::Google);
         assert_eq!(login.organization.as_deref(), Some("org-one"));
         assert_eq!(login.workspace.as_deref(), Some("workspace-one"));
+    }
+
+    #[test]
+    fn launch_attestation_overrides_parse() {
+        use rts::attest::{AttestOptions, ComposePolicy};
+        let Action::Launch { attest, .. } = parse_args(&[
+            "launch",
+            "--allow-tcb-out-of-date",
+            "--compose-policy",
+            "mr-config-only",
+        ])
+        .unwrap() else {
+            panic!("not launch")
+        };
+        assert_eq!(
+            attest,
+            AttestOptions {
+                allow_tcb_out_of_date: true,
+                compose_policy: ComposePolicy::MrConfigOnly,
+                allow_unattested_provider: false,
+            }
+        );
+        let Action::Launch { attest, file, .. } =
+            parse_args(&["launch", "--compose-policy", "pinned", "--config", "c.json"]).unwrap()
+        else {
+            panic!("not launch")
+        };
+        assert_eq!(attest, AttestOptions::default());
+        assert_eq!(file, Some("c.json".into()));
     }
 
     #[test]
@@ -368,6 +457,24 @@ mod tests {
             vec!["launch", "--config", "a", "--config", "b"],
             vec!["login", "--organization", "../escape"],
             vec!["launch", "--config", ""],
+            vec!["launch", "--compose-policy", "other"],
+            vec!["launch", "--compose-policy"],
+            vec!["launch", "--compose-policy", "--allow-tcb-out-of-date"],
+            vec![
+                "launch",
+                "--compose-policy",
+                "pinned",
+                "--compose-policy",
+                "pinned",
+            ],
+            vec![
+                "launch",
+                "--allow-tcb-out-of-date",
+                "--allow-tcb-out-of-date",
+            ],
+            vec!["launch", "--allow-tcb-out-of-date", "yes"],
+            vec!["login", "--allow-tcb-out-of-date"],
+            vec!["login", "--compose-policy", "pinned"],
             vec!["other"],
             vec![],
         ] {
