@@ -57,9 +57,10 @@ impl Fatal {
         })
     }
 
-    /// Keeps the first reason; later ones are dropped.
-    pub fn raise(&self, reason: impl Into<String>) {
-        let _ = self.reason.set(reason.into());
+    /// Keeps the first reason; later ones are dropped. True when this call
+    /// set it.
+    pub fn raise(&self, reason: impl Into<String>) -> bool {
+        self.reason.set(reason.into()).is_ok()
     }
 
     pub fn reason(&self) -> Option<String> {
@@ -272,23 +273,41 @@ fn local(status: StatusCode, message: &'static str) -> Out {
     resp
 }
 
-fn fatal_reply(state: &State, status: &str, reason: String) -> Out {
-    state.record.set_status(status, &reason);
-    state.fatal.raise(format!("{status}: {reason}"));
+/// Raises fatal and, only if this is the first fatal, writes the matching
+/// terminal status, so attestation.json and the stop reason agree.
+fn stop(fatal: &Fatal, record: &AttestationRecord, status: &str, reason: &str) -> bool {
+    let first = fatal.raise(format!("{status}: {reason}"));
+    if first {
+        record.set_status(status, reason);
+    }
+    first
+}
+
+/// Method and path only: never headers, query or body.
+fn not_forwarded_line(method: &Method, path: &str) -> String {
+    format!("[rts forwarder] 404 {method} {path}: not forwarded")
+}
+
+fn stopped_reply() -> Out {
     local(
         StatusCode::BAD_GATEWAY,
         "rts forwarder: inference stopped; see attestation.json",
     )
 }
 
+fn fatal_reply(state: &State, status: &str, reason: String) -> Out {
+    stop(&state.fatal, &state.record, status, &reason);
+    stopped_reply()
+}
+
 async fn handle(state: &State, req: Request<Incoming>) -> Out {
+    // Fatal is checked here, again once the body has arrived, before every
+    // upstream send, and inside `learn`: it can be raised at any point.
     if state.fatal.reason().is_some() {
-        return local(
-            StatusCode::BAD_GATEWAY,
-            "rts forwarder: inference stopped; see attestation.json",
-        );
+        return stopped_reply();
     }
     if req.method() != Method::POST || req.uri().path() != "/v1/chat/completions" {
+        eprintln!("{}", not_forwarded_line(req.method(), req.uri().path()));
         return local(StatusCode::NOT_FOUND, "rts forwarder: not forwarded");
     }
     let mut headers = reqwest::header::HeaderMap::new();
@@ -311,6 +330,9 @@ async fn handle(state: &State, req: Request<Incoming>) -> Out {
         }
         Err(_) => return local(StatusCode::BAD_REQUEST, "rts forwarder: unreadable request"),
     };
+    if state.fatal.reason().is_some() {
+        return stopped_reply();
+    }
     let Some(model) = request_model(&body) else {
         return local(
             StatusCode::BAD_REQUEST,
@@ -319,13 +341,12 @@ async fn handle(state: &State, req: Request<Incoming>) -> Out {
     };
     if !state.models.contains(&model) {
         let shown: String = model.chars().take(128).collect();
-        state.record.set_status(
+        stop(
+            &state.fatal,
+            &state.record,
             "model-refused",
             &format!("model {shown:?} is not in the allowlist"),
         );
-        state.fatal.raise(format!(
-            "model-refused: model {shown:?} is not in the allowlist"
-        ));
         return local(
             StatusCode::FORBIDDEN,
             "rts forwarder: model is not in the allowlist",
@@ -340,6 +361,9 @@ async fn handle(state: &State, req: Request<Incoming>) -> Out {
             .body(body.clone())
             .send()
     };
+    if state.fatal.reason().is_some() {
+        return stopped_reply();
+    }
     let resp = match send().await {
         Ok(resp) => resp,
         Err(_) => match state.pins.take_rejected() {
@@ -360,8 +384,15 @@ async fn handle(state: &State, req: Request<Incoming>) -> Out {
                 );
             }
             Some(Rejected::Unpinned(fp)) => {
-                if let Err(reason) = learn(state, fp).await {
-                    return fatal_reply(state, "pin-failed", reason);
+                match learn(state, fp).await {
+                    Ok(()) => {}
+                    Err(Unlearned::Stopped) => return stopped_reply(),
+                    Err(Unlearned::Failed(reason)) => {
+                        return fatal_reply(state, "pin-failed", reason);
+                    }
+                }
+                if state.fatal.reason().is_some() {
+                    return stopped_reply();
                 }
                 match send().await {
                     Ok(resp) => resp,
@@ -391,32 +422,49 @@ async fn handle(state: &State, req: Request<Incoming>) -> Out {
     relay(resp)
 }
 
+enum Unlearned {
+    /// Fatal was raised meanwhile (possibly by another request's `learn`).
+    Stopped,
+    Failed(String),
+}
+
 /// Re-attests (on the blocking pool, one at a time) until `fp` is attested,
-/// recording each re-attestation.
-async fn learn(state: &State, fp: [u8; 32]) -> Result<(), String> {
+/// recording each re-attestation. Stops as soon as fatal is raised: after
+/// taking the lock, before each attempt, and before recording a result.
+async fn learn(state: &State, fp: [u8; 32]) -> Result<(), Unlearned> {
+    let stopped = || state.fatal.reason().is_some();
     let _one_at_a_time = state.reattesting.lock().await;
     for _ in 0..REATTEST_ATTEMPTS {
+        if stopped() {
+            return Err(Unlearned::Stopped);
+        }
         if state.pins.contains(&fp) {
             return Ok(());
         }
         let reattest = state.reattest.clone();
         let attested = tokio::task::spawn_blocking(move || reattest())
             .await
-            .map_err(|_| "pin: re-attestation did not complete".to_string())?
-            .map_err(|e| format!("pin: re-attestation failed: {e}"))?;
+            .map_err(|_| Unlearned::Failed("pin: re-attestation did not complete".into()))?
+            .map_err(|e| Unlearned::Failed(format!("pin: re-attestation failed: {e}")))?;
+        if stopped() {
+            return Err(Unlearned::Stopped);
+        }
         state
             .record
             .reattested(&attested)
-            .map_err(|e| format!("pin: cannot record re-attestation: {e}"))?;
+            .map_err(|e| Unlearned::Failed(format!("pin: cannot record re-attestation: {e}")))?;
         state.pins.extend(&attested.fingerprints);
+    }
+    if stopped() {
+        return Err(Unlearned::Stopped);
     }
     if state.pins.contains(&fp) {
         return Ok(());
     }
-    Err(format!(
+    Err(Unlearned::Failed(format!(
         "pin: upstream certificate {} is not attested after {REATTEST_ATTEMPTS} re-attestations",
         hex::encode(fp)
-    ))
+    )))
 }
 
 /// Status, Content-Type and the body as it arrives.
@@ -1120,12 +1168,121 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    fn post_to(base_url: &str, body: &[u8]) -> u16 {
+        reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap()
+            .post(format!("{base_url}/chat/completions"))
+            .bearer_auth(DUMMY_KEY)
+            .body(body.to_vec())
+            .send()
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    /// Review finding: a request parked on the re-attestation lock while
+    /// another request's attempts end in pin-failed must not re-attest again
+    /// or reach upstream.
+    #[test]
+    fn parked_requests_share_one_round_of_reattestation_and_stop_after_fatal() {
+        let up = upstream(|_| "b", false, ok_reply);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        let first_tx = Mutex::new(first_tx);
+        let counted = calls.clone();
+        let slow: Reattest = Arc::new(move || {
+            if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _ = first_tx.lock().unwrap().send(());
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(Attested {
+                fingerprints: fps(&["a"]),
+                ..Attested::default()
+            })
+        });
+        let rig = rig(&up, &["a"], slow, 1 << 20);
+        let base = rig.forwarder.base_url();
+        let a = {
+            let base = base.clone();
+            std::thread::spawn(move || post_to(&base, BODY))
+        };
+        // B starts while A is inside its first re-attestation, so B takes
+        // its own Unpinned rejection and parks on the lock.
+        first_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let b = std::thread::spawn(move || post_to(&base, BODY));
+        assert_eq!(a.join().unwrap(), 502);
+        assert_eq!(b.join().unwrap(), 502);
+        wait_for("both rejected handshakes", || up.handshakes().len() == 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "B re-attested after fatal");
+        assert!(up.requests().is_empty());
+        let doc = rig.doc();
+        assert_eq!(doc["status"], "pin-failed");
+        assert_eq!(doc["reattestations"].as_array().unwrap().len(), 3);
+        assert!(rig.fatal.reason().unwrap().starts_with("pin-failed"));
+    }
+
+    /// Review finding: fatal raised while a request body is still arriving
+    /// must stop that request before it is sent.
+    #[test]
+    fn a_fatal_raised_while_the_body_arrives_stops_the_request() {
+        use std::net::TcpStream;
+        let up = upstream(|_| "a", false, ok_reply);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        let mut s = TcpStream::connect(("127.0.0.1", rig.forwarder.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        write!(
+            s,
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {DUMMY_KEY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            BODY.len()
+        )
+        .unwrap();
+        s.write_all(&BODY[..10]).unwrap();
+        s.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        rig.fatal.raise("signature-failed: x");
+        s.write_all(&BODY[10..]).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 502"), "{resp}");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(up.handshakes().is_empty());
+        assert!(up.requests().is_empty());
+    }
+
+    #[test]
+    fn the_first_fatal_owns_the_record_status() {
+        let dir = crate::testutil::tempdir("forwarder-stop");
+        let record =
+            AttestationRecord::create(&dir, "0123456789ab", &AttestOptions::default()).unwrap();
+        let fatal = Fatal::new();
+        assert!(stop(&fatal, &record, "model-refused", "model \"x\""));
+        assert!(!stop(&fatal, &record, "pin-failed", "pin: later"));
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(record.path()).unwrap()).unwrap();
+        assert_eq!(doc["status"], "model-refused");
+        assert_eq!(doc["reason"], "model \"x\"");
+        assert_eq!(fatal.reason().unwrap(), "model-refused: model \"x\"");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_refused_path_is_logged_by_method_and_path_only() {
+        assert_eq!(
+            not_forwarded_line(&Method::GET, "/v1/models"),
+            "[rts forwarder] 404 GET /v1/models: not forwarded"
+        );
+    }
+
     #[test]
     fn fatal_keeps_its_first_reason() {
         let f = Fatal::new();
         assert_eq!(f.reason(), None);
-        f.raise("pin-failed: one");
-        f.raise("model-refused: two");
+        assert!(f.raise("pin-failed: one"));
+        assert!(!f.raise("model-refused: two"));
         assert_eq!(f.reason().as_deref(), Some("pin-failed: one"));
     }
 }
