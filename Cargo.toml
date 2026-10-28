@@ -1,0 +1,23 @@
+[package]
+name = "rts"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Sandboxed opencode sessions on mvm"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "rts"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.23.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+
+[profile.release]
+panic = "abort"
