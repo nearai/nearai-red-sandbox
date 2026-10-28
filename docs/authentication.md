@@ -86,6 +86,7 @@ The automated tests use an in-memory credential store and local mock HTTP
 servers. They do not establish that browser sign-in, native credential storage,
 or live Cloud inference has been exercised on this machine.
 
-The latest recorded real containment run on 2026-10-28 was 19 passed and
-1 failed; byte-exact copy-out remains under investigation.
-The sandbox remains unvalidated; see [the OpenCode operator notes](../opencode/README.md#recorded-live-validation-status).
+The latest recorded real containment run on 2026-10-28 passed all 20 tests
+on an Apple-silicon Mac with the patched mvm supervisor. See the
+[OpenCode operator notes](../opencode/README.md#recorded-live-validation-status)
+for the scope of that result and [supervisor setup](mvm-supervisor.md).
