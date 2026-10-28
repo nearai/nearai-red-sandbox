@@ -368,7 +368,7 @@ pub fn append_inference_line(path: &Path, line: &InferenceLine) -> std::io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
+    use ed25519_dalek::{Signer, SigningKey, Verifier};
     use sha2::{Digest, Sha256};
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
@@ -526,18 +526,29 @@ mod tests {
         r.signing_address = "0x".to_string() + &r.signing_address;
         assert!(check_receipt(&r, &ex, &keys).is_err());
 
-        // A small-order key (the identity point) with an all-zero signature
-        // passes a non-strict verify; verify_strict refuses it.
-        let mut small = [0u8; 32];
-        small[0] = 1;
+        // The identity point as the key, with R = identity and s = 0: the
+        // non-strict `verify` accepts it for any message (sB - kA = identity
+        // = R); `verify_strict` refuses the small-order key. The first
+        // assertion proves the vector tells the two apart.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(&identity);
+        let weak = VerifyingKey::from_bytes(&identity).unwrap();
+        assert!(
+            weak.verify(good_text().as_bytes(), &Signature::from_bytes(&sig))
+                .is_ok(),
+            "the vector must pass a non-strict verify"
+        );
         let r = Receipt {
             text: good_text(),
-            signature: hex::encode([0u8; 64]),
-            signing_address: hex::encode(small),
+            signature: hex::encode(sig),
+            signing_address: hex::encode(identity),
             signing_algo: "ed25519".into(),
             signature_kind: None,
         };
-        assert!(check_receipt(&r, &ex, &BTreeSet::from([small])).is_err());
+        let e = check_receipt(&r, &ex, &BTreeSet::from([identity])).unwrap_err();
+        assert!(e.contains("does not verify"), "{e}");
     }
 
     #[test]

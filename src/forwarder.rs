@@ -42,7 +42,10 @@ use signature::{Exchange, InferenceLine, SignaturePolicy, SseId};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+/// Beyond the drain of pending checks (up to the signature window).
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the shutdown drain looks for pending checks.
+const DRAIN_POLL: Duration = Duration::from_millis(20);
 const REATTEST_ATTEMPTS: usize = 3;
 /// Per read on the upstream connection, resetting after each read: the
 /// default `upstream_timeout_secs` IronWire bf8b90b applies to its own reads
@@ -110,6 +113,8 @@ pub struct ForwarderConfig {
 /// Owns the loopback listener and its runtime thread, as `EmbeddedInference`.
 pub struct Forwarder {
     port: u16,
+    /// The signature window: how long `drop` lets pending checks finish.
+    drain: Duration,
     shutdown: Option<oneshot::Sender<()>>,
     finished: mpsc::Receiver<()>,
     worker: Option<JoinHandle<()>>,
@@ -140,8 +145,22 @@ struct State {
     keys: RwLock<BTreeMap<String, BTreeSet<[u8; 32]>>>,
     signatures: SignaturePolicy,
     inference_log: PathBuf,
-    /// One appender at a time, so lines never interleave.
-    log_lock: Mutex<()>,
+    /// Responses relayed or being checked that have no line yet. Whoever
+    /// removes an entry writes its line, under this lock: the check task, or
+    /// the shutdown drain for what is still here when the window ends. The
+    /// lock also keeps lines from interleaving.
+    pending: Mutex<BTreeMap<u64, Open>>,
+    next_check: std::sync::atomic::AtomicU64,
+}
+
+/// What is known of a response before its check settles.
+struct Open {
+    model: String,
+    streamed: bool,
+    request_sha256: [u8; 32],
+    chat_id: String,
+    /// Set once the relay has read the whole response.
+    response_sha256: Option<[u8; 32]>,
 }
 
 type Out = Response<BoxBody<Bytes, BoxError>>;
@@ -159,6 +178,7 @@ impl Forwarder {
         if !upstream.starts_with("https://") {
             return Err("forwarder: upstream must be https".into());
         }
+        let drain = cfg.signatures.window;
         let pins = PinSet::new(cfg.seed.fingerprints.clone());
         let client = reqwest::Client::builder()
             .use_preconfigured_tls(pin::pinned_tls(cfg.roots, pins.clone())?)
@@ -187,7 +207,8 @@ impl Forwarder {
             keys: RwLock::new(cfg.seed.keys),
             signatures: cfg.signatures,
             inference_log: cfg.inference_log,
-            log_lock: Mutex::new(()),
+            pending: Mutex::new(BTreeMap::new()),
+            next_check: std::sync::atomic::AtomicU64::new(0),
         });
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
             .map_err(|e| format!("forwarder: cannot bind 127.0.0.1: {e}"))?;
@@ -215,6 +236,7 @@ impl Forwarder {
         }
         Ok(Forwarder {
             port,
+            drain,
             shutdown: Some(shutdown),
             finished,
             worker: Some(worker),
@@ -232,7 +254,10 @@ impl Drop for Forwarder {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        if self.finished.recv_timeout(WORKER_STOP_TIMEOUT).is_ok()
+        if self
+            .finished
+            .recv_timeout(self.drain + WORKER_STOP_TIMEOUT)
+            .is_ok()
             && let Some(worker) = self.worker.take()
         {
             let _ = worker.join();
@@ -265,13 +290,77 @@ fn run_worker(
                 return;
             }
         };
-        let accept = tokio::spawn(accept_loop(listener, state));
+        let accept = tokio::spawn(accept_loop(listener, state.clone()));
         if ready.send(Ok(())).is_ok() {
             let _ = shutdown.await;
         }
         accept.abort();
+        drain(&state).await;
     });
     runtime.shutdown_timeout(RUNTIME_STOP_TIMEOUT);
+}
+
+/// Lets pending checks finish for up to the signature window; then each one
+/// still pending gets a `failed: unchecked at shutdown` line and the session
+/// is marked `signature-failed`, so nothing is left looking verified.
+async fn drain(state: &State) {
+    let deadline = tokio::time::Instant::now() + state.signatures.window;
+    while tokio::time::Instant::now() < deadline && !lock(&state.pending).is_empty() {
+        tokio::time::sleep(DRAIN_POLL).await;
+    }
+    let mut pending = lock(&state.pending);
+    if pending.is_empty() {
+        return;
+    }
+    let reason = "unchecked at shutdown";
+    let mut written = Ok(());
+    for open in std::mem::take(&mut *pending).into_values() {
+        let line = InferenceLine {
+            ts: now_secs(),
+            chat_id: open.chat_id,
+            model: open.model,
+            streamed: open.streamed,
+            request_sha256: hex::encode(open.request_sha256),
+            response_sha256: open.response_sha256.map(hex::encode).unwrap_or_default(),
+            signing_key: None,
+            signature_ms: None,
+            result: format!("failed: {reason}"),
+        };
+        written = written.and(write_line(state, &line));
+    }
+    stop(&state.fatal, &state.record, "signature-failed", reason);
+    unwritten(state, written);
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Appends one line. The caller holds `pending`, and passes the result to
+/// `unwritten` after recording any failure of its own, so that failure owns
+/// the status.
+fn write_line(state: &State, line: &InferenceLine) -> std::io::Result<()> {
+    signature::append_inference_line(&state.inference_log, line)
+}
+
+/// A line that cannot be written is fatal.
+fn unwritten(state: &State, written: std::io::Result<()>) {
+    if let Err(e) = written {
+        // The kind only: never a path or a header.
+        eprintln!("[rts forwarder] cannot write inference.jsonl: {}", e.kind());
+        stop(
+            &state.fatal,
+            &state.record,
+            "signature-failed",
+            "cannot write inference.jsonl",
+        );
+    }
 }
 
 async fn accept_loop(listener: tokio::net::TcpListener, state: Arc<State>) {
@@ -564,6 +653,19 @@ fn relay(state: Arc<State>, mut upstream: reqwest::Response, sent: Sent) -> Out 
     let status = upstream.status();
     let content_type = upstream.headers().get(CONTENT_TYPE).cloned();
     let streamed = is_event_stream(content_type.as_ref());
+    let id = state
+        .next_check
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    lock(&state.pending).insert(
+        id,
+        Open {
+            model: sent.model.clone(),
+            streamed,
+            request_sha256: sent.request_sha256,
+            chat_id: String::new(),
+            response_sha256: None,
+        },
+    );
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     tokio::spawn(async move {
         let mut hasher = Sha256::new();
@@ -624,7 +726,11 @@ fn relay(state: Arc<State>, mut upstream: reqwest::Response, sent: Sent) -> Out 
             request_sha256: sent.request_sha256,
             response_sha256: hasher.finalize().into(),
         };
-        check(&state, status, relayed, ex, sent.authorization).await;
+        if let Some(open) = lock(&state.pending).get_mut(&id) {
+            open.chat_id = ex.chat_id.clone();
+            open.response_sha256 = Some(ex.response_sha256);
+        }
+        check(&state, id, status, relayed, ex, sent.authorization).await;
     });
     let mut resp = Response::new(Relay { rx }.boxed());
     *resp.status_mut() = status;
@@ -638,6 +744,7 @@ fn relay(state: Arc<State>, mut upstream: reqwest::Response, sent: Sent) -> Out 
 /// failure of a 2xx answer, `signature-failed`.
 async fn check(
     state: &State,
+    id: u64,
     status: StatusCode,
     relayed: Relayed,
     ex: Exchange,
@@ -670,9 +777,7 @@ async fn check(
         Checked::Failed(reason) => (format!("failed: {reason}"), None, None),
     };
     let line = InferenceLine {
-        ts: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs()),
+        ts: now_secs(),
         chat_id: ex.chat_id.clone(),
         model: ex.model.clone(),
         streamed: ex.streamed,
@@ -682,19 +787,17 @@ async fn check(
         signature_ms,
         result,
     };
-    let written = {
-        let _one = state.log_lock.lock().unwrap_or_else(|e| e.into_inner());
-        signature::append_inference_line(&state.inference_log, &line)
-    };
-    if let Err(e) = written {
-        eprintln!(
-            "[rts forwarder] cannot write {}: {e}",
-            state.inference_log.display()
-        );
+    let mut pending = lock(&state.pending);
+    if pending.remove(&id).is_none() {
+        // The shutdown drain gave up on it and wrote its line.
+        return;
     }
-    if let Checked::Failed(reason) = outcome {
-        stop(&state.fatal, &state.record, "signature-failed", &reason);
+    let written = write_line(state, &line);
+    if let Checked::Failed(reason) = &outcome {
+        stop(&state.fatal, &state.record, "signature-failed", reason);
     }
+    unwritten(state, written);
+    drop(pending);
 }
 
 enum Checked {
@@ -1165,7 +1268,8 @@ mod tests {
     }
 
     struct Rig {
-        forwarder: Forwarder,
+        /// None once `stop_forwarder` has run.
+        forwarder: Option<Forwarder>,
         fatal: Arc<Fatal>,
         record: Arc<AttestationRecord>,
         dir: std::path::PathBuf,
@@ -1176,7 +1280,14 @@ mod tests {
             serde_json::from_slice(&std::fs::read(self.record.path()).unwrap()).unwrap()
         }
         fn post(&self, body: &[u8]) -> (u16, Vec<u8>) {
-            send(&self.forwarder, "POST", "/v1/chat/completions", body)
+            send(self.fw(), "POST", "/v1/chat/completions", body)
+        }
+        fn fw(&self) -> &Forwarder {
+            self.forwarder.as_ref().expect("forwarder running")
+        }
+        /// Drops the forwarder (its drain included); the files stay.
+        fn stop_forwarder(&mut self) {
+            drop(self.forwarder.take());
         }
         fn log_path(&self) -> std::path::PathBuf {
             self.record.session_dir().join("inference.jsonl")
@@ -1237,7 +1348,7 @@ mod tests {
         })
         .unwrap();
         Rig {
-            forwarder,
+            forwarder: Some(forwarder),
             fatal,
             record,
             dir,
@@ -1278,8 +1389,8 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
         assert_eq!(
-            rig.forwarder.base_url(),
-            format!("http://127.0.0.1:{}/v1", rig.forwarder.port)
+            rig.fw().base_url(),
+            format!("http://127.0.0.1:{}/v1", rig.fw().port)
         );
         let (status, body) = rig.post(BODY);
         assert_eq!(status, 200);
@@ -1322,7 +1433,7 @@ mod tests {
             .build()
             .unwrap();
         let resp = client
-            .post(format!("{}/chat/completions", rig.forwarder.base_url()))
+            .post(format!("{}/chat/completions", rig.fw().base_url()))
             .bearer_auth(DUMMY_KEY)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
@@ -1492,11 +1603,7 @@ mod tests {
             ("POST", "/v1/chat/completions/x"),
             ("POST", "/chat/completions"),
         ] {
-            assert_eq!(
-                send(&rig.forwarder, method, path, BODY).0,
-                404,
-                "{method} {path}"
-            );
+            assert_eq!(send(rig.fw(), method, path, BODY).0, 404, "{method} {path}");
         }
         std::thread::sleep(Duration::from_millis(200));
         assert!(up.handshakes().is_empty());
@@ -1541,7 +1648,7 @@ mod tests {
         let inference = crate::inference::start_with_endpoint(
             DUMMY_KEY.to_string().into(),
             &["m".into()],
-            &rig.forwarder.base_url(),
+            &rig.fw().base_url(),
         )
         .unwrap();
         let client = reqwest::blocking::Client::builder()
@@ -1637,7 +1744,7 @@ mod tests {
             })
         });
         let rig = rig(&up, &["a"], slow, 1 << 20);
-        let base = rig.forwarder.base_url();
+        let base = rig.fw().base_url();
         let a = {
             let base = base.clone();
             std::thread::spawn(move || post_to(&base, BODY))
@@ -1665,7 +1772,7 @@ mod tests {
         let up = upstream(|_| "a", false, ok_reply);
         let calls = Arc::new(AtomicUsize::new(0));
         let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
-        let mut s = TcpStream::connect(("127.0.0.1", rig.forwarder.port)).unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", rig.fw().port)).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         write!(
             s,
@@ -1737,7 +1844,7 @@ mod tests {
 
     fn post_stream(rig: &Rig) -> reqwest::blocking::Response {
         stream_client()
-            .post(format!("{}/chat/completions", rig.forwarder.base_url()))
+            .post(format!("{}/chat/completions", rig.fw().base_url()))
             .bearer_auth(DUMMY_KEY)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
@@ -2085,5 +2192,115 @@ mod tests {
         assert!(results[2].starts_with("failed:"), "{results:?}");
         wait_for("fatal", || rig.fatal.reason().is_some());
         no_key_in(&rig);
+    }
+
+    /// Review fix: a response still relaying when the forwarder stops gets
+    /// a line and a non-verified status after the drain.
+    #[test]
+    fn a_check_unfinished_after_the_drain_is_recorded_as_failed() {
+        let last_sent = Arc::new(Mutex::new(None));
+        let sent = last_sent.clone();
+        let pauses = vec![Duration::ZERO, Duration::ZERO, Duration::from_secs(5)];
+        let up = upstream(|_| "a", false, move |_| sse_answer(pauses.clone(), &sent));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let policy = SignaturePolicy {
+            window: Duration::from_millis(300),
+            ..quick()
+        };
+        let mut rig = rig_with(
+            &up,
+            &["a"],
+            &[test_vk()],
+            reattest(&["a"], &calls),
+            1 << 20,
+            policy,
+        );
+        let mut resp = post_stream(&rig);
+        let mut buf = [0u8; 64];
+        assert!(resp.read(&mut buf).unwrap() > 0);
+        drop(resp);
+        let start = Instant::now();
+        rig.stop_forwarder();
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            start.elapsed()
+        );
+        let lines = rig.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["result"], "failed: unchecked at shutdown");
+        assert_eq!(lines[0]["request_sha256"], sha_hex(STREAM_BODY));
+        let doc = rig.doc();
+        assert_eq!(doc["status"], "signature-failed");
+        assert_eq!(doc["reason"], "unchecked at shutdown");
+        assert_eq!(
+            rig.fatal.reason().unwrap(),
+            "signature-failed: unchecked at shutdown"
+        );
+        no_key_in(&rig);
+    }
+
+    /// Review fix: a receipt still answered 404 when the forwarder stops is
+    /// never left "verified".
+    #[test]
+    fn a_receipt_still_missing_at_shutdown_is_not_verified() {
+        let up = upstream_with(|_| "a", false, ok_reply, |_, _| (404, b"{}".to_vec()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        assert_eq!(rig.post(BODY).0, 200);
+        rig.stop_forwarder();
+        let lines = rig.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let result = lines[0]["result"].as_str().unwrap();
+        assert!(result.starts_with("failed:"), "{result}");
+        assert_eq!(rig.doc()["status"], "signature-failed");
+    }
+
+    /// Review fix: a check that completes inside the drain is recorded as
+    /// it is.
+    #[test]
+    fn a_check_finishing_during_the_drain_is_verified() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let sign = move |req: &[u8], resp: &[u8]| {
+            if n.fetch_add(1, Ordering::SeqCst) < 3 {
+                (404, b"{}".to_vec())
+            } else {
+                good_receipt(req, resp)
+            }
+        };
+        let up = upstream_with(|_| "a", false, ok_reply, sign);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        assert_eq!(rig.post(BODY).0, 200);
+        rig.stop_forwarder();
+        let lines = rig.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["result"], "verified", "{}", lines[0]);
+        assert_eq!(up.signature_requests().len(), 4);
+        assert_eq!(rig.doc()["status"], "verified");
+        assert_eq!(rig.fatal.reason(), None);
+    }
+
+    /// Review fix: a line that cannot be written is fatal.
+    #[test]
+    fn a_failed_inference_log_write_ends_the_session() {
+        let up = upstream(|_| "a", false, ok_reply);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        // A directory where the log file should be: every append fails.
+        std::fs::create_dir(rig.log_path()).unwrap();
+        assert_eq!(rig.post(BODY).0, 200);
+        wait_within(Duration::from_secs(3), "fatal", || {
+            rig.fatal.reason().is_some()
+        });
+        assert_eq!(
+            rig.fatal.reason().unwrap(),
+            "signature-failed: cannot write inference.jsonl"
+        );
+        wait_for("signature-failed", || {
+            rig.doc()["status"] == "signature-failed"
+        });
+        assert_eq!(rig.doc()["reason"], "cannot write inference.jsonl");
+        assert_eq!(rig.post(BODY).0, 502);
     }
 }
