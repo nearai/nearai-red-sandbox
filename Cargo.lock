@@ -2791,6 +2791,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "dcap-qvl",
+ "ed25519-dalek",
  "hex",
  "http-body-util",
  "hyper",

@@ -33,10 +33,12 @@ hyper-util = { version = "0.1.21", features = ["tokio"] }
 http-body-util = "0.1.5"
 bytes = "1.12.1"
 sha2 = "0.11.1"
+# Per-response NEAR AI receipts (src/forwarder/signature.rs). Promoted from Cargo.lock; no new packages.
+ed25519-dalek = "2.2.0"
 ironwire_proxy = { git = "https://github.com/nearai/ironwire", rev = "bf8b90ba7b2e3b4da3011e1107a8a2068c8085bc" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
 url = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "sync", "macros"] }
 tempfile = "3"
 secrecy = "0.10"
 zeroize = "1"

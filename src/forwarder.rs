@@ -5,17 +5,24 @@
 //! NEAR AI over TLS pinned to the attested certificate fingerprints
 //! (`pin.rs`). A pin failure or a refused model raises `Fatal`, after which
 //! nothing reaches upstream and the session loop ends the session.
+//!
+//! Each completion is hashed as it is relayed and, once it has ended, its
+//! NEAR AI receipt is fetched and checked off the response path
+//! (`signature.rs`). A failed check is fatal (`signature-failed`); every
+//! completion leaves one line in `inference.jsonl`.
 
 pub mod pin;
+pub mod signature;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::mpsc;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
@@ -24,18 +31,28 @@ use hyper::body::{Frame, Incoming};
 use hyper::header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use serde::de::{IgnoredAny, MapAccess, Visitor};
+use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use crate::attest::Attested;
 use crate::attest::record::AttestationRecord;
 use pin::{PinSet, Rejected};
+use signature::{Exchange, InferenceLine, SignaturePolicy, SseId};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const REATTEST_ATTEMPTS: usize = 3;
+/// Per read on the upstream connection, resetting after each read: the
+/// default `upstream_timeout_secs` IronWire bf8b90b applies to its own reads
+/// (`ironwire_core/src/config.rs`), so the forwarder never gives up on a
+/// response IronWire still waits for, and a stalled upstream is not read
+/// forever after IronWire has gone. Before the response head this is a 502;
+/// mid-body it is a stream error, which is fatal.
+const UPSTREAM_READ_TIMEOUT: Duration = Duration::from_secs(900);
+/// How often a relay or a signature fetch looks for a fatal raised elsewhere.
+const FATAL_POLL: Duration = Duration::from_millis(50);
 
 /// The first fatal reason; set once, read by the session loop.
 pub struct Fatal {
@@ -85,6 +102,9 @@ pub struct ForwarderConfig {
     pub record: Arc<AttestationRecord>,
     /// 32 MiB in production.
     pub max_request_bytes: usize,
+    pub signatures: signature::SignaturePolicy,
+    /// `record.session_dir().join("inference.jsonl")`.
+    pub inference_log: std::path::PathBuf,
 }
 
 /// Owns the loopback listener and its runtime thread, as `EmbeddedInference`.
@@ -113,6 +133,15 @@ struct State {
     fatal: Arc<Fatal>,
     record: Arc<AttestationRecord>,
     max_request_bytes: usize,
+    /// "https://cloud-api.near.ai/v1", for `/signature/{id}`.
+    upstream: String,
+    /// The seed's attested signing keys per model, merged with every
+    /// re-attestation.
+    keys: RwLock<BTreeMap<String, BTreeSet<[u8; 32]>>>,
+    signatures: SignaturePolicy,
+    inference_log: PathBuf,
+    /// One appender at a time, so lines never interleave.
+    log_lock: Mutex<()>,
 }
 
 type Out = Response<BoxBody<Bytes, BoxError>>;
@@ -141,6 +170,7 @@ impl Forwarder {
             .no_deflate()
             .no_zstd()
             .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(UPSTREAM_READ_TIMEOUT)
             .build()
             .map_err(|e| format!("forwarder: upstream client: {e}"))?;
         let state = Arc::new(State {
@@ -153,6 +183,11 @@ impl Forwarder {
             fatal: cfg.fatal,
             record: cfg.record,
             max_request_bytes: cfg.max_request_bytes,
+            upstream: upstream.to_string(),
+            keys: RwLock::new(cfg.seed.keys),
+            signatures: cfg.signatures,
+            inference_log: cfg.inference_log,
+            log_lock: Mutex::new(()),
         });
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
             .map_err(|e| format!("forwarder: cannot bind 127.0.0.1: {e}"))?;
@@ -300,7 +335,7 @@ fn fatal_reply(state: &State, status: &str, reason: String) -> Out {
     stopped_reply()
 }
 
-async fn handle(state: &State, req: Request<Incoming>) -> Out {
+async fn handle(state: &Arc<State>, req: Request<Incoming>) -> Out {
     // Fatal is checked here, again once the body has arrived, before every
     // upstream send, and inside `learn`: it can be raised at any point.
     if state.fatal.reason().is_some() {
@@ -352,7 +387,15 @@ async fn handle(state: &State, req: Request<Incoming>) -> Out {
             "rts forwarder: model is not in the allowlist",
         );
     }
-    // The exact bytes received, never a re-serialization.
+    // The exact bytes received, never a re-serialization; hashed as sent.
+    let sent = Sent {
+        model,
+        request_sha256: Sha256::digest(&body).into(),
+        authorization: headers.get(AUTHORIZATION).cloned().map(|mut v| {
+            v.set_sensitive(true);
+            v
+        }),
+    };
     let send = || {
         state
             .client
@@ -419,7 +462,7 @@ async fn handle(state: &State, req: Request<Incoming>) -> Out {
             }
         },
     };
-    relay(resp)
+    relay(state.clone(), resp, sent)
 }
 
 enum Unlearned {
@@ -441,19 +484,7 @@ async fn learn(state: &State, fp: [u8; 32]) -> Result<(), Unlearned> {
         if state.pins.contains(&fp) {
             return Ok(());
         }
-        let reattest = state.reattest.clone();
-        let attested = tokio::task::spawn_blocking(move || reattest())
-            .await
-            .map_err(|_| Unlearned::Failed("pin: re-attestation did not complete".into()))?
-            .map_err(|e| Unlearned::Failed(format!("pin: re-attestation failed: {e}")))?;
-        if stopped() {
-            return Err(Unlearned::Stopped);
-        }
-        state
-            .record
-            .reattested(&attested)
-            .map_err(|e| Unlearned::Failed(format!("pin: cannot record re-attestation: {e}")))?;
-        state.pins.extend(&attested.fingerprints);
+        reattest_once(state, "pin").await?;
     }
     if stopped() {
         return Err(Unlearned::Stopped);
@@ -467,26 +498,133 @@ async fn learn(state: &State, fp: [u8; 32]) -> Result<(), Unlearned> {
     )))
 }
 
-/// Status, Content-Type and the body as it arrives.
-fn relay(mut upstream: reqwest::Response) -> Out {
+/// One re-attestation, by a caller holding `reattesting`: run on the
+/// blocking pool, recorded, and merged into the pins and the keys. Stops if
+/// fatal is raised before it starts or before its result is recorded.
+async fn reattest_once(state: &State, what: &str) -> Result<(), Unlearned> {
+    let stopped = || state.fatal.reason().is_some();
+    if stopped() {
+        return Err(Unlearned::Stopped);
+    }
+    let reattest = state.reattest.clone();
+    let attested = tokio::task::spawn_blocking(move || reattest())
+        .await
+        .map_err(|_| Unlearned::Failed(format!("{what}: re-attestation did not complete")))?
+        .map_err(|e| Unlearned::Failed(format!("{what}: re-attestation failed: {e}")))?;
+    if stopped() {
+        return Err(Unlearned::Stopped);
+    }
+    state
+        .record
+        .reattested(&attested)
+        .map_err(|e| Unlearned::Failed(format!("{what}: cannot record re-attestation: {e}")))?;
+    state.pins.extend(&attested.fingerprints);
+    let mut keys = state.keys.write().unwrap_or_else(|e| e.into_inner());
+    for (model, more) in attested.keys {
+        keys.entry(model).or_default().extend(more);
+    }
+    Ok(())
+}
+
+/// What `handle` sent upstream, for the receipt check.
+struct Sent {
+    model: String,
+    request_sha256: [u8; 32],
+    /// The inbound Authorization, passed to the signature fetch. Marked
+    /// sensitive; never formatted.
+    authorization: Option<HeaderValue>,
+}
+
+/// How the relay of one response ended.
+enum Relayed {
+    Complete,
+    /// Fatal was raised elsewhere while it was relaying.
+    Stopped,
+    Failed(String),
+}
+
+/// Resolves once fatal has been raised.
+async fn fatal_raised(fatal: &Fatal) {
+    while fatal.reason().is_none() {
+        tokio::time::sleep(FATAL_POLL).await;
+    }
+}
+
+fn is_event_stream(content_type: Option<&HeaderValue>) -> bool {
+    content_type
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+/// Status, Content-Type and the body as it arrives. A task reads upstream to
+/// the end, hashing every chunk it relays, even after the client has gone;
+/// then checks the receipt. A fatal raised elsewhere cuts the relay.
+fn relay(state: Arc<State>, mut upstream: reqwest::Response, sent: Sent) -> Out {
     let status = upstream.status();
     let content_type = upstream.headers().get(CONTENT_TYPE).cloned();
+    let streamed = is_event_stream(content_type.as_ref());
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     tokio::spawn(async move {
-        loop {
-            match upstream.chunk().await {
-                Ok(Some(chunk)) => {
-                    if tx.send(Ok(chunk)).await.is_err() {
-                        return;
-                    }
+        let mut hasher = Sha256::new();
+        let mut sse = SseId::default();
+        // A non-streamed 2xx body, kept to find its chat ID.
+        let mut kept = Vec::new();
+        let keep = !streamed && status.is_success();
+        let mut client = Some(tx);
+        let relayed = loop {
+            let next = tokio::select! {
+                biased;
+                () = fatal_raised(&state.fatal) => break Relayed::Stopped,
+                next = upstream.chunk() => next,
+            };
+            let chunk = match next {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break Relayed::Complete,
+                Err(_) => break Relayed::Failed("upstream stream failed".into()),
+            };
+            if keep {
+                if kept.len() + chunk.len() > signature::MAX_ID_SCAN_BYTES {
+                    break Relayed::Failed(format!(
+                        "response over {} bytes",
+                        signature::MAX_ID_SCAN_BYTES
+                    ));
                 }
-                Ok(None) => return,
-                Err(_) => {
-                    let _ = tx.send(Err("upstream stream failed".into())).await;
-                    return;
-                }
+                kept.extend_from_slice(&chunk);
+            } else if streamed {
+                sse.push(&chunk);
             }
+            hasher.update(&chunk);
+            if let Some(tx) = &client
+                && tx.send(Ok(chunk)).await.is_err()
+            {
+                // The client went away: keep reading so the hash covers the
+                // whole response.
+                client = None;
+            }
+        };
+        if let Some(tx) = client {
+            if !matches!(relayed, Relayed::Complete) {
+                let _ = tx.send(Err("upstream response stopped".into())).await;
+            }
+            // Dropping the sender ends the client's body before the check.
+            drop(tx);
         }
+        let chat_id = if streamed {
+            sse.id().map(str::to_string)
+        } else {
+            signature::chat_id_from_json(&kept)
+        };
+        let ex = Exchange {
+            model: sent.model,
+            chat_id: chat_id
+                .filter(|id| signature::usable_id(id))
+                .unwrap_or_default(),
+            streamed,
+            request_sha256: sent.request_sha256,
+            response_sha256: hasher.finalize().into(),
+        };
+        check(&state, status, relayed, ex, sent.authorization).await;
     });
     let mut resp = Response::new(Relay { rx }.boxed());
     *resp.status_mut() = status;
@@ -494,6 +632,115 @@ fn relay(mut upstream: reqwest::Response) -> Out {
         resp.headers_mut().insert(CONTENT_TYPE, content_type);
     }
     resp
+}
+
+/// Settles one relayed response: an `inference.jsonl` line and, on any
+/// failure of a 2xx answer, `signature-failed`.
+async fn check(
+    state: &State,
+    status: StatusCode,
+    relayed: Relayed,
+    ex: Exchange,
+    authorization: Option<HeaderValue>,
+) {
+    let outcome = match relayed {
+        Relayed::Stopped => Checked::Stopped,
+        _ if !status.is_success() => Checked::NotSigned,
+        Relayed::Failed(reason) => Checked::Failed(reason),
+        Relayed::Complete if ex.chat_id.is_empty() => {
+            Checked::Failed("no usable chat ID in the response".into())
+        }
+        Relayed::Complete => match authorization {
+            None => Checked::Failed("no Authorization to fetch the signature with".into()),
+            Some(auth) => tokio::select! {
+                biased;
+                () = fatal_raised(&state.fatal) => Checked::Stopped,
+                checked = verify(state, &ex, &auth) => checked,
+            },
+        },
+    };
+    let (result, signing_key, signature_ms) = match &outcome {
+        Checked::Verified(key, took) => (
+            "verified".to_string(),
+            Some(hex::encode(key)),
+            Some(u64::try_from(took.as_millis()).unwrap_or(u64::MAX)),
+        ),
+        Checked::NotSigned => (format!("not-signed (HTTP {})", status.as_u16()), None, None),
+        Checked::Stopped => ("failed: session stopped".to_string(), None, None),
+        Checked::Failed(reason) => (format!("failed: {reason}"), None, None),
+    };
+    let line = InferenceLine {
+        ts: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        chat_id: ex.chat_id.clone(),
+        model: ex.model.clone(),
+        streamed: ex.streamed,
+        request_sha256: hex::encode(ex.request_sha256),
+        response_sha256: hex::encode(ex.response_sha256),
+        signing_key,
+        signature_ms,
+        result,
+    };
+    let written = {
+        let _one = state.log_lock.lock().unwrap_or_else(|e| e.into_inner());
+        signature::append_inference_line(&state.inference_log, &line)
+    };
+    if let Err(e) = written {
+        eprintln!(
+            "[rts forwarder] cannot write {}: {e}",
+            state.inference_log.display()
+        );
+    }
+    if let Checked::Failed(reason) = outcome {
+        stop(&state.fatal, &state.record, "signature-failed", &reason);
+    }
+}
+
+enum Checked {
+    Verified([u8; 32], Duration),
+    NotSigned,
+    Stopped,
+    Failed(String),
+}
+
+fn attested_keys(state: &State, model: &str) -> BTreeSet<[u8; 32]> {
+    state
+        .keys
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(model)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Fetches and checks the receipt. A key not attested for the model gets one
+/// re-attestation, then the check runs again.
+async fn verify(state: &State, ex: &Exchange, auth: &HeaderValue) -> Checked {
+    let (receipt, took) =
+        match signature::fetch_receipt(&state.client, &state.upstream, auth, ex, state.signatures)
+            .await
+        {
+            Ok(fetched) => fetched,
+            Err(e) => return Checked::Failed(format!("signature: {e}")),
+        };
+    if let Ok(key) = signature::receipt_key(&receipt)
+        && !attested_keys(state, &ex.model).contains(&key)
+    {
+        let _one_at_a_time = state.reattesting.lock().await;
+        // Another task may have learned it while this one waited.
+        if !attested_keys(state, &ex.model).contains(&key) {
+            match reattest_once(state, "signature").await {
+                Ok(()) => {}
+                Err(Unlearned::Stopped) => return Checked::Stopped,
+                Err(Unlearned::Failed(reason)) => return Checked::Failed(reason),
+            }
+        }
+    }
+    match signature::check_receipt(&receipt, ex, &attested_keys(state, &ex.model)) {
+        Ok(key) => Checked::Verified(key, took),
+        Err(e) => Checked::Failed(format!("signature: {e}")),
+    }
 }
 
 struct Relay {
@@ -517,34 +764,7 @@ impl hyper::body::Body for Relay {
 /// The top-level string "model" of a JSON object. A second "model" key is
 /// refused: parsers disagree on which one wins.
 fn request_model(body: &[u8]) -> Option<String> {
-    struct Model(Option<String>);
-    impl<'de> serde::Deserialize<'de> for Model {
-        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            d.deserialize_map(ModelVisitor)
-        }
-    }
-    struct ModelVisitor;
-    impl<'de> Visitor<'de> for ModelVisitor {
-        type Value = Model;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a JSON object")
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Model, A::Error> {
-            let mut model = None;
-            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
-                if key == "model" {
-                    if model.is_some() {
-                        return Err(serde::de::Error::duplicate_field("model"));
-                    }
-                    model = Some(map.next_value::<String>()?);
-                } else {
-                    map.next_value::<IgnoredAny>()?;
-                }
-            }
-            Ok(Model(model))
-        }
-    }
-    serde_json::from_slice::<Model>(body).ok()?.0
+    signature::top_level_string(body, "model")
 }
 
 #[cfg(test)]
@@ -552,9 +772,12 @@ mod tests {
     use super::*;
     use crate::attest::record::AttestationRecord;
     use crate::attest::{AttestOptions, Attested};
+    use crate::forwarder::signature::SignaturePolicy;
+    use ed25519_dalek::{Signer, SigningKey};
     use rustls::HandshakeKind;
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -565,6 +788,89 @@ mod tests {
     const DUMMY_KEY: &str = "rts-dummy-key-never-send-to-a-provider";
     const BODY: &[u8] = br#"{"model":"m","messages":[],"stream":false}"#;
     const REPLY: &[u8] = br#"{"id":"x","object":"chat.completion","choices":[]}"#;
+    const STREAM_BODY: &[u8] = br#"{"model":"m","messages":[],"stream":true}"#;
+    const SSE: [&[u8]; 3] = [
+        b"data: {\"id\":\"chatcmpl-s1\",\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n",
+        b"data: {\"id\":\"chatcmpl-s1\",\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n",
+        b"data: [DONE]\n\n",
+    ];
+
+    fn test_key() -> SigningKey {
+        SigningKey::from_bytes(&[9; 32])
+    }
+
+    fn test_vk() -> [u8; 32] {
+        test_key().verifying_key().to_bytes()
+    }
+
+    fn sha_hex(b: &[u8]) -> String {
+        hex::encode(Sha256::digest(b))
+    }
+
+    /// A receipt as NEAR AI returns it, signed with the test key.
+    fn receipt_for(text: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "text": text,
+            "signature": hex::encode(test_key().sign(text.as_bytes()).to_bytes()),
+            "signing_address": hex::encode(test_vk()),
+            "signing_algo": "ed25519",
+            "signature_kind": "provider_tee",
+        }))
+        .unwrap()
+    }
+
+    /// Signs sha256(request body received) and sha256(response body sent).
+    fn good_receipt(req: &[u8], resp: &[u8]) -> (u16, Vec<u8>) {
+        (
+            200,
+            receipt_for(&format!("m:{}:{}", sha_hex(req), sha_hex(resp))),
+        )
+    }
+
+    /// Signs another response hash.
+    fn wrong_receipt(req: &[u8], _: &[u8]) -> (u16, Vec<u8>) {
+        (
+            200,
+            receipt_for(&format!("m:{}:{}", sha_hex(req), sha_hex(b"other"))),
+        )
+    }
+
+    fn quick() -> SignaturePolicy {
+        SignaturePolicy {
+            window: Duration::from_secs(2),
+            first_backoff: Duration::from_millis(20),
+            max_backoff: Duration::from_millis(100),
+        }
+    }
+
+    /// What the test upstream answers to a completion.
+    enum Answer {
+        Whole(u16, Vec<u8>),
+        /// `text/event-stream`, chunked: `pauses[i]` before chunk i; the time
+        /// just before the last chunk is written goes to `last_sent`.
+        Sse {
+            chunks: Vec<Vec<u8>>,
+            pauses: Vec<Duration>,
+            last_sent: Arc<Mutex<Option<Instant>>>,
+        },
+    }
+
+    impl Answer {
+        fn bytes(&self) -> Vec<u8> {
+            match self {
+                Answer::Whole(_, b) => b.clone(),
+                Answer::Sse { chunks, .. } => chunks.concat(),
+            }
+        }
+    }
+
+    fn sse_answer(pauses: Vec<Duration>, last_sent: &Arc<Mutex<Option<Instant>>>) -> Answer {
+        Answer::Sse {
+            chunks: SSE.iter().map(|c| c.to_vec()).collect(),
+            pauses,
+            last_sent: last_sent.clone(),
+        }
+    }
 
     fn pem(name: &str) -> &'static [u8] {
         match name {
@@ -620,6 +926,7 @@ mod tests {
         port: u16,
         handshakes: Arc<Mutex<Vec<Option<HandshakeKind>>>>,
         requests: Arc<Mutex<Vec<Seen>>>,
+        signatures: Arc<Mutex<Vec<Seen>>>,
     }
 
     impl Upstream {
@@ -629,8 +936,12 @@ mod tests {
         fn handshakes(&self) -> Vec<Option<HandshakeKind>> {
             self.handshakes.lock().unwrap().clone()
         }
+        /// Completions only.
         fn requests(&self) -> Vec<Seen> {
             self.requests.lock().unwrap().clone()
+        }
+        fn signature_requests(&self) -> Vec<Seen> {
+            self.signatures.lock().unwrap().clone()
         }
     }
 
@@ -648,17 +959,50 @@ mod tests {
         )
     }
 
+    /// Answers `GET /v1/signature/..` with a good receipt for the last
+    /// completion.
     fn upstream(
         certs: impl Fn(usize) -> &'static str + Send + 'static,
         close_each: bool,
-        reply: impl Fn(&Seen) -> (u16, Vec<u8>) + Send + Sync + 'static,
+        reply: impl Fn(&Seen) -> Answer + Send + Sync + 'static,
+    ) -> Upstream {
+        upstream_with(certs, close_each, reply, good_receipt)
+    }
+
+    type Reply = dyn Fn(&Seen) -> Answer + Send + Sync;
+    type Sign = dyn Fn(&[u8], &[u8]) -> (u16, Vec<u8>) + Send + Sync;
+    type Last = Mutex<Option<(Vec<u8>, Vec<u8>)>>;
+
+    struct Script {
+        reply: Box<Reply>,
+        sign: Box<Sign>,
+        handshakes: Arc<Mutex<Vec<Option<HandshakeKind>>>>,
+        requests: Arc<Mutex<Vec<Seen>>>,
+        signatures: Arc<Mutex<Vec<Seen>>>,
+        /// The last completion's request body and the response bytes sent.
+        last: Last,
+    }
+
+    /// `sign(request body, response bytes)` answers the signature route.
+    fn upstream_with(
+        certs: impl Fn(usize) -> &'static str + Send + 'static,
+        close_each: bool,
+        reply: impl Fn(&Seen) -> Answer + Send + Sync + 'static,
+        sign: impl Fn(&[u8], &[u8]) -> (u16, Vec<u8>) + Send + Sync + 'static,
     ) -> Upstream {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let handshakes = Arc::new(Mutex::new(Vec::new()));
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let (h, r) = (handshakes.clone(), requests.clone());
-        let reply = Arc::new(reply);
+        let signatures = Arc::new(Mutex::new(Vec::new()));
+        let script = Arc::new(Script {
+            reply: Box::new(reply),
+            sign: Box::new(sign),
+            handshakes: handshakes.clone(),
+            requests: requests.clone(),
+            signatures: signatures.clone(),
+            last: Mutex::new(None),
+        });
         // One ServerConfig per certificate, shared across connections, so a
         // client that offered resumption would get it.
         std::thread::spawn(move || {
@@ -674,14 +1018,15 @@ mod tests {
                         cfg
                     }
                 };
-                let (h, r, reply) = (h.clone(), r.clone(), reply.clone());
-                std::thread::spawn(move || serve(tcp, config, close_each, &h, &r, &*reply));
+                let script = script.clone();
+                std::thread::spawn(move || serve(tcp, config, close_each, &script));
             }
         });
         Upstream {
             port,
             handshakes,
             requests,
+            signatures,
         }
     }
 
@@ -689,10 +1034,9 @@ mod tests {
         mut tcp: std::net::TcpStream,
         config: Arc<rustls::ServerConfig>,
         close_each: bool,
-        handshakes: &Mutex<Vec<Option<HandshakeKind>>>,
-        requests: &Mutex<Vec<Seen>>,
-        reply: &(dyn Fn(&Seen) -> (u16, Vec<u8>) + Send + Sync),
+        script: &Script,
     ) {
+        let handshakes = &script.handshakes;
         tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let mut conn = rustls::ServerConnection::new(config).unwrap();
         while conn.is_handshaking() {
@@ -726,19 +1070,57 @@ mod tests {
                 return;
             }
             let seen = Seen { head, body };
-            requests.lock().unwrap().push(seen.clone());
-            let (status, out) = reply(&seen);
+            let answer = if seen.head.starts_with("GET /v1/signature/") {
+                script.signatures.lock().unwrap().push(seen.clone());
+                let last = script.last.lock().unwrap().clone();
+                let (status, out) = match last {
+                    Some((req, resp)) => (script.sign)(&req, &resp),
+                    None => (404, b"{}".to_vec()),
+                };
+                Answer::Whole(status, out)
+            } else {
+                script.requests.lock().unwrap().push(seen.clone());
+                let answer = (script.reply)(&seen);
+                *script.last.lock().unwrap() = Some((seen.body.clone(), answer.bytes()));
+                answer
+            };
             let close = if close_each {
                 "Connection: close\r\n"
             } else {
                 ""
             };
-            let _ = write!(
-                tls,
-                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{close}\r\n",
-                out.len()
-            );
-            let _ = tls.write_all(&out);
+            match answer {
+                Answer::Whole(status, out) => {
+                    let _ = write!(
+                        tls,
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{close}\r\n",
+                        out.len()
+                    );
+                    let _ = tls.write_all(&out);
+                }
+                Answer::Sse {
+                    chunks,
+                    pauses,
+                    last_sent,
+                } => {
+                    let _ = write!(
+                        tls,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n{close}\r\n"
+                    );
+                    let _ = tls.flush();
+                    for (i, chunk) in chunks.iter().enumerate() {
+                        std::thread::sleep(pauses.get(i).copied().unwrap_or_default());
+                        if i + 1 == chunks.len() {
+                            *last_sent.lock().unwrap() = Some(Instant::now());
+                        }
+                        let _ = write!(tls, "{:x}\r\n", chunk.len());
+                        let _ = tls.write_all(chunk);
+                        let _ = tls.write_all(b"\r\n");
+                        let _ = tls.flush();
+                    }
+                    let _ = tls.write_all(b"0\r\n\r\n");
+                }
+            }
             let _ = tls.flush();
             if close_each {
                 tls.conn.send_close_notify();
@@ -748,15 +1130,21 @@ mod tests {
         }
     }
 
-    fn ok_reply(_: &Seen) -> (u16, Vec<u8>) {
-        (200, REPLY.to_vec())
+    fn ok_reply(_: &Seen) -> Answer {
+        Answer::Whole(200, REPLY.to_vec())
     }
 
     /// Counts calls and returns `answer`. Starting a runtime panics on a
     /// Tokio worker thread, exactly as `BlockingHttp` does, so this also
     /// proves `reattest` runs on the blocking pool.
     fn reattest(answer: &[&str], calls: &Arc<AtomicUsize>) -> Reattest {
+        reattest_keys(answer, &[], calls)
+    }
+
+    /// As `reattest`, also attesting `keys` for model "m".
+    fn reattest_keys(answer: &[&str], keys: &[[u8; 32]], calls: &Arc<AtomicUsize>) -> Reattest {
         let answer = fps(answer);
+        let keys: BTreeSet<[u8; 32]> = keys.iter().copied().collect();
         let calls = calls.clone();
         Arc::new(move || {
             tokio::runtime::Builder::new_current_thread()
@@ -766,6 +1154,11 @@ mod tests {
             calls.fetch_add(1, Ordering::SeqCst);
             Ok(Attested {
                 fingerprints: answer.clone(),
+                keys: if keys.is_empty() {
+                    Default::default()
+                } else {
+                    [("m".to_string(), keys.clone())].into()
+                },
                 ..Attested::default()
             })
         })
@@ -785,6 +1178,20 @@ mod tests {
         fn post(&self, body: &[u8]) -> (u16, Vec<u8>) {
             send(&self.forwarder, "POST", "/v1/chat/completions", body)
         }
+        fn log_path(&self) -> std::path::PathBuf {
+            self.record.session_dir().join("inference.jsonl")
+        }
+        fn lines(&self) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(self.log_path())
+                .unwrap_or_default()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        }
+        fn wait_lines(&self, n: usize) -> Vec<serde_json::Value> {
+            wait_for("inference.jsonl lines", || self.lines().len() >= n);
+            self.lines()
+        }
     }
 
     impl Drop for Rig {
@@ -794,11 +1201,24 @@ mod tests {
     }
 
     fn rig(up: &Upstream, seed: &[&str], reattest: Reattest, max: usize) -> Rig {
+        rig_with(up, seed, &[test_vk()], reattest, max, quick())
+    }
+
+    /// `keys` are the seed's attested keys for model "m".
+    fn rig_with(
+        up: &Upstream,
+        seed: &[&str],
+        keys: &[[u8; 32]],
+        reattest: Reattest,
+        max: usize,
+        signatures: SignaturePolicy,
+    ) -> Rig {
         let dir = crate::testutil::tempdir("forwarder");
         let record =
             AttestationRecord::create(&dir, "0123456789ab", &AttestOptions::default()).unwrap();
         let seed = Attested {
             fingerprints: fps(seed),
+            keys: [("m".to_string(), keys.iter().copied().collect())].into(),
             ..Attested::default()
         };
         record.verified(&seed).unwrap();
@@ -812,6 +1232,8 @@ mod tests {
             fatal: fatal.clone(),
             record: record.clone(),
             max_request_bytes: max,
+            signatures,
+            inference_log: record.session_dir().join("inference.jsonl"),
         })
         .unwrap();
         Rig {
@@ -843,6 +1265,9 @@ mod tests {
     fn no_key_in(rig: &Rig) {
         let text = std::fs::read_to_string(rig.record.path()).unwrap();
         assert!(!text.contains(DUMMY_KEY));
+        let log = std::fs::read_to_string(rig.log_path()).unwrap_or_default();
+        assert!(!log.contains(DUMMY_KEY));
+        assert!(!log.contains("Bearer"));
         assert!(!rig.fatal.reason().unwrap_or_default().contains(DUMMY_KEY));
         assert!(!format!("{:?}", rig.forwarder).contains(DUMMY_KEY));
     }
@@ -1000,10 +1425,16 @@ mod tests {
         let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
         assert_eq!(rig.post(BODY).0, 200);
         assert_eq!(rig.post(BODY).0, 200);
-        wait_for("two handshakes", || up.handshakes().len() == 2);
-        assert_eq!(
-            up.handshakes(),
-            vec![Some(HandshakeKind::Full), Some(HandshakeKind::Full)]
+        // Two completions and two signature fetches, each its own connection.
+        let lines = rig.wait_lines(2);
+        assert!(lines.iter().all(|l| l["result"] == "verified"), "{lines:?}");
+        wait_for("four handshakes", || up.handshakes().len() == 4);
+        assert!(
+            up.handshakes()
+                .iter()
+                .all(|h| *h == Some(HandshakeKind::Full)),
+            "{:?}",
+            up.handshakes()
         );
     }
 
@@ -1161,6 +1592,8 @@ mod tests {
             fatal: Fatal::new(),
             record: record.clone(),
             max_request_bytes: 1024,
+            signatures: SignaturePolicy::default(),
+            inference_log: record.session_dir().join("inference.jsonl"),
         };
         assert!(Forwarder::start(cfg("https://127.0.0.1:1/v1", &[])).is_err());
         assert!(Forwarder::start(cfg("http://127.0.0.1:1/v1", &["a"])).is_err());
@@ -1284,5 +1717,373 @@ mod tests {
         assert!(f.raise("pin-failed: one"));
         assert!(!f.raise("model-refused: two"));
         assert_eq!(f.reason().as_deref(), Some("pin-failed: one"));
+    }
+
+    fn wait_within(limit: Duration, what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + limit;
+        while !cond() {
+            assert!(Instant::now() < deadline, "not within {limit:?}: {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn stream_client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap()
+    }
+
+    fn post_stream(rig: &Rig) -> reqwest::blocking::Response {
+        stream_client()
+            .post(format!("{}/chat/completions", rig.forwarder.base_url()))
+            .bearer_auth(DUMMY_KEY)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .body(STREAM_BODY.to_vec())
+            .send()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_verified_completion_is_logged_and_the_session_continues() {
+        let up = upstream(|_| "a", false, ok_reply);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        let (status, body) = rig.post(BODY);
+        assert_eq!(status, 200);
+        assert_eq!(body, REPLY);
+        let lines = rig.wait_lines(1);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let l = &lines[0];
+        assert_eq!(l["result"], "verified", "{l}");
+        assert_eq!(l["chat_id"], "x");
+        assert_eq!(l["model"], "m");
+        assert_eq!(l["streamed"], false);
+        assert_eq!(l["request_sha256"], sha_hex(BODY));
+        assert_eq!(l["response_sha256"], sha_hex(REPLY));
+        assert_eq!(l["signing_key"], hex::encode(test_vk()));
+        assert!(l["signature_ms"].is_u64(), "{l}");
+        assert!(l["ts"].as_u64().unwrap() > 1_700_000_000, "{l}");
+        let sig = up.signature_requests();
+        assert_eq!(sig.len(), 1);
+        assert!(
+            sig[0]
+                .head
+                .starts_with("GET /v1/signature/x?model=m&signing_algo=ed25519 HTTP/1.1\r\n"),
+            "{}",
+            sig[0].head
+        );
+        assert!(
+            sig[0]
+                .head
+                .lines()
+                .any(|l| l.eq_ignore_ascii_case(&format!("authorization: Bearer {DUMMY_KEY}")))
+        );
+        assert_eq!(rig.fatal.reason(), None);
+        assert_eq!(rig.doc()["status"], "verified");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // The session continues.
+        assert_eq!(rig.post(BODY).0, 200);
+        let lines = rig.wait_lines(2);
+        assert_eq!(lines[1]["result"], "verified");
+        assert_eq!(rig.fatal.reason(), None);
+        no_key_in(&rig);
+    }
+
+    #[test]
+    fn a_verified_stream_is_logged_and_was_not_buffered() {
+        let last_sent = Arc::new(Mutex::new(None));
+        let sent = last_sent.clone();
+        let pauses = vec![Duration::ZERO, Duration::ZERO, Duration::from_millis(200)];
+        let up = upstream(|_| "a", false, move |_| sse_answer(pauses.clone(), &sent));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        let mut resp = post_stream(&rig);
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+        let mut buf = [0u8; 4096];
+        let n = resp.read(&mut buf).unwrap();
+        assert!(n > 0);
+        let first_at = Instant::now();
+        let mut all = buf[..n].to_vec();
+        resp.read_to_end(&mut all).unwrap();
+        assert_eq!(all, SSE.concat());
+        let sent_at = last_sent.lock().unwrap().expect("last chunk sent");
+        assert!(
+            first_at < sent_at,
+            "the client got its first bytes only after upstream sent the last chunk"
+        );
+        let lines = rig.wait_lines(1);
+        let l = &lines[0];
+        assert_eq!(l["result"], "verified", "{l}");
+        assert_eq!(l["streamed"], true);
+        assert_eq!(l["chat_id"], "chatcmpl-s1");
+        assert_eq!(l["request_sha256"], sha_hex(STREAM_BODY));
+        assert_eq!(l["response_sha256"], sha_hex(&SSE.concat()));
+        assert!(
+            up.signature_requests()[0]
+                .head
+                .starts_with("GET /v1/signature/chatcmpl-s1?model=m&signing_algo=ed25519 ")
+        );
+        assert_eq!(rig.fatal.reason(), None);
+        no_key_in(&rig);
+    }
+
+    /// Carried from Task 5: a client that goes away mid-stream does not stop
+    /// the relay reading upstream, so the hash covers the whole response.
+    #[test]
+    fn a_stream_the_client_dropped_is_read_to_the_end_and_verified() {
+        let last_sent = Arc::new(Mutex::new(None));
+        let sent = last_sent.clone();
+        let up = upstream(
+            |_| "a",
+            false,
+            move |_| Answer::Sse {
+                chunks: (0..8)
+                    .map(|i| format!("data: {{\"id\":\"chatcmpl-d\",\"n\":{i}}}\n\n").into_bytes())
+                    .collect(),
+                pauses: vec![Duration::from_millis(100); 8],
+                last_sent: sent.clone(),
+            },
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        let mut resp = post_stream(&rig);
+        let mut buf = [0u8; 64];
+        assert!(resp.read(&mut buf).unwrap() > 0);
+        drop(resp);
+        let lines = rig.wait_lines(1);
+        let l = &lines[0];
+        assert_eq!(l["result"], "verified", "{l}");
+        assert_eq!(l["chat_id"], "chatcmpl-d");
+        assert!(last_sent.lock().unwrap().is_some());
+        assert_eq!(rig.fatal.reason(), None);
+    }
+
+    #[test]
+    fn a_wrong_receipt_ends_the_session() {
+        let up = upstream_with(|_| "a", false, ok_reply, wrong_receipt);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        let (status, body) = rig.post(BODY);
+        assert_eq!(status, 200, "relayed before the check");
+        assert_eq!(body, REPLY);
+        wait_within(Duration::from_secs(2), "fatal", || {
+            rig.fatal.reason().is_some()
+        });
+        let reason = rig.fatal.reason().unwrap();
+        assert!(reason.contains("signature"), "{reason}");
+        wait_for("signature-failed", || {
+            rig.doc()["status"] == "signature-failed"
+        });
+        let doc = rig.doc();
+        assert!(
+            doc["reason"].as_str().unwrap().contains("response"),
+            "{doc}"
+        );
+        let lines = rig.wait_lines(1);
+        let result = lines[0]["result"].as_str().unwrap();
+        assert!(result.starts_with("failed:"), "{result}");
+        assert_eq!(lines[0]["signing_key"], serde_json::Value::Null);
+        let handshakes = up.handshakes().len();
+        assert_eq!(rig.post(BODY).0, 502);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            up.handshakes().len(),
+            handshakes,
+            "no handshake after fatal"
+        );
+        assert_eq!(up.requests().len(), 1);
+        assert_eq!(up.signature_requests().len(), 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a known key never re-attests"
+        );
+        no_key_in(&rig);
+    }
+
+    #[test]
+    fn a_receipt_that_never_arrives_ends_the_session() {
+        let up = upstream_with(|_| "a", false, ok_reply, |_, _| (404, b"{}".to_vec()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let policy = SignaturePolicy {
+            window: Duration::from_millis(300),
+            ..quick()
+        };
+        let rig = rig_with(
+            &up,
+            &["a"],
+            &[test_vk()],
+            reattest(&["a"], &calls),
+            1 << 20,
+            policy,
+        );
+        assert_eq!(rig.post(BODY).0, 200);
+        wait_within(Duration::from_secs(3), "fatal", || {
+            rig.fatal.reason().is_some()
+        });
+        assert!(rig.fatal.reason().unwrap().contains("signature"));
+        // stop() raises fatal first, then writes the status.
+        wait_for("signature-failed", || {
+            rig.doc()["status"] == "signature-failed"
+        });
+        let lines = rig.wait_lines(1);
+        let result = lines[0]["result"].as_str().unwrap();
+        assert!(result.starts_with("failed:"), "{result}");
+        assert!(result.contains("no signature within"), "{result}");
+        assert!(up.signature_requests().len() >= 2);
+        no_key_in(&rig);
+    }
+
+    #[test]
+    fn an_unattested_key_is_reattested_once() {
+        // Re-attestation attests the key: verified.
+        let up = upstream(|_| "a", false, ok_reply);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig_with(
+            &up,
+            &["a"],
+            &[],
+            reattest_keys(&["a"], &[test_vk()], &calls),
+            1 << 20,
+            quick(),
+        );
+        assert_eq!(rig.post(BODY).0, 200);
+        let lines = rig.wait_lines(1);
+        assert_eq!(lines[0]["result"], "verified", "{}", lines[0]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let doc = rig.doc();
+        assert_eq!(doc["reattestations"].as_array().unwrap().len(), 1);
+        assert_eq!(doc["status"], "verified");
+        assert_eq!(rig.fatal.reason(), None);
+        // The merged key is kept: the next receipt needs no re-attestation.
+        assert_eq!(rig.post(BODY).0, 200);
+        assert_eq!(rig.wait_lines(2)[1]["result"], "verified");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Re-attestation does not attest it: fatal after exactly one.
+        let up = upstream(|_| "a", false, ok_reply);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig_with(&up, &["a"], &[], reattest(&["a"], &calls), 1 << 20, quick());
+        assert_eq!(rig.post(BODY).0, 200);
+        wait_within(Duration::from_secs(3), "fatal", || {
+            rig.fatal.reason().is_some()
+        });
+        let reason = rig.fatal.reason().unwrap();
+        assert!(reason.contains("signature"), "{reason}");
+        assert!(reason.contains("not attested"), "{reason}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // stop() raises fatal first, then writes the status.
+        wait_for("signature-failed", || {
+            rig.doc()["status"] == "signature-failed"
+        });
+        assert!(
+            rig.wait_lines(1)[0]["result"]
+                .as_str()
+                .unwrap()
+                .starts_with("failed:")
+        );
+    }
+
+    #[test]
+    fn a_non_2xx_answer_is_relayed_and_logged_unsigned() {
+        let up = upstream(
+            |_| "a",
+            false,
+            |_| Answer::Whole(429, br#"{"error":"slow down"}"#.to_vec()),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        let (status, body) = rig.post(BODY);
+        assert_eq!(status, 429);
+        assert_eq!(body, br#"{"error":"slow down"}"#);
+        let lines = rig.wait_lines(1);
+        let l = &lines[0];
+        assert_eq!(l["result"], "not-signed (HTTP 429)", "{l}");
+        assert_eq!(l["chat_id"], "");
+        assert_eq!(l["request_sha256"], sha_hex(BODY));
+        assert_eq!(l["signing_key"], serde_json::Value::Null);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(up.signature_requests().is_empty());
+        assert_eq!(rig.fatal.reason(), None);
+        assert_eq!(rig.doc()["status"], "verified");
+        no_key_in(&rig);
+    }
+
+    /// Decision for Task 6: a fatal raised elsewhere cuts a response still
+    /// streaming; nothing more reaches the model and no receipt is fetched.
+    #[test]
+    fn a_stream_in_flight_is_cut_when_fatal_is_raised() {
+        let last_sent = Arc::new(Mutex::new(None));
+        let sent = last_sent.clone();
+        let pauses = vec![Duration::ZERO, Duration::ZERO, Duration::from_millis(1500)];
+        let up = upstream(|_| "a", false, move |_| sse_answer(pauses.clone(), &sent));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        let mut resp = post_stream(&rig);
+        let mut buf = [0u8; 4096];
+        let n = resp.read(&mut buf).unwrap();
+        assert!(n > 0);
+        let raised = Instant::now();
+        assert!(rig.fatal.raise("model-refused: elsewhere"));
+        let mut rest = buf[..n].to_vec();
+        let _ = resp.read_to_end(&mut rest);
+        assert!(
+            raised.elapsed() < Duration::from_millis(1000),
+            "the stream was not cut"
+        );
+        assert!(!rest.ends_with(SSE[2]), "the last chunk reached the client");
+        let lines = rig.wait_lines(1);
+        assert_eq!(
+            lines[0]["result"], "failed: session stopped",
+            "{}",
+            lines[0]
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(up.signature_requests().is_empty());
+        assert_eq!(rig.fatal.reason().unwrap(), "model-refused: elsewhere");
+    }
+
+    #[test]
+    fn the_logs_never_hold_the_key() {
+        // Verified, then unsigned (429), then a wrong receipt.
+        let n = Arc::new(AtomicUsize::new(0));
+        let count = n.clone();
+        let reply = move |_: &Seen| match count.fetch_add(1, Ordering::SeqCst) {
+            1 => Answer::Whole(429, br#"{"error":"slow"}"#.to_vec()),
+            _ => Answer::Whole(200, REPLY.to_vec()),
+        };
+        let signed = Arc::new(AtomicUsize::new(0));
+        let sign = move |req: &[u8], resp: &[u8]| {
+            if signed.fetch_add(1, Ordering::SeqCst) == 0 {
+                good_receipt(req, resp)
+            } else {
+                wrong_receipt(req, resp)
+            }
+        };
+        let up = upstream_with(|_| "a", false, reply, sign);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        assert_eq!(rig.post(BODY).0, 200);
+        rig.wait_lines(1);
+        assert_eq!(rig.post(BODY).0, 429);
+        rig.wait_lines(2);
+        assert_eq!(rig.post(BODY).0, 200);
+        let lines = rig.wait_lines(3);
+        let results: Vec<&str> = lines
+            .iter()
+            .map(|l| l["result"].as_str().unwrap())
+            .collect();
+        assert_eq!(results[0], "verified");
+        assert_eq!(results[1], "not-signed (HTTP 429)");
+        assert!(results[2].starts_with("failed:"), "{results:?}");
+        wait_for("fatal", || rig.fatal.reason().is_some());
+        no_key_in(&rig);
     }
 }

@@ -311,6 +311,8 @@ fn launch(
                         fatal: fatal.clone(),
                         record: record.clone(),
                         max_request_bytes: 32 << 20,
+                        signatures: forwarder::signature::SignaturePolicy::default(),
+                        inference_log: record.session_dir().join("inference.jsonl"),
                     })
                 },
                 |forwarder| {
