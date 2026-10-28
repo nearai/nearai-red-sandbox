@@ -163,6 +163,25 @@ impl StateDir {
             let _ = fs::write(self.marker(), reason);
         }
     }
+    /// Stop queued tools and wait for an active exec to finish before export.
+    /// Holding the returned lock keeps teardown serialized with every bridge.
+    pub fn quiesce(&self, timeout: Duration) -> io::Result<File> {
+        fs::create_dir_all(&self.0)?;
+        if !self.marker().exists() {
+            fs::write(self.marker(), "session ended")?;
+        }
+        let f = OpenOptions::new().create(true).truncate(false).write(true).open(self.0.join("exec.lock"))?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            match f.try_lock() {
+                Ok(()) => return Ok(f),
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                Err(std::fs::TryLockError::WouldBlock) => return Err(io::Error::new(io::ErrorKind::TimedOut, "active tool did not finish before teardown deadline")),
+                Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            }
+        }
+    }
+
     fn lock(&self) -> io::Result<File> {
         fs::create_dir_all(&self.0)?;
         let f = OpenOptions::new().create(true).truncate(false).write(true).open(self.0.join("exec.lock"))?;
@@ -557,6 +576,23 @@ mod tests {
         let sb = MvmSandbox::new(NAME, f).unwrap().with_state(StateDir(dir.clone()));
         assert_eq!(sb.exec(&sv(&["true"]), &opts()).unwrap_err().to_string(), "sandbox unavailable: sandbox removed");
         assert!(calls.lock().unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn quiesce_is_bounded_and_stops_later_tools_when_an_exec_is_stuck() {
+        let dir = crate::testutil::tempdir("quiesce-deadline");
+        let state = StateDir(dir.clone());
+        let active = state.lock().unwrap();
+        let start = Instant::now();
+        let err = state.quiesce(Duration::from_millis(50)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let (runner, calls) = fake(|_| panic!("a stopped tool must never run mvmctl"));
+        let tool = MvmSandbox::new(NAME, runner).unwrap().with_state(state);
+        assert!(matches!(tool.exec(&sv(&["true"]), &opts()), Err(Error::Unavailable(_))));
+        assert!(calls.lock().unwrap().is_empty());
+        drop(active);
         fs::remove_dir_all(dir).unwrap();
     }
 

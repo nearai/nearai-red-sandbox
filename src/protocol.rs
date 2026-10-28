@@ -247,7 +247,8 @@ mod tests {
     #[test]
     fn host_sh_workdir() {
         let r = run_wrapped_locally(&s(&["pwd"]), 10, 65536, Some("/tmp"));
-        assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), "/tmp");
+        let actual = std::fs::canonicalize(String::from_utf8_lossy(&r.stdout).trim()).unwrap();
+        assert_eq!(actual, std::fs::canonicalize("/tmp").unwrap());
         let r = run_wrapped_locally(&s(&["pwd"]), 10, 65536, Some("/does/not/exist"));
         assert_eq!(r.exit_code, 126);
     }
