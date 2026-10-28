@@ -18,14 +18,14 @@ tool effects land.
 | Where the harness runs | Host. Tools are replaced, not intercepted, so execution goes to the VM. |
 | Sandbox | mvm (`tinylabscom/mvm`, Apache-2.0), dev profile, `machine create` / `exec` / `rm` |
 | Guest image | A digest-pinned OCI image (default `docker.io/library/alpine@sha256:e311ae74...ffb42`, the one the probes ran on). A Nix `mkGuest` image is deferred. |
-| Inference | NEAR AI provider in the host opencode config. The key stays on the host; the VM never sees it. |
+| Inference | NEAR AI through IronWire's local OpenAI façade (`127.0.0.1:8463/openai/v1`). IronWire holds the key, so neither opencode nor the VM sees it. A direct NEAR AI provider with the key in an env var remains possible. |
 | VM egress | None. mvm default-deny, no `--allow-host`. |
 | Files in | An operator inputs directory, packed into a tar on the host and pushed in after boot as base64 argv chunks, extracted to `/in`. A copy, not a live mount. |
 | Files out | Only the guest's `/out`, copied to `sessions/<id>/out` before teardown. |
 | Lifecycle | One VM per opencode session, always destroyed when the session ends, including on crash or signal. |
 | mvm access | Shell out to `mvmctl` release v0.22.0, installed from the cosign-verified release tarball at `~/.local/mvm/v0.22.0`. No mvm SDK in v1. |
 | Backend seam | Launcher and plugin talk to a `Sandbox` interface, never to `mvmctl` directly. mvm is the only v1 backend. |
-| Language | TypeScript on bun for the launcher and plugin. Nix flake for the guest image. |
+| Language | Rust for the launcher, the Sandbox backend and the tools (`rts`), following IronWire's conventions. The opencode plugin stays a thin TypeScript shim that spawns `rts tool`, because opencode loads plugins in-process. Nix flake for the guest image. |
 
 ## Architecture
 
@@ -300,11 +300,13 @@ Written test-first.
 ## Repository layout
 
 ```
-sandbox/         Sandbox interface, MvmSandbox, hostile-archive extractor
-launcher/        TypeScript CLI (bun): preflight, VM lifecycle, export, orphan sweep
-plugin/          opencode V2 plugin: tool transform, allowlist check, audit hooks
-opencode/        pinned version and opencode config (NEAR AI provider, plugin enabled)
-tests/unit/      fake-executor tests
+src/             rts (Rust): Sandbox trait, MvmSandbox, hostile-archive extractor,
+                 the six tools, `rts tool` bridge, and the launcher (preflight,
+                 VM lifecycle, export, orphan sweep)
+plugin/          opencode V2 plugin shim: tool transform, allowlist check, audit
+                 hooks; each tool call spawns `rts tool`
+opencode/        pinned version and opencode config (IronWire provider, plugin enabled)
+tests/unit/      plugin shim tests (Rust unit tests live beside the code in src/)
 tests/contain/   real-mvm containment suite and the leak-detection check
 sessions/        per-session out/ and tools.jsonl (gitignored)
 docs/specs/      design documents

@@ -1,0 +1,17 @@
+{
+  "image": "docker.io/library/alpine@sha256:e311ae748be7f56ae5cba304bc488f0786df68ee507513f654a5cc8597cffb42",
+  "inputsDir": "./inputs",
+  "provider": {
+    "id": "ironwire",
+    "baseURL": "http://127.0.0.1:8463/openai/v1",
+    "models": ["z-ai/glm-5.3-flash"]
+  },
+  "limits": {
+    "toolTimeoutMs": 120000,
+    "maxOutputBytes": 65536,
+    "memoryMiB": 2048,
+    "cpus": 2,
+    "hostRssCeilingMiB": 3072,
+    "handshakeMs": 30000
+  }
+}
