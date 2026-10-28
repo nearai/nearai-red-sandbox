@@ -86,6 +86,6 @@ The automated tests use an in-memory credential store and local mock HTTP
 servers. They do not establish that browser sign-in, native credential storage,
 or live Cloud inference has been exercised on this machine.
 
-The latest recorded real containment run on 2026-10-28 was 17 passed and
-3 failed; copy-out and hostile archive checks remain under investigation.
+The latest recorded real containment run on 2026-10-28 was 19 passed and
+1 failed; byte-exact copy-out remains under investigation.
 The sandbox remains unvalidated; see [the OpenCode operator notes](../opencode/README.md#recorded-live-validation-status).

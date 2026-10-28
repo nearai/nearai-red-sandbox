@@ -184,9 +184,10 @@ policy and writes the matching readiness nonce.
 
 ## Recorded live validation status
 
-The latest recorded macOS containment run on 2026-10-28 had **17 passed and
-3 failed** using the derived guest image. The remaining failures were the
-byte-exact copy-out, oversized-file, and hardlink refusal tests.
+The latest recorded macOS containment run on 2026-10-28 had **19 passed and
+1 failed** using the derived guest image. Byte-exact copy-out failed when
+mvm's control stream closed during a slice; smaller slices also failed in
+focused reproductions. The session fails closed, but exported data can be lost.
 
 Containment remains unvalidated until those failures are resolved and the
 real suite passes. Unit tests, mocked browser callbacks, and local inference
