@@ -1,7 +1,7 @@
 # Sandboxed opencode sessions on mvm: design
 
 Date: 2026-10-27
-Status: draft, awaiting review
+Status: approved 2026-10-27, then amended by probes 1-5 the same day
 
 ## Purpose
 
@@ -17,6 +17,7 @@ tool effects land.
 | Harness | opencode, a released v2 build pinned by version (v2.1.4, already installed). Plugin API V2; its tool API is identical in v2.1.4, v2.2.0 and `dev`. |
 | Where the harness runs | Host. Tools are replaced, not intercepted, so execution goes to the VM. |
 | Sandbox | mvm (`tinylabscom/mvm`, Apache-2.0), dev profile, `machine create` / `exec` / `rm` |
+| Guest image | A digest-pinned OCI image (default `docker.io/library/alpine@sha256:e311ae74...ffb42`, the one the probes ran on). A Nix `mkGuest` image is deferred. |
 | Inference | NEAR AI provider in the host opencode config. The key stays on the host; the VM never sees it. |
 | VM egress | None. mvm default-deny, no `--allow-host`. |
 | Files in | An operator inputs directory, packed into a tar on the host and pushed in after boot as base64 argv chunks, extracted to `/in`. A copy, not a live mount. |
@@ -49,7 +50,8 @@ launcher
 interface Sandbox {
   create(spec: { name: string; image: string; memoryMiB: number; cpus: number }): Promise<void>
   exec(argv: string[], opts: { timeoutMs: number; maxOutputBytes: number }):
-    Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array; truncated: boolean }>
+    Promise<{ exitCode: number; timedOut: boolean; stdout: Uint8Array; stderr: Uint8Array;
+              stdoutBytes: number; stderrBytes: number; truncated: boolean }>
   copyIn(hostDir: string, guestDir: string): Promise<void>
   copyOut(guestDir: string, hostDir: string): Promise<void>
   remove(): Promise<void>
@@ -57,7 +59,9 @@ interface Sandbox {
 ```
 
 The v1 implementation, `MvmSandbox`, shells out to `mvmctl`. Every call is
-argv-based; nothing is passed through a host shell.
+argv-based; nothing is passed through a host shell. A second backend (for
+example apple/container) would implement the same interface and must pass the
+same containment suite.
 
 `create` runs exactly `mvmctl machine create <name> --image <digest-ref>
 --profile dev --cpus <n> --memory <MiB>M`, then `mvmctl machine start <name>`.
@@ -89,8 +93,10 @@ implementation:
   measured to work; the host's own `ARG_MAX` refused 1 MiB.
 - **Large stdout is truncated silently.** An 8 MiB stdout arrived as
   974,403 bytes with no error. The wrapper writes the command's stdout to a
-  guest temp file, reports its full size in the trailer, and emits only the
-  first `maxOutputBytes`, so `truncated` is computed from the reported size.
+  guest temp file, and stderr to another, reports both full sizes in the
+  trailer, and emits only the first `maxOutputBytes` of each, so `truncated`
+  is computed from the reported sizes. The trailer line is
+  `RTS_EXIT_<nonce> <status> <stdoutBytes> <stderrBytes>`.
 - Any exec result containing the `no durable finish` error, or missing its
   trailer, means the machine is unusable: `exec` reports `sandbox
   unavailable` for that call and every later one.
@@ -122,9 +128,7 @@ Other v0.22.0 behavior the implementation depends on (probe 5):
 - No egress, measured on a dev-profile alpine machine created as above: the
   only interface is `lo`; routes are blackholes for `100.64.0.0/10`,
   `169.254.0.0/16`, and `169.254.169.254`; there is no `/etc/resolv.conf`;
-  `wget http://1.1.1.1` fails with `Network unreachable`. A second backend (for
-example apple/container) would implement the same interface and must pass the
-same containment suite.
+  `wget http://1.1.1.1` fails with `Network unreachable`.
 
 `copyIn` packs the host inputs directory into a tar on the host and pushes it
 as base64 argv chunks (the `write` path), then extracts it to `/in` in the
@@ -219,10 +223,12 @@ fixed scripts read operands from `"$1"`, `"$2"` and so on. `patch` is
 removed rather than sandboxed: implementing opencode's patch format is out of
 scope for v1, and `edit` and `write` cover the same ground.
 
-### Guest image (`image/`)
+### Guest image
 
-An mvm `mkGuest` Nix flake with `entrypoint.shell` (dev profile). The operator
-supplies the contents. The harness requires `sh`, coreutils, `find`, `grep`,
+A digest-pinned OCI image, pulled with `mvmctl image pull` before the first
+session. The operator chooses it; the default is the alpine digest the probes
+ran on. A Nix `mkGuest` flake is deferred: it needs mvm's builder VM, which
+was not exercised. The harness requires `sh`, coreutils, `find`, `grep`,
 `timeout`, `base64`, and `tar` in the guest (busybox provides all of them, as
 in the alpine image used for the probes), plus a writable `/out` and `/tmp`.
 
@@ -295,7 +301,6 @@ Written test-first.
 sandbox/         Sandbox interface, MvmSandbox, hostile-archive extractor
 launcher/        TypeScript CLI (bun): preflight, VM lifecycle, export, orphan sweep
 plugin/          opencode V2 plugin: tool transform, allowlist check, audit hooks
-image/           Nix mkGuest flake
 opencode/        pinned version and opencode config (NEAR AI provider, plugin enabled)
 tests/unit/      fake-executor tests
 tests/contain/   real-mvm containment suite and the leak-detection check
@@ -311,6 +316,7 @@ docs/specs/      design documents
 - Concurrent sessions.
 - Linux hosts (Firecracker should work unchanged, but is not tested).
 - Guest image contents beyond the harness minimum.
+- A Nix `mkGuest` guest image (needs the builder VM, not exercised).
 
 ## Checks before the implementation plan is final
 
