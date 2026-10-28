@@ -3,13 +3,20 @@
 // MCP server and every model outside the configured provider, then proves
 // it loaded by writing the launcher's nonce to the ready file.
 //
+// opencode loads plugins in-process as TypeScript, so this file stays a
+// thin shim: each sandboxed tool call spawns `rts tool <name>` (the Rust
+// binary that launched the session) and returns its output.
+//
 // No imports from @opencode/*: the shapes used are the v2.1.4 `Context`
 // domains `tool`, `mcp` and `model` (packages/plugin/src/promise/*.ts).
 
+import { spawn } from "node:child_process"
 import { writeFile } from "node:fs/promises"
-import { MACHINE_NAME_RE, MvmSandbox, spawnRunner } from "../sandbox/mvm.ts"
 import { appendAudit, inputSha256 } from "./audit.ts"
-import { SANDBOXED_TOOLS, makeTools, type ToolName } from "./tools.ts"
+
+export const SANDBOXED_TOOLS = ["shell", "read", "write", "edit", "glob", "grep"] as const
+export type ToolName = (typeof SANDBOXED_TOOLS)[number]
+const MACHINE_NAME_RE = /^rts-[0-9a-f]{12}$/
 
 export const ALLOWED_TOOLS = ["shell", "read", "write", "edit", "glob", "grep", "question"] as const
 const ALLOWED = new Set<string>(ALLOWED_TOOLS)
@@ -20,15 +27,11 @@ export type PluginOptions = {
   nonce: string
   readyFile: string
   auditFile: string
-  mvmctl: string
-  emptyGitConfig: string
   provider: string
-  timeoutMs: number
-  maxOutputBytes: number
-  cwd?: string
-  // The operator's real HOME, for mvmctl's own state. opencode itself runs
-  // with HOME pointed at the session directory.
-  mvmHome?: string
+  // The rts binary, and the options it needs to reach this session's
+  // machine (passed through to `rts tool` unchanged; see src/bridge.rs).
+  rts: string
+  bridge: Record<string, unknown>
   // When set, the verified tool, MCP and model state is written here as JSON.
   debugFile?: string
 }
@@ -52,26 +55,21 @@ function checkOptions(o: any): PluginOptions {
     if (typeof o?.[k] !== "string" || o[k] === "") throw new Error(`rts-sandbox: option ${k} is required`)
     return o[k] as string
   }
-  const int = (k: string) => {
-    if (!Number.isInteger(o?.[k]) || o[k] <= 0) throw new Error(`rts-sandbox: option ${k} must be a positive integer`)
-    return o[k] as number
-  }
   const machine = str("machine")
   if (!MACHINE_NAME_RE.test(machine)) throw new Error("rts-sandbox: bad machine name")
   const nonce = str("nonce")
   if (!/^[0-9a-f]{24,}$/.test(nonce)) throw new Error("rts-sandbox: bad nonce")
+  const bridge = o.bridge
+  if (!bridge || typeof bridge !== "object" || Array.isArray(bridge)) throw new Error("rts-sandbox: option bridge is required")
+  if (bridge.machine !== machine) throw new Error("rts-sandbox: bridge.machine must match machine")
   return {
     machine,
     nonce,
     readyFile: str("readyFile"),
     auditFile: str("auditFile"),
-    mvmctl: str("mvmctl"),
-    emptyGitConfig: str("emptyGitConfig"),
     provider: str("provider"),
-    timeoutMs: int("timeoutMs"),
-    maxOutputBytes: int("maxOutputBytes"),
-    cwd: typeof o.cwd === "string" ? o.cwd : undefined,
-    mvmHome: typeof o.mvmHome === "string" && o.mvmHome !== "" ? o.mvmHome : undefined,
+    rts: str("rts"),
+    bridge,
     debugFile: typeof o.debugFile === "string" && o.debugFile !== "" ? o.debugFile : undefined,
   }
 }
@@ -146,13 +144,36 @@ export async function setupWith(ctx: any, makeImpl: (o: PluginOptions) => Record
   await writeFile(o.readyFile, o.nonce, { flag: "wx", mode: 0o600 })
 }
 
+// Exit codes from `rts tool` (src/bridge.rs).
+const EXIT_UNAVAILABLE = 3
+
+// One sandboxed call: the request goes to `rts tool <name>` on stdin and the
+// tool's text comes back on stdout. Any failure, including a lost machine,
+// is thrown so opencode reports it to the model; nothing falls back to the host.
+export function runRts(rts: string, tool: ToolName, request: unknown): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const p = spawn(rts, ["tool", tool], { stdio: ["pipe", "pipe", "pipe"] })
+    const out: Buffer[] = []
+    const err: Buffer[] = []
+    p.stdout.on("data", (b: Buffer) => out.push(b))
+    p.stderr.on("data", (b: Buffer) => err.push(b))
+    p.on("error", (e) => reject(new Error(`rts-sandbox: cannot run ${rts}: ${e.message}`)))
+    p.on("close", (code) => {
+      const stderr = Buffer.concat(err).toString("utf8").trim()
+      if (code === 0) return resolve(Buffer.concat(out).toString("utf8"))
+      const prefix = code === EXIT_UNAVAILABLE ? "" : `${tool} failed: `
+      reject(new Error(prefix + (stderr || `rts tool exited ${code}`)))
+    })
+    p.stdin.on("error", () => {})
+    p.stdin.end(JSON.stringify(request))
+  })
+}
+
 // The tool implementations the plugin installs. Exported so the
 // containment suite exercises exactly this construction.
-export function makePluginTools(o: PluginOptions) {
-  const leak = process.env.RTS_TEST_LEAK === "shell" ? ("shell" as const) : undefined
-  if (leak) console.error("rts-sandbox: RTS_TEST_LEAK=shell is set; shell runs ON THE HOST (leak check only)")
-  const sb = MvmSandbox.attach(o.machine, spawnRunner(o.mvmctl, o.emptyGitConfig, o.mvmHome ? { HOME: o.mvmHome } : {}))
-  return makeTools(sb, { timeoutMs: o.timeoutMs, maxOutputBytes: o.maxOutputBytes, cwd: o.cwd, leak })
+export function makePluginTools(o: PluginOptions): Record<ToolName, (input: any) => Promise<string>> {
+  const mk = (tool: ToolName) => (input: unknown) => runRts(o.rts, tool, { options: o.bridge, input: input ?? {} })
+  return { shell: mk("shell"), read: mk("read"), write: mk("write"), edit: mk("edit"), glob: mk("glob"), grep: mk("grep") }
 }
 
 export async function setup(ctx: any) {

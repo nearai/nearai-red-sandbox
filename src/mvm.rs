@@ -339,9 +339,10 @@ mod tests {
     const NAME: &str = "rts-0123456789ab";
     const IMAGE: &str = "docker.io/library/alpine@sha256:e311ae748be7f56ae5cba304bc488f0786df68ee507513f654a5cc8597cffb42";
 
+    type Calls = Arc<Mutex<Vec<(Vec<String>, Duration)>>>;
     type Reply = Box<dyn Fn(&[String]) -> RunOutput + Send + Sync>;
     struct Fake {
-        calls: Arc<Mutex<Vec<(Vec<String>, Duration)>>>,
+        calls: Calls,
         reply: Reply,
     }
     impl Runner for Fake {
@@ -350,7 +351,7 @@ mod tests {
             Ok((self.reply)(argv))
         }
     }
-    fn fake(reply: impl Fn(&[String]) -> RunOutput + Send + Sync + 'static) -> (Box<Fake>, Arc<Mutex<Vec<(Vec<String>, Duration)>>>) {
+    fn fake(reply: impl Fn(&[String]) -> RunOutput + Send + Sync + 'static) -> (Box<Fake>, Calls) {
         let calls = Arc::new(Mutex::new(vec![]));
         (Box::new(Fake { calls: calls.clone(), reply: Box::new(reply) }), calls)
     }
@@ -364,7 +365,7 @@ mod tests {
     fn opts() -> ExecOptions {
         ExecOptions::new(120_000, 65536)
     }
-    fn argvs(c: &Arc<Mutex<Vec<(Vec<String>, Duration)>>>) -> Vec<Vec<String>> {
+    fn argvs(c: &Calls) -> Vec<Vec<String>> {
         c.lock().unwrap().iter().map(|(a, _)| a.clone()).collect()
     }
     const FORBIDDEN: [&str; 4] = ["--net", "--allow-host", "--peer", "--gpu"];

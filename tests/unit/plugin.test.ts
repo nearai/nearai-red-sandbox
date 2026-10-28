@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import plugin, { ALLOWED_TOOLS, setupWith } from "../../plugin/index.ts"
+import plugin, { ALLOWED_TOOLS, makePluginTools, setupWith, type PluginOptions } from "../../plugin/index.ts"
 
 // The 20 v2.1.4 tool IDs from probe 2 (the spec names the families; the
 // exact session, MCP-resource and remaining IDs here are stand-ins).
@@ -25,7 +25,7 @@ function fakeCtx(options: Record<string, unknown>, stubborn: Stubborn = {}) {
   const models = [
     { id: "big-pickle", providerID: "opencode", enabled: true },
     { id: "grok-code", providerID: "opencode", enabled: true },
-    { id: "z-ai/glm-5.3-flash", providerID: "nearai", enabled: true },
+    { id: "z-ai/glm-5.3-flash", providerID: "ironwire", enabled: true },
   ]
   const transforms = { tool: [] as any[], mcp: [] as any[], model: [] as any[] }
   const hooks: Record<string, ((ev: any) => any)[]> = {}
@@ -105,11 +105,9 @@ beforeEach(() => {
     nonce: "ab".repeat(12),
     readyFile: join(dir, "ready"),
     auditFile: join(dir, "tools.jsonl"),
-    mvmctl: "/nonexistent/mvmctl",
-    emptyGitConfig: join(dir, "empty.gitconfig"),
-    provider: "nearai",
-    timeoutMs: 120_000,
-    maxOutputBytes: 65536,
+    provider: "ironwire",
+    rts: "/nonexistent/rts",
+    bridge: { machine: "rts-0123456789ab", stateDir: join(dir, "state") },
   }
 })
 afterEach(() => rmSync(dir, { recursive: true, force: true }))
@@ -128,12 +126,12 @@ test("the default export is a V2 { id, setup } plugin", () => {
   expect(typeof plugin.setup).toBe("function")
 })
 
-test("setup leaves exactly the seven tools, no MCP servers, only nearai models, and writes the nonce", async () => {
+test("setup leaves exactly the seven tools, no MCP servers, only ironwire models, and writes the nonce", async () => {
   const f = fakeCtx(options)
   await setupWith(f.ctx, fakeImpl)
   expect((await f.ctx.tool.list()).map((t) => t.id).sort()).toEqual([...ALLOWED_TOOLS].sort())
   expect((await f.ctx.mcp.list()).data).toEqual([])
-  expect((await f.ctx.model.list()).data.every((m) => m.providerID === "nearai")).toBe(true)
+  expect((await f.ctx.model.list()).data.every((m) => m.providerID === "ironwire")).toBe(true)
   expect(readFileSync(join(dir, "ready"), "utf8")).toBe("ab".repeat(12))
 })
 
@@ -187,9 +185,9 @@ test("an MCP server that survives makes setup throw and leaves no ready file", a
   expect(existsSync(join(dir, "ready"))).toBe(false)
 })
 
-test("a non-nearai model that survives makes setup throw and leaves no ready file", async () => {
+test("a model from another provider that survives makes setup throw and leaves no ready file", async () => {
   const f = fakeCtx(options, { model: "opencode" })
-  await expect(setupWith(f.ctx, fakeImpl)).rejects.toThrow("model outside provider nearai")
+  await expect(setupWith(f.ctx, fakeImpl)).rejects.toThrow("model outside provider ironwire")
   expect(existsSync(join(dir, "ready"))).toBe(false)
 })
 
@@ -199,6 +197,8 @@ test("bad options refuse before touching anything", async () => {
   expect(f.tools.size).toBe(20)
   const g = fakeCtx({ ...options, nonce: undefined })
   await expect(setupWith(g.ctx, fakeImpl)).rejects.toThrow("option nonce is required")
+  const h = fakeCtx({ ...options, bridge: { machine: "rts-ffffffffffff" } })
+  await expect(setupWith(h.ctx, fakeImpl)).rejects.toThrow("bridge.machine must match machine")
 })
 
 test("an existing ready file is never overwritten", async () => {
@@ -230,4 +230,33 @@ test("execute.after appends one audit line with the input hash and no raw input"
   expect(rec).toMatchObject({ tool: "shell", callID: "call-1", status: "completed" })
   expect(rec.inputSha256).toBe(createHash("sha256").update(JSON.stringify(input)).digest("hex"))
   expect(rec.durationMs).toBeGreaterThanOrEqual(0)
+})
+
+// A stand-in for the rts binary: records argv and stdin, then answers like
+// `rts tool` would for the exit code it is told to use.
+function fakeRts(exitCode: number, stdout: string, stderr: string) {
+  const file = join(dir, "rts")
+  writeFileSync(
+    file,
+    `#!/bin/sh\nprintf '%s ' "$@" > "${dir}/argv"\ncat > "${dir}/stdin"\nprintf '%s' '${stdout}'\nprintf '%s' '${stderr}' >&2\nexit ${exitCode}\n`,
+  )
+  chmodSync(file, 0o755)
+  return file
+}
+
+test("a sandboxed call sends the bridge options and the input to rts tool on stdin", async () => {
+  const o = { ...options, rts: fakeRts(0, "hello from the guest", "") } as PluginOptions
+  const out = await makePluginTools(o).shell({ command: "echo hi" })
+  expect(out).toBe("hello from the guest")
+  expect(readFileSync(join(dir, "argv"), "utf8").trim()).toBe("tool shell")
+  expect(JSON.parse(readFileSync(join(dir, "stdin"), "utf8"))).toEqual({ options: options.bridge, input: { command: "echo hi" } })
+})
+
+test("a failed call or a lost machine throws with rts's message and never runs on the host", async () => {
+  const failing = { ...options, rts: fakeRts(1, "", "oldString not found") } as PluginOptions
+  await expect(makePluginTools(failing).edit({})).rejects.toThrow("edit failed: oldString not found")
+  const lost = { ...options, rts: fakeRts(3, "", "sandbox unavailable: sandbox removed") } as PluginOptions
+  await expect(makePluginTools(lost).shell({ command: "id" })).rejects.toThrow(/^sandbox unavailable: sandbox removed$/)
+  const missing = { ...options, rts: join(dir, "no-such-rts") } as PluginOptions
+  await expect(makePluginTools(missing).read({ path: "/etc/passwd" })).rejects.toThrow("cannot run")
 })

@@ -3,7 +3,6 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "bun test tests/unit",
-    "contain": "bun test tests/contain"
+    "test": "bun test tests/unit"
   }
 }
