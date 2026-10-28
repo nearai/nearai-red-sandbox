@@ -396,18 +396,26 @@ pub struct Deps {
     /// Chosen by the caller when it writes into sessions/<id>/ before the
     /// session starts (attestation.json); None picks a fresh one.
     pub session_id: Option<String>,
+    /// Raised by the attested forwarder; the session ends when it is set.
+    pub fatal: Option<Arc<crate::forwarder::Fatal>>,
 }
 
 impl Deps {
-    pub fn real(session_id: String) -> Result<Self, String> {
+    pub fn real(session_id: String, fatal: Option<Arc<crate::forwarder::Fatal>>) -> Result<Self, String> {
         Ok(Self {
             host: Arc::new(RealHost),
             runner: None,
             env: std::env::vars().collect(),
             rts: std::env::current_exe().map_err(|e| format!("cannot locate the rts binary: {e}"))?,
             session_id: Some(session_id),
+            fatal,
         })
     }
+}
+
+/// The forwarder's fatal reason, once raised.
+pub fn stop_reason(fatal: Option<&crate::forwarder::Fatal>) -> Option<String> {
+    fatal.and_then(crate::forwarder::Fatal::reason)
 }
 
 /// 12 lowercase hex characters from the OS.
@@ -532,6 +540,10 @@ fn interrupted(log: &Logger) -> Option<String> {
     })
 }
 
+fn stopped(deps: &Deps, log: &Logger) -> Option<String> {
+    stop_reason(deps.fatal.as_deref()).inspect(|why| log.log(&format!("stopping: {why}")))
+}
+
 /// The options opencode passes to the sandbox plugin (plugin/index.ts).
 pub fn plugin_options(p: &SessionPaths, cfg: &OperatorConfig, rts: &Path, nonce: &str, operator_home: &str) -> Value {
     json!({
@@ -566,7 +578,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         provider: &cfg.provider,
     })?;
     sweep_orphans(run, &mut |m| live.log.log(m))?;
-    if let Some(why) = interrupted(live.log) {
+    if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)) {
         return Err(why);
     }
 
@@ -582,7 +594,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         live.sb.copy_in(inputs, "/in").map_err(|e| e.to_string())?;
         live.log.log(&format!("copied {} to /in", inputs.display()));
     }
-    if let Some(why) = interrupted(live.log) {
+    if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)) {
         return Err(format!("{why} before opencode started"));
     }
 
@@ -621,7 +633,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
             transport_error = terminal.pump().err().map(|e| format!("terminal relay failed: {e}"));
         }
         if signalled.is_none() {
-            signalled = interrupted(live.log);
+            signalled = interrupted(live.log).or_else(|| stopped(deps, live.log));
         }
         transport_error.is_some() || signalled.is_some() || child.try_wait().ok().flatten().is_some()
     })
@@ -635,7 +647,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             return Ok(status.code().unwrap_or(1));
         }
-        if let Some(why) = interrupted(live.log) {
+        if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)) {
             return Err(why);
         }
         if Instant::now() >= next_sample {
@@ -1025,7 +1037,7 @@ mod tests {
     fn a_session_refuses_before_any_vm_exists_when_opencode_is_the_wrong_version() {
         let d = tempdir("sess");
         let f = Fake::new(|a| if a.last().map(String::as_str) == Some("--version") { out(0, "1.0.0", "") } else { out(0, "", "") });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into(), session_id: None };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into(), session_id: None, fatal: None };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         assert!(!f.calls().iter().any(|c| c.starts_with("machine")), "{:?}", f.calls());
         fs::remove_dir_all(d).unwrap();
@@ -1035,13 +1047,22 @@ mod tests {
     fn a_session_uses_the_id_its_caller_chose() {
         let d = tempdir("sess-id");
         let f = Fake::new(|a| if a.last().map(String::as_str) == Some("--version") { out(0, "1.0.0", "") } else { out(0, "", "") });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into(), session_id: Some("0123456789ab".into()) };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into(), session_id: Some("0123456789ab".into()), fatal: None };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         let log = fs::read_to_string(d.join("0123456789ab/launcher.log"));
         let entries: Vec<_> = fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name()).collect();
         fs::remove_dir_all(&d).unwrap();
         assert!(log.unwrap().contains("session 0123456789ab"), "{entries:?}");
         assert_eq!(entries, vec![std::ffi::OsString::from("0123456789ab")]);
+    }
+
+    #[test]
+    fn a_raised_fatal_stops_the_session() {
+        let f = crate::forwarder::Fatal::new();
+        assert_eq!(stop_reason(None), None);
+        assert_eq!(stop_reason(Some(&f)), None);
+        f.raise("signature-failed: x");
+        assert_eq!(stop_reason(Some(&f)).as_deref(), Some("signature-failed: x"));
     }
 
     #[test]
@@ -1065,6 +1086,7 @@ mod tests {
             env: vec![("MVM_HOME".into(), d.join("mvm").to_string_lossy().into_owned())],
             rts: "/x/rts".into(),
             session_id: None,
+            fatal: None,
         };
         let mut cfg = session_cfg(&sessions, &d, serve(MODELS_OK));
         cfg.opencode = "/nonexistent-opencode-rss-test".into();
@@ -1083,7 +1105,7 @@ mod tests {
             s if s.starts_with("machine create") => out(1, "", "image pull failed"),
             _ => healthy(a),
         });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into(), session_id: None };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into(), session_id: None, fatal: None };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         let calls = f.calls();
         assert!(calls.iter().any(|c| c.starts_with("machine rm rts-") && c.ends_with(" --force --yes")), "{calls:?}");

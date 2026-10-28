@@ -3,6 +3,7 @@ pub mod bridge;
 pub mod auth;
 pub mod inference;
 pub mod config;
+pub mod forwarder;
 pub mod copy;
 pub mod files;
 pub mod glob;

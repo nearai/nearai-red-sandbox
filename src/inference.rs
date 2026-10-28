@@ -99,7 +99,8 @@ fn embed_options(key: HostSecret) -> EmbedOptions {
     options
 }
 
-fn start_with_endpoint(
+/// Start IronWire with its NEAR AI backend at `endpoint` (the forwarder).
+pub fn start_with_endpoint(
     key: HostSecret,
     models: &[String],
     endpoint: &str,
