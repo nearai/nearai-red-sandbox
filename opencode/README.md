@@ -194,10 +194,11 @@ real suite passes. Unit tests, mocked browser callbacks, and local inference
 HTTP tests do not establish live Cloud sign-in or VM containment.
 
 The derived image in `guest/Dockerfile` was built with Colima for `linux/arm64`
-and published to the private Google Artifact Registry repository
+and published to the public Google Artifact Registry repository
 `us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images`. Its registry
 manifest digest is the default image pin in `src/config.rs`. Before the first
-launch on a machine, an authorized operator can cache the image in mvm:
+launch on a machine, an operator with Google Cloud registry access can cache
+the image in mvm:
 
 ```sh
 MVM_OCI_BEARER_TOKEN_US_WEST1_DOCKER_PKG_DEV="$(gcloud auth print-access-token)" \
@@ -205,6 +206,9 @@ MVM_OCI_BEARER_TOKEN_US_WEST1_DOCKER_PKG_DEV="$(gcloud auth print-access-token)"
   us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images/guest@sha256:56406743ca98389029c795a9cd55f0d1f55e569d57226c10e6c4f6f340cf9ac1
 ```
 
-The active Google Cloud identity needs Artifact Registry Reader access. The
-short-lived token is passed only to this explicit pull command; do not put it
-in the sandbox configuration or OpenCode environment.
+The image is public and anonymous Docker pulls work. However, a fresh anonymous
+pull using mvm 0.22.0 failed when Artifact Registry returned a 302 redirect for
+a layer; mvm rejected the redirect. The authenticated pull above succeeded; it
+requires an identity with Artifact Registry Reader access. The short-lived
+token is passed only to this explicit pull command; do not put it in the
+sandbox configuration or OpenCode environment.
