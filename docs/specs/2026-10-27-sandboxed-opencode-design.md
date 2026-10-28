@@ -14,7 +14,7 @@ tool effects land.
 
 | Topic | Decision |
 |---|---|
-| Harness | opencode, built from a pinned `dev` commit (plugin API V2, `@opencode/plugin` 2.2.0) |
+| Harness | opencode, a released v2 build pinned by version (v2.1.4, already installed). Plugin API V2; its tool API is identical in v2.1.4, v2.2.0 and `dev`. |
 | Where the harness runs | Host. Tools are replaced, not intercepted, so execution goes to the VM. |
 | Sandbox | mvm (`tinylabscom/mvm`, Apache-2.0), dev profile, `machine create` / `exec` / `rm` |
 | Inference | NEAR AI provider in the host opencode config. The key stays on the host; the VM never sees it. |
@@ -32,7 +32,7 @@ host (macOS)                                   mvm microVM (dev profile, no netw
 -------------------------------------          -------------------------------------
 launcher
   1. mvmctl machine create rts-<session>  ---> boots image, inputs copied in read-only
-  2. starts opencode (pinned dev commit)
+  2. starts opencode (pinned v2 version)
        |-- NEAR AI provider (key on host)
        '-- sandbox plugin
              bash/read/write/edit/glob/grep
@@ -44,8 +44,8 @@ launcher
 
 ### Launcher (`launcher/`)
 
-- Preflight: `mvmctl doctor`, and a check that the opencode binary matches the
-  pinned commit. Any failure refuses before a VM exists and names what is
+- Preflight: `mvmctl doctor`, and a check that the opencode binary reports the
+  pinned version. Any failure refuses before a VM exists and names what is
   missing.
 - Sweeps orphaned `rts-*` machines left by an earlier crash, before creating a
   new one.
@@ -133,7 +133,7 @@ Written test-first.
 launcher/        TypeScript CLI (bun): preflight, VM lifecycle, export, orphan sweep
 plugin/          opencode V2 plugin: tool transform, allowlist check, audit hooks
 image/           Nix mkGuest flake
-opencode/        pinned dev commit and opencode config (NEAR AI provider, plugin enabled)
+opencode/        pinned version and opencode config (NEAR AI provider, plugin enabled)
 tests/unit/      fake-executor tests
 tests/contain/   real-mvm containment suite and the leak-detection check
 sessions/        per-session out/ and tools.jsonl (gitignored)
@@ -153,8 +153,7 @@ docs/specs/      design documents
 
 Each is a short probe. None is assumed.
 
-1. opencode builds from the pinned `dev` commit and loads a V2 plugin from
-   config.
+1. opencode v2.1.4 loads a V2 plugin from config.
 2. The built-in tool IDs are exactly the six above, and `ctx.tool.list()`
    reflects removals.
 3. `ctx.mcp.transform` covers every MCP source: global config, project config,
@@ -164,6 +163,12 @@ Each is a short probe. None is assumed.
 
 ## Dependencies requiring approval before install
 
-- mvm (`mvmctl`), built from source.
-- opencode, built from the pinned `dev` commit.
-- bun, if not already installed.
+- mvm (`mvmctl`), built from source. Four advisories were published
+  2026-10-26, none with a patched version listed. Relevant here:
+  GHSA-x85r-49ww-2pxq (medium), where a guest can grow host memory through the
+  vsock device model. That is a denial-of-service on the host, not an escape,
+  but this design assumes a hostile guest. Not relevant: the externally signed
+  plan replay (not used), the GPU endpoint (not enabled), and the Firecracker
+  `/tmp` socket issue (Linux only).
+
+opencode v2.1.4 and bun 1.3.3 are already installed and need no new install.
