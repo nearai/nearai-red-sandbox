@@ -47,7 +47,7 @@ launcher
 
 ```ts
 interface Sandbox {
-  create(spec: { name: string; image: string; inputs?: string; memoryMiB: number; cpus: number }): Promise<void>
+  create(spec: { name: string; image: string; memoryMiB: number; cpus: number }): Promise<void>
   exec(argv: string[], opts: { timeoutMs: number; maxOutputBytes: number }):
     Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array; truncated: boolean }>
   copyIn(hostDir: string, guestDir: string): Promise<void>
@@ -58,6 +58,12 @@ interface Sandbox {
 
 The v1 implementation, `MvmSandbox`, shells out to `mvmctl`. Every call is
 argv-based; nothing is passed through a host shell.
+
+`create` runs exactly `mvmctl machine create <name> --image <digest-ref>
+--profile dev --cpus <n> --memory <MiB>M`, then `mvmctl machine start <name>`.
+It never passes `--net`, `--allow-host`, `--peer`, or `--gpu`; those are what
+would open a path out. Every `mvmctl` child gets stdin `/dev/null` and
+`GIT_CONFIG_GLOBAL` pointing at an empty file.
 
 `mvmctl machine exec` constraints measured on v0.22.0 (probe 4) shape the
 implementation:
@@ -89,6 +95,17 @@ implementation:
   trailer, means the machine is unusable: `exec` reports `sandbox
   unavailable` for that call and every later one.
 
+Root cause of the poisoning, read from the v0.22.0 source: `machine exec`
+journals a start (`machine/mod.rs:1448`) and a finish (`:1450`) around
+`exec_machine`, but the console path calls `std::process::exit` on a nonzero
+guest status (`vm/console.rs:320`), so the finish is never written. A host
+kill skips it the same way. `main` at `054ec4c3` has the same structure. No
+upstream issue was found as of 2026-10-27.
+
+The SDK (`mvm` on npm) may use a different vsock path for `exec` and
+`files.write`; that is the obvious v2 investigation if the argv protocol
+becomes a bottleneck, and it needs its own dependency approval.
+
 Other v0.22.0 behavior the implementation depends on (probe 5):
 
 - `machine create` accepts any string as `--image`, including an error
@@ -101,7 +118,11 @@ Other v0.22.0 behavior the implementation depends on (probe 5):
 - `image inspect` has no `--digest-ref` in v0.22.0 (that flag is on `main`).
   The digest comes from the `Resolved digest:` line of `image inspect
   <full reference>`.
-- An alpine machine (1 vCPU, 512 MiB) boots in about 2 s on the HVF backend. A second backend (for
+- An alpine machine (1 vCPU, 512 MiB) boots in about 2 s on the HVF backend.
+- No egress, measured on a dev-profile alpine machine created as above: the
+  only interface is `lo`; routes are blackholes for `100.64.0.0/10`,
+  `169.254.0.0/16`, and `169.254.169.254`; there is no `/etc/resolv.conf`;
+  `wget http://1.1.1.1` fails with `Network unreachable`. A second backend (for
 example apple/container) would implement the same interface and must pass the
 same containment suite.
 
@@ -189,7 +210,7 @@ Tool implementations, all on guest paths:
 | `shell` | `sh -c <command>` in the guest, with `workdir` applied by `cd` inside the wrapper. The only tool whose input is run as a shell command. `background: true` is refused, since exec is synchronous. |
 | `read` | Bounded guest read (`head -c`), path as an argv entry. Line slicing and the `<line>: <content>` prefix are applied on the host. A directory returns one entry per line. Text only; images and PDFs are not returned. |
 | `write` | Content as base64 argv chunks, decoded and appended in the guest into a temp file that is then renamed over the target. Path as an argv entry. |
-| `edit` | Read the file from the guest, apply the exact-match replacement on the host (a pure function), and write it back as `write` does. Fails if `oldString` is missing, or matches more than once without `replaceAll`. |
+| `edit` | Read the file from the guest, apply the exact-match replacement on the host (a pure function), and write it back as `write` does. Fails if `oldString` is missing, or matches more than once without `replaceAll`. Refuses, writing nothing, when the read reports `truncated` (file larger than `maxOutputBytes`), so a large file is never written back short. |
 | `glob` | Guest `find <root> -type f` (bounded), then the pattern matched on the host with `Bun.Glob`. |
 | `grep` | Guest `grep -rn`, with `-F` for `literal`, `-i` when `caseSensitive` is false, and `--include` for `include`. Pattern and root as argv entries. Exit status 1 (no match) is reported as no matches, not an error. |
 
@@ -252,7 +273,20 @@ Written test-first.
    - A guest `/out` containing a symlink to a host path, a hardlink, a `..`
      entry, and an oversized file: none is written to the host, and the export
      reports a rejection.
-3. Leak-detection check: replacing one tool's implementation with a stub that
+3. Exec-protocol tests (`tests/contain/`, real mvm), one fresh machine each:
+   - A guest command exiting 3, then `echo ok`: the first reports status 3,
+     the second succeeds (the wrapper prevents poisoning).
+   - `sleep 30` with a 3 s limit: a timeout error with status 137, and the
+     next exec succeeds.
+   - A 2 MiB stdout with `maxOutputBytes` 64 KiB: exactly 64 KiB returned,
+     `truncated: true`, and the reported full size is 2,097,152.
+   - A 200 KiB random binary `write` (several argv chunks), read back
+     byte-exact by sha256 in the guest.
+   - `edit` on a file larger than `maxOutputBytes` is refused and the file's
+     guest sha256 is unchanged.
+   - An exec result without a valid trailer, simulated by a fake executor in
+     the unit tests, marks the sandbox unavailable for every later call.
+4. Leak-detection check: replacing one tool's implementation with a stub that
    runs on the host must turn the containment suite red.
 
 ## Repository layout
