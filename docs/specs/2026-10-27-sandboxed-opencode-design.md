@@ -1,7 +1,9 @@
 # Sandboxed opencode sessions on mvm: design
 
 Date: 2026-10-27
-Status: approved 2026-10-27, then amended by probes 1-5 the same day
+Status: approved 2026-10-27, then amended by probes 1-5 the same day.
+Amended 2026-10-28 for attested NEAR AI inference (decisions by Zaki the same
+day; plan `docs/plans/2026-10-28-attested-inference.md`).
 
 ## Purpose
 
@@ -18,7 +20,10 @@ tool effects land.
 | Where the harness runs | Host. Tools are replaced, not intercepted, so execution goes to the VM. |
 | Sandbox | mvm (`tinylabscom/mvm`, Apache-2.0), dev profile, `machine create` / `exec` / `rm` |
 | Guest image | A digest-pinned OCI image (default `docker.io/library/alpine@sha256:e311ae74...ffb42`, the one the probes ran on). A Nix `mkGuest` image is deferred. |
-| Inference | NEAR AI through IronWire's local OpenAI façade (`127.0.0.1:8463/openai/v1`). IronWire holds the key, so neither opencode nor the VM sees it. A direct NEAR AI provider with the key in an env var remains possible. |
+| Inference | NEAR AI through IronWire embedded in `rts` (`ironwire_proxy::embed`, loopback port 0, OpenAI façade at `http://127.0.0.1:<port>/openai/v1`). IronWire holds the key, so neither opencode nor the VM sees it. An explicit external provider (any of `provider.id`, `provider.baseURL` or `provider.apiKeyEnv` set, `src/config.rs:219`) bypasses IronWire and the forwarder, so it is refused unless `--allow-unattested-provider` is passed. |
+| Models | By default, only NEAR AI's private abliterated models, by exact ID (launching 2026-10-29; on staging as of 2026-10-28; IDs not yet known, so the default is a marked placeholder that refuses to launch). `provider.models` is the allowlist. It is enforced three times: by `rts` config, by the plugin's model filter (exact IDs passed as a plugin option), and by the forwarder. |
+| Inference attestation | Before every session, in `rts`, after credentials and before IronWire starts: fetch NEAR AI's attestation report with a fresh nonce and verify it fail-closed (TDX quote with `dcap-qvl =0.7.0`, report data binding, compose measurement, NVIDIA GPU verdict). Any failure refuses the session. |
+| Inference path | IronWire's NEAR AI endpoint is an attested forwarder inside `rts` (`http://127.0.0.1:<port>/v1`), not `cloud-api.near.ai`. The forwarder pins upstream TLS to the attested certificate fingerprints, refuses models outside the allowlist, and verifies every response's ed25519 signature. A failed signature ends the session. Chosen over patching IronWire. |
 | VM egress | None. mvm default-deny, no `--allow-host`. |
 | Files in | An operator inputs directory, packed into a tar on the host and pushed in after boot as base64 argv chunks, extracted to `/in`. A copy, not a live mount. |
 | Files out | Only the guest's `/out`, copied to `sessions/<id>/out` before teardown. |
@@ -34,8 +39,9 @@ host (macOS)                                   mvm microVM (dev profile, no netw
 -------------------------------------          -------------------------------------
 launcher
   1. mvmctl machine create/start rts-<s> ---> boots image; inputs pushed to /in
+  0. credentials -> attest NEAR AI -> forwarder -> embedded IronWire
   2. starts opencode (pinned v2 version)
-       |-- NEAR AI provider (key on host)
+       |-- provider: IronWire -> forwarder (pinned TLS) -> NEAR AI
        '-- sandbox plugin
              shell/read/write/edit/glob/grep
                '-- mvmctl machine exec    ---> runs in guest, stdout/stderr/exit back
@@ -151,7 +157,19 @@ blocks.
 
 - Preflight: `mvmctl doctor`, and a check that the opencode binary reports the
   pinned version. Any failure refuses before a VM exists and names what is
-  missing.
+  missing. This local preflight reads no credentials (`local_preflight`,
+  `src/main.rs:110`), and attestation is not part of it.
+- Connect, for embedded inference only (`run_connected`, `src/main.rs:91`):
+  load or obtain the NEAR AI key (`auth::load_or_login`), then attest NEAR AI
+  for every allowed model, then start the attested forwarder seeded with the
+  verified fingerprints and keys, then start embedded IronWire with its NEAR
+  AI endpoint set to the forwarder. A failure at any step refuses the session
+  before a VM exists. The session ID is chosen before connect, so
+  `sessions/<id>/attestation.json` records a refused attestation too.
+- Refuses to launch, before any of the above, when `IRONWIRE_NEARAI_BASE_URL`
+  is set in its environment, when `provider.models` is still the placeholder,
+  or when the config selects an external provider without
+  `--allow-unattested-provider`.
 - Sweeps orphaned `rts-*` machines left by an earlier crash, before creating a
   new one.
 - Creates and starts `rts-<session-id>` from the configured image, runs
@@ -178,6 +196,236 @@ blocks.
   then runs the session with the host tools.
 - On normal exit, SIGINT or SIGTERM: export `/out`, then `mvmctl machine rm`.
   If the export fails, report it loudly and still remove the VM.
+- A fatal report from the forwarder (signature failure, pin failure after
+  re-attestation, or a refused model) is polled in the session loop beside
+  the signal check and ends the session the same way: export `/out`, then
+  remove the VM.
+
+### Inference attestation (`src/attest.rs`, `src/attest/`)
+
+Source: NEAR AI's attestation API reference
+(<https://docs.near.ai/api-reference/attestation/get-attestation-report>) and
+model verification guide (<https://docs.near.ai/cloud/verification/model>),
+read 2026-10-28 against production `cloud-api.near.ai`, and NEAR's TypeScript
+verifier `nearai/nearai-cloud-verifier` at `94554726` (`ts/model_verifier.ts`,
+`ts/chat_verifier.ts`) for the report shape. Staging may differ; check 6
+confirms it before the defaults point anywhere.
+
+In the connect step, after `auth::load_or_login` and before IronWire starts,
+`rts` calls, once per allowed model,
+
+```
+GET https://cloud-api.near.ai/v1/attestation/report
+    ?model=<id>&nonce=<64 hex>&signing_algo=ed25519&provider=near
+    &include_tls_fingerprint=true
+Authorization: Bearer <key>
+```
+
+with a fresh random 32-byte nonce per request. `provider=near` matters: the
+default picks the first provider to respond, which can also be `chutes`.
+`signing_algo=ed25519` matches IronWire's receipt scheme and NEAR's ed25519
+signing mode, so the per-response signatures below can be checked against the
+attested keys. The session is refused unless every check holds:
+
+- **Presence.** Each response has a `gateway_attestation` with a
+  `tls_cert_fingerprint`, and a non-empty `model_attestations`. Every allowed
+  model is covered.
+- **TDX quote.** Each `intel_quote` (gateway and every model attestation)
+  verifies with `dcap_qvl::verify::ring::verify` against collateral that `rts`
+  fetches itself from Intel PCS, with the host clock as `now`. The TCB status
+  must be `UpToDate`; `--allow-tcb-out-of-date` also accepts `OutOfDate` and
+  records it. Any other status refuses.
+- **Report data.** In the verified quote, `report_data[32..64]` equals the raw
+  nonce, and `report_data[0..32]` equals
+  `sha256(signing_address_bytes || tls_cert_fingerprint_bytes)`. For ed25519,
+  `signing_address` is the hex public key. An entry without a
+  `tls_cert_fingerprint` must instead carry the bare 32-byte key in
+  `report_data[0..32]` (upstream's non-TLS mode, `checkReportData`); the
+  gateway entry may not use that mode. Model entries must be ed25519 with a
+  32-byte key.
+- **Compose.** `mr_config_id` starts with `01` followed by
+  `sha256(app_compose)`, where `app_compose` is the string at
+  `info.tcb_info.app_compose` (`tcb_info` may arrive as a JSON string or an
+  object). By default that hash must also be in the pinned list in
+  `opencode/attestation-policy.json`, which is compiled into `rts`.
+  `--compose-policy mr-config-only` drops the list check and is recorded.
+- **GPU.** For every model attestation, `nvidia_payload.nonce` equals the
+  nonce sent. `rts` posts the payload unchanged to NVIDIA NRAS
+  (`https://nras.attestation.nvidia.com/v3/attest/gpu`). The overall token is
+  the JWT at `[0][1]` of the response. Its `alg` must be `ES384`, and its
+  signature must verify with `ring` (`ECDSA_P384_SHA384_FIXED`) against the key
+  whose `kid` matches, from
+  `https://nras.attestation.nvidia.com/.well-known/jwks.json`. Its `exp` must
+  be in the future, and `x-nvidia-overall-att-result` must be `true`.
+
+The result is the session's verified state: the set of gateway TLS
+fingerprints, and for each model the set of attested ed25519 signing keys.
+
+**Quote collateral.** `dcap-qvl` is built without `report`, so it has no
+network code. `rts` mirrors what `dcap-qvl` 0.7.0's own collateral client
+does (`src/collateral.rs:116-135`, `:458-560`) against Intel PCS
+(`https://api.trustedservices.intel.com`). It reads the FMSPC and the PCK CA
+(`processor` or `platform`) from the quote's PCK chain, then fetches:
+
+| Item | URL | Taken from the response |
+|---|---|---|
+| PCK CRL | `/sgx/certification/v4/pckcrl?ca=<ca>&encoding=der` | body (DER); header `SGX-PCK-CRL-Issuer-Chain` |
+| TCB info | `/tdx/certification/v4/tcb?fmspc=<FMSPC>&update=standard` | `tcbInfo` (the exact bytes Intel signed) and `signature` (hex); header `TCB-Info-Issuer-Chain` or `SGX-TCB-Info-Issuer-Chain` |
+| QE identity | `/tdx/certification/v4/qe/identity?update=standard` | `enclaveIdentity` and `signature`; header `SGX-Enclave-Identity-Issuer-Chain` |
+| Root CA CRL | `https://certificates.trustedservices.intel.com/IntelSGXRootCA.der` | body (DER) |
+
+The issuer-chain headers are percent-encoded PEM. Against Intel PCS,
+`dcap-qvl` does not use `/rootcacrl`. It reads the CRL distribution point
+from the root certificate, which is the URL above (checked 2026-10-28 on the
+`TrustedRootCA.der` shipped in the crate). The PCK chain itself comes from
+the quote (certification data type 5); any other type refuses.
+
+**What the checks trust.** Intel's PCS and root CA (quote collateral), and
+NVIDIA's NRAS and its JWKS (the GPU verdict), each over CA-validated TLS. The
+host clock supplies the verification time. `rts` contacts all three during
+connect.
+
+**The first fetch is not pinned.** `rts` learns the fingerprint from the
+report, so the report fetch itself is ordinary CA-validated TLS, and it
+carries the API key. An interception there would expose the billing
+credential, not session data: no prompt is sent until the forwarder holds a
+verified fingerprint. Re-attestation during a session (below) is unpinned
+for the same reason.
+
+**Why not upstream's verifier.** `nearai-cloud-verifier` at `94554726` is a
+walkthrough that logs results and does not fail closed: `checkReportData`
+returns `binds_address` and `embeds_nonce` and `verifyAttestation` ignores
+them; the GPU nonce and the NRAS verdict are printed; the NRAS JWT payload is
+base64-decoded but its signature is never checked; `mr_config` against the
+compose hash is printed; a missing `gateway_attestation` or
+`model_attestations` returns normally. Its TDX quote library,
+`@phala/dcap-qvl-node` `^0.3.3`, is affected by GHSA-796p-j2gh-9m2q
+(critical, published 2026-01-26, every published version, no patch): the QE
+Identity signature is never checked, so a forged quoting enclave can sign
+quotes that verify. Upstream's Python verifier requires `dcap-qvl>=0.3.2`,
+which also admits vulnerable versions. The Rust crate `dcap-qvl` 0.7.0 is past
+the 0.3.9 fix and checks the QE Identity signature (`verify.rs:753-801`).
+`rts` reimplements the checks in Rust, each refusing, and uses `dcap-qvl`
+only for the quote. NEAR should be told about the advisory upstream.
+
+| Upstream behavior (`94554726`) | `rts` |
+|---|---|
+| `binds_address` / `embeds_nonce` computed, then ignored | Either false refuses |
+| Quote `verified: false` is logged | Refuses |
+| GPU nonce match and NRAS verdict are logged | Refuses unless the nonce matches and the verdict is `true` |
+| NRAS JWT payload decoded, signature not checked | ES384 signature verified against the JWKS key with the token's `kid` before the verdict is read |
+| `mr_config` vs compose hash is logged | Refuses on mismatch; by default the hash must also be pinned |
+| Missing `gateway_attestation` or `model_attestations` returns | Refuses |
+| TCB `OutOfDate` accepted | Refused unless `--allow-tcb-out-of-date` |
+
+**Compose policy (operational choice).** Pinning the compose hash proves which
+gateway and model builds are running, but every NEAR deploy then refuses
+sessions until someone adds the new hash to `opencode/attestation-policy.json`
+and rebuilds. `--compose-policy mr-config-only` accepts any compose that
+`mr_config_id` vouches for: it proves the compose shown is the one running,
+not that it is a known build. The default is the pinned list, and the list
+starts empty, so sessions refuse until check 6 records the first hashes.
+
+**TCB `OutOfDate` (operational choice).** Upstream accepts it. `rts` refuses it
+by default, so if NEAR's platform is `OutOfDate` on launch day, every session
+refuses until the operator passes `--allow-tcb-out-of-date`.
+
+**Record.** `sessions/<id>/attestation.json` holds every report as received,
+the nonces, the verified fingerprints, the signing keys per model, the
+compose hashes, the TCB statuses, the NRAS `kid`s and verdicts, the
+overrides in force, and a `status`: `verified`, `refused` (with the reason),
+`unattested-provider`, `pin-failed`, `model-refused` or `signature-failed`.
+It is written atomically (temp file and rename) on every change.
+
+### Attested forwarder (`src/forwarder.rs`, `src/forwarder/`)
+
+Attestation proves what answered `rts`. Without more, IronWire would then open
+its own TLS connections to `cloud-api.near.ai` that nothing ties to the
+attested gateway: IronWire `bf8b90b` does no attestation-report verification
+and no TLS pinning, and checks receipts only in the background, after the
+answer was delivered (`ironwire_proxy/src/proof.rs`). `rts` closes the gap
+with a forwarder between IronWire and NEAR AI, instead of patching IronWire.
+
+- **Placement.** A loopback HTTP server in the `rts` process
+  (`127.0.0.1`, port 0), on its own thread and Tokio runtime, like the
+  embedded IronWire worker (`src/inference.rs:150-200`). IronWire's generated
+  config sets the `nearai` backend's `base_url` to
+  `http://127.0.0.1:<port>/v1` (`inference::start_with_endpoint`,
+  `src/inference.rs:99`). The pinned IronWire already accepts this: the
+  existing test `the_selected_model_and_host_key_reach_only_the_local_test_upstream`
+  points it at plain-HTTP loopback and receives
+  `POST /v1/chat/completions` with the key. IronWire attaches a credential
+  only to the configured host, and loopback counts
+  (`ironwire_upstream/src/credential_host.rs:45-52`).
+- **`IRONWIRE_NEARAI_BASE_URL`.** `rts` refuses to launch when it is set. In
+  `bf8b90b` the config file's `base_url` wins over that variable
+  (`ironwire_proxy/src/embed.rs:1681-1689`), so this is defense in depth
+  against a later IronWire revision changing the precedence.
+- **The key.** IronWire keeps the key and sends it as `Authorization` on
+  each completion; the forwarder passes that header through unchanged and
+  does not add one of its own. The forwarder's own calls (re-attestation and
+  signature fetches) use the same key, which `rts` already holds in memory
+  for the attestation step. Holding it in the forwarder for completions too
+  would add no protection: it is the same process and the same secret. It
+  would also turn the forwarder's loopback port into a credentialed proxy any
+  local process could spend through. With pass-through, a request without
+  the key gets NEAR AI's 401.
+- **Paths.** Only `POST /v1/chat/completions` is forwarded. IronWire with
+  `capture.receipts = false` never fetches `/v1/signature`
+  (`ironwire_proxy/src/pipeline.rs:672`), and with startup probes off it
+  never probes `/v1/models`. Anything else gets 404 and a log line, without
+  contacting upstream.
+- **Pinning.** Upstream TLS uses `rustls` 0.23 with a custom
+  `ServerCertVerifier`. It runs the normal `webpki` validation against the
+  native root store (as `reqwest`'s `rustls-tls-native-roots` does today),
+  and then requires `sha256(leaf DER)` to be in the session's attested
+  fingerprint set. It is installed on the upstream client itself
+  (`reqwest::ClientBuilder::use_preconfigured_tls`), so every connection the
+  pool holds passed it at its handshake. The earlier TypeScript design
+  measured why that matters (bun 1.3.3, 2026-10-28): a per-request
+  `checkServerIdentity` was skipped when the pool reused a connection, and a
+  wrong pin succeeded. TLS session resumption is disabled on this client, so
+  every handshake presents a certificate to the verifier.
+- **Fingerprint set and re-attestation.** Connect seeds the set. A
+  connection whose certificate is not in it fails during the handshake,
+  before any request byte is sent. The forwarder then re-runs the full
+  attestation, up to three times, adding any newly verified fingerprints and
+  keys, and retries the request once. If it still fails, IronWire gets a 502,
+  `attestation.json` is marked `pin-failed`, and the session ends. On
+  2026-10-28 the gateway presented a Let's Encrypt certificate valid until
+  2026-12-30, so rotation during a long session is expected, not theoretical.
+- **Model allowlist, third layer.** The forwarder parses the request body and
+  refuses any `model` not in `provider.models` with 403, before contacting
+  upstream. That can only happen if the plugin filter and IronWire's own
+  catalogue were bypassed, so it is also fatal (`model-refused`).
+- **Compression.** The forwarder sends `Accept-Encoding: identity` upstream,
+  so the bytes it hashes are the bytes NEAR AI signs.
+- **Per-response signatures.** For each completion, the forwarder hashes the
+  exact request bytes it sent and the exact response bytes it received,
+  streamed or not, while relaying them; nothing is buffered before delivery.
+  It takes the chat ID from `id` in the JSON body, or from the first SSE
+  `data:` event. After the response ends, off the response path, it fetches
+  `GET /v1/signature/{id}?model=<id>&signing_algo=ed25519` over the pinned
+  client, retrying 404 with backoff inside a 10 s window (to be measured in
+  check 6). It then requires: `signing_algo` is `ed25519`; `text` is
+  `<model>:<request sha256>:<response sha256>` (or the two-part form without
+  a model) with the model equal to the request's and both hashes equal to its
+  own; `signing_address` is a key attested for that model this session; and
+  `ed25519-dalek`'s `verify_strict` accepts `signature` over `text`. The
+  receipt shape matches IronWire's `RawReceipt`
+  (`ironwire_upstream/src/receipt.rs`). Any failure, including a missing
+  signature at the end of the window or a broken upstream stream, is fatal:
+  `attestation.json` is marked `signature-failed` and the session is torn
+  down (export `/out`, remove the VM). A non-2xx upstream answer carries no
+  chat ID and expects no signature; it is logged, not fatal.
+- **Why streaming is allowed.** Pinning protects confidentiality before any
+  request byte leaves the host. Signatures add integrity and audit after the
+  fact. A response that fails its check has already reached the model, but its
+  only possible effect is tool calls inside the VM. So responses are relayed as
+  they arrive, and a failure ends the session.
+- **Audit.** `sessions/<id>/inference.jsonl`, one line per completion: time,
+  chat ID, model, streamed or not, request and response sha256, signing key,
+  and result.
 
 ### Sandbox plugin (`plugin/`)
 
@@ -198,12 +446,16 @@ network), `opencode_worktree_create` / `_remove` (host git), `subagent`,
   tool not on the list. opencode re-runs transforms on reload, so the
   transform is idempotent.
 - `ctx.mcp.transform` removes every MCP server.
-- `ctx.model.transform` keeps only the NEAR AI provider's models. With no
-  credentials configured, v2.1.4 still offers about 80 models from opencode's
-  own hosted service; without this step a prompt could go there instead of
-  NEAR AI.
-- After setup, `ctx.tool.list()` must equal the seven-tool list exactly and
-  every remaining model must be NEAR AI. Anything else makes setup throw, the
+- `ctx.model.transform` keeps only models whose provider is the session's
+  provider and whose ID is in the `models` plugin option, the exact
+  `provider.models` list. With no credentials configured, v2.1.4 still offers
+  about 80 models from opencode's own hosted service; without this step a
+  prompt could go there instead of NEAR AI. Matching on the provider alone
+  (the filter before 2026-10-28, `plugin/index.ts:103-105`) is not enough once
+  the allowlist names specific private models.
+- After setup, `ctx.tool.list()` must equal the seven-tool list exactly, and
+  the enabled models must be exactly the `models` option (non-empty, every one
+  from the session's provider). Anything else makes setup throw, the
   ready file is never written, and the launcher refuses the session.
 - A `tool` `execute.before` hook rejects any tool name outside the allowlist, a
   second layer behind the transform.
@@ -254,6 +506,19 @@ Every failure ends in a refusal or a tool error. Nothing falls back to the host.
   GHSA-x85r-49ww-2pxq (guest-driven host memory growth through vsock), the
   launcher also samples the per-VM host process RSS and tears the session down
   if it exceeds a configured ceiling.
+- Attestation fails in connect: no forwarder, IronWire or VM is started and
+  opencode never starts. The reason is printed and written to
+  `sessions/<id>/attestation.json` with status `refused`. PCS, NRAS or NEAR AI
+  being unreachable is a failure, not a skip.
+- `IRONWIRE_NEARAI_BASE_URL` set, `provider.models` still the placeholder, or
+  an external provider without `--allow-unattested-provider`: refused before
+  credentials are read.
+- Mid-session, the TLS pin still fails after three re-attestations, a model
+  outside the allowlist reaches the forwarder, or a response signature is
+  missing, late or wrong: the forwarder returns an error to IronWire, refuses
+  every later request, records the status in `attestation.json`, and raises a
+  fatal report. The session loop sees it and tears the session down (export
+  `/out`, then remove the VM).
 
 ## Audit
 
@@ -261,6 +526,14 @@ Every failure ends in a refusal or a tool error. Nothing falls back to the host.
 - The launcher writes `sessions/<id>/tools.jsonl`, one line per tool call: tool
   name, call ID, SHA-256 of the input, status, and duration. Inputs and outputs
   are not stored in this log.
+- `sessions/<id>/attestation.json`: every report as received, the nonces, the
+  verified fingerprints and per-model signing keys, compose hashes, TCB
+  statuses, NRAS results, any re-attestations, the overrides in force
+  (`--allow-tcb-out-of-date`, `--compose-policy`,
+  `--allow-unattested-provider`), and the final status.
+- `sessions/<id>/inference.jsonl`: one line per completion, with chat ID,
+  model, request and response hashes, signing key, and signature result.
+  Prompts and completions are not stored.
 
 ## Testing
 
@@ -296,6 +569,31 @@ Written test-first.
      the unit tests, marks the sandbox unavailable for every later call.
 4. Leak-detection check: replacing one tool's implementation with a stub that
    runs on the host must turn the containment suite red.
+5. Attestation and forwarder tests (plan `2026-10-28-attested-inference.md`),
+   all offline except the last. HTTP and the clock are injected everywhere.
+   - `dcap-qvl`'s own sample TDX quote and collateral, vendored as fixtures,
+     verify at a fixed `now` inside the collateral window, through `rts`'s PCS
+     fetch code served by a fake HTTP client. The same quote with one byte
+     flipped is refused, and so is a `now` past the window.
+   - NRAS tokens signed in the test with an openssl-generated P-384 key: a
+     good token passes; a wrong key, unknown `kid`, other `alg`, expired
+     token, edited payload, false verdict or foreign nonce is refused.
+   - Constructed reports with a fake quote verifier: each fail-closed check in
+     the table above refuses on its own tampered input, and a good report
+     yields the expected fingerprints and keys and writes `attestation.json`.
+   - The forwarder against a local TLS upstream using openssl-generated test
+     certificates: an unpinned certificate is refused before any request byte
+     arrives, a rotated certificate is accepted after one re-attestation, a
+     model outside the list gets 403 without an upstream connection, and
+     IronWire's requests arrive through the forwarder with the key.
+   - Signatures with an ed25519 key made in the test: good streamed and
+     non-streamed responses pass and are logged; a wrong hash, unknown key,
+     bad signature, or a 404 past the window ends the session and marks
+     `signature-failed`.
+   - An opt-in live test against NEAR AI staging, ignored unless its
+     environment variables are set (check 6).
+   The five pre-existing `copy::tests` failures (host tar fixtures carry a pax
+   `x` header the extractor refuses) are the baseline and must not grow.
 
 ## Repository layout
 
@@ -303,12 +601,23 @@ Written test-first.
 src/             rts (Rust): Sandbox trait, MvmSandbox, hostile-archive extractor,
                  the six tools, `rts tool` bridge, and the launcher (preflight,
                  VM lifecycle, export, orphan sweep)
-plugin/          opencode V2 plugin shim: tool transform, allowlist check, audit
-                 hooks; each tool call spawns `rts tool`
-opencode/        pinned version and opencode config (IronWire provider, plugin enabled)
+src/attest.rs    attestation orchestration, policies, attestation.json
+src/attest/      tdx.rs (PCS collateral, dcap-qvl), nras.rs (GPU), report.rs
+                 (report shape, report_data and compose checks), http.rs (seam)
+src/forwarder.rs the attested forwarder; forwarder/pin.rs (rustls verifier),
+                 forwarder/signature.rs (receipts, inference.jsonl)
+vendor/dcap-qvl-0.7.0/  the reviewed dcap-qvl source, used as a path dependency
+plugin/          opencode V2 plugin shim: tool transform, tool and model
+                 allowlist checks, audit hooks; each tool call spawns `rts tool`
+opencode/        pinned version, opencode config notes, attestation-policy.json
+                 (pinned compose hashes, compiled into rts)
 tests/unit/      plugin shim tests (Rust unit tests live beside the code in src/)
+tests/fixtures/  dcap/ (dcap-qvl sample quote and collateral), nras/ and tls/
+                 (openssl-generated test keys and certificates)
 tests/contain/   real-mvm containment suite and the leak-detection check
-sessions/        per-session out/ and tools.jsonl (gitignored)
+tests/live_attest.rs  opt-in live attestation test against NEAR AI staging
+sessions/        per-session out/, tools.jsonl, attestation.json,
+                 inference.jsonl (gitignored)
 docs/specs/      design documents
 ```
 
@@ -343,6 +652,56 @@ Each is a short probe. None is assumed.
    the constraints under the sandbox interface.
 5. Done 2026-10-27: dev-profile `machine create` / `start` / `exec` /
    `rm --force --yes` work on the macOS HVF backend.
+6. Open: on NEAR AI staging, record the base URL, the exact IDs of the
+   private abliterated models (they replace the `provider.models`
+   placeholder), how the API marks a model as private, and one real
+   attestation report per model, saved as fixtures. Confirm the report shape
+   matches production: `gateway_attestation` with `tls_cert_fingerprint`,
+   `model_attestations` with ed25519 `signing_address`, `nvidia_payload` and
+   `info.tcb_info.app_compose`; whether model entries carry a
+   `tls_cert_fingerprint`; and the TCB status of each quote. Record the
+   compose hashes into `opencode/attestation-policy.json`. Measure how soon
+   `GET /v1/signature/{chat_id}` answers after a completion ends, streamed and
+   not, which sets the 10 s window. Confirm the signature `text` hashes the
+   raw request and response bytes as sent with `Accept-Encoding: identity`
+   (upstream's non-streaming example hashes `JSON.stringify(response)`), and
+   which `signature_kind` model receipts carry. Check whether the gateway
+   certificate below is the attested `tls_cert_fingerprint`, and whether
+   every gateway instance shares it. Repeat against production after the
+   2026-10-29 launch, before the default config points there.
+7. Done 2026-10-28, for attestation and the forwarder:
+   - `cloud-api.near.ai` presented leaf sha256
+     `5664580137f5b2abc8b2cc9ef53dc2bd7cd79b6ffc9f840dbbfca708a2c51022` on
+     three handshakes (and on four earlier the same day): `CN=cloud-api.near.ai`,
+     issuer Let's Encrypt `YE1`, notAfter 2026-12-30.
+   - NVIDIA's JWKS served 212 keys, all `kty EC`, `crv P-384`, each with a
+     two-certificate `x5c` and a dated `kid`; keys rotate daily, so the JWKS
+     is fetched per attestation.
+   - `dcap-qvl` 0.7.0 (crates.io tarball, sha256
+     `b992c9511adf7135ae7c63c023c9303a3615c0f38d7b39514dcc262f91c6adda`): the
+     collateral client and PCS URLs are behind `report`
+     (`src/lib.rs:133-140`); `verify::ring::verify(quote, &collateral, now)`
+     returns `VerifiedReport { status: String, report, .. }`
+     (`src/verify.rs:1718`); `intel::quote_fmspc` and `intel::quote_ca` read
+     the PCK chain without `report`. Its sample TDX quote verifies
+     `UpToDate` with no advisories (its own test, `tests/verify_quote.rs:435`),
+     and the sample collateral is valid from 2025-06-19T10:32:27Z to
+     2025-07-19T10:00:35Z.
+   - IronWire `bf8b90b`: the config `base_url` wins over
+     `IRONWIRE_NEARAI_BASE_URL`; the NEAR AI backend posts to
+     `<base>/chat/completions` and fetches receipts only with
+     `capture.receipts` on; receipts are ed25519 over
+     `<model>:<req sha256>:<resp sha256>`.
+   - Baseline before any change, with `RUSTFLAGS="-D warnings"
+     CARGO_INCREMENTAL=0`: `cargo test --lib` = 136 passed, 5 failed,
+     1 ignored. The five are `copy::tests` (`a_long_name_is_refused`,
+     `a_symlink_to_a_host_path_is_refused`, `a_hardlink_is_refused`,
+     `copy_out_is_byte_exact_across_slices`, `an_oversized_file_is_refused`):
+     the host-built tar fixtures carry a pax `x` header
+     (`PaxHeader/currentdir`) that the extractor refuses.
+   - Carried from the earlier TypeScript design: bun 1.3.3 `fetch` skipped
+     `tls.checkServerIdentity` on a pooled connection (the reason the
+     verifier sits on the client here).
 
 ## Host setup notes (measured 2026-10-27)
 
@@ -375,3 +734,52 @@ Each is a short probe. None is assumed.
   `/tmp` socket issue (Linux only).
 
 opencode v2.1.4 and bun 1.3.3 are already installed and need no new install.
+
+For attestation and the forwarder (2026-10-28):
+
+- **`dcap-qvl =0.7.0`**, the only new crate. Approved 2026-10-28 by Zaki,
+  with the conditions already recorded for near-ai-coordinator and Books:
+  `default-features = false, features = ["std", "ring", "default-x509"]`,
+  never `report` (its PCS fetch code, which also pulls a second `reqwest`);
+  vendor the source after a read-through, as a path dependency at
+  `vendor/dcap-qvl-0.7.0` from the crates.io tarball above; targeted review of
+  `verify.rs` and `x509.rs`; re-review on any version bump. The host clock is
+  `now`, under the same exception as near-ai-coordinator. MIT, Phala Network.
+  Its `std` feature turns on `serde_json/preserve_order`, which this graph
+  already has (`serde_json` depends on `indexmap` in `Cargo.lock`). It brings
+  the RustCrypto `der` / `x509-cert` stack, `parity-scale-codec`,
+  `scale-info`, `chrono`, `asn1_der`, `pem` and the `dcap-qvl-webpki` fork;
+  the exact count of new lockfile packages is recorded when it is added.
+- **Promoted from transitive to direct, no new package**, each at its
+  `Cargo.lock` version today: `ring` 0.17.14 (ES384 for NRAS, already
+  approved for near-ai-coordinator), `ed25519-dalek` 2.2.0 (`verify_strict`),
+  `rustls` 0.23.46 and `rustls-native-certs` 0.8.5 (the pinned verifier and
+  its roots), `hyper` 1.12.0, `hyper-util` 0.1.21, `http-body-util` 0.1.5 and
+  `bytes` 1.12.1 (the forwarder's server and streaming bodies), `hex` 0.4.3.
+  `serde_json` gains its `raw_value` feature, to keep Intel's signed
+  `tcbInfo` bytes exact. These change `Cargo.toml` but should add no
+  lockfile package; the plan checks that with a lockfile diff.
+- **Test certificates and keys** are openssl-generated PEM and PKCS#8
+  fixtures committed under `tests/fixtures/`. No `rcgen`, no `p384`.
+- The policy file is JSON, not TOML: `toml` is only transitive here, and
+  `serde_json` is already direct.
+
+Rejected:
+
+- `@phala/dcap-qvl-node` (upstream's choice): GHSA-796p-j2gh-9m2q, critical,
+  every published version (`<= 0.3.3`), no patch; the QE Identity signature
+  is never verified.
+- The npm `nearai-cloud-verifier` `0.0.1-alpha.1` (2025-10-29): no repository
+  link, stale, and depends on the vulnerable package. The repo's own verifier
+  at `94554726` does not fail closed (see Inference attestation).
+- `@phala/dcap-qvl` 0.7.0 (pure JS): about 20 packages, including `elliptic`
+  with an open low-severity advisory and no patch, and it is TypeScript in a
+  Rust launcher.
+- `dcap-qvl` with `report` or default features: a second `reqwest` and PCCS
+  code `rts` does not need; `rts` fetches from Intel PCS itself.
+- `rcgen` and `p384`: openssl fixtures and `ring` cover the same ground.
+- `@noble/curves` and `@noble/hashes`, approved for the TypeScript design:
+  not needed, because `rts` asks for ed25519 signatures instead of ECDSA with
+  EIP-191 recovery.
+- Patching IronWire to pin and verify inline: a fork of a fast-moving
+  dependency, and its receipt check is deliberately off the response path.
