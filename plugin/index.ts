@@ -29,6 +29,8 @@ export type PluginOptions = {
   // The operator's real HOME, for mvmctl's own state. opencode itself runs
   // with HOME pointed at the session directory.
   mvmHome?: string
+  // When set, the verified tool, MCP and model state is written here as JSON.
+  debugFile?: string
 }
 
 const DESCRIPTIONS: Record<ToolName, string> = {
@@ -70,6 +72,7 @@ function checkOptions(o: any): PluginOptions {
     maxOutputBytes: int("maxOutputBytes"),
     cwd: typeof o.cwd === "string" ? o.cwd : undefined,
     mvmHome: typeof o.mvmHome === "string" && o.mvmHome !== "" ? o.mvmHome : undefined,
+    debugFile: typeof o.debugFile === "string" && o.debugFile !== "" ? o.debugFile : undefined,
   }
 }
 
@@ -134,17 +137,26 @@ export async function setupWith(ctx: any, makeImpl: (o: PluginOptions) => Record
   const strays = listOf(await ctx.model.list()).filter((m: any) => m.providerID !== o.provider && m.enabled !== false)
   if (strays.length) throw new Error(`model outside provider ${o.provider}: ${strays.map((m: any) => `${m.providerID}/${m.id}`).join(", ")}`)
 
+  const providerModels = listOf(await ctx.model.list()).filter((m: any) => m.providerID === o.provider).length
+  const verified = { tools: [...ids].sort(), mcp: servers, providerModels }
+  console.error(`rts-sandbox: verified tools ${verified.tools.join(",")}; mcp none; ${providerModels} ${o.provider} models`)
+  if (o.debugFile) await writeFile(o.debugFile, JSON.stringify(verified) + "\n", { mode: 0o600 })
+
   // "wx": never follow or overwrite an existing path.
   await writeFile(o.readyFile, o.nonce, { flag: "wx", mode: 0o600 })
 }
 
+// The tool implementations the plugin installs. Exported so the
+// containment suite exercises exactly this construction.
+export function makePluginTools(o: PluginOptions) {
+  const leak = process.env.RTS_TEST_LEAK === "shell" ? ("shell" as const) : undefined
+  if (leak) console.error("rts-sandbox: RTS_TEST_LEAK=shell is set; shell runs ON THE HOST (leak check only)")
+  const sb = MvmSandbox.attach(o.machine, spawnRunner(o.mvmctl, o.emptyGitConfig, o.mvmHome ? { HOME: o.mvmHome } : {}))
+  return makeTools(sb, { timeoutMs: o.timeoutMs, maxOutputBytes: o.maxOutputBytes, cwd: o.cwd, leak })
+}
+
 export async function setup(ctx: any) {
-  await setupWith(ctx, (o) => {
-    const leak = process.env.RTS_TEST_LEAK === "shell" ? ("shell" as const) : undefined
-    if (leak) console.error("rts-sandbox: RTS_TEST_LEAK=shell is set; shell runs ON THE HOST (leak check only)")
-    const sb = MvmSandbox.attach(o.machine, spawnRunner(o.mvmctl, o.emptyGitConfig, o.mvmHome ? { HOME: o.mvmHome } : {}))
-    return makeTools(sb, { timeoutMs: o.timeoutMs, maxOutputBytes: o.maxOutputBytes, cwd: o.cwd, leak })
-  })
+  await setupWith(ctx, makePluginTools)
 }
 
 export default { id: "rts-sandbox", setup }

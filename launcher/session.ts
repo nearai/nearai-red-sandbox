@@ -2,7 +2,7 @@
 // isolated opencode launch, plugin handshake, RSS ceiling, and teardown
 // (export /out, then remove the VM) that runs exactly once.
 
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { DEFAULT_COPY_LIMITS } from "../sandbox/copy.ts"
@@ -322,6 +322,10 @@ export async function runSession(cfg: OperatorConfig, deps: { hostExec?: HostExe
       mvmHome: operatorHome,
     }
     writeOpencodeConfig(p.configDir, { pluginDir: PLUGIN_DIR, pluginOptions, provider: cfg.provider })
+    // opencode loads opencode.json, AGENTS.md and .opencode/ from its cwd.
+    if (readdirSync(p.work).length) throw new Error(`work directory is not empty: ${p.work}`)
+    const found = ancestorConfig(p.work)
+    if (found.length) throw new Error(`opencode would load config from: ${found.join(", ")}`)
     const launch = opencodeLaunch(p, cfg.opencode, env)
     child = Bun.spawn(launch.argv, { cwd: launch.cwd, env: launch.env, stdin: "inherit", stdout: "inherit", stderr: "inherit" })
     const exited = child.exited.then((code) => {
