@@ -178,7 +178,7 @@ Written test-first.
    executor: argv construction, line ranges, edit semantics, truncation, and
    timeout mapping.
 2. Containment tests (`tests/contain/`) run against real mvm:
-   - `write` and `bash touch` of a sentinel path: present in the guest, absent
+   - `write` and `shell touch` of a sentinel path: present in the guest, absent
      on the host.
    - A network connection attempt from inside the guest fails.
    - With an MCP server configured and a second plugin adding a stray tool, the
