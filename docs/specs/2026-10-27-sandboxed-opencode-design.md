@@ -84,6 +84,11 @@ blocks.
   `XDG_STATE_HOME` at a per-session directory, so no global opencode plugins,
   config, auth, or session history load. The only config is the one the
   launcher writes.
+- Runs opencode with its working directory set to an empty, launcher-created
+  directory, never the operator's project. opencode loads `opencode.json` and
+  `AGENTS.md` from its working directory, and a project `opencode.json` can
+  declare local MCP servers that opencode spawns as host processes (probe 3).
+  Operator inputs reach the VM through the inputs mount only.
 - Plugin handshake: the launcher passes a random per-session nonce as a plugin
   option. After its allowlist checks pass, the plugin writes the nonce to a
   ready file. If the ready file does not appear with the right nonce before a
@@ -224,8 +229,12 @@ Each is a short probe. None is assumed.
    path is skipped with only a warning (hence the handshake).
 2. Done 2026-10-27: the 20 built-in tool IDs are as listed under the sandbox
    plugin, and `ctx.tool.list()` reflects a removal made in the transform.
-3. `ctx.mcp.transform` covers every MCP source: global config, project config,
-   and plugin-added servers.
+3. Done 2026-10-27: removing servers in `ctx.mcp.transform` stops local MCP
+   servers from both global and project config from spawning. Control: with
+   removal off, both spawned and wrote their sentinel files. Not covered:
+   servers added by another plugin after ours. The XDG isolation and the
+   launcher-owned working directory mean no other plugin loads, and the plugin
+   also checks that `ctx.mcp.list()` is empty before writing the ready file.
 4. `mvmctl machine exec` passes stdin through and returns the guest exit code.
 5. Dev-profile `machine create` / `exec` / `rm` works on the macOS HVF backend.
 
