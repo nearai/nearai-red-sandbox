@@ -106,8 +106,9 @@ Root cause of the poisoning, read from the v0.22.0 source: `machine exec`
 journals a start (`machine/mod.rs:1448`) and a finish (`:1450`) around
 `exec_machine`, but the console path calls `std::process::exit` on a nonzero
 guest status (`vm/console.rs:320`), so the finish is never written. A host
-kill skips it the same way. `main` at `054ec4c3` has the same structure. No
-upstream issue was found as of 2026-10-27.
+kill skips it the same way. `main` at `054ec4c3` has the same structure. Filed
+upstream as tinylabscom/mvm#4809 on 2026-10-27. When it is fixed, the
+wrapper can stay; it costs one `sh` per exec.
 
 The SDK (`mvm` on npm) may use a different vsock path for `exec` and
 `files.write`; that is the obvious v2 investigation if the argv protocol
