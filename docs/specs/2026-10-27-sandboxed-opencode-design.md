@@ -36,7 +36,7 @@ launcher
   2. starts opencode (pinned v2 version)
        |-- NEAR AI provider (key on host)
        '-- sandbox plugin
-             bash/read/write/edit/glob/grep
+             shell/read/write/edit/patch/glob/grep
                '-- mvmctl machine exec    ---> runs in guest, stdout/stderr/exit back
   3. on exit or signal:
        copy /out -> sessions/<id>/out     <--- /out only
@@ -77,20 +77,49 @@ blocks.
   new one.
 - Creates `rts-<session-id>` from the configured image with the inputs mount,
   then starts opencode with the machine name passed to the plugin as an option.
+- Runs opencode with `--standalone` (a private server per session). Without it,
+  v2 attaches to the operator's shared background service, which loads the
+  operator's own config and plugins.
+- Points `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and
+  `XDG_STATE_HOME` at a per-session directory, so no global opencode plugins,
+  config, auth, or session history load. The only config is the one the
+  launcher writes.
+- Plugin handshake: the launcher passes a random per-session nonce as a plugin
+  option. After its allowlist checks pass, the plugin writes the nonce to a
+  ready file. If the ready file does not appear with the right nonce before a
+  deadline, the launcher kills opencode and removes the VM. This is required
+  because v2.1.4 skips a plugin that fails to load with only a log warning (a
+  configured path that is a file rather than a directory is one such case) and
+  then runs the session with the host tools.
 - On normal exit, SIGINT or SIGTERM: export `/out`, then `mvmctl machine rm`.
   If the export fails, report it loudly and still remove the VM.
 
 ### Sandbox plugin (`plugin/`)
 
-The allowlist is exactly six tool IDs: `bash`, `read`, `write`, `edit`, `glob`,
-`grep`.
+opencode v2.1.4 registers 20 built-in tools (measured, probe 2). The plugin
+keeps eight:
 
-- One `ctx.tool.transform` replaces each allowlisted tool's `execute` with an
-  implementation that runs through `mvmctl machine exec`, and removes every
-  other tool.
+- Sandboxed, `execute` replaced: `shell`, `read`, `write`, `edit`, `patch`,
+  `glob`, `grep`.
+- Kept unchanged because it executes nothing: `question` (asks the operator in
+  the opencode UI).
+
+It removes the other twelve, among them `webfetch` and `websearch` (host
+network), `opencode_worktree_create` / `_remove` (host git), `subagent`,
+`skill`, `opencode_session_*`, `opencode_models`, and the MCP resource tools.
+
+- One `ctx.tool.transform` replaces each sandboxed tool's `execute` with an
+  implementation that runs through the `Sandbox` interface, and removes every
+  tool not on the list. opencode re-runs transforms on reload, so the
+  transform is idempotent.
 - `ctx.mcp.transform` removes every MCP server.
-- After setup, `ctx.tool.list()` must equal the allowlist exactly. Any extra or
-  missing tool makes setup throw and the session does not start.
+- `ctx.model.transform` keeps only the NEAR AI provider's models. With no
+  credentials configured, v2.1.4 still offers about 80 models from opencode's
+  own hosted service; without this step a prompt could go there instead of
+  NEAR AI.
+- After setup, `ctx.tool.list()` must equal the eight-tool list exactly and
+  every remaining model must be NEAR AI. Anything else makes setup throw, the
+  ready file is never written, and the launcher refuses the session.
 - A `tool` `execute.before` hook rejects any tool name outside the allowlist, a
   second layer behind the transform.
 - `execute.before` / `execute.after` also write the audit log (below).
@@ -99,10 +128,11 @@ Tool implementations, all on guest paths:
 
 | Tool | Guest-side implementation |
 |---|---|
-| `bash` | `sh -c <command>` in the guest. The only tool that gets a shell. |
+| `shell` | `sh -c <command>` in the guest. The only tool that gets a shell. |
 | `read` | Line-range read, path passed as an argv entry. |
 | `write` | Content sent on stdin, path as an argv entry. |
 | `edit` | A small exact-match replacement applier, inputs via stdin and argv. |
+| `patch` | The same applier, taking opencode's patch format on stdin. |
 | `glob` | `find`, pattern and root as argv entries. |
 | `grep` | `grep`, pattern and root as argv entries. |
 
@@ -189,9 +219,11 @@ docs/specs/      design documents
 
 Each is a short probe. None is assumed.
 
-1. opencode v2.1.4 loads a V2 plugin from config.
-2. The built-in tool IDs are exactly the six above, and `ctx.tool.list()`
-   reflects removals.
+1. Done 2026-10-27: opencode v2.1.4 runs a V2 `{ id, setup }` plugin loaded
+   from a directory path in config, and passes config options to it. A file
+   path is skipped with only a warning (hence the handshake).
+2. Done 2026-10-27: the 20 built-in tool IDs are as listed under the sandbox
+   plugin, and `ctx.tool.list()` reflects a removal made in the transform.
 3. `ctx.mcp.transform` covers every MCP source: global config, project config,
    and plugin-added servers.
 4. `mvmctl machine exec` passes stdin through and returns the guest exit code.
