@@ -667,8 +667,11 @@ mod tests {
         );
 
         let (url, heads) = plain_server(|_| (404, b"{}".to_vec()));
+        // Built outside the timed span: loading the native roots is slow
+        // under host load and is not part of the window.
+        let c = client();
         let start = Instant::now();
-        let e = fetch_receipt(&client(), &url, &auth, &exchange(), fast(300), &no_pins())
+        let e = fetch_receipt(&c, &url, &auth, &exchange(), fast(300), &no_pins())
             .await
             .unwrap_err()
             .to_string();
