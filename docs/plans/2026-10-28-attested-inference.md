@@ -566,7 +566,7 @@ run_connected(&mut cfg, local_preflight, |cfg| {
 - Produces (`src/forwarder/pin.rs`):
 
 ```rust
-pub fn sha256_der(der: &[u8]) -> [u8; 32];
+pub fn spki_sha256(cert: &CertificateDer<'_>) -> Option<[u8; 32]>; // was sha256_der(leaf DER); production attests the SPKI hash (2026-10-29)
 pub struct PinSet { /* RwLock<BTreeSet<[u8; 32]>>, Mutex<Option<[u8; 32]>> last unknown */ }
 impl PinSet {
     pub fn new(seed: BTreeSet<[u8; 32]>) -> Arc<Self>;

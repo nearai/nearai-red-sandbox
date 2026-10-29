@@ -386,8 +386,14 @@ with a forwarder between IronWire and NEAR AI, instead of patching IronWire.
 - **Pinning.** Upstream TLS uses `rustls` 0.23 with a custom
   `ServerCertVerifier`. It runs the normal `webpki` validation against the
   native root store (as `reqwest`'s `rustls-tls-native-roots` does today),
-  and then requires `sha256(leaf DER)` to be in the session's attested
-  fingerprint set. It is installed on the upstream client itself
+  and then requires the SHA-256 of the leaf certificate's
+  SubjectPublicKeyInfo DER (the full SEQUENCE, as `openssl x509 -pubkey
+  -noout | openssl pkey -pubin -outform DER` writes it) to be in the
+  session's attested fingerprint set. That is what NEAR AI's
+  `tls_cert_fingerprint` is (measured against production 2026-10-29, and
+  what NEAR's own `nearai-cloud-verifier` checks); it is not
+  `sha256(leaf DER)`, which never matches. A pin on the key also survives a
+  certificate renewal that keeps the key. It is installed on the upstream client itself
   (`reqwest::ClientBuilder::use_preconfigured_tls`), so every connection the
   pool holds passed it at its handshake. The earlier TypeScript design
   measured why that matters (bun 1.3.3, 2026-10-28): a per-request
@@ -688,10 +694,13 @@ Each is a short probe. None is assumed.
    every gateway instance shares it. Repeat against production after the
    2026-10-29 launch, before the default config points there.
 7. Done 2026-10-28, for attestation and the forwarder:
-   - `cloud-api.near.ai` presented leaf sha256
+   - `cloud-api.near.ai` presented leaf sha256 (of the whole DER)
      `5664580137f5b2abc8b2cc9ef53dc2bd7cd79b6ffc9f840dbbfca708a2c51022` on
      three handshakes (and on four earlier the same day): `CN=cloud-api.near.ai`,
-     issuer Let's Encrypt `YE1`, notAfter 2026-12-30.
+     issuer Let's Encrypt `YE1`, notAfter 2026-12-30. Its SPKI sha256 is
+     `73862c254372091cc6895b900111503860694f8916ebf0c63b18d245ba8ba5ad`,
+     which is the gateway's attested `tls_cert_fingerprint` (2026-10-29);
+     the pin is on the SPKI hash.
    - NVIDIA's JWKS served 212 keys, all `kty EC`, `crv P-384`, each with a
      two-certificate `x5c` and a dated `kid`; keys rotate daily, so the JWKS
      is fetched per attestation.
