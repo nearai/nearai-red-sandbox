@@ -8,11 +8,42 @@ per session, with guest networking disabled, inputs copied into the guest, and
 results exported through `/out`. Inference runs on the host so provider
 credentials stay outside the guest.
 
+## Install
+
+macOS on Apple silicon only. Either one-liner places a signed, notarized
+`rts` and the patched mvm supervisor from a GitHub release:
+
+```sh
+curl -fsSL https://github.com/nearai/nearai-red-sandbox/releases/latest/download/install.sh | bash
+```
+
+```sh
+brew install nearai/tap/rts
+rts setup
+```
+
+The curl installer installs under `~/.local` (`RTS_INSTALL_PREFIX`
+overrides), checks the tarball against the release's `SHA256SUMS` and, when
+`gh` is installed, its build-provenance attestation, then runs `rts setup`.
+Homebrew cannot write to your home directory during install, so run
+`rts setup` once yourself.
+
+`rts setup` downloads mvm v0.22.0 to `~/.local/mvm/v0.22.0/` and opencode
+v2.2.2 to `~/.local/share/nearai-red-sandbox/opencode/2.2.2/`, each pinned by
+sha256 and checked before it is unpacked; then it runs `mvmctl env sign`,
+`mvmctl doctor`, the supervisor probes and `opencode --version`, and pulls
+the pinned guest image. It never replaces an existing copy that fails
+verification; it names the path to remove instead. `rts setup --check`
+re-checks everything and downloads and changes nothing; `rts setup --check
+--offline` checks only the installed plugin, supervisor and code signatures,
+without mvmctl or the network. See the [launcher guide](opencode/README.md#installed-layout)
+for where an installed `rts` finds its files.
+
 ## Project status
 
-The implementation is under development. On macOS, build the patched mvm
-supervisor described in the [setup guide](docs/mvm-supervisor.md) before
-launching. The pinned guest image is in a public Google Artifact Registry
+The implementation is under development. Source builds on macOS need the
+patched mvm supervisor described in the [setup guide](docs/mvm-supervisor.md)
+before launching; releases ship it. The pinned guest image is in a public Google Artifact Registry
 repository; see the launcher guide for access and setup.
 
 - [Design](docs/specs/2026-10-27-sandboxed-opencode-design.md)

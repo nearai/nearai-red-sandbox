@@ -6,7 +6,8 @@ umask 077
 readonly UPSTREAM=https://github.com/tinylabscom/mvm.git
 readonly REV=b6b77f83730bed54d52f5f8b9cdcd8d5136ca1de
 readonly PATCH_VERSION=rts-vsock-drain-v1
-readonly ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+readonly ROOT
 readonly PATCH="$ROOT/patches/mvm-v0.22.0-hvf-drain.patch"
 source_dir=
 install_dir="${HOME:?HOME must be set}/.local/share/nearai-red-sandbox"

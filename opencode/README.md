@@ -35,6 +35,56 @@ mvm, the patched supervisor, and opencode 2.2.2 (on `PATH` or at
 `RTS_OPENCODE`). These tests create real VMs
 and fail when a prerequisite is missing.
 
+## Installed layout
+
+A release (see the [install section](../README.md#install)) unpacks one
+tarball under a prefix: `~/.local` for the curl installer
+(`RTS_INSTALL_PREFIX` overrides), the keg for Homebrew, with `bin/rts`
+linked into Homebrew's prefix.
+
+```
+<prefix>/bin/rts
+<prefix>/libexec/nearai-red-sandbox/mvm-hvf-supervisor
+<prefix>/libexec/nearai-red-sandbox/mvm-hvf-supervisor.build-info
+<prefix>/share/nearai-red-sandbox/plugin/
+<prefix>/share/nearai-red-sandbox/opencode/session.example.json
+```
+
+`rts` resolves its own executable and canonicalizes it (Homebrew's
+`bin/rts` is a symlink into the Cellar); `<prefix>` is the parent of its
+`bin/` directory. `rts` counts as installed when
+`<prefix>/share/nearai-red-sandbox/plugin` is a directory. A source build
+(`target/debug/rts`, `target/release/rts`) has no such prefix and keeps using
+the checkout. Explicit settings always win:
+
+| Item | Lookup order |
+|---|---|
+| plugin | config `pluginDir`; `<prefix>/share/nearai-red-sandbox/plugin`; the checkout's `plugin/` |
+| supervisor | `MVM_HVF_SUPERVISOR_PATH`; `<prefix>/libexec/nearai-red-sandbox/mvm-hvf-supervisor` if present; `~/.local/share/nearai-red-sandbox/mvm-hvf-supervisor` |
+| mvmctl | config `mvmctl`; `RTS_MVMCTL`; `~/.local/mvm/v0.22.0/mvmctl` |
+| opencode | config `opencode`; `~/.local/share/nearai-red-sandbox/opencode/2.2.2/opencode` if present; `opencode` on `PATH` |
+| sessions | config `sessionsDir`; for an installed `rts`, `~/.local/share/nearai-red-sandbox/sessions`; for a source build, the checkout's `sessions/` |
+
+mvm and opencode live under the home directory, not the prefix, so both
+install methods share one copy of each pinned version. `rts setup` fetches
+them (mvm v0.22.0 to `~/.local/mvm/v0.22.0/`, opencode v2.2.2 to
+`~/.local/share/nearai-red-sandbox/opencode/2.2.2/`), checking each download's
+pinned sha256 before unpacking it, then runs `mvmctl env sign` (never with
+`MVM_HVF_SUPERVISOR_PATH`, so mvm cannot re-sign the release's supervisor),
+`mvmctl doctor`, the supervisor probes and `opencode --version`, and pulls the
+pinned guest image. An existing copy that fails verification is refused with
+its path, never replaced: remove it and re-run `rts setup`.
+`rts setup --check` runs the same checks and downloads and changes nothing;
+`rts setup --check --offline` checks only the plugin, the supervisor probes
+and the code signatures of `rts` and the supervisor, without mvmctl or the
+network.
+
+Because `~/.local/share/nearai-red-sandbox/` also holds opencode, sessions
+and possibly a source-built supervisor, the curl installer replaces only the
+paths the tarball owns. For a full removal delete the prefix's files above,
+`~/.local/mvm/v0.22.0` and `~/.local/share/nearai-red-sandbox` (this deletes
+the default sessions directory too).
+
 ## Inference through embedded IronWire
 
 By default opencode talks to [IronWire](https://github.com/nearai/ironwire)'s

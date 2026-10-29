@@ -6,6 +6,28 @@ v0.22.0. The source base is the immutable upstream commit
 [tinylabscom/mvm](https://github.com/tinylabscom/mvm/tree/b6b77f83730bed54d52f5f8b9cdcd8d5136ca1de).
 The reviewed changes live in `patches/mvm-v0.22.0-hvf-drain.patch`.
 
+## Released supervisor
+
+Releases ship the patched supervisor, so an installed `rts` needs no local
+build. The release workflow (`.github/workflows/release.yml`) builds it with
+the script below from the same pinned commit and patch, then re-signs it with
+a Developer ID Application identity (hardened runtime, secure timestamp, the
+`com.apple.security.hypervisor` entitlement from
+`packaging/macos/mvm-hvf-supervisor.entitlements`), notarizes it with `rts`,
+and checks both probes on the signed binary. It is installed at
+`<prefix>/libexec/nearai-red-sandbox/mvm-hvf-supervisor` beside its
+`.build-info`, whose `signed_binary_sha256` is the signed binary's digest.
+An installed `rts` selects it when `MVM_HVF_SUPERVISOR_PATH` is unset, and
+`rts setup` never passes it to `mvmctl env sign`, so mvm does not replace
+the Developer ID signature. mvm writes a `mvm-hvf-supervisor.mvm-hvf-signed`
+marker beside it, so that directory must stay writable by you.
+
+## Building from source
+
+The rest of this page is the source-build path, for a checkout without a
+release install. Its ad-hoc signing notes apply only to a supervisor built
+this way.
+
 Build on Apple-silicon macOS with Apple's command line tools, Git, and Rust
 installed. The upstream `rust-toolchain.toml` selects its compiler. Cargo may
 download that toolchain and locked dependencies. The isolated source and target
