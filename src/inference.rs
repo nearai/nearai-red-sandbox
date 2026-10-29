@@ -65,13 +65,6 @@ impl Drop for EmbeddedInference {
 /// NEAR AI Cloud's production API base.
 pub const NEAR_BASE_URL: &str = "https://cloud-api.near.ai/v1";
 
-/// Start only the NEAR AI backend, without credential discovery or probes.
-pub fn start(key: HostSecret, models: &[String]) -> Result<EmbeddedInference, String> {
-    // Pin the endpoint explicitly: IronWire's environment-based URL override
-    // is independent of its credential source.
-    start_with_endpoint(key, models, NEAR_BASE_URL)
-}
-
 /// Value for each model's `x-ironwire-route` request header.
 ///
 /// Required because the pinned IronWire revision otherwise chooses among an
@@ -99,7 +92,11 @@ fn embed_options(key: HostSecret) -> EmbedOptions {
     options
 }
 
-/// Start IronWire with its NEAR AI backend at `endpoint` (the forwarder).
+/// Start IronWire with only its NEAR AI backend at `endpoint`, without
+/// credential discovery or probes. In production `endpoint` is always the
+/// loopback forwarder: no path starts IronWire at NEAR AI directly. The
+/// endpoint is pinned explicitly because IronWire's environment-based URL
+/// override is independent of its credential source.
 pub fn start_with_endpoint(
     key: HostSecret,
     models: &[String],
@@ -307,7 +304,8 @@ mod tests {
             vec!["m:alias".into()],
             vec!["m\r\nheader: value".into()],
         ] {
-            let error = start(DUMMY_KEY.to_string().into(), &models).unwrap_err();
+            let error = start_with_endpoint(DUMMY_KEY.to_string().into(), &models, NEAR_BASE_URL)
+                .unwrap_err();
             assert!(error.contains("model"));
             assert!(!error.contains(DUMMY_KEY));
         }
@@ -358,32 +356,49 @@ mod tests {
     fn the_selected_model_and_host_key_reach_only_the_local_test_upstream() {
         let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         upstream.set_nonblocking(true).unwrap();
-        let endpoint = format!("http://{}/v1", upstream.local_addr().unwrap());
+        let addr = upstream.local_addr().unwrap();
+        let endpoint = format!("http://{addr}/v1");
+        // A spare connection closed before any bytes, as a client's pool may
+        // open: queued first, so the upstream must skip it.
+        drop(std::net::TcpStream::connect(addr).unwrap());
         let received = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(15);
-            let stream = loop {
-                match upstream.accept() {
-                    Ok((stream, _)) => break stream,
+            // IronWire may open a spare connection and close it before
+            // sending anything: skip those, bounded by the deadline, until
+            // one carries a request.
+            let (mut stream, mut request, header_end) = loop {
+                let stream = match upstream.accept() {
+                    Ok((stream, _)) => stream,
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             && Instant::now() < deadline =>
                     {
                         std::thread::sleep(Duration::from_millis(10));
+                        continue;
                     }
                     Err(e) => panic!("local test upstream did not receive a request: {e}"),
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut stream = BufReader::new(stream);
+                let mut request = Vec::new();
+                let header_end = loop {
+                    if stream.read_until(b'\n', &mut request).unwrap() == 0 {
+                        break None;
+                    }
+                    if request.ends_with(b"\r\n\r\n") {
+                        break Some(request.len());
+                    }
+                    assert!(request.len() < 16_384);
+                };
+                match header_end {
+                    Some(end) => break (stream, request, end),
+                    // Closed before a whole request head: only an empty
+                    // spare connection may be skipped.
+                    None => assert!(request.is_empty(), "truncated request head"),
                 }
-            };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .unwrap();
-            let mut stream = BufReader::new(stream);
-            let mut request = Vec::new();
-            let header_end = loop {
-                assert_ne!(stream.read_until(b'\n', &mut request).unwrap(), 0);
-                if request.ends_with(b"\r\n\r\n") {
-                    break request.len();
-                }
-                assert!(request.len() < 16_384);
             };
             let headers = String::from_utf8(request.clone()).unwrap();
             assert!(headers.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
@@ -440,7 +455,8 @@ mod tests {
             "z-ai/glm-5.3-flash".into(),
             "explicitly-selected-model".into(),
         ];
-        let inference = start(DUMMY_KEY.to_string().into(), &models).unwrap();
+        let inference =
+            start_with_endpoint(DUMMY_KEY.to_string().into(), &models, NEAR_BASE_URL).unwrap();
         let provider = inference.provider();
         assert_eq!(provider.id, "nearai-red-embedded");
         let (_, port, path) = provider.loopback().unwrap();
