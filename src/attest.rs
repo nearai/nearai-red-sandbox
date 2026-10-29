@@ -733,6 +733,24 @@ mod tests {
         );
     }
 
+    /// The production compose hashes measured on 2026-10-29: the gateway
+    /// (dstack-0.5.12) and the abliterated DeepSeek model entry
+    /// (dstack-nvidia-0.5.11), each sha256(info.tcb_info.app_compose).
+    #[test]
+    fn the_committed_policy_pins_the_production_composes() {
+        let policy = load_policy(POLICY_JSON).unwrap();
+        for h in [
+            "f571e5dafe8f96baf116a271b4be9cba228b447dd6ebe502bbda81ede7bcc7ce",
+            "ae66f844658a7aee331dcb9fb59bd40323d71d192d37719e022cc4af8389265b",
+        ] {
+            assert!(
+                policy.compose_hashes.contains(&report::hex32(h).unwrap()),
+                "{h} is not pinned"
+            );
+        }
+        assert_eq!(policy.compose_hashes.len(), 2);
+    }
+
     #[test]
     fn the_committed_policy_parses_and_bad_entries_are_refused() {
         load_policy(POLICY_JSON).unwrap();
