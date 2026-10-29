@@ -213,6 +213,20 @@ impl Defaults {
     }
 }
 
+/// A valid route ID that stands in until the real NEAR AI model IDs are
+/// chosen (check 6); launching with it is refused by `require_real_models`.
+pub const MODEL_ID_PLACEHOLDER: &str = "PLACEHOLDER-near-private-abliterated";
+pub const DEFAULT_MODELS: &[&str] = &[MODEL_ID_PLACEHOLDER];
+
+pub fn require_real_models(models: &[String]) -> Result<(), String> {
+    if models.iter().any(|m| m == MODEL_ID_PLACEHOLDER) {
+        return Err(format!(
+            "provider.models still contains the placeholder {MODEL_ID_PLACEHOLDER}: the default models are placeholders until check 6 picks the real NEAR AI model IDs; set provider.models explicitly"
+        ));
+    }
+    Ok(())
+}
+
 pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<OperatorConfig, String> {
     let raw: Raw = serde_json::from_str(text).map_err(|e| format!("config: {e}"))?;
     let p = raw.provider;
@@ -241,7 +255,7 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
     }
     let models = p
         .models
-        .unwrap_or_else(|| vec!["z-ai/glm-5.3-flash".into()]);
+        .unwrap_or_else(|| DEFAULT_MODELS.iter().map(|m| (*m).to_string()).collect());
     if models.is_empty() || models.iter().any(String::is_empty) {
         return Err("config: provider.models must be a non-empty list of model IDs".into());
     }
@@ -326,12 +340,22 @@ mod tests {
     fn an_omitted_provider_uses_the_default_near_ai_model() {
         let c = parse("{}").unwrap();
         assert!(c.embedded_inference);
-        assert_eq!(c.provider.models, ["z-ai/glm-5.3-flash"]);
+        assert_eq!(c.provider.models, DEFAULT_MODELS);
         assert_eq!(c.inputs_dir, None);
         assert_eq!(c.provider.api_key_env, None);
     }
     fn parse(t: &str) -> Result<OperatorConfig, String> {
         parse_config(t, Path::new("/cfg"), &d())
+    }
+
+    #[test]
+    fn the_default_models_are_the_marked_placeholder() {
+        let c = parse("{}").unwrap();
+        assert_eq!(c.provider.models, DEFAULT_MODELS);
+        let e = require_real_models(&c.provider.models).unwrap_err();
+        assert!(e.contains("placeholder") && e.contains("provider.models"), "{e}");
+        assert!(require_real_models(&["z-ai/glm-5.3-flash".into()]).is_ok());
+        assert!(require_real_models(&["a".into(), MODEL_ID_PLACEHOLDER.into()]).is_err());
     }
 
     #[test]
