@@ -4,7 +4,8 @@
 //!
 //!     cargo test --test contain -- --ignored --test-threads=1
 //!
-//! Each test skips, printing why, when mvmctl or opencode is not usable.
+//! Explicitly requested tests fail when the patched HVF supervisor, mvmctl,
+//! or the pinned opencode prerequisite is unavailable; they never pass by skipping.
 
 mod copy;
 mod exec;

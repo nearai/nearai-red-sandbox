@@ -31,8 +31,8 @@ export PATH="$(brew --prefix coreutils)/libexec/gnubin:$(brew --prefix gnu-tar)/
 Tests: `RUSTFLAGS="-D warnings" CARGO_INCREMENTAL=0 cargo test` (unit),
 `bun test tests/unit` (the plugin shim), and
 `RUSTFLAGS="-D warnings" CARGO_INCREMENTAL=0 cargo test --test contain -- --ignored --test-threads=1` on a host with
-mvm and opencode 2.1.4 (real VMs; each test skips with the reason when
-either is missing).
+mvm, the patched supervisor, and opencode 2.1.4. These tests create real VMs
+and fail when a prerequisite is missing.
 
 ## Inference through embedded IronWire
 
@@ -184,14 +184,16 @@ policy and writes the matching readiness nonce.
 
 ## Recorded live validation status
 
-The latest recorded macOS containment run on 2026-10-28 had **19 passed and
-1 failed** using the derived guest image. Byte-exact copy-out failed when
-mvm's control stream closed during a slice; smaller slices also failed in
-focused reproductions. The session fails closed, but exported data can be lost.
+The recorded macOS containment run on 2026-10-28 passed **20 of 20** real mvm
+and OpenCode tests using the pinned guest image and the locally built, installed
+release-profile v0.22.0 HVF supervisor. It includes four byte-exact exports of a 700 KiB guest file, network
+denial, hostile archive rejection, and a deliberate host-leak check. The stock
+v0.22.0 supervisor fails the export test; the launcher now refuses a supervisor
+without the required fix. See [supervisor setup](../docs/mvm-supervisor.md).
 
-Containment remains unvalidated until those failures are resolved and the
-real suite passes. Unit tests, mocked browser callbacks, and local inference
-HTTP tests do not establish live Cloud sign-in or VM containment.
+This is evidence for the tested Apple-silicon Mac and versions, not a claim
+about other platforms or releases. Live Cloud sign-in and inference have not
+been exercised by these tests.
 
 The derived image in `guest/Dockerfile` was built with Colima for `linux/arm64`
 and published to the public Google Artifact Registry repository
