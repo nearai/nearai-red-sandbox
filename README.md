@@ -16,7 +16,7 @@ credentials stay outside the guest.
 
 ▁▁▂▃▄▅▄▃▂▁▁▁▂▂▃▃▂▁▁▁▁▂▃▄▅▆▅▄▃▂▁▁▁▂▃▃▂▂▁▁▁▂▃▄▃▂▁▁▁▁▂▂▃▄▅▄▃▂▁▁
 
-## ▁▃▅▃▁ Quick start
+## <img src="docs/assets/ramp.svg" alt="" height="16"> Quick start
 
 ```console
 $ rts launch    # signs in when needed, then starts a sandboxed OpenCode session
@@ -26,7 +26,7 @@ $ rts login     # optional: sign in to NEAR AI Cloud ahead of time
 `rts launch --config PATH` takes a session file; see the
 [launcher and inference setup](opencode/README.md) for its options.
 
-## ▁▃▅▃▁ Project status
+## <img src="docs/assets/ramp.svg" alt="" height="16"> Project status
 
 The implementation is under development. On macOS, build the patched mvm
 supervisor described in the [setup guide](docs/mvm-supervisor.md) before
@@ -38,7 +38,7 @@ repository; see the launcher guide for access and setup.
 - [Launcher and inference setup](opencode/README.md)
 - [NEAR AI Cloud sign-in](docs/authentication.md)
 
-## ▁▃▅▃▁ NEAR AI Cloud access
+## <img src="docs/assets/ramp.svg" alt="" height="16"> NEAR AI Cloud access
 
 `rts launch` uses browser sign-in and an embedded
 [IronWire](https://github.com/nearai/ironwire) proxy by default. Credentials are
