@@ -1,7 +1,7 @@
 # Controlled network access from the sandbox: design
 
 Date: 2026-10-29
-Status: draft for review
+Status: draft for review; BLOCKED on mvm v0.22.0 (see Blockers measured 2026-10-29)
 
 ## Purpose
 
@@ -54,6 +54,43 @@ Full notes with file:line citations:
   caps; connection-rate limits default to off.
 - **Changes** to egress need a VM restart (`machine reconfigure`), so a
   session's allowlist is fixed for its life.
+
+## Blockers measured 2026-10-29 (spike on this host)
+
+Full record: `docs/research/2026-10-29-mvm-egress-spike-hvf.md`.
+
+1. **Egress does not work on persistent machines on HVF in v0.22.0**, even with
+   plain `--allow-host`. `machine start` spawns `mvm-network-endpoint` as a
+   child of the `mvmctl` process, and the endpoint's parent-death watchdog
+   makes it exit about 0.5 s after `machine start` returns; the guest then
+   logs "guest egress is down". Reproduced on two machines. No upstream issue
+   or newer release (v0.22.0 is the latest stable) covers it. `rts` uses
+   persistent machines (`create`, `start`, `exec`, `rm`), so this design cannot
+   work until it is fixed or worked around.
+2. **mvm's TLS interception does not close CDN fronting**, so it is not part
+   of this design:
+   - Routes with `intercept = true` close fronting only when the guest
+     connects by name: a mismatched `Host` gets 421 and a mismatched SNI is
+     refused. A guest that connects to a pinned IP (`curl --connect-to`, or
+     SOCKS5 with a resolved address) is admitted without termination, and
+     fronting works again with the real certificate. IP routes close IPv4
+     only; IPv6 route hosts fail validation.
+   - Routes cannot be recorded on a persistent machine (`machine create
+     --policy` refuses: "network.routes cannot be recorded on a persistent
+     machine's spec yet"); only a foreground `machine run --policy` enforces
+     them.
+   - Under interception, pip fails (mvm's always-on PII redaction rewrites
+     response bodies, breaking pip's hash checks), npm fails (mvm's upstream
+     TLS to Cloudflare is rejected with a ProtocolVersion alert), and any
+     response over 16 MiB returns 502. curl and apk work.
+3. **`machine exec` gets none of mvm's proxy environment**, so `rts` must set
+   `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` itself for tool calls.
+4. **The rts guest image has no curl, python or node**, and exec runs as uid
+   901 without root; tools must come from the image or `apk add --usermode`.
+
+Consequences for this design: risk 2 (IP-level filtering, CDN co-tenancy)
+stays an accepted, documented limitation in v1. Closing it needs an
+rts-owned SNI-checking path, which is out of scope until blocker 1 is solved.
 
 ## Risks accepted with this design
 
