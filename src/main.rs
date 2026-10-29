@@ -199,6 +199,7 @@ fn local_preflight(cfg: &config::OperatorConfig, host: &dyn session::Host, env: 
         mvmctl: cfg.mvmctl.clone(),
         empty_git_config,
         extra_env: session::mvm_environment(env, &supervisor),
+        remove_env: Vec::new(),
     };
     // A pinned HTTPS placeholder skips the loopback-provider probe. Local
     // prerequisites must succeed before any native credential read or browser.
@@ -391,15 +392,12 @@ fn setup_command(o: &setup::SetupOptions) -> Result<i32, String> {
     let rts_exe = std::env::current_exe().map_err(|e| format!("Cannot locate the running rts: {e}"))?;
     let (_temp, empty_git_config) = private_git_config("rts-setup-")?;
     let fetch = setup::HttpsFetch::new()?;
-    let mvm_plain = rts::mvm::SpawnRunner {
-        mvmctl: defaults.mvmctl.clone(),
-        empty_git_config: empty_git_config.clone(),
-        extra_env: setup::plain_mvm_env(&env),
-    };
+    let mvm_plain = setup::plain_mvm_runner(&defaults.mvmctl, &empty_git_config, &env);
     let mvm = rts::mvm::SpawnRunner {
         mvmctl: defaults.mvmctl.clone(),
         empty_git_config,
         extra_env: session::mvm_environment(&env, &supervisor),
+        remove_env: Vec::new(),
     };
     let lines = setup::run(
         o,

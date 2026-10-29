@@ -14,7 +14,7 @@ use url::Url;
 
 use crate::config::{DEFAULT_IMAGE, Defaults};
 use crate::install::{MVM_VERSION, mvm_dir, opencode_dir};
-use crate::mvm::{RunOutput, Runner, tail};
+use crate::mvm::{RunOutput, Runner, SpawnRunner, tail};
 use crate::session::{Host, OPENCODE_VERSION, SUPERVISOR_FIX_VERSION, check_opencode, check_supervisor_contract, check_supervisor_marker};
 
 pub const ALLOWED_HOSTS: [&str; 3] = ["github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"];
@@ -306,6 +306,18 @@ pub fn run(o: &SetupOptions, c: &SetupContext) -> Result<Vec<String>, String> {
 /// MVM_HVF_SUPERVISOR_PATH, so `env sign` cannot re-sign the supervisor.
 pub fn plain_mvm_env(env: &[(String, String)]) -> std::collections::HashMap<String, String> {
     env.iter().filter(|(k, _)| matches!(k.as_str(), "HOME" | "MVM_HOME")).cloned().collect()
+}
+
+/// The runner for `mvmctl env sign` and other plain mvmctl calls. It sets
+/// only `plain_mvm_env` and removes MVM_HVF_SUPERVISOR_PATH from the child,
+/// so an override exported in the operator's shell never reaches mvmctl.
+pub fn plain_mvm_runner(mvmctl: &Path, empty_git_config: &Path, env: &[(String, String)]) -> SpawnRunner {
+    SpawnRunner {
+        mvmctl: mvmctl.to_path_buf(),
+        empty_git_config: empty_git_config.to_path_buf(),
+        extra_env: plain_mvm_env(env),
+        remove_env: vec!["MVM_HVF_SUPERVISOR_PATH".to_string()],
+    }
 }
 
 /// `mvmctl --version` prints exactly `mvmctl <MVM_VERSION>`.
@@ -1082,6 +1094,16 @@ mod tests {
         assert_eq!((e["HOME"].as_str(), e["MVM_HOME"].as_str()), ("/h", "/m"));
         // a_fresh_setup_installs_signs_checks_and_pulls_in_order also checks
         // that ["env", "sign"] went to mvm_plain, never to mvm.
+    }
+
+    #[test]
+    fn the_plain_runner_removes_an_inherited_supervisor_override() {
+        let env: Vec<(String, String)> = vec![("HOME".into(), "/h".into()), ("MVM_HVF_SUPERVISOR_PATH".into(), "/s".into())];
+        let r = plain_mvm_runner(Path::new("/bin/mvmctl"), Path::new("/g"), &env);
+        let cmd = r.command(&["env".to_string(), "sign".to_string()]);
+        let envs: Vec<_> = cmd.get_envs().map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string()))).collect();
+        assert!(envs.contains(&("MVM_HVF_SUPERVISOR_PATH".into(), None)), "{envs:?}");
+        assert!(envs.contains(&("HOME".into(), Some("/h".into()))), "{envs:?}");
     }
 
     #[test]

@@ -41,7 +41,7 @@ fn patched_runner(mvmctl: PathBuf, empty_git_config: PathBuf, env: &[(String, St
     {
         return Err(format!("Containment requires supervisor {SUPERVISOR_FIX_VERSION}. {install}"));
     }
-    Ok(SpawnRunner { mvmctl, empty_git_config, extra_env: mvm_environment(env, &supervisor) })
+    Ok(SpawnRunner { mvmctl, empty_git_config, extra_env: mvm_environment(env, &supervisor), remove_env: Vec::new() })
 }
 
 fn probe() -> Result<Harness, String> {

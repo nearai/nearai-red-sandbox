@@ -592,6 +592,7 @@ pub fn run_session(cfg: &OperatorConfig, deps: Deps) -> i32 {
             mvmctl: cfg.mvmctl.clone(),
             empty_git_config: p.empty_git_config.clone(),
             extra_env: mvm_environment(&deps.env, &supervisor),
+            remove_env: Vec::new(),
         })
     });
     // The launcher's handle does not share the state dir's marker: teardown

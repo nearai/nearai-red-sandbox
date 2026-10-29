@@ -122,7 +122,7 @@ pub fn run(tool: &str) -> Outcome {
     if let Some(h) = &o.mvm_home {
         extra_env.insert("HOME".to_string(), h.clone());
     }
-    let runner = SpawnRunner { mvmctl: o.mvmctl.clone(), empty_git_config: o.empty_git_config.clone(), extra_env };
+    let runner = SpawnRunner { mvmctl: o.mvmctl.clone(), empty_git_config: o.empty_git_config.clone(), extra_env, remove_env: Vec::new() };
     let sb = match MvmSandbox::new(&o.machine, Box::new(runner)) {
         Ok(sb) => sb.with_state(StateDir(o.state_dir.clone())),
         Err(e) => return Outcome::fail(EXIT_BAD_REQUEST, e.to_string()),
