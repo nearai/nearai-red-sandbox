@@ -31,7 +31,7 @@ pub fn limits() -> ExecOptions {
 }
 
 fn patched_runner(mvmctl: PathBuf, empty_git_config: PathBuf, env: &[(String, String)], host: &dyn Host) -> Result<SpawnRunner, String> {
-    let supervisor = supervisor_path(env)?;
+    let supervisor = supervisor_path(env, None)?;
     let executable = supervisor.to_str().ok_or("patched supervisor path is not valid UTF-8")?;
     let install = "Run scripts/build-patched-mvm-supervisor.sh or set MVM_HVF_SUPERVISOR_PATH to an absolute patched supervisor path";
     let output = host.run(&[executable.into(), "--rts-vsock-drain-fix-version".into()], Duration::from_secs(5))
@@ -191,7 +191,7 @@ mod tests {
         for override_path in [None, Some("/explicit supervisor/mvm-hvf-supervisor")] {
             let mut env = vec![("HOME".into(), "/operator home".into()), ("MVM_HOME".into(), "/vm state".into())];
             if let Some(path) = override_path { env.push(("MVM_HVF_SUPERVISOR_PATH".into(), path.into())); }
-            let selected = supervisor_path(&env).unwrap();
+            let selected = supervisor_path(&env, None).unwrap();
             let host = FakeHost { output: rts::mvm::RunOutput { code: Some(0), stdout: b"rts-vsock-drain-v1\n".to_vec(), ..Default::default() }, calls: Default::default() };
             let runner = patched_runner("/fake/mvmctl".into(), "/fake/gitconfig".into(), &env, &host).unwrap();
             assert_eq!(runner.extra_env["MVM_HVF_SUPERVISOR_PATH"], selected.to_str().unwrap());

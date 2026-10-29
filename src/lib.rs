@@ -8,6 +8,7 @@ pub mod forwarder;
 pub mod copy;
 pub mod files;
 pub mod glob;
+pub mod install;
 pub mod mvm;
 pub mod protocol;
 pub mod session;

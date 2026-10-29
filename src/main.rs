@@ -157,7 +157,7 @@ fn local_preflight(cfg: &config::OperatorConfig, host: &dyn session::Host, env: 
         .map_err(|_| "Cannot create preflight Git configuration")?;
     let work = temp.path().join("work");
     std::fs::create_dir(&work).map_err(|_| "Cannot create preflight work directory")?;
-    let supervisor = session::supervisor_path(env)?;
+    let supervisor = session::supervisor_path(env, rts::install::current_prefix().as_deref())?;
     let runner = rts::mvm::SpawnRunner {
         mvmctl: cfg.mvmctl.clone(),
         empty_git_config,
@@ -172,6 +172,7 @@ fn local_preflight(cfg: &config::OperatorConfig, host: &dyn session::Host, env: 
     session::preflight(&session::PreflightInput {
         host,
         run: &runner,
+        mvmctl: &cfg.mvmctl,
         opencode: &cfg.opencode,
         leak_seam_set: env.iter().any(|(key, _)| key == "RTS_TEST_LEAK"),
         supervisor_path: Some(&supervisor),
@@ -395,8 +396,10 @@ mod tests {
             "{}",
             Path::new("/cfg"),
             &config::Defaults {
-                repo: "/repo".into(),
                 mvmctl: "/bin/mvmctl".into(),
+                plugin_dir: "/repo/plugin".into(),
+                opencode: "opencode".into(),
+                sessions_dir: "/repo/sessions".into(),
             },
         )
         .unwrap()
