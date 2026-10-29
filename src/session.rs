@@ -258,7 +258,9 @@ pub fn check_provider(p: &ProviderConfig) -> Result<(), String> {
 }
 
 pub const SUPERVISOR_FIX_VERSION: &str = "rts-vsock-drain-v1";
-const SUPERVISOR_PROBE: &str = "--rts-vsock-drain-fix-version";
+pub const SUPERVISOR_PROBE: &str = "--rts-vsock-drain-fix-version";
+pub const SUPERVISOR_CONTRACT_PROBE: &str = "--contract-version";
+pub const SUPERVISOR_CONTRACT: &str = "mvm-hvf-supervisor contract-version=4";
 const SUPERVISOR_INSTALL: &str = "Run rts setup; from a source checkout, run scripts/build-patched-mvm-supervisor.sh to install the patched mvm v0.22.0 supervisor in ~/.local/share/nearai-red-sandbox/mvm-hvf-supervisor, or set MVM_HVF_SUPERVISOR_PATH to its absolute path";
 
 /// Resolve only the supplied operator environment and install prefix, never
@@ -307,15 +309,9 @@ pub fn preflight(o: &PreflightInput) -> Result<(), String> {
         return Err("RTS_TEST_LEAK is set; refusing to start a real session".into());
     }
     check_opencode(o.host, o.opencode)?;
-    let supervisor = o.supervisor_path.filter(|p| p.is_absolute()).and_then(Path::to_str)
+    let supervisor = o.supervisor_path.filter(|p| p.is_absolute() && p.to_str().is_some())
         .ok_or_else(|| format!("An absolute patched HVF supervisor path is required ({SUPERVISOR_FIX_VERSION}). {SUPERVISOR_INSTALL}"))?;
-    let probe = o.host.run(&sv(&[supervisor, SUPERVISOR_PROBE]), Duration::from_secs(5))
-        .map_err(|_| format!("Cannot verify patched HVF supervisor ({SUPERVISOR_FIX_VERSION}). {SUPERVISOR_INSTALL}"))?;
-    if probe.killed || probe.code != Some(0)
-        || !(probe.stdout == SUPERVISOR_FIX_VERSION.as_bytes() || probe.stdout == format!("{SUPERVISOR_FIX_VERSION}\n").as_bytes())
-    {
-        return Err(format!("HVF supervisor must report {SUPERVISOR_FIX_VERSION}; its copy-out fix could not be verified. {SUPERVISOR_INSTALL}"));
-    }
+    check_supervisor_marker(o.host, supervisor)?;
     let doctor = o.run.run(&sv(&["doctor"]), Duration::from_secs(60)).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             format!("mvmctl not found at {}; run rts setup", o.mvmctl.display())
@@ -334,6 +330,33 @@ pub fn preflight(o: &PreflightInput) -> Result<(), String> {
         }
     }
     check_provider(o.provider)
+}
+
+/// `stdout` is exactly `expected`, optionally followed by one newline.
+fn exact_line(stdout: &[u8], expected: &str) -> bool {
+    stdout == expected.as_bytes() || stdout == format!("{expected}\n").as_bytes()
+}
+
+/// The supervisor at `path` prints exactly SUPERVISOR_FIX_VERSION for
+/// SUPERVISOR_PROBE within 5 s and exits 0.
+pub fn check_supervisor_marker(host: &dyn Host, path: &Path) -> Result<(), String> {
+    let probe = host.run(&[path.to_string_lossy().into_owned(), SUPERVISOR_PROBE.into()], Duration::from_secs(5))
+        .map_err(|_| format!("Cannot verify patched HVF supervisor ({SUPERVISOR_FIX_VERSION}). {SUPERVISOR_INSTALL}"))?;
+    if probe.killed || probe.code != Some(0) || !exact_line(&probe.stdout, SUPERVISOR_FIX_VERSION) {
+        return Err(format!("HVF supervisor must report {SUPERVISOR_FIX_VERSION}; its copy-out fix could not be verified. {SUPERVISOR_INSTALL}"));
+    }
+    Ok(())
+}
+
+/// The supervisor at `path` prints exactly SUPERVISOR_CONTRACT for
+/// SUPERVISOR_CONTRACT_PROBE within 5 s and exits 0.
+pub fn check_supervisor_contract(host: &dyn Host, path: &Path) -> Result<(), String> {
+    let probe = host.run(&[path.to_string_lossy().into_owned(), SUPERVISOR_CONTRACT_PROBE.into()], Duration::from_secs(5))
+        .map_err(|_| format!("Cannot verify the HVF supervisor contract ({SUPERVISOR_CONTRACT}). {SUPERVISOR_INSTALL}"))?;
+    if probe.killed || probe.code != Some(0) || !exact_line(&probe.stdout, SUPERVISOR_CONTRACT) {
+        return Err(format!("HVF supervisor must report {SUPERVISOR_CONTRACT}. {SUPERVISOR_INSTALL}"));
+    }
+    Ok(())
 }
 
 /// `opencode --version` must report exactly OPENCODE_VERSION.
@@ -1069,6 +1092,38 @@ mod tests {
                 assert!(error.contains("scripts/build-patched-mvm-supervisor.sh"), "{error}");
                 assert!(!error.contains("secret diagnostic"));
                 assert!(runner.calls().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn the_supervisor_contract_must_be_exact_successful_and_bounded() {
+        struct ProbeHost { output: RunOutput, calls: Mutex<Vec<(Vec<String>, Duration)>> }
+        impl Host for ProbeHost {
+            fn run(&self, argv: &[String], timeout: Duration) -> io::Result<RunOutput> {
+                self.calls.lock().unwrap().push((argv.to_vec(), timeout));
+                Ok(self.output.clone())
+            }
+        }
+        let path = Path::new("/patched supervisor/with spaces;$shell");
+        for (output, valid) in [
+            (out(0, "mvm-hvf-supervisor contract-version=4", ""), true),
+            (out(0, "mvm-hvf-supervisor contract-version=4\n", ""), true),
+            (out(0, "mvm-hvf-supervisor contract-version=3\n", ""), false),
+            (out(0, " mvm-hvf-supervisor contract-version=4\n", ""), false),
+            (out(0, "mvm-hvf-supervisor contract-version=4\n\n", ""), false),
+            (out(1, "mvm-hvf-supervisor contract-version=4\n", "secret diagnostic"), false),
+            (RunOutput { killed: true, ..out(0, "mvm-hvf-supervisor contract-version=4", "") }, false),
+        ] {
+            let host = ProbeHost { output, calls: Mutex::new(vec![]) };
+            let result = check_supervisor_contract(&host, path);
+            assert_eq!(*host.calls.lock().unwrap(), [(vec![path.to_str().unwrap().into(), SUPERVISOR_CONTRACT_PROBE.into()], Duration::from_secs(5))]);
+            if valid {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.contains("contract-version=4") && error.contains("rts setup"), "{error}");
+                assert!(!error.contains("secret diagnostic"));
             }
         }
     }
