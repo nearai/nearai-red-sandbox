@@ -213,15 +213,18 @@ impl Defaults {
     }
 }
 
-/// A valid route ID that stands in until the real NEAR AI model IDs are
-/// chosen (check 6); launching with it is refused by `require_real_models`.
+/// The route ID that stood in for the default model before NEAR AI's
+/// production launch. It is no longer a default, but a config written then
+/// may still name it, so launching with it is still refused.
 pub const MODEL_ID_PLACEHOLDER: &str = "PLACEHOLDER-near-private-abliterated";
-pub const DEFAULT_MODELS: &[&str] = &[MODEL_ID_PLACEHOLDER];
+/// NEAR AI's abliterated DeepSeek, listed by production `/v1/models` on
+/// 2026-10-29 (owned_by `nearai`).
+pub const DEFAULT_MODELS: &[&str] = &["deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated"];
 
 pub fn require_real_models(models: &[String]) -> Result<(), String> {
     if models.iter().any(|m| m == MODEL_ID_PLACEHOLDER) {
         return Err(format!(
-            "provider.models still contains the placeholder {MODEL_ID_PLACEHOLDER}: the default models are placeholders until check 6 picks the real NEAR AI model IDs; set provider.models explicitly"
+            "provider.models still contains the retired placeholder {MODEL_ID_PLACEHOLDER}: remove it from provider.models, or omit provider.models for the default NEAR AI model"
         ));
     }
     Ok(())
@@ -349,11 +352,29 @@ mod tests {
     }
 
     #[test]
-    fn the_default_models_are_the_marked_placeholder() {
+    fn the_default_model_is_near_ais_abliterated_deepseek() {
         let c = parse("{}").unwrap();
-        assert_eq!(c.provider.models, DEFAULT_MODELS);
+        assert_eq!(
+            c.provider.models,
+            ["deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated"]
+        );
+        assert!(require_real_models(&c.provider.models).is_ok());
+        for m in DEFAULT_MODELS {
+            assert!(crate::inference::route_header(m).is_ok(), "{m}");
+        }
+    }
+
+    #[test]
+    fn a_config_that_still_names_the_retired_placeholder_is_refused() {
+        let c = parse(&format!(
+            r#"{{"provider": {{"models": ["{MODEL_ID_PLACEHOLDER}"]}}}}"#
+        ))
+        .unwrap();
         let e = require_real_models(&c.provider.models).unwrap_err();
-        assert!(e.contains("placeholder") && e.contains("provider.models"), "{e}");
+        assert!(
+            e.contains("placeholder") && e.contains("provider.models"),
+            "{e}"
+        );
         assert!(require_real_models(&["z-ai/glm-5.3-flash".into()]).is_ok());
         assert!(require_real_models(&["a".into(), MODEL_ID_PLACEHOLDER.into()]).is_err());
     }

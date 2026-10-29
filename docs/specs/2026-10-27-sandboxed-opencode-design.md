@@ -21,7 +21,7 @@ tool effects land.
 | Sandbox | mvm (`tinylabscom/mvm`, Apache-2.0), dev profile, `machine create` / `exec` / `rm` |
 | Guest image | A digest-pinned OCI image (default `docker.io/library/alpine@sha256:e311ae74...ffb42`, the one the probes ran on). A Nix `mkGuest` image is deferred. |
 | Inference | NEAR AI through IronWire embedded in `rts` (`ironwire_proxy::embed`, loopback port 0, OpenAI façade at `http://127.0.0.1:<port>/openai/v1`). IronWire holds the key, so neither opencode nor the VM sees it. An explicit external provider (any of `provider.id`, `provider.baseURL` or `provider.apiKeyEnv` set, `src/config.rs:219`) bypasses IronWire and the forwarder, so it is refused unless `--allow-unattested-provider` is passed. |
-| Models | By default, only NEAR AI's private abliterated models, by exact ID (launching 2026-10-29; on staging as of 2026-10-28; IDs not yet known, so the default is a marked placeholder that refuses to launch). `provider.models` is the allowlist. It is enforced three times: by `rts` config, by the plugin's model filter (exact IDs passed as a plugin option), and by the forwarder. |
+| Models | By default, only NEAR AI's abliterated DeepSeek, by exact ID: `deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated` (listed by production `/v1/models` on 2026-10-29). A config that still names the retired pre-launch placeholder `PLACEHOLDER-near-private-abliterated` is refused. `provider.models` is the allowlist. It is enforced three times: by `rts` config, by the plugin's model filter (exact IDs passed as a plugin option), and by the forwarder. |
 | Inference attestation | Before every session, in `rts`, after credentials and before IronWire starts: fetch NEAR AI's attestation report with a fresh nonce and verify it fail-closed (TDX quote with `dcap-qvl =0.7.0`, report data binding, compose measurement, NVIDIA GPU verdict). Any failure refuses the session. |
 | Inference path | IronWire's NEAR AI endpoint is an attested forwarder inside `rts` (`http://127.0.0.1:<port>/v1`), not `cloud-api.near.ai`. The forwarder pins upstream TLS to the attested certificate fingerprints, refuses models outside the allowlist, and verifies every response's ed25519 signature. A failed signature ends the session. Chosen over patching IronWire. |
 | VM egress | None. mvm default-deny, no `--allow-host`. |
@@ -167,7 +167,7 @@ blocks.
   before a VM exists. The session ID is chosen before connect, so
   `sessions/<id>/attestation.json` records a refused attestation too.
 - Refuses to launch, before any of the above, when `IRONWIRE_NEARAI_BASE_URL`
-  is set in its environment, when `provider.models` is still the placeholder,
+  is set in its environment, when `provider.models` still names the retired placeholder,
   or when the config selects an external provider without
   `--allow-unattested-provider`.
 - Sweeps orphaned `rts-*` machines left by an earlier crash, before creating a
@@ -534,7 +534,7 @@ Every failure ends in a refusal or a tool error. Nothing falls back to the host.
   opencode never starts. The reason is printed and written to
   `sessions/<id>/attestation.json` with status `refused`. PCS, NRAS or NEAR AI
   being unreachable is a failure, not a skip.
-- `IRONWIRE_NEARAI_BASE_URL` set, `provider.models` still the placeholder, or
+- `IRONWIRE_NEARAI_BASE_URL` set, `provider.models` still naming the retired placeholder, or
   an external provider without `--allow-unattested-provider`: refused before
   credentials are read.
 - Mid-session, the TLS pin still fails after three re-attestations, a model
@@ -677,8 +677,9 @@ Each is a short probe. None is assumed.
 5. Done 2026-10-27: dev-profile `machine create` / `start` / `exec` /
    `rm --force --yes` work on the macOS HVF backend.
 6. Open: on NEAR AI staging, record the base URL, the exact IDs of the
-   private abliterated models (they replace the `provider.models`
-   placeholder), how the API marks a model as private, and one real
+   private abliterated models (production lists
+   `deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated`, now the default,
+   2026-10-29), how the API marks a model as private, and one real
    attestation report per model, saved as fixtures. Confirm the report shape
    matches production: `gateway_attestation` with `tls_cert_fingerprint`,
    `model_attestations` with ed25519 `signing_address`, `nvidia_payload` and

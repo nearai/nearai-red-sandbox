@@ -422,11 +422,15 @@ mod tests {
     }
 
     #[test]
-    fn launch_refuses_placeholder_models_before_credentials() {
+    fn launch_refuses_the_retired_placeholder_model_before_credentials() {
         let none = attest::AttestOptions::default();
-        let e = check_launch(&default_config(), &[], &none).unwrap_err();
+        let mut cfg = default_config();
+        cfg.provider.models = vec![config::MODEL_ID_PLACEHOLDER.into()];
+        let e = check_launch(&cfg, &[], &none).unwrap_err();
         assert!(e.contains("placeholder"), "{e}");
         assert!(check_launch(&real_models(), &[], &none).is_ok());
+        // The default config names the real NEAR AI model and launches.
+        assert!(check_launch(&default_config(), &[], &none).is_ok());
     }
 
     #[test]

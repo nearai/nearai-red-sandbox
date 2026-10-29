@@ -55,7 +55,10 @@ To use a separately managed IronWire daemon, explicitly set
 `provider.id` and `provider.baseURL` in the operator configuration. The old
 `http://127.0.0.1:8463/openai/v1` connection remains available in that external
 mode and bypasses browser sign-in. A provider with only `models` selects
-embedded inference; omitting the provider entirely selects the default model.
+embedded inference; omitting the provider entirely selects the default model,
+NEAR AI's `deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated` (listed by
+production `/v1/models` on 2026-10-29). A config that still names the retired
+placeholder `PLACEHOLDER-near-private-abliterated` is refused at launch.
 
 A provider reached directly (for example `https://cloud-api.near.ai/v1`)
 still works: set `provider.id`, `provider.baseURL` (https) and
