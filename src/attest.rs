@@ -766,6 +766,130 @@ mod tests {
         assert_eq!(policy.compose_hashes.len(), 2);
     }
 
+    /// The production evidence recorded by tests/live_attest.rs on
+    /// 2026-10-29 (report, PCS collateral, root CRL, NRAS answer and the
+    /// JWKS key it names), replayed through the real quote and GPU
+    /// verifiers at the recorded time.
+    fn production_replay(
+        now: u64,
+        policy: Policy,
+        key: Option<HostSecret>,
+    ) -> Result<Attested, String> {
+        use base64::Engine;
+        let run: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/near-prod/live-run-2026-10-29.json"
+        ))
+        .unwrap();
+        let http = FakeHttp::new();
+        for e in run["exchanges"].as_array().unwrap() {
+            let headers = e["headers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| {
+                    (
+                        h[0].as_str().unwrap().to_string(),
+                        h[1].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            http.route(
+                e["method"].as_str().unwrap(),
+                e["url"].as_str().unwrap(),
+                HttpResponse {
+                    status: e["status"].as_u64().unwrap() as u16,
+                    headers,
+                    body: base64::engine::general_purpose::STANDARD
+                        .decode(e["body_b64"].as_str().unwrap())
+                        .unwrap(),
+                },
+            );
+        }
+        let nonce = report::hex32(run["nonces"][0].as_str().unwrap()).unwrap();
+        let http: Arc<dyn Http> = http;
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(now));
+        Attestor {
+            quotes: Arc::new(PcsQuoteVerifier { http: http.clone() }),
+            gpus: Arc::new(NrasGpuVerifier {
+                http: http.clone(),
+                clock: clock.clone(),
+            }),
+            http,
+            clock,
+            base_url: run["base_url"].as_str().unwrap().into(),
+            key,
+            models: vec![crate::config::DEFAULT_MODELS[0].to_string()],
+            options: AttestOptions::default(),
+            policy,
+            nonce: Arc::new(move || nonce),
+        }
+        .attest()
+    }
+
+    const PRODUCTION_RECORDED_AT: u64 = 1_793_309_354;
+
+    #[test]
+    fn the_recorded_production_evidence_attests_under_the_default_options() {
+        let a = production_replay(
+            PRODUCTION_RECORDED_AT,
+            load_policy(POLICY_JSON).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            a.fingerprints,
+            BTreeSet::from([
+                report::hex32("73862c254372091cc6895b900111503860694f8916ebf0c63b18d245ba8ba5ad")
+                    .unwrap(),
+                report::hex32("4066aed3031802c9de0197e0e849a18133e445f2bb085b036c2a18ab47796408")
+                    .unwrap(),
+            ])
+        );
+        // The live leaf's SPKI hash is the gateway's attested fingerprint.
+        use rustls::pki_types::pem::PemObject;
+        let leaf = rustls::pki_types::CertificateDer::from_pem_slice(include_bytes!(
+            "../tests/fixtures/near-prod/cloud-api-leaf.pem"
+        ))
+        .unwrap();
+        assert!(
+            a.fingerprints
+                .contains(&crate::forwarder::pin::spki_sha256(&leaf).unwrap())
+        );
+        assert_eq!(
+            a.keys[crate::config::DEFAULT_MODELS[0]],
+            BTreeSet::from([report::hex32(
+                "88fbc43bdd80a7cc51c3f47ac7ec88b37efe2471b4e20a651281fbd81adcee78"
+            )
+            .unwrap()])
+        );
+        let entries = a.evidence[0]["entries"].as_array().unwrap();
+        assert!(entries.iter().all(|e| e["tcb_status"] == "UpToDate"));
+    }
+
+    #[test]
+    fn the_recorded_production_evidence_is_refused_without_its_pinned_composes() {
+        let e = production_replay(
+            PRODUCTION_RECORDED_AT,
+            Policy {
+                compose_hashes: BTreeSet::new(),
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(e.contains("not pinned"), "{e}");
+    }
+
+    #[test]
+    fn the_recorded_production_evidence_is_refused_once_the_nras_token_expires() {
+        let e = production_replay(
+            PRODUCTION_RECORDED_AT + 7 * 24 * 3600,
+            load_policy(POLICY_JSON).unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert!(e.contains("GPU attestation"), "{e}");
+    }
+
     #[test]
     fn the_committed_policy_parses_and_bad_entries_are_refused() {
         load_policy(POLICY_JSON).unwrap();
