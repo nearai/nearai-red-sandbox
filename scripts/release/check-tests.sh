@@ -30,21 +30,39 @@ allowed() {
   return 1
 }
 
-# Exit 0 only when LOG has a `test result:` line and every failed test in it
-# is one of ALLOWED.
+# Exit 0 only when LOG has a `test result:` line, every failed test named on
+# a `test X ... FAILED` line is one of ALLOWED, and the failed counts on the
+# result lines add up to no more than those named lines. The count check
+# matters: stray stderr from a child process can split a FAILED line so the
+# anchored pattern misses it, and the gate must not fail open then.
 parse() {
-  local log=$1 line have_result=0 unexpected=()
+  local log=$1 line have_result=0 failed_total=0 named=0 unexpected=()
   [[ -f "$log" && -r "$log" ]] || die "log is not a readable file: $log"
   local re='^test ([^[:space:]]+) \.\.\. FAILED$'
+  local result_re='^test result: .* ([0-9]+) failed;'
   while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ "$line" == "test result: "* ]]; then have_result=1; fi
-    if [[ "$line" =~ $re ]] && ! allowed "${BASH_REMATCH[1]}"; then
-      unexpected+=("${BASH_REMATCH[1]}")
+    if [[ "$line" == "test result: "* ]]; then
+      have_result=1
+      if [[ "$line" =~ $result_re ]]; then
+        failed_total=$((failed_total + 10#${BASH_REMATCH[1]}))
+      else
+        printf 'check-tests: cannot read the failed count from: %s\n' "$line" >&2
+        return 1
+      fi
+    fi
+    if [[ "$line" =~ $re ]]; then
+      named=$((named + 1))
+      allowed "${BASH_REMATCH[1]}" || unexpected+=("${BASH_REMATCH[1]}")
     fi
   done < "$log"
   local status=0
   if [[ "$have_result" == 0 ]]; then
     printf 'check-tests: no test result line in %s (did the build fail?)\n' "$log" >&2
+    status=1
+  fi
+  if (( failed_total > named )); then
+    printf 'check-tests: the result lines report %d failed, but only %d FAILED lines were read; see %s\n' \
+      "$failed_total" "$named" "$log" >&2
     status=1
   fi
   local name

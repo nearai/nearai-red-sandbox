@@ -49,7 +49,10 @@ Steps:
 4. Sign `rts` and the supervisor with `codesign --sign "Developer ID
    Application: ..." --options runtime --timestamp`; the supervisor also gets
    an entitlements file with `com.apple.security.hypervisor`. Verify with
-   `codesign --verify --strict` and `spctl --assess --type execute`.
+   `codesign --verify --strict`; after notarization, `spctl --assess --type
+   install -vv` must report `source=Notarized Developer ID`. (`--type
+   execute` assesses app bundles and rejects every bare Mach-O CLI as "does
+   not seem to be an app", notarized or not.)
 5. Notarize: zip both binaries, `xcrun notarytool submit --wait` with the App
    Store Connect API key. A rejection fails the release and prints the
    notarization log. Bare Mach-O binaries cannot be stapled; Gatekeeper

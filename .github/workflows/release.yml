@@ -223,8 +223,21 @@ jobs:
           fi
 
           # Only after notarization: Gatekeeper rejects an unnotarized Developer ID binary.
-          spctl --assess --type execute -vv "$RTS"
-          spctl --assess --type execute -vv "$SUP"
+          # The install type, not the execute type: execute assesses app bundles
+          # and rejects every bare Mach-O CLI ("does not seem to be an app",
+          # exit 3), notarized or not. The verdict must name a notarized
+          # Developer ID.
+          assess_notarized() {
+            local bin=$1 out
+            out="$(spctl --assess --type install -vv "$bin" 2>&1 || true)"
+            echo "$out"
+            if ! grep -q 'source=Notarized Developer ID' <<<"$out"; then
+              echo "refusing: $bin is not accepted as Notarized Developer ID" >&2
+              exit 1
+            fi
+          }
+          assess_notarized "$RTS"
+          assess_notarized "$SUP"
 
       # After signing: package-release.sh checksums the signed bytes, and
       # rewrites the build-info's signed_binary_sha256 to the signed supervisor.

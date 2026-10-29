@@ -31,6 +31,19 @@ for (const [log, status] of [["baseline", 0], ["ok", 0], ["fewer", 0], ["sixth",
   })
 }
 
+test("a FAILED line split by stray stderr still counts against the result line", () => {
+  const r = run("scripts/release/check-tests.sh", ["--parse", join(FIXTURES, "split.log")])
+  expect(r.status).toBe(1)
+  expect(r.stderr).toContain("report 6 failed, but only 5 FAILED lines")
+})
+
+test("the release workflow assesses CLI binaries as notarized, not as apps", () => {
+  const wf = readFileSync(join(ROOT, ".github", "workflows", "release.yml"), "utf8")
+  expect(wf).not.toContain("--type execute")
+  expect(wf).toContain("spctl --assess --type install -vv")
+  expect(wf).toContain("source=Notarized Developer ID")
+})
+
 test("a substring of an allowed name is not allowed", () => {
   const r = run("scripts/release/check-tests.sh", ["--parse", join(FIXTURES, "substring.log")])
   expect(r.status).toBe(1)
