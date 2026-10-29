@@ -333,7 +333,9 @@ refuses until the operator passes `--allow-tcb-out-of-date`.
 **Record.** `sessions/<id>/attestation.json` holds every report as received,
 the nonces, the verified fingerprints, the signing keys per model, the
 compose hashes, the TCB statuses, the NRAS `kid`s and verdicts, the
-overrides in force, and a `status`: `verified`, `refused` (with the reason),
+overrides in force, and a `status`: `pending` (written when the record is
+created, before attestation has finished; a record left at `pending` was
+never attested), `verified`, `refused` (with the reason),
 `unattested-provider`, `pin-failed`, `model-refused` or `signature-failed`.
 It is written atomically (temp file and rename) on every change.
 
@@ -351,8 +353,8 @@ with a forwarder between IronWire and NEAR AI, instead of patching IronWire.
   embedded IronWire worker (`src/inference.rs:150-200`). IronWire's generated
   config sets the `nearai` backend's `base_url` to
   `http://127.0.0.1:<port>/v1` (`inference::start_with_endpoint`,
-  `src/inference.rs:99`). The pinned IronWire already accepts this: the
-  existing test `the_selected_model_and_host_key_reach_only_the_local_test_upstream`
+  `src/inference.rs:100`, the only way `rts` starts IronWire). The pinned
+  IronWire already accepts this: the existing test `the_selected_model_and_host_key_reach_only_the_local_test_upstream`
   points it at plain-HTTP loopback and receives
   `POST /v1/chat/completions` with the key. IronWire attaches a credential
   only to the configured host, and loopback counts
@@ -363,9 +365,15 @@ with a forwarder between IronWire and NEAR AI, instead of patching IronWire.
   against a later IronWire revision changing the precedence.
 - **The key.** IronWire keeps the key and sends it as `Authorization` on
   each completion; the forwarder passes that header through unchanged and
-  does not add one of its own. The forwarder's own calls (re-attestation and
-  signature fetches) use the same key, which `rts` already holds in memory
-  for the attestation step. Holding it in the forwarder for completions too
+  does not add one of its own. Re-attestation uses the key `rts` already
+  holds in memory for the attestation step (captured by the re-attestation
+  closure, which has no `Debug`). Signature fetches do not: each one reuses
+  the `Authorization` header of the completion it checks, held marked
+  sensitive and never formatted. That fetches the receipt with the
+  credential that made the completion, and keeps a second copy of the key
+  out of the forwarder's per-request state; a completion that arrived
+  without `Authorization` cannot have its receipt fetched, so its check
+  fails (`signature-failed`). Holding the key in the forwarder for completions too
   would add no protection: it is the same process and the same secret. It
   would also turn the forwarder's loopback port into a credentialed proxy any
   local process could spend through. With pass-through, a request without
@@ -391,7 +399,14 @@ with a forwarder between IronWire and NEAR AI, instead of patching IronWire.
   before any request byte is sent. The forwarder then re-runs the full
   attestation, up to three times, adding any newly verified fingerprints and
   keys, and retries the request once. If it still fails, IronWire gets a 502,
-  `attestation.json` is marked `pin-failed`, and the session ends. On
+  `attestation.json` is marked `pin-failed`, and the session ends. A
+  signature fetch can be the first connection to meet a rotated
+  certificate (it opens its own connection after the completion ended); it
+  is handled the same way: an unpinned certificate is learned by the same
+  re-attestation (at most three attempts, shared with any parked
+  completion), and the fetch is retried within what is left of its window.
+  An untrusted certificate, a failed re-attestation, or a certificate still
+  refused afterwards is `pin-failed`, not `signature-failed`. On
   2026-10-28 the gateway presented a Let's Encrypt certificate valid until
   2026-12-30, so rotation during a long session is expected, not theoretical.
 - **Model allowlist, third layer.** The forwarder parses the request body and
@@ -399,7 +414,10 @@ with a forwarder between IronWire and NEAR AI, instead of patching IronWire.
   upstream. That can only happen if the plugin filter and IronWire's own
   catalogue were bypassed, so it is also fatal (`model-refused`).
 - **Compression.** The forwarder sends `Accept-Encoding: identity` upstream,
-  so the bytes it hashes are the bytes NEAR AI signs.
+  so the bytes it hashes are the bytes NEAR AI signs. A 2xx answer with any
+  `Content-Encoding` other than absent or `identity` is not relayed and is
+  fatal (`signature-failed`): the receipt covers the bytes as sent, and the
+  forwarder neither decodes nor asks for a coding.
 - **Per-response signatures.** For each completion, the forwarder hashes the
   exact request bytes it sent and the exact response bytes it received,
   streamed or not, while relaying them; nothing is buffered before delivery.
@@ -756,6 +774,9 @@ For attestation and the forwarder (2026-10-28):
   `rustls` 0.23.46 and `rustls-native-certs` 0.8.5 (the pinned verifier and
   its roots), `hyper` 1.12.0, `hyper-util` 0.1.21, `http-body-util` 0.1.5 and
   `bytes` 1.12.1 (the forwarder's server and streaming bodies), `hex` 0.4.3.
+  `tokio` keeps its `macros` feature: production code uses `tokio::select!`
+  (the relay and the signature check each race their work against a fatal
+  raised elsewhere), as well as `#[tokio::test]` in tests.
   `serde_json` gains its `raw_value` feature, to keep Intel's signed
   `tcbInfo` bytes exact. These change `Cargo.toml` but should add no
   lockfile package; the plan checks that with a lockfile diff.
