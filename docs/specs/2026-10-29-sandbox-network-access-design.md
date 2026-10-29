@@ -64,7 +64,7 @@ Full record: `docs/research/2026-10-29-mvm-egress-spike-hvf.md`.
    child of the `mvmctl` process, and the endpoint's parent-death watchdog
    makes it exit about 0.5 s after `machine start` returns; the guest then
    logs "guest egress is down". Reproduced on two machines. No upstream issue
-   or newer release (v0.22.0 is the latest stable) covers it. `rts` uses
+   or newer release (v0.22.0 is the latest stable) covered it; filed upstream as tinylabscom/mvm#4860 on 2026-10-29 (reproduced with the stock supervisor). `rts` uses
    persistent machines (`create`, `start`, `exec`, `rm`), so this design cannot
    work until it is fixed or worked around.
 2. **mvm's TLS interception does not close CDN fronting**, so it is not part
