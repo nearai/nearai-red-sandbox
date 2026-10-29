@@ -154,12 +154,10 @@ impl GpuVerifier for NrasGpuVerifier {
         if nonce_hex.is_empty() || !nonce_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("GPU evidence: expected nonce is not hex".into());
         }
-        let payload: Value = serde_json::from_str(nvidia_payload)
-            .map_err(|e| format!("GPU evidence is not JSON: {e}"))?;
-        let nonce = payload
-            .get("nonce")
-            .and_then(Value::as_str)
-            .ok_or("GPU evidence has no nonce")?;
+        // One top-level string "nonce": a repeated key is refused, since
+        // NRAS may read the first where serde_json's Value keeps the last.
+        let nonce = crate::json::top_level_string(nvidia_payload.as_bytes(), "nonce")
+            .ok_or("GPU evidence is not a JSON object with exactly one string nonce")?;
         if !nonce.eq_ignore_ascii_case(nonce_hex) {
             return Err("GPU evidence nonce does not match the request nonce".into());
         }
@@ -479,6 +477,26 @@ mod tests {
         assert!(e.contains("nonce"), "{e}");
         let e = v.verify("not json", &nonce()).unwrap_err();
         assert!(!e.is_empty());
+        assert!(http.calls().is_empty());
+    }
+
+    /// Review finding: the nonce is the only binding of the GPU evidence to
+    /// this session, and parsers disagree on which duplicate key wins, so a
+    /// second "nonce" is refused whichever one matches.
+    #[test]
+    fn a_payload_with_two_nonces_is_refused_before_any_request() {
+        let (http, v) = verifier(true, 200);
+        let other = "6a".repeat(32);
+        for (first, second) in [(nonce(), other.clone()), (other.clone(), nonce())] {
+            let p = format!(
+                r#"{{"nonce":"{first}","arch":"HOPPER","nonce":"{second}","evidence_list":[]}}"#
+            );
+            let e = v.verify(&p, &nonce()).unwrap_err();
+            assert!(e.contains("nonce"), "{e}");
+        }
+        // A non-string nonce is no nonce.
+        let e = v.verify(r#"{"nonce":5}"#, &nonce()).unwrap_err();
+        assert!(e.contains("nonce"), "{e}");
         assert!(http.calls().is_empty());
     }
 }

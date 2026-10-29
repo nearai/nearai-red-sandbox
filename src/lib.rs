@@ -2,6 +2,7 @@ pub mod attest;
 pub mod bridge;
 pub mod auth;
 pub mod inference;
+pub(crate) mod json;
 pub mod config;
 pub mod forwarder;
 pub mod copy;

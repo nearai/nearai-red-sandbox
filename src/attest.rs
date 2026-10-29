@@ -212,6 +212,15 @@ impl Attestor {
         let keys = out.keys.entry(model.to_string()).or_default();
         for (i, entry) in entries.iter().enumerate() {
             let at = |e: String| format!("model_attestations[{i}]: {e}");
+            // Evidence for another model is not evidence for this one. NEAR
+            // AI may omit the field; that is accepted until check 6.
+            if let Some(name) = entry.model_name.as_deref()
+                && name != model
+            {
+                return Err(at(format!(
+                    "model_name {name:?} is not the requested model {model:?}"
+                )));
+            }
             let key = report::ed25519_key(entry).map_err(at)?;
             let mut record = self.check_quote(entry, &nonce).map_err(at)?;
             let payload = entry
@@ -484,6 +493,10 @@ mod tests {
                         "intel_quote".into(),
                         hex::encode(format!("m0-{model}")).into(),
                     );
+                    // Only the fixture's default; a tampered name stays.
+                    if m.get("model_name").and_then(|n| n.as_str()) == Some("m") {
+                        m.insert("model_name".into(), (*model).into());
+                    }
                 }
             }
         }
@@ -662,6 +675,12 @@ mod tests {
                     m0(c).insert("signing_algo".into(), "ecdsa".into());
                 }),
             ),
+            (
+                "model_name \"other-model\" is not the requested model \"m\"",
+                Box::new(|c| {
+                    m0(c).insert("model_name".into(), "other-model".into());
+                }),
+            ),
             ("HTTP 401", Box::new(|c| c.status = 401)),
             (
                 "report",
@@ -679,6 +698,18 @@ mod tests {
             );
             assert!(!err.contains(DUMMY_KEY), "key leaked into {err}");
         }
+    }
+
+    /// `model_name` is checked when present; NEAR AI may omit it, so its
+    /// absence is not refused until check 6 confirms the field.
+    #[test]
+    fn an_entry_without_model_name_is_accepted() {
+        let mut case = Case::good([1; 32]);
+        case.report["model_attestations"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("model_name");
+        assert!(run_one(case).result.is_ok());
     }
 
     #[test]
