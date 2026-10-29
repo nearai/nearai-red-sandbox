@@ -14,7 +14,7 @@ const V214_TOOLS = [
   "mcp_resource_list", "mcp_resource_read",
 ]
 
-type Stubborn = { tool?: string; mcp?: string; model?: string; modelId?: string }
+type Stubborn = { tool?: string; mcp?: string; model?: string; modelId?: string; modelsNotLoaded?: boolean }
 
 // A fake v2.1.4 plugin Context with just the domains the plugin uses.
 function fakeCtx(options: Record<string, unknown>, stubborn: Stubborn = {}) {
@@ -22,7 +22,9 @@ function fakeCtx(options: Record<string, unknown>, stubborn: Stubborn = {}) {
     V214_TOOLS.map((id) => [id, { id, name: id, description: `orig ${id}`, input: { schemaOf: id }, output: { out: id }, execute: async () => ({ content: `host ${id}` }) }]),
   )
   const servers = new Map<string, any>([["g", { type: "local" }], ["p", { type: "local" }]])
-  const models = [
+  // Real opencode loads provider models after plugin setup; modelsNotLoaded
+  // reproduces that ordering.
+  const models = stubborn.modelsNotLoaded ? [] : [
     { id: "big-pickle", providerID: "opencode", enabled: true },
     { id: "grok-code", providerID: "opencode", enabled: true },
     { id: "z-ai/glm-5.3-flash", providerID: "ironwire", enabled: true },
@@ -203,9 +205,18 @@ test("a provider model outside the allowlist that survives makes setup throw", a
   await expect(setupWith(f.ctx, fakeImpl)).rejects.toThrow("model allowlist mismatch: ironwire/other-nearai-model")
   expect(existsSync(options.readyFile as string)).toBe(false)
 })
-test("an allowlisted model that opencode does not offer makes setup throw", async () => {
+// opencode v2.1.4 loads provider models after plugin setup (model.updated
+// follows the plugin load), so an allowlisted model may not be listed yet.
+// Presence is checked by rts against IronWire's /models before opencode starts.
+test("an allowlisted model that opencode has not listed yet does not fail setup", async () => {
   const f = fakeCtx({ ...options, models: ["z-ai/glm-5.3-flash", "not-offered"] })
-  await expect(setupWith(f.ctx, fakeImpl)).rejects.toThrow("model allowlist mismatch: missing ironwire/not-offered")
+  await setupWith(f.ctx, fakeImpl)
+  expect(existsSync(options.readyFile as string)).toBe(true)
+})
+test("setup succeeds when opencode lists no provider models yet", async () => {
+  const f = fakeCtx(options, { modelsNotLoaded: true })
+  await setupWith(f.ctx, fakeImpl)
+  expect(existsSync(options.readyFile as string)).toBe(true)
 })
 for (const models of [undefined, [], [""], "z-ai/glm-5.3-flash", [1]]) {
   test(`option models ${JSON.stringify(models)} is refused`, async () => {

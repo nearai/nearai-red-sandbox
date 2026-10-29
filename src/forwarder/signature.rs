@@ -234,15 +234,13 @@ pub enum FetchError {
 impl std::fmt::Display for FetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FetchError::Rejected(Rejected::Unpinned(fp)) => write!(
+            FetchError::Rejected(r @ Rejected::Unpinned(_)) => {
+                write!(f, "signature fetch: {} is not attested", r.certificate())
+            }
+            FetchError::Rejected(r @ Rejected::Untrusted(_)) => write!(
                 f,
-                "signature fetch: upstream certificate {} is not attested",
-                hex::encode(fp)
-            ),
-            FetchError::Rejected(Rejected::Untrusted(fp)) => write!(
-                f,
-                "signature fetch: upstream certificate {} does not chain to a trusted root",
-                hex::encode(fp)
+                "signature fetch: {} does not chain to a trusted root",
+                r.certificate()
             ),
             FetchError::Failed(reason) => f.write_str(reason),
         }

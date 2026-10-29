@@ -28,6 +28,9 @@ ring = "0.17.14"
 # The pinned forwarder (src/forwarder.rs). Promoted from Cargo.lock; no new packages.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.5"
+# The forwarder pins the leaf's SubjectPublicKeyInfo (src/forwarder/pin.rs),
+# parsed by the same X.509 code rustls verifies with. Promoted from Cargo.lock; no new packages.
+rustls-webpki = { version = "0.103.16", default-features = false, features = ["alloc"] }
 hyper = { version = "1.12.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 http-body-util = "0.1.5"

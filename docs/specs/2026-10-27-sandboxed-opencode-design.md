@@ -21,7 +21,7 @@ tool effects land.
 | Sandbox | mvm (`tinylabscom/mvm`, Apache-2.0), dev profile, `machine create` / `exec` / `rm` |
 | Guest image | A digest-pinned OCI image (default `docker.io/library/alpine@sha256:e311ae74...ffb42`, the one the probes ran on). A Nix `mkGuest` image is deferred. |
 | Inference | NEAR AI through IronWire embedded in `rts` (`ironwire_proxy::embed`, loopback port 0, OpenAI façade at `http://127.0.0.1:<port>/openai/v1`). IronWire holds the key, so neither opencode nor the VM sees it. An explicit external provider (any of `provider.id`, `provider.baseURL` or `provider.apiKeyEnv` set, `src/config.rs:219`) bypasses IronWire and the forwarder, so it is refused unless `--allow-unattested-provider` is passed. |
-| Models | By default, only NEAR AI's private abliterated models, by exact ID (launching 2026-10-29; on staging as of 2026-10-28; IDs not yet known, so the default is a marked placeholder that refuses to launch). `provider.models` is the allowlist. It is enforced three times: by `rts` config, by the plugin's model filter (exact IDs passed as a plugin option), and by the forwarder. |
+| Models | By default, only NEAR AI's abliterated DeepSeek, by exact ID: `deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated` (listed by production `/v1/models` on 2026-10-29). A config that still names the retired pre-launch placeholder `PLACEHOLDER-near-private-abliterated` is refused. `provider.models` is the allowlist. It is enforced three times: by `rts` config, by the plugin's model filter (exact IDs passed as a plugin option), and by the forwarder. |
 | Inference attestation | Before every session, in `rts`, after credentials and before IronWire starts: fetch NEAR AI's attestation report with a fresh nonce and verify it fail-closed (TDX quote with `dcap-qvl =0.7.0`, report data binding, compose measurement, NVIDIA GPU verdict). Any failure refuses the session. |
 | Inference path | IronWire's NEAR AI endpoint is an attested forwarder inside `rts` (`http://127.0.0.1:<port>/v1`), not `cloud-api.near.ai`. The forwarder pins upstream TLS to the attested certificate fingerprints, refuses models outside the allowlist, and verifies every response's ed25519 signature. A failed signature ends the session. Chosen over patching IronWire. |
 | VM egress | None. mvm default-deny, no `--allow-host`. |
@@ -167,7 +167,7 @@ blocks.
   before a VM exists. The session ID is chosen before connect, so
   `sessions/<id>/attestation.json` records a refused attestation too.
 - Refuses to launch, before any of the above, when `IRONWIRE_NEARAI_BASE_URL`
-  is set in its environment, when `provider.models` is still the placeholder,
+  is set in its environment, when `provider.models` still names the retired placeholder,
   or when the config selects an external provider without
   `--allow-unattested-provider`.
 - Sweeps orphaned `rts-*` machines left by an earlier crash, before creating a
@@ -386,8 +386,14 @@ with a forwarder between IronWire and NEAR AI, instead of patching IronWire.
 - **Pinning.** Upstream TLS uses `rustls` 0.23 with a custom
   `ServerCertVerifier`. It runs the normal `webpki` validation against the
   native root store (as `reqwest`'s `rustls-tls-native-roots` does today),
-  and then requires `sha256(leaf DER)` to be in the session's attested
-  fingerprint set. It is installed on the upstream client itself
+  and then requires the SHA-256 of the leaf certificate's
+  SubjectPublicKeyInfo DER (the full SEQUENCE, as `openssl x509 -pubkey
+  -noout | openssl pkey -pubin -outform DER` writes it) to be in the
+  session's attested fingerprint set. That is what NEAR AI's
+  `tls_cert_fingerprint` is (measured against production 2026-10-29, and
+  what NEAR's own `nearai-cloud-verifier` checks); it is not
+  `sha256(leaf DER)`, which never matches. A pin on the key also survives a
+  certificate renewal that keeps the key. It is installed on the upstream client itself
   (`reqwest::ClientBuilder::use_preconfigured_tls`), so every connection the
   pool holds passed it at its handshake. The earlier TypeScript design
   measured why that matters (bun 1.3.3, 2026-10-28): a per-request
@@ -528,7 +534,7 @@ Every failure ends in a refusal or a tool error. Nothing falls back to the host.
   opencode never starts. The reason is printed and written to
   `sessions/<id>/attestation.json` with status `refused`. PCS, NRAS or NEAR AI
   being unreachable is a failure, not a skip.
-- `IRONWIRE_NEARAI_BASE_URL` set, `provider.models` still the placeholder, or
+- `IRONWIRE_NEARAI_BASE_URL` set, `provider.models` still naming the retired placeholder, or
   an external provider without `--allow-unattested-provider`: refused before
   credentials are read.
 - Mid-session, the TLS pin still fails after three re-attestations, a model
@@ -671,8 +677,9 @@ Each is a short probe. None is assumed.
 5. Done 2026-10-27: dev-profile `machine create` / `start` / `exec` /
    `rm --force --yes` work on the macOS HVF backend.
 6. Open: on NEAR AI staging, record the base URL, the exact IDs of the
-   private abliterated models (they replace the `provider.models`
-   placeholder), how the API marks a model as private, and one real
+   private abliterated models (production lists
+   `deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated`, now the default,
+   2026-10-29), how the API marks a model as private, and one real
    attestation report per model, saved as fixtures. Confirm the report shape
    matches production: `gateway_attestation` with `tls_cert_fingerprint`,
    `model_attestations` with ed25519 `signing_address`, `nvidia_payload` and
@@ -687,11 +694,28 @@ Each is a short probe. None is assumed.
    certificate below is the attested `tls_cert_fingerprint`, and whether
    every gateway instance shares it. Repeat against production after the
    2026-10-29 launch, before the default config points there.
+   - Done 2026-10-29 against production, for attestation only
+     (`tests/live_attest.rs`; facts in `opencode/README.md`): the report is
+     served without an API key and has the shape above; model entries carry
+     `model_name` equal to the requested ID and their own
+     `tls_cert_fingerprint`; both quotes are `UpToDate` with no advisories;
+     NRAS answers overall `true`; both compose hashes are pinned and each
+     equals the entry's `info.compose_hash` (which `rts` does not read: the
+     measured `mr_config_id` is what it checks). `tls_cert_fingerprint` is
+     sha256 of the leaf's SubjectPublicKeyInfo, and the live leaf's matches
+     the gateway's, so the forwarder pins on SPKI. Whether every gateway
+     instance shares the key was not measured beyond repeated handshakes.
+   - Still open, needing an API key: the signature receipt latency (the 10 s
+     window), the receipt `text` format against the exact relayed bytes, and
+     `signature_kind`; and one real completion through the forwarder.
 7. Done 2026-10-28, for attestation and the forwarder:
-   - `cloud-api.near.ai` presented leaf sha256
+   - `cloud-api.near.ai` presented leaf sha256 (of the whole DER)
      `5664580137f5b2abc8b2cc9ef53dc2bd7cd79b6ffc9f840dbbfca708a2c51022` on
      three handshakes (and on four earlier the same day): `CN=cloud-api.near.ai`,
-     issuer Let's Encrypt `YE1`, notAfter 2026-12-30.
+     issuer Let's Encrypt `YE1`, notAfter 2026-12-30. Its SPKI sha256 is
+     `73862c254372091cc6895b900111503860694f8916ebf0c63b18d245ba8ba5ad`,
+     which is the gateway's attested `tls_cert_fingerprint` (2026-10-29);
+     the pin is on the SPKI hash.
    - NVIDIA's JWKS served 212 keys, all `kty EC`, `crv P-384`, each with a
      two-certificate `x5c` and a dated `kid`; keys rotate daily, so the JWKS
      is fetched per attestation.
