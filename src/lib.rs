@@ -12,6 +12,7 @@ pub mod install;
 pub mod mvm;
 pub mod protocol;
 pub mod session;
+pub mod setup;
 pub mod sandbox;
 pub mod sys;
 pub mod tools;
