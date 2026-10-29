@@ -14,7 +14,7 @@ const V214_TOOLS = [
   "mcp_resource_list", "mcp_resource_read",
 ]
 
-type Stubborn = { tool?: string; mcp?: string; model?: string }
+type Stubborn = { tool?: string; mcp?: string; model?: string; modelId?: string }
 
 // A fake v2.1.4 plugin Context with just the domains the plugin uses.
 function fakeCtx(options: Record<string, unknown>, stubborn: Stubborn = {}) {
@@ -26,6 +26,7 @@ function fakeCtx(options: Record<string, unknown>, stubborn: Stubborn = {}) {
     { id: "big-pickle", providerID: "opencode", enabled: true },
     { id: "grok-code", providerID: "opencode", enabled: true },
     { id: "z-ai/glm-5.3-flash", providerID: "ironwire", enabled: true },
+    { id: "other-nearai-model", providerID: "ironwire", enabled: true },
   ]
   const transforms = { tool: [] as any[], mcp: [] as any[], model: [] as any[] }
   const hooks: Record<string, ((ev: any) => any)[]> = {}
@@ -55,7 +56,7 @@ function fakeCtx(options: Record<string, unknown>, stubborn: Stubborn = {}) {
     get: () => undefined,
     update: () => {},
     remove: (p: string, id: string) => {
-      if (p === stubborn.model) return
+      if (p === stubborn.model || id === stubborn.modelId) return
       const i = models.findIndex((m) => m.providerID === p && m.id === id)
       if (i >= 0) models.splice(i, 1)
     },
@@ -106,6 +107,7 @@ beforeEach(() => {
     readyFile: join(dir, "ready"),
     auditFile: join(dir, "tools.jsonl"),
     provider: "ironwire",
+    models: ["z-ai/glm-5.3-flash"],
     rts: "/nonexistent/rts",
     bridge: { machine: "rts-0123456789ab", stateDir: join(dir, "state") },
   }
@@ -190,6 +192,27 @@ test("a model from another provider that survives makes setup throw and leaves n
   await expect(setupWith(f.ctx, fakeImpl)).rejects.toThrow("model outside provider ironwire")
   expect(existsSync(join(dir, "ready"))).toBe(false)
 })
+
+test("setup keeps only the allowlisted model IDs of the session provider", async () => {
+  const f = fakeCtx(options)
+  await setupWith(f.ctx, fakeImpl)
+  expect((await f.ctx.model.list()).data.map((m: any) => `${m.providerID}/${m.id}`)).toEqual(["ironwire/z-ai/glm-5.3-flash"])
+})
+test("a provider model outside the allowlist that survives makes setup throw", async () => {
+  const f = fakeCtx(options, { modelId: "other-nearai-model" })
+  await expect(setupWith(f.ctx, fakeImpl)).rejects.toThrow("model allowlist mismatch: ironwire/other-nearai-model")
+  expect(existsSync(options.readyFile as string)).toBe(false)
+})
+test("an allowlisted model that opencode does not offer makes setup throw", async () => {
+  const f = fakeCtx({ ...options, models: ["z-ai/glm-5.3-flash", "not-offered"] })
+  await expect(setupWith(f.ctx, fakeImpl)).rejects.toThrow("model allowlist mismatch: missing ironwire/not-offered")
+})
+for (const models of [undefined, [], [""], "z-ai/glm-5.3-flash", [1]]) {
+  test(`option models ${JSON.stringify(models)} is refused`, async () => {
+    const f = fakeCtx({ ...options, models })
+    await expect(setupWith(f.ctx, fakeImpl)).rejects.toThrow("rts-sandbox: option models must be a non-empty list of model IDs")
+  })
+}
 
 test("bad options refuse before touching anything", async () => {
   const f = fakeCtx({ ...options, machine: "web" })

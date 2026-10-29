@@ -217,8 +217,9 @@ fn sigint_to_the_launcher_exports_out_and_leaves_no_rts_machine() {
         "limits": { "handshakeMs": 60_000 },
     });
     fs::write(&cfg, config.to_string()).unwrap();
+    // A fake external IronWire is not attested: allow it explicitly.
     let mut child = Command::new(env!("CARGO_BIN_EXE_rts"))
-        .args(["launch", "--config"])
+        .args(["launch", "--allow-unattested-provider", "--config"])
         .arg(&cfg)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

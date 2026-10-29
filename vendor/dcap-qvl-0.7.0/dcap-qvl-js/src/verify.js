@@ -1,0 +1,737 @@
+// Quote verification logic
+// Converted from verify.rs
+
+const crypto = require('./crypto-compat');
+const { Buffer } = require('buffer');
+const { Quote, EnclaveReport } = require('./quote');
+const { TcbInfo, TcbStatus } = require('./tcb_info');
+const { QeIdentity } = require('./qe_identity');
+const utils = require('./utils');
+const intel = require('./intel');
+const {
+    TRUSTED_ROOT_CA_DER,
+    ATTESTATION_KEY_TYPE_ECDSA256_WITH_P256_CURVE,
+    PCK_CERT_CHAIN,
+    QE_HASH_DATA_BYTE_LEN,
+    ATTESTATION_KEY_LEN,
+    ALLOWED_QUOTE_VERSIONS,
+    ALLOWED_TEE_TYPES,
+    TEE_TYPE_SGX,
+    TEE_TYPE_TDX,
+} = require('./constants');
+
+class VerifiedReport {
+    constructor(status, advisoryIds, report, ppid) {
+        this.status = status;
+        this.advisory_ids = advisoryIds;
+        this.report = report;
+        this.ppid = ppid;
+    }
+}
+
+class QuoteVerifier {
+    constructor(rootCaDer) {
+        this.rootCaDer = rootCaDer || TRUSTED_ROOT_CA_DER;
+        this.allowDebugFlag = false;
+        this.allowServiceTdFlag = false;
+    }
+
+    static newProd() {
+        return new QuoteVerifier(TRUSTED_ROOT_CA_DER);
+    }
+
+    static newWithRootCa(rootCaDer) {
+        return new QuoteVerifier(rootCaDer);
+    }
+
+    // Allow debug-mode enclaves (SGX debug bit, TDX TUD.DEBUG). Default false.
+    allowDebug(allow) {
+        this.allowDebugFlag = !!allow;
+        return this;
+    }
+
+    // Allow non-zero mr_service_td in TDX 1.5 quotes (opt-in). Default false.
+    allowServiceTd(allow) {
+        this.allowServiceTdFlag = !!allow;
+        return this;
+    }
+
+    verify(rawQuote, collateral, nowSecs) {
+        return verifyImpl(
+            rawQuote,
+            collateral,
+            nowSecs,
+            this.rootCaDer,
+            this.allowDebugFlag,
+            this.allowServiceTdFlag,
+        );
+    }
+}
+
+function verifyImpl(rawQuote, collateral, nowSecs, rootCaDer, allowDebug = false, allowServiceTd = false) {
+    const now = new Date(nowSecs * 1000);
+
+    // Parse quote
+    let quote;
+    try {
+        quote = Quote.parse(rawQuote);
+    } catch (e) {
+        throw new Error('Failed to decode quote', { cause: e });
+    }
+    const signedQuoteLen = quote.signedLength();
+
+    // Check quote version and TEE type
+    if (!ALLOWED_QUOTE_VERSIONS.includes(quote.header.version)) {
+        throw new Error('Unsupported DCAP quote version');
+    }
+    if (!ALLOWED_TEE_TYPES.includes(quote.header.teeType)) {
+        throw new Error('Unsupported DCAP TEE type');
+    }
+    if (quote.header.teeType == TEE_TYPE_SGX && quote.header.version != 3) {
+        throw new Error('SGX TEE quote must have version 3');
+    }
+    if (quote.header.teeType == TEE_TYPE_TDX && (quote.header.version != 4 && quote.header.version != 5)) {
+        throw new Error('TDX TEE quote must have version 4 or 5');
+    }
+
+    // Check attestation key type
+    if (quote.header.attestationKeyType !== ATTESTATION_KEY_TYPE_ECDSA256_WITH_P256_CURVE) {
+        throw new Error('Unsupported DCAP attestation key type');
+    }
+
+    // Parse TCB info
+    let tcbInfo;
+    try {
+        tcbInfo = TcbInfo.fromJSON(collateral.tcb_info);
+    } catch (e) {
+        throw new Error('Failed to decode TcbInfo', { cause: e });
+    }
+
+    // Check TCB info validity window
+    const issueDate = new Date(tcbInfo.issueDate);
+    if (nowSecs < issueDate.getTime() / 1000) {
+        throw new Error('TCBInfo issue date is in the future');
+    }
+    const nextUpdate = new Date(tcbInfo.nextUpdate);
+    if (nowSecs > nextUpdate.getTime() / 1000) {
+        throw new Error('TCBInfo expired');
+    }
+
+    // Prepare CRLs (convert from hex if needed)
+    const rootCaCrl = typeof collateral.root_ca_crl === 'string'
+        ? Buffer.from(collateral.root_ca_crl, 'hex')
+        : Buffer.from(collateral.root_ca_crl);
+    const pckCrl = typeof collateral.pck_crl === 'string'
+        ? Buffer.from(collateral.pck_crl, 'hex')
+        : Buffer.from(collateral.pck_crl);
+    const crls = utils.validateCollateralCrls(
+        rootCaDer,
+        collateral.pck_crl_issuer_chain,
+        rootCaCrl,
+        pckCrl,
+        nowSecs,
+    );
+
+    // Verify TCB info certificate chain and signature
+    const tcbLeafCerts = utils.extractCerts(Buffer.from(collateral.tcb_info_issuer_chain));
+    if (tcbLeafCerts.length < 2) {
+        throw new Error('Certificate chain is too short for TCB Info');
+    }
+
+    utils.verifyCertificateChain(
+        tcbLeafCerts[0],
+        tcbLeafCerts.slice(1),
+        nowSecs,
+        crls,
+        rootCaDer
+    );
+
+    // Verify TCB info signature
+    const tcbInfoSig = typeof collateral.tcb_info_signature === 'string'
+        ? Buffer.from(collateral.tcb_info_signature, 'hex')
+        : Buffer.from(collateral.tcb_info_signature);
+    const tcbInfoSignatureDer = utils.encodeAsDer(tcbInfoSig);
+    try {
+        verifyEcdsaSignature(
+            tcbLeafCerts[0],
+            Buffer.from(collateral.tcb_info, 'utf-8'),
+            tcbInfoSignatureDer
+        );
+    } catch (e) {
+        throw new Error('Signature is invalid for tcb_info');
+    }
+
+    // Step 2: Verify QE Identity signature
+    let qeIdentity;
+    try {
+        qeIdentity = QeIdentity.fromJSON(collateral.qe_identity);
+    } catch (e) {
+        throw new Error('Failed to decode QeIdentity', { cause: e });
+    }
+
+    // Check QE Identity validity window
+    const qeIssueDate = new Date(qeIdentity.issueDate);
+    if (nowSecs < qeIssueDate.getTime() / 1000) {
+        throw new Error('QE Identity issue date is in the future');
+    }
+    const qeIdentityNextUpdate = new Date(qeIdentity.nextUpdate);
+    if (nowSecs > qeIdentityNextUpdate.getTime() / 1000) {
+        throw new Error('QE Identity expired');
+    }
+
+    // Verify QE Identity certificate chain
+    const qeIdCerts = utils.extractCerts(Buffer.from(collateral.qe_identity_issuer_chain));
+    if (qeIdCerts.length < 2) {
+        throw new Error('Certificate chain is too short for QE Identity');
+    }
+
+    utils.verifyCertificateChain(
+        qeIdCerts[0],
+        qeIdCerts.slice(1),
+        nowSecs,
+        crls,
+        rootCaDer
+    );
+
+    // Verify QE Identity signature
+    const qeIdSig = typeof collateral.qe_identity_signature === 'string'
+        ? Buffer.from(collateral.qe_identity_signature, 'hex')
+        : Buffer.from(collateral.qe_identity_signature);
+    const qeIdSignatureDer = utils.encodeAsDer(qeIdSig);
+    try {
+        verifyEcdsaSignature(
+            qeIdCerts[0],
+            Buffer.from(collateral.qe_identity, 'utf-8'),
+            qeIdSignatureDer
+        );
+    } catch (e) {
+        throw new Error('Signature is invalid for qe_identity');
+    }
+
+    const expectedQeId = quote.header.teeType === TEE_TYPE_TDX ? 'TD_QE' : 'QE';
+    const allowedQeVersions = quote.header.teeType === TEE_TYPE_TDX ? [2, 3] : [2];
+    if (qeIdentity.id !== expectedQeId || !allowedQeVersions.includes(qeIdentity.version)) {
+        throw new Error('Unsupported QE Identity id/version for the quote TEE type');
+    }
+
+    // Extract auth data
+    const authData = quote.authData.intoV3();
+    const certificationData = authData.certificationData;
+
+    // Extract PCK certificate chain - prefer collateral, fall back to quote
+    let qeCertificationCerts;
+    if (collateral.pck_certificate_chain) {
+        // Use certificate chain from collateral (supports cert_type 3/5)
+        qeCertificationCerts = utils.extractCerts(Buffer.from(collateral.pck_certificate_chain, 'utf-8'));
+        if (qeCertificationCerts.length === 0) {
+            throw new Error('Failed to extract PCK certificates from collateral');
+        }
+    } else {
+        // Backward compatibility: extract from quote (only works for cert_type 5)
+        if (certificationData.certType !== PCK_CERT_CHAIN) {
+            throw new Error(`Unsupported DCAP PCK cert format: ${certificationData.certType}. Use get_collateral() to fetch PCK certificate.`);
+        }
+        qeCertificationCerts = utils.extractCerts(certificationData.body);
+        if (qeCertificationCerts.length === 0) {
+            throw new Error('Failed to extract PCK certificates from quote');
+        }
+    }
+
+    if (qeCertificationCerts.length < 2) {
+        throw new Error('Certificate chain is too short in quote');
+    }
+
+    // Verify PCK certificate chain
+    utils.verifyCertificateChain(
+        qeCertificationCerts[0],
+        qeCertificationCerts.slice(1),
+        nowSecs,
+        crls,
+        rootCaDer
+    );
+
+    // Extract PPID
+    let ppid = Buffer.alloc(0);
+    try {
+        const pckExt = intel.parsePckExtension(qeCertificationCerts[0]);
+        ppid = pckExt.ppid;
+    } catch (e) {
+        // Ignore
+    }
+
+    // Verify QE report signature
+    const qeReportSig = Buffer.from(authData.qeReportSignature);
+    const qeReportSignatureDer = utils.encodeAsDer(qeReportSig);
+    try {
+        verifyEcdsaSignature(
+            qeCertificationCerts[0],
+            Buffer.from(authData.qeReport),
+            qeReportSignatureDer
+        );
+    } catch (e) {
+        throw new Error('Signature is invalid for qe_report in quote');
+    }
+
+    // Decode QE report
+    const { BinaryReader } = require('./quote');
+    const qeReportReader = new BinaryReader(authData.qeReport);
+    const qeReport = EnclaveReport.decode(qeReportReader);
+
+    // Verify QE hash
+    const qeHashData = Buffer.alloc(QE_HASH_DATA_BYTE_LEN);
+    Buffer.from(authData.ecdsaAttestationKey).copy(qeHashData, 0);
+    Buffer.from(authData.qeAuthData).copy(qeHashData, ATTESTATION_KEY_LEN);
+
+    const qeHash = crypto.createHash('sha256').update(qeHashData).digest();
+
+    if (!qeHash.equals(Buffer.from(qeReport.reportData.slice(0, 32)))) {
+        throw new Error('QE report hash mismatch');
+    }
+
+    // Step 6: Verify QE Report policy against QE Identity
+    const qeTcbStatus = verifyQeIdentityPolicy(qeReport, qeIdentity);
+
+    // Step 7: Verify quote signature using ECDSA attestation key
+    const publicKeyBytes = Buffer.concat([
+        Buffer.from([0x04]), // Uncompressed format
+        Buffer.from(authData.ecdsaAttestationKey)
+    ]);
+
+    const publicKey = crypto.createPublicKey({
+        key: {
+            kty: 'EC',
+            crv: 'P-256',
+            x: toBase64Url(Buffer.from(authData.ecdsaAttestationKey.slice(0, 32))),
+            y: toBase64Url(Buffer.from(authData.ecdsaAttestationKey.slice(32, 64))),
+        },
+        format: 'jwk'
+    });
+
+    const signedData = Buffer.from(rawQuote).slice(0, signedQuoteLen);
+    const signature = Buffer.from(authData.ecdsaSignature);
+
+    // Convert signature to DER format for verification
+    const signatureDer = utils.encodeAsDer(signature);
+
+    const verifier = crypto.createVerify('SHA256');
+    verifier.update(signedData);
+
+    if (!verifier.verify(publicKey, signatureDer)) {
+        throw new Error('ISV enclave report signature is invalid');
+    }
+
+    // Extract PCK extension information
+    const extensionSection = utils.getIntelExtension(qeCertificationCerts[0]);
+    const cpuSvn = utils.getCpuSvn(extensionSection);
+    const pceSvn = utils.getPceSvn(extensionSection);
+    const fmspc = utils.getFmspc(extensionSection);
+
+    // Check FMSPC match
+    const tcbFmspc = Buffer.from(tcbInfo.fmspc, 'hex');
+    if (!Buffer.from(fmspc).equals(tcbFmspc)) {
+        throw new Error('Fmspc mismatch');
+    }
+
+    // Check TEE-specific requirements
+    if (quote.header.teeType === TEE_TYPE_TDX) {
+        if (tcbInfo.version < 3 || tcbInfo.id !== 'TDX') {
+            throw new Error('TDX quote with non-TDX TCB info in the collateral');
+        }
+    } else if (quote.header.teeType === TEE_TYPE_SGX) {
+        if (tcbInfo.version < 2 || tcbInfo.id !== 'SGX') {
+            throw new Error('SGX quote with non-SGX TCB info in the collateral');
+        }
+    }
+
+    // Step 8: Match Platform TCB
+    const platformTcbStatus = matchPlatformTcb(tcbInfo, quote, cpuSvn, pceSvn);
+
+    // Step 9 & 10: QE TCB matching is done in verifyQeIdentityPolicy, merge statuses
+    let finalStatus = platformTcbStatus.launch.merge(qeTcbStatus);
+    const currentStatus = platformTcbStatus.current && platformTcbStatus.current.merge(qeTcbStatus);
+
+    // Reject invalid TCB status (including Revoked). Unlike Intel QVL, this
+    // also covers the current TCB of a TD 1.5.
+    for (const status of [finalStatus, currentStatus]) {
+        if (status && !status.isValid()) {
+            throw new Error(`TCB status is invalid: ${status.status}`);
+        }
+    }
+    if (currentStatus) {
+        finalStatus = finalStatus.checkForRelaunch(currentStatus);
+    }
+
+    // Validate attributes
+    validateAttrs(quote.report, allowDebug, allowServiceTd);
+
+    return new VerifiedReport(finalStatus.status, finalStatus.advisoryIds, quote.report, ppid);
+}
+
+// Step 8: Match Platform TCB
+function matchPlatformTcb(tcbInfo, quote, cpuSvn, pceSvn) {
+    if (quote.header.teeType !== TEE_TYPE_TDX) {
+        const tcbLevel = findTcbLevel(tcbInfo, cpuSvn, pceSvn, null);
+        return { launch: new TcbStatus(tcbLevel.tcbStatus, [...tcbLevel.advisoryIDs]), current: null };
+    }
+
+    const tdReport = quote.report.asTd10();
+    if (!tdReport) {
+        throw new Error('Failed to get TD10 report');
+    }
+    const launch = evaluateTdxTcb(tcbInfo, cpuSvn, pceSvn, tdReport.teeTcbSvn);
+    verifyTdxModuleIdentity(tcbInfo, tdReport);
+
+    // A TD 1.5 report also carries the current TCB, which differs from the
+    // launch TCB after a TD-preserving module update. Like Intel QVL, require
+    // it to be appraisable too.
+    const td15 = quote.report.asTd15();
+    if (!td15) {
+        return { launch, current: null };
+    }
+    try {
+        return { launch, current: evaluateTdxTcb(tcbInfo, cpuSvn, pceSvn, td15.teeTcbSvn2) };
+    } catch (e) {
+        throw new Error('Failed to evaluate the current TDX TCB (TEE_TCB_SVN2)', { cause: e });
+    }
+}
+
+// TCB statuses Intel QVL accepts in each collateral structure
+const TCB_INFO_STATUSES = [
+    'UpToDate',
+    'OutOfDate',
+    'ConfigurationNeeded',
+    'Revoked',
+    'OutOfDateConfigurationNeeded',
+    'SWHardeningNeeded',
+    'ConfigurationAndSWHardeningNeeded',
+];
+const TDX_MODULE_STATUSES = ['UpToDate', 'OutOfDate', 'Revoked'];
+const QE_IDENTITY_STATUSES = ['UpToDate', 'OutOfDate', 'ConfigurationNeeded', 'Revoked', 'OutOfDateConfigurationNeeded'];
+
+// Reject a TCB status that Intel QVL does not accept for the given collateral structure
+function ensureValidStatus(status, valid, structure) {
+    if (!valid.includes(status)) {
+        throw new Error(`Unrecognized TCB status ${status} in ${structure}`);
+    }
+}
+
+// Find the first TCB level whose components are all met by the platform
+function findTcbLevel(tcbInfo, cpuSvn, pceSvn, teeTcbSvn) {
+    for (const tcbLevel of tcbInfo.tcbLevels) {
+        // Check PCE SVN
+        if (pceSvn < tcbLevel.tcb.pcesvn) {
+            continue;
+        }
+
+        // Check SGX components
+        const sgxComponents = tcbLevel.tcb.sgxtcbcomponents.map(c => c.svn);
+        if (sgxComponents.length !== cpuSvn.length) {
+            throw new Error(`SGX component count mismatch: expected ${cpuSvn.length}, got ${sgxComponents.length}`);
+        }
+
+        if (!compareSvnArrays(cpuSvn, sgxComponents)) {
+            continue;
+        }
+
+        // Check TDX components for TDX quotes
+        if (teeTcbSvn) {
+            const tdxComponents = tcbLevel.tcb.tdxtcbcomponents.map(c => c.svn);
+            if (tdxComponents.length !== teeTcbSvn.length) {
+                throw new Error(`TDX component count mismatch: expected ${teeTcbSvn.length}, got ${tdxComponents.length}`);
+            }
+
+            // Like Intel QVL, a non-zero module version leaves the module SVNs
+            // (indices 0 and 1) to the TDX module identity evaluation
+            if (!compareSvnArrays(teeTcbSvn, tdxComponents, teeTcbSvn[1] > 0 ? 2 : 0)) {
+                continue;
+            }
+        }
+
+        ensureValidStatus(tcbLevel.tcbStatus, TCB_INFO_STATUSES, 'TCB Info');
+        return tcbLevel;
+    }
+
+    throw new Error('No matching TCB level found');
+}
+
+// Match the platform TCB level for teeTcbSvn and converge it with the TDX
+// module TCB level selected by the same SVNs
+function evaluateTdxTcb(tcbInfo, cpuSvn, pceSvn, teeTcbSvn) {
+    const tcbLevel = findTcbLevel(tcbInfo, cpuSvn, pceSvn, teeTcbSvn);
+    const status = new TcbStatus(tcbLevel.tcbStatus, [...tcbLevel.advisoryIDs]);
+    const moduleLevel = matchTdxModuleLevel(tcbInfo, teeTcbSvn);
+    if (!moduleLevel) {
+        return status;
+    }
+    return status.merge(new TcbStatus(moduleLevel.tcbStatus, moduleLevel.advisoryIDs));
+}
+
+// The module identity selected by the module version (teeTcbSvn[1]), or null
+// if the version is 0
+function tdxModuleIdentity(tcbInfo, teeTcbSvn) {
+    const moduleVersion = teeTcbSvn[1];
+    if (moduleVersion === 0) {
+        return null;
+    }
+    const wantedId = `TDX_${moduleVersion.toString(16).toUpperCase().padStart(2, '0')}`;
+    const identity = tcbInfo.tdxModuleIdentities.find(id => id.id.toUpperCase() === wantedId);
+    if (!identity) {
+        throw new Error(`No TDX module identity with id ${wantedId} found in TCB Info`);
+    }
+    return identity;
+}
+
+// The module TCB level met by the module ISVSVN (teeTcbSvn[0])
+function matchTdxModuleLevel(tcbInfo, teeTcbSvn) {
+    const identity = tdxModuleIdentity(tcbInfo, teeTcbSvn);
+    if (!identity) {
+        return null;
+    }
+    const moduleIsvsvn = teeTcbSvn[0];
+    const level = identity.tcbLevels.find(l => moduleIsvsvn >= l.tcb.isvsvn);
+    if (!level) {
+        throw new Error(`TDX module ISVSVN ${moduleIsvsvn} is below minimum required from TDX module TCB levels`);
+    }
+    ensureValidStatus(level.tcbStatus, TDX_MODULE_STATUSES, 'TDX module identity');
+    return level;
+}
+
+// Verify the TD report's SEAM module signer and attributes against the TCB Info
+function verifyTdxModuleIdentity(tcbInfo, tdReport) {
+    if (!tcbInfo.tdxModule) {
+        throw new Error('TDX TCB Info is missing tdxModule field');
+    }
+    const expected = tdxModuleIdentity(tcbInfo, tdReport.teeTcbSvn) || tcbInfo.tdxModule;
+
+    const mrSignerSeam = Buffer.from(tdReport.mrSignerSeam);
+    if (!mrSignerSeam.equals(Buffer.from(expected.mrsigner, 'hex'))) {
+        throw new Error(`TDX module MRSIGNER mismatch: expected ${expected.mrsigner.toUpperCase()}, got ${mrSignerSeam.toString('hex').toUpperCase()}`);
+    }
+
+    const attributes = Buffer.from(expected.attributes, 'hex');
+    const mask = Buffer.from(expected.attributesMask, 'hex');
+    if (attributes.length !== 8 || mask.length !== 8) {
+        throw new Error('Invalid TDX module attributes or attributesMask length');
+    }
+    for (let i = 0; i < 8; i++) {
+        const actual = tdReport.seamAttributes[i];
+        const expectedMasked = attributes[i] & mask[i];
+        const actualMasked = actual & mask[i];
+        if (expectedMasked !== actualMasked) {
+            throw new Error(`TDX module SEAMATTRIBUTES mismatch at byte ${i}: expected ${hexByte(expectedMasked)} (masked), got ${hexByte(actualMasked)} (masked)`);
+        }
+        if ((actual & ~mask[i]) !== 0) {
+            throw new Error(`TDX module SEAMATTRIBUTES has bits set outside mask at byte ${i}`);
+        }
+    }
+}
+
+function hexByte(value) {
+    return value.toString(16).padStart(2, '0').toUpperCase();
+}
+
+// Step 6 & 9: Verify QE Report policy and match QE TCB
+function verifyQeIdentityPolicy(qeReport, qeIdentity) {
+    // Verify MRSIGNER
+    const expectedMrsigner = Buffer.from(qeIdentity.mrsigner, 'hex');
+    if (!Buffer.from(qeReport.mrSigner).equals(expectedMrsigner)) {
+        throw new Error(`QE MRSIGNER mismatch: expected ${qeIdentity.mrsigner}, got ${Buffer.from(qeReport.mrSigner).toString('hex').toUpperCase()}`);
+    }
+
+    // Verify ISVPRODID
+    if (qeReport.isvProdId !== qeIdentity.isvprodid) {
+        throw new Error(`QE ISVPRODID mismatch: expected ${qeIdentity.isvprodid}, got ${qeReport.isvProdId}`);
+    }
+
+    // QE must always be production-mode; allow_debug only governs the workload.
+    validateSgx(qeReport, false);
+
+    // Verify MISCSELECT with mask
+    const expectedMiscselect = Buffer.from(qeIdentity.miscselect, 'hex');
+    const miscselectMask = Buffer.from(qeIdentity.miscselectMask, 'hex');
+
+    const expectedMiscselectU32 = expectedMiscselect.readUInt32LE(0);
+    const miscselectMaskU32 = miscselectMask.readUInt32LE(0);
+    const qeMiscselectMasked = qeReport.miscSelect & miscselectMaskU32;
+    const expectedMiscselectMasked = expectedMiscselectU32 & miscselectMaskU32;
+
+    if (qeMiscselectMasked !== expectedMiscselectMasked) {
+        throw new Error(`QE MISCSELECT mismatch: expected ${expectedMiscselectMasked.toString(16).padStart(8, '0').toUpperCase()} (masked), got ${qeMiscselectMasked.toString(16).padStart(8, '0').toUpperCase()} (masked)`);
+    }
+
+    // Verify ATTRIBUTES with mask
+    const expectedAttributes = Buffer.from(qeIdentity.attributes, 'hex');
+    const attributesMask = Buffer.from(qeIdentity.attributesMask, 'hex');
+
+    for (let i = 0; i < 16; i++) {
+        const expectedMasked = expectedAttributes[i] & attributesMask[i];
+        const qeMasked = qeReport.attributes[i] & attributesMask[i];
+        if (expectedMasked !== qeMasked) {
+            throw new Error(`QE ATTRIBUTES mismatch at byte ${i}: expected ${expectedMasked.toString(16).padStart(2, '0').toUpperCase()} (masked), got ${qeMasked.toString(16).padStart(2, '0').toUpperCase()} (masked)`);
+        }
+    }
+
+    // Match QE TCB level based on ISVSVN
+    return matchQeTcbLevel(qeReport.isvSvn, qeIdentity.tcbLevels);
+}
+
+// Match QE ISVSVN against QE Identity TCB levels
+function matchQeTcbLevel(isvSvn, tcbLevels) {
+    for (const tcbLevel of tcbLevels) {
+        if (isvSvn >= tcbLevel.tcb.isvsvn) {
+            ensureValidStatus(tcbLevel.tcbStatus, QE_IDENTITY_STATUSES, 'QE Identity');
+            return new TcbStatus(tcbLevel.tcbStatus, [...tcbLevel.advisoryIDs]);
+        }
+    }
+
+    // No matching level found
+    if (tcbLevels.length === 0) {
+        throw new Error('No TCB levels found in QE Identity');
+    }
+
+    // ISVSVN is below all defined TCB levels
+    const minRequired = tcbLevels[tcbLevels.length - 1].tcb.isvsvn;
+    throw new Error(`QE ISVSVN ${isvSvn} is below minimum required ${minRequired} from QE Identity`);
+}
+
+// Compare SVN arrays (must be >= for each component)
+function compareSvnArrays(actual, required, start = 0) {
+    // Component-wise comparison: every actual[i] must be >= required[i]
+    // This matches the Rust implementation: cpu_svn.iter().zip(&sgx_components).any(|(a, b)| a < b)
+    for (let i = start; i < actual.length; i++) {
+        if (actual[i] < required[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Validate report attributes
+function validateAttrs(report, allowDebug = false, allowServiceTd = false) {
+    if (report.type === 'sgx') {
+        validateSgx(report.data, allowDebug);
+    } else if (report.type === 'td10') {
+        // A TD with service TDs never gets a TD 1.0 body: Intel's TDQE emits a v5 quote for it.
+        validateTd10(report.data, allowDebug, false);
+    } else if (report.type === 'td15') {
+        validateTd15(report.data, allowDebug, allowServiceTd);
+    } else if (report.type === 'td15ex') {
+        // Same checks as TDX 1.5, as in Intel's QVL: the 1.5ex fields carry no attributes to validate.
+        validateTd15(report.data.base, allowDebug, allowServiceTd);
+    } else {
+        throw new Error(`Unsupported report type: ${report.type}`);
+    }
+}
+
+function validateSgx(report, allowDebug = false) {
+    // Check if debug mode is enabled (bit 1 of attributes[0])
+    const isDebug = (report.attributes[0] & 0x02) !== 0;
+    if (isDebug && !allowDebug) {
+        throw new Error('Debug mode is enabled');
+    }
+}
+
+function validateTd10(report, allowDebug = false, allowServtdExt = false) {
+    const tdAttrs = parseTdAttributes(report.tdAttributes);
+
+    if ((tdAttrs.tud & 0x01) !== 0 && !allowDebug) {
+        throw new Error('Debug mode is enabled');
+    }
+    if ((tdAttrs.tud & 0x70) !== 0 && !allowDebug) {
+        throw new Error('TD profiling is enabled');
+    }
+
+    if (tdAttrs.reserved !== 0n) {
+        throw new Error('Reserved bits in TD attributes are set');
+    }
+    if (tdAttrs.sec.migratable) {
+        throw new Error('TD migration is enabled');
+    }
+    if (tdAttrs.sec.servtdExt && !allowServtdExt) {
+        throw new Error('SERVTD_EXT is enabled');
+    }
+
+    if (!tdAttrs.sec.septVeDisable) {
+        throw new Error('SEPT_VE_DISABLE is not enabled');
+    }
+}
+
+function validateTd15(report, allowDebug = false, allowServiceTd = false) {
+    if (!allowServiceTd) {
+        const allZero = report.mrServiceTd.every(b => b === 0);
+        if (!allZero) {
+            throw new Error('Invalid mr service td');
+        }
+    }
+
+    validateTd10(report.base, allowDebug, allowServiceTd);
+}
+
+function ones(start, end) {
+    const first = BigInt(start);
+    const last = BigInt(end);
+    return ((1n << (last - first + 1n)) - 1n) << first;
+}
+
+// Intel TDX Module ABI Specification 348551-008US, Table 3.23:
+// https://www.intel.com/content/www/us/en/content-details/865802/intel-tdx-module-abi-specification.html
+const TD_ATTRIBUTES_RESERVED_MBZ_MASK =
+    ones(1, 3) | ones(7, 15) | ones(23, 26) | ones(32, 61);
+
+function parseTdAttributes(input) {
+    const bytes = Uint8Array.from(input);
+    const attributes = new DataView(bytes.buffer).getBigUint64(0, true);
+    const isSet = bit => (attributes & ones(bit, bit)) !== 0n;
+    const tud = input[0];
+
+    return {
+        tud,
+        sec: {
+            icssd: isSet(16),
+            servtdExt: isSet(17),
+            lass: isSet(27),
+            septVeDisable: isSet(28),
+            migratable: isSet(29),
+            pks: isSet(30),
+            kl: isSet(31),
+        },
+        other: {
+            tpa: isSet(62),
+            perfmon: isSet(63),
+        },
+        reserved: attributes & TD_ATTRIBUTES_RESERVED_MBZ_MASK,
+    };
+}
+
+// Verify ECDSA signature using certificate
+function verifyEcdsaSignature(certDer, data, signatureDer) {
+    // Convert cert to PEM and use Node.js crypto
+    const certPem = utils.derToPem(certDer, 'CERTIFICATE');
+    const cert = new crypto.X509Certificate(certPem);
+
+    // Verify signature
+    const verifier = crypto.createVerify('SHA256');
+    verifier.update(data);
+
+    if (!verifier.verify(cert.publicKey, signatureDer)) {
+        throw new Error('Signature verification failed');
+    }
+}
+
+// Main verify function using Intel's root CA
+function verify(rawQuote, collateral, nowSecs) {
+    return QuoteVerifier.newProd().verify(rawQuote, collateral, nowSecs);
+}
+
+function toBase64Url(buffer) {
+    return buffer.toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=/g, '');
+}
+
+module.exports = {
+    QuoteVerifier,
+    VerifiedReport,
+    verify,
+};

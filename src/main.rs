@@ -7,8 +7,9 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use rts::{auth, bridge, config, inference, session};
+use rts::{attest, auth, bridge, config, forwarder, inference, session};
 
 #[derive(Debug)]
 enum Action {
@@ -18,6 +19,7 @@ enum Action {
     Launch {
         file: Option<PathBuf>,
         login: auth::LoginOptions,
+        attest: attest::AttestOptions,
     },
 }
 
@@ -37,18 +39,40 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
     }
     let mut file = None;
     let mut login = auth::LoginOptions::default();
+    let mut attest = attest::AttestOptions::default();
     let mut seen = std::collections::HashSet::new();
     let mut flags = flags.iter();
     while let Some(&flag) = flags.next() {
+        let launch_only = matches!(
+            flag,
+            "--config"
+                | "--allow-tcb-out-of-date"
+                | "--compose-policy"
+                | "--allow-unattested-provider"
+        );
         if !matches!(
             flag,
-            "--config" | "--provider" | "--organization" | "--workspace"
-        ) || (flag == "--config" && *command != "launch")
+            "--config"
+                | "--provider"
+                | "--organization"
+                | "--workspace"
+                | "--allow-tcb-out-of-date"
+                | "--compose-policy"
+                | "--allow-unattested-provider"
+        ) || (launch_only && *command != "launch")
         {
             return Err(format!("Unknown option for {command}: {flag}"));
         }
         if !seen.insert(flag) {
             return Err(format!("Duplicate option: {flag}"));
+        }
+        if flag == "--allow-tcb-out-of-date" {
+            attest.allow_tcb_out_of_date = true;
+            continue;
+        }
+        if flag == "--allow-unattested-provider" {
+            attest.allow_unattested_provider = true;
+            continue;
         }
         let value = flags
             .next()
@@ -57,6 +81,13 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
             .ok_or_else(|| format!("{flag} needs a value"))?;
         match flag {
             "--config" => file = Some(PathBuf::from(value)),
+            "--compose-policy" => {
+                attest.compose_policy = match value {
+                    "pinned" => attest::ComposePolicy::Pinned,
+                    "mr-config-only" => attest::ComposePolicy::MrConfigOnly,
+                    _ => return Err("--compose-policy must be pinned or mr-config-only".into()),
+                }
+            }
             "--provider" => {
                 login.provider = match value {
                     "github" => auth::Provider::Github,
@@ -84,7 +115,11 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
     Ok(if *command == "login" {
         Action::Login(login)
     } else {
-        Action::Launch { file, login }
+        Action::Launch {
+            file,
+            login,
+            attest,
+        }
     })
 }
 
@@ -105,7 +140,7 @@ fn run_connected<G>(
     Ok(run(cfg))
 }
 
-const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed and starts a private inference proxy.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in.";
+const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider]\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider.";
 
 fn local_preflight(cfg: &config::OperatorConfig, host: &dyn session::Host, env: &[(String, String)]) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -145,7 +180,79 @@ fn local_preflight(cfg: &config::OperatorConfig, host: &dyn session::Host, env: 
     })
 }
 
-fn launch(file: Option<&Path>, login: &auth::LoginOptions) -> Result<i32, String> {
+/// IronWire reads this variable and would send NEAR AI traffic around the
+/// pinned forwarder, so its mere presence (even empty) refuses the launch.
+const IRONWIRE_ENDPOINT_OVERRIDE: &str = "IRONWIRE_NEARAI_BASE_URL";
+
+fn check_launch(
+    cfg: &config::OperatorConfig,
+    env: &[(String, String)],
+    opts: &attest::AttestOptions,
+) -> Result<(), String> {
+    if env.iter().any(|(k, _)| k == IRONWIRE_ENDPOINT_OVERRIDE) {
+        return Err(format!(
+            "{IRONWIRE_ENDPOINT_OVERRIDE} is set: rts pins NEAR AI's endpoint to its attested forwarder; unset it"
+        ));
+    }
+    config::require_real_models(&cfg.provider.models)?;
+    if !cfg.embedded_inference && !opts.allow_unattested_provider {
+        return Err("the config names an external provider (provider.id, baseURL or apiKeyEnv), which rts cannot attest; pass --allow-unattested-provider to use it anyway".into());
+    }
+    Ok(())
+}
+
+/// For an allowed external provider: attestation.json says it is unattested.
+fn record_unattested(
+    cfg: &config::OperatorConfig,
+    session_id: &str,
+    opts: &attest::AttestOptions,
+) -> Result<(), String> {
+    let record = attest::record::AttestationRecord::create(&cfg.sessions_dir, session_id, opts)?;
+    record.set_status(
+        "unattested-provider",
+        &format!(
+            "external provider {} allowed by --allow-unattested-provider; not attested",
+            cfg.provider.base_url
+        ),
+    );
+    Ok(())
+}
+
+/// IronWire, then the forwarder: fields drop in declaration order, so
+/// IronWire shuts down before its only route to NEAR AI.
+struct Connected {
+    _inference: inference::EmbeddedInference,
+    _forwarder: forwarder::Forwarder,
+}
+
+/// After attestation verified: record it, then start the forwarder, then
+/// IronWire. A failed start is recorded as "refused" naming the step.
+fn start_connected<F, I>(
+    record: &attest::record::AttestationRecord,
+    attested: attest::Attested,
+    start_forwarder: impl FnOnce(attest::Attested) -> Result<F, String>,
+    start_inference: impl FnOnce(&F) -> Result<I, String>,
+) -> Result<(F, I), String> {
+    let path = record.path().display().to_string();
+    record
+        .verified(&attested)
+        .map_err(|e| format!("cannot record the verified attestation in {path}: {e}"))?;
+    let refuse = |step: &str, e: String| {
+        let reason = format!("{step} failed to start after attestation verified: {e}");
+        record.set_status("refused", &reason);
+        format!("{reason} (see {path})")
+    };
+    let forwarder = start_forwarder(attested).map_err(|e| refuse("the pinned forwarder", e))?;
+    let inference =
+        start_inference(&forwarder).map_err(|e| refuse("the IronWire inference proxy", e))?;
+    Ok((forwarder, inference))
+}
+
+fn launch(
+    file: Option<&Path>,
+    login: &auth::LoginOptions,
+    attest_options: attest::AttestOptions,
+) -> Result<i32, String> {
     let defaults = config::Defaults::from_env();
     let mut cfg = if let Some(file) = file {
         config::load_config(file, &defaults)?
@@ -156,16 +263,77 @@ fn launch(file: Option<&Path>, login: &auth::LoginOptions) -> Result<i32, String
             &defaults,
         )?
     };
-    let deps = session::Deps::real()?;
+    check_launch(&cfg, &std::env::vars().collect::<Vec<_>>(), &attest_options)?;
+    let session_id = session::new_session_id();
+    let fatal = forwarder::Fatal::new();
+    let deps = session::Deps::real(session_id.clone(), Some(fatal.clone()))?;
+    if !cfg.embedded_inference {
+        record_unattested(&cfg, &session_id, &attest_options)?;
+    }
     let preflight_env = deps.env.clone();
     let preflight_host = deps.host.clone();
     run_connected(
         &mut cfg,
         |cfg| local_preflight(cfg, preflight_host.as_ref(), &preflight_env),
+        // Runs on the main thread, outside any Tokio runtime: attestation
+        // uses blocking HTTP, and IronWire's runtime starts on its own thread
+        // only after attestation succeeds.
         |cfg| {
             let credential = auth::load_or_login(login)?;
-            let inference = inference::start(credential.key, &cfg.provider.models)?;
-            Ok((inference.provider(), inference))
+            let record = attest::record::AttestationRecord::create(
+                &cfg.sessions_dir,
+                &session_id,
+                &attest_options,
+            )?;
+            let refused = |e: String| {
+                record.set_status("refused", &e);
+                format!("attestation failed: {e} (see {})", record.path().display())
+            };
+            let attestor = Arc::new(
+                attest::Attestor::real(
+                    credential.key.clone(),
+                    &cfg.provider.models,
+                    attest_options,
+                )
+                .map_err(refused)?,
+            );
+            let attested = attestor.attest().map_err(refused)?;
+            let (forwarder, inference) = start_connected(
+                &record,
+                attested,
+                |seed| {
+                    forwarder::Forwarder::start(forwarder::ForwarderConfig {
+                        upstream: inference::NEAR_BASE_URL.into(),
+                        models: cfg.provider.models.clone(),
+                        roots: forwarder::pin::native_roots()?,
+                        seed,
+                        // BlockingHttp: the forwarder runs this on Tokio's blocking pool.
+                        reattest: {
+                            let attestor = attestor.clone();
+                            Arc::new(move || attestor.attest())
+                        },
+                        fatal: fatal.clone(),
+                        record: record.clone(),
+                        max_request_bytes: 32 << 20,
+                        signatures: forwarder::signature::SignaturePolicy::default(),
+                        inference_log: record.session_dir().join("inference.jsonl"),
+                    })
+                },
+                |forwarder| {
+                    inference::start_with_endpoint(
+                        credential.key,
+                        &cfg.provider.models,
+                        &forwarder.base_url(),
+                    )
+                },
+            )?;
+            Ok((
+                inference.provider(),
+                Connected {
+                    _inference: inference,
+                    _forwarder: forwarder,
+                },
+            ))
         },
         |cfg| session::run_session(cfg, deps),
     )
@@ -186,7 +354,11 @@ fn main() -> ExitCode {
         }
     };
     let result = match action {
-        Action::Launch { file, login } => launch(file.as_deref(), &login),
+        Action::Launch {
+            file,
+            login,
+            attest,
+        } => launch(file.as_deref(), &login, attest),
         Action::Login(options) => auth::login(&options).map(|_| {
             println!("Signed in to NEAR AI Cloud.");
             0
@@ -228,6 +400,190 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn real_models() -> config::OperatorConfig {
+        let mut cfg = default_config();
+        cfg.provider.models = vec!["real-model".into()];
+        cfg
+    }
+
+    fn external(cfg: &mut config::OperatorConfig) {
+        cfg.embedded_inference = false;
+        cfg.provider.id = "fake".into();
+        cfg.provider.base_url = "http://127.0.0.1:9/v1".into();
+    }
+
+    fn allow_unattested() -> attest::AttestOptions {
+        attest::AttestOptions {
+            allow_unattested_provider: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn launch_refuses_placeholder_models_before_credentials() {
+        let none = attest::AttestOptions::default();
+        let e = check_launch(&default_config(), &[], &none).unwrap_err();
+        assert!(e.contains("placeholder"), "{e}");
+        assert!(check_launch(&real_models(), &[], &none).is_ok());
+    }
+
+    #[test]
+    fn launch_refuses_an_ironwire_endpoint_override_even_when_empty() {
+        let none = attest::AttestOptions::default();
+        for value in ["https://elsewhere.example/v1", ""] {
+            let env = [
+                ("HOME".to_string(), "/h".to_string()),
+                ("IRONWIRE_NEARAI_BASE_URL".to_string(), value.to_string()),
+            ];
+            let e = check_launch(&real_models(), &env, &none).unwrap_err();
+            assert!(e.contains("IRONWIRE_NEARAI_BASE_URL"), "{e}");
+            let e = check_launch(&real_models(), &env, &allow_unattested()).unwrap_err();
+            assert!(e.contains("IRONWIRE_NEARAI_BASE_URL"), "{e}");
+        }
+        let env = [("IRONWIRE_NEARAI_BASE_URL_X".to_string(), "x".to_string())];
+        assert!(check_launch(&real_models(), &env, &none).is_ok());
+    }
+
+    #[test]
+    fn an_external_provider_needs_the_explicit_unattested_flag() {
+        let mut cfg = real_models();
+        external(&mut cfg);
+        let e = check_launch(&cfg, &[], &attest::AttestOptions::default()).unwrap_err();
+        assert!(e.contains("--allow-unattested-provider"), "{e}");
+        assert!(check_launch(&cfg, &[], &allow_unattested()).is_ok());
+        let Action::Launch { attest, .. } =
+            parse_args(&["launch", "--allow-unattested-provider"]).unwrap()
+        else {
+            panic!("not launch")
+        };
+        assert_eq!(attest, allow_unattested());
+    }
+
+    #[test]
+    fn an_allowed_external_provider_is_recorded_as_unattested() {
+        let d = tempfile::tempdir().unwrap();
+        let mut cfg = real_models();
+        external(&mut cfg);
+        cfg.sessions_dir = d.path().join("sessions");
+        record_unattested(&cfg, "0123456789ab", &allow_unattested()).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(cfg.sessions_dir.join("0123456789ab/attestation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(doc["status"], "unattested-provider");
+        assert!(
+            doc["reason"]
+                .as_str()
+                .unwrap()
+                .contains("http://127.0.0.1:9/v1"),
+            "{doc}"
+        );
+        assert_eq!(doc["overrides"]["allow_unattested_provider"], true);
+    }
+
+    fn verified_record() -> (
+        tempfile::TempDir,
+        std::sync::Arc<attest::record::AttestationRecord>,
+    ) {
+        let d = tempfile::tempdir().unwrap();
+        let record = attest::record::AttestationRecord::create(
+            d.path(),
+            "0123456789ab",
+            &attest::AttestOptions::default(),
+        )
+        .unwrap();
+        (d, record)
+    }
+
+    fn seed() -> attest::Attested {
+        let mut a = attest::Attested::default();
+        a.fingerprints.insert([0xaa; 32]);
+        a
+    }
+
+    fn status(record: &attest::record::AttestationRecord) -> (String, String) {
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(record.path()).unwrap()).unwrap();
+        (
+            doc["status"].as_str().unwrap_or_default().into(),
+            doc["reason"].as_str().unwrap_or_default().into(),
+        )
+    }
+
+    #[test]
+    fn connect_starts_the_forwarder_with_the_verified_seed_and_then_ironwire() {
+        let (_d, record) = verified_record();
+        let events = std::cell::RefCell::new(vec![]);
+        let (f, i) = start_connected(
+            &record,
+            seed(),
+            |s| {
+                assert_eq!(status(&record).0, "verified");
+                events.borrow_mut().push("forwarder");
+                Ok(s.fingerprints.len())
+            },
+            |f| {
+                events.borrow_mut().push("inference");
+                Ok(*f + 1)
+            },
+        )
+        .unwrap();
+        assert_eq!((f, i), (1, 2));
+        assert_eq!(*events.borrow(), ["forwarder", "inference"]);
+        assert_eq!(status(&record).0, "verified");
+    }
+
+    #[test]
+    fn a_forwarder_that_fails_to_start_refuses_the_session_on_record() {
+        let (_d, record) = verified_record();
+        let e = start_connected::<(), ()>(
+            &record,
+            seed(),
+            |_| Err("bind failed".into()),
+            |_| panic!("IronWire must not start without the forwarder"),
+        )
+        .unwrap_err();
+        assert!(e.contains("forwarder") && e.contains("bind failed"), "{e}");
+        assert!(e.contains(&record.path().display().to_string()), "{e}");
+        let (s, reason) = status(&record);
+        assert_eq!(s, "refused");
+        assert!(reason.contains("forwarder"), "{reason}");
+    }
+
+    #[test]
+    fn an_ironwire_that_fails_to_start_refuses_the_session_on_record() {
+        let (_d, record) = verified_record();
+        let e = start_connected::<(), ()>(
+            &record,
+            seed(),
+            |_| Ok(()),
+            |_| Err("inference: embedded proxy refused startup".into()),
+        )
+        .unwrap_err();
+        assert!(e.contains("IronWire"), "{e}");
+        let (s, reason) = status(&record);
+        assert_eq!(s, "refused");
+        assert!(reason.contains("IronWire"), "{reason}");
+    }
+
+    #[test]
+    fn a_verified_record_that_cannot_be_written_names_the_record() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, record) = verified_record();
+        let dir = record.session_dir().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let e = start_connected::<(), ()>(
+            &record,
+            seed(),
+            |_| panic!("the forwarder must not start without a record"),
+            |_| panic!("IronWire must not start without a record"),
+        )
+        .unwrap_err();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(e.contains(&record.path().display().to_string()), "{e}");
+        assert_eq!(status(&record).0, "pending");
     }
 
     #[test]
@@ -328,12 +684,18 @@ mod tests {
 
     #[test]
     fn default_launch_and_explicit_account_flags_parse_without_side_effects() {
-        let Action::Launch { file, login } = parse_args(&["launch"]).unwrap() else {
+        let Action::Launch {
+            file,
+            login,
+            attest,
+        } = parse_args(&["launch"]).unwrap()
+        else {
             panic!("not launch")
         };
         assert_eq!(file, None);
         assert_eq!(login.provider, Provider::Github);
-        let Action::Launch { file, login } = parse_args(&[
+        assert_eq!(attest, rts::attest::AttestOptions::default());
+        let Action::Launch { file, login, .. } = parse_args(&[
             "launch",
             "--workspace",
             "workspace-one",
@@ -351,6 +713,35 @@ mod tests {
         assert_eq!(login.provider, Provider::Google);
         assert_eq!(login.organization.as_deref(), Some("org-one"));
         assert_eq!(login.workspace.as_deref(), Some("workspace-one"));
+    }
+
+    #[test]
+    fn launch_attestation_overrides_parse() {
+        use rts::attest::{AttestOptions, ComposePolicy};
+        let Action::Launch { attest, .. } = parse_args(&[
+            "launch",
+            "--allow-tcb-out-of-date",
+            "--compose-policy",
+            "mr-config-only",
+        ])
+        .unwrap() else {
+            panic!("not launch")
+        };
+        assert_eq!(
+            attest,
+            AttestOptions {
+                allow_tcb_out_of_date: true,
+                compose_policy: ComposePolicy::MrConfigOnly,
+                allow_unattested_provider: false,
+            }
+        );
+        let Action::Launch { attest, file, .. } =
+            parse_args(&["launch", "--compose-policy", "pinned", "--config", "c.json"]).unwrap()
+        else {
+            panic!("not launch")
+        };
+        assert_eq!(attest, AttestOptions::default());
+        assert_eq!(file, Some("c.json".into()));
     }
 
     #[test]
@@ -377,6 +768,31 @@ mod tests {
             vec!["launch", "--config", "a", "--config", "b"],
             vec!["login", "--organization", "../escape"],
             vec!["launch", "--config", ""],
+            vec!["launch", "--compose-policy", "other"],
+            vec!["launch", "--compose-policy"],
+            vec!["launch", "--compose-policy", "--allow-tcb-out-of-date"],
+            vec![
+                "launch",
+                "--compose-policy",
+                "pinned",
+                "--compose-policy",
+                "pinned",
+            ],
+            vec![
+                "launch",
+                "--allow-tcb-out-of-date",
+                "--allow-tcb-out-of-date",
+            ],
+            vec!["launch", "--allow-tcb-out-of-date", "yes"],
+            vec!["login", "--allow-tcb-out-of-date"],
+            vec!["login", "--compose-policy", "pinned"],
+            vec!["login", "--allow-unattested-provider"],
+            vec!["launch", "--allow-unattested-provider", "yes"],
+            vec![
+                "launch",
+                "--allow-unattested-provider",
+                "--allow-unattested-provider",
+            ],
             vec!["other"],
             vec![],
         ] {

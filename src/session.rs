@@ -433,17 +433,34 @@ pub struct Deps {
     pub env: Vec<(String, String)>,
     /// The `rts` binary the plugin shim spawns for each tool call.
     pub rts: PathBuf,
+    /// Chosen by the caller when it writes into sessions/<id>/ before the
+    /// session starts (attestation.json); None picks a fresh one.
+    pub session_id: Option<String>,
+    /// Raised by the attested forwarder; the session ends when it is set.
+    pub fatal: Option<Arc<crate::forwarder::Fatal>>,
 }
 
 impl Deps {
-    pub fn real() -> Result<Self, String> {
+    pub fn real(session_id: String, fatal: Option<Arc<crate::forwarder::Fatal>>) -> Result<Self, String> {
         Ok(Self {
             host: Arc::new(RealHost),
             runner: None,
             env: std::env::vars().collect(),
             rts: std::env::current_exe().map_err(|e| format!("cannot locate the rts binary: {e}"))?,
+            session_id: Some(session_id),
+            fatal,
         })
     }
+}
+
+/// The forwarder's fatal reason, once raised.
+pub fn stop_reason(fatal: Option<&crate::forwarder::Fatal>) -> Option<String> {
+    fatal.and_then(crate::forwarder::Fatal::reason)
+}
+
+/// 12 lowercase hex characters from the OS.
+pub fn new_session_id() -> String {
+    random_hex(6)
 }
 
 struct Logger {
@@ -513,7 +530,7 @@ impl Live<'_> {
 /// Run one session. Returns opencode's exit code, or 1 when the session
 /// was refused or failed.
 pub fn run_session(cfg: &OperatorConfig, deps: Deps) -> i32 {
-    let id = random_hex(6);
+    let id = deps.session_id.clone().unwrap_or_else(new_session_id);
     let runtime = std::env::temp_dir().join(format!("rts-{id}-{}", random_hex(4)));
     let p = session_paths(&id, &cfg.sessions_dir, &runtime);
     let log = Logger { id: id.clone(), file: p.log_file.clone() };
@@ -570,6 +587,32 @@ fn interrupted(log: &Logger) -> Option<String> {
     })
 }
 
+fn stopped(deps: &Deps, log: &Logger) -> Option<String> {
+    stop_reason(deps.fatal.as_deref()).inspect(|why| log.log(&format!("stopping: {why}")))
+}
+
+/// The options opencode passes to the sandbox plugin (plugin/index.ts).
+pub fn plugin_options(p: &SessionPaths, cfg: &OperatorConfig, rts: &Path, nonce: &str, operator_home: &str) -> Value {
+    json!({
+        "machine": p.machine,
+        "nonce": nonce,
+        "readyFile": p.ready_file,
+        "auditFile": p.audit_file,
+        "provider": cfg.provider.id,
+        "models": cfg.provider.models,
+        "rts": rts,
+        "bridge": {
+            "machine": p.machine,
+            "mvmctl": cfg.mvmctl,
+            "emptyGitConfig": p.empty_git_config,
+            "stateDir": p.state_dir,
+            "timeoutMs": cfg.limits.tool_timeout_ms,
+            "maxOutputBytes": cfg.limits.max_output_bytes,
+            "mvmHome": operator_home,
+        },
+    })
+}
+
 fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operator_home: &str, supervisor: &Path, live: &mut Live) -> Result<i32, String> {
     let p = live.paths;
     let leak_seam_set = deps.env.iter().any(|(k, _)| k == "RTS_TEST_LEAK");
@@ -583,7 +626,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         provider: &cfg.provider,
     })?;
     sweep_orphans(run, &mut |m| live.log.log(m))?;
-    if let Some(why) = interrupted(live.log) {
+    if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)) {
         return Err(why);
     }
 
@@ -599,7 +642,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         live.sb.copy_in(inputs, "/in").map_err(|e| e.to_string())?;
         live.log.log(&format!("copied {} to /in", inputs.display()));
     }
-    if let Some(why) = interrupted(live.log) {
+    if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)) {
         return Err(format!("{why} before opencode started"));
     }
 
@@ -608,23 +651,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     live.log.log(&format!("sampling host RSS of pid {} (found via {})", supervisor.pid, supervisor.pid_file.display()));
 
     let nonce = new_nonce();
-    let plugin_options = json!({
-        "machine": p.machine,
-        "nonce": nonce,
-        "readyFile": p.ready_file,
-        "auditFile": p.audit_file,
-        "provider": cfg.provider.id,
-        "rts": deps.rts,
-        "bridge": {
-            "machine": p.machine,
-            "mvmctl": cfg.mvmctl,
-            "emptyGitConfig": p.empty_git_config,
-            "stateDir": p.state_dir,
-            "timeoutMs": cfg.limits.tool_timeout_ms,
-            "maxOutputBytes": cfg.limits.max_output_bytes,
-            "mvmHome": operator_home,
-        },
-    });
+    let plugin_options = plugin_options(p, cfg, &deps.rts, &nonce, operator_home);
     write_opencode_config(&p.config_dir, &cfg.plugin_dir, &plugin_options, &cfg.provider)?;
     // opencode loads opencode.json, AGENTS.md and .opencode/ from its cwd.
     if fs::read_dir(&p.work).map_err(|e| e.to_string())?.next().is_some() {
@@ -654,7 +681,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
             transport_error = terminal.pump().err().map(|e| format!("terminal relay failed: {e}"));
         }
         if signalled.is_none() {
-            signalled = interrupted(live.log);
+            signalled = interrupted(live.log).or_else(|| stopped(deps, live.log));
         }
         transport_error.is_some() || signalled.is_some() || child.try_wait().ok().flatten().is_some()
     })
@@ -668,7 +695,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             return Ok(status.code().unwrap_or(1));
         }
-        if let Some(why) = interrupted(live.log) {
+        if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)) {
             return Err(why);
         }
         if Instant::now() >= next_sample {
@@ -686,6 +713,17 @@ mod tests {
     use crate::testutil::tempdir;
     use std::net::TcpListener;
     use std::sync::Mutex;
+
+    #[test]
+    fn plugin_options_carry_the_exact_model_allowlist() {
+        let mut cfg = parse_config("{}", Path::new("/cfg"), &Defaults { repo: "/r".into(), mvmctl: "/m".into() }).unwrap();
+        cfg.provider.models = vec!["m-one".into(), "m-two".into()];
+        let p = session_paths("0123456789ab", Path::new("/s"), Path::new("/rt"));
+        let o = plugin_options(&p, &cfg, Path::new("/x/rts"), &"ab".repeat(12), "/home/op");
+        assert_eq!(o["models"], serde_json::json!(["m-one", "m-two"]));
+        assert_eq!(o["provider"], serde_json::json!(cfg.provider.id));
+        assert_eq!(o["bridge"]["machine"], serde_json::json!("rts-0123456789ab"));
+    }
 
     fn provider() -> ProviderConfig {
         ProviderConfig { id: "ironwire".into(), base_url: "http://127.0.0.1:8463/openai/v1".into(), models: vec!["z-ai/glm-5.3-flash".into()], api_key_env: None }
@@ -998,7 +1036,7 @@ mod tests {
     fn external_sessions_refuse_an_unpatched_supervisor_before_any_vm_command() {
         let d = tempdir("unpatched");
         let f = Fake::new(|a| if a.last().map(String::as_str) == Some(SUPERVISOR_PROBE) { out(0, "stock", "") } else { healthy(a) });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into() };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None };
         let external = ProviderConfig { base_url: "https://cloud-api.near.ai/v1".into(), ..provider() };
         assert_eq!(run_session(&session_cfg(&d, &d, external), deps), 1);
         assert_eq!(f.calls(), ["opencode --version", "/fake/home/.local/share/nearai-red-sandbox/mvm-hvf-supervisor --rts-vsock-drain-fix-version"]);
@@ -1162,10 +1200,40 @@ mod tests {
     fn a_session_refuses_before_any_vm_exists_when_opencode_is_the_wrong_version() {
         let d = tempdir("sess");
         let f = Fake::new(|a| if a.last().map(String::as_str) == Some("--version") { out(0, "1.0.0", "") } else { out(0, "", "") });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into() };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         assert!(!f.calls().iter().any(|c| c.starts_with("machine")), "{:?}", f.calls());
         fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_session_uses_the_id_its_caller_chose() {
+        let d = tempdir("sess-id");
+        let f = Fake::new(|a| if a.last().map(String::as_str) == Some("--version") { out(0, "1.0.0", "") } else { out(0, "", "") });
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into(), session_id: Some("0123456789ab".into()), fatal: None };
+        assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
+        let log = fs::read_to_string(d.join("0123456789ab/launcher.log"));
+        let entries: Vec<_> = fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name()).collect();
+        fs::remove_dir_all(&d).unwrap();
+        assert!(log.unwrap().contains("session 0123456789ab"), "{entries:?}");
+        assert_eq!(entries, vec![std::ffi::OsString::from("0123456789ab")]);
+    }
+
+    #[test]
+    fn a_raised_fatal_stops_the_session() {
+        let f = crate::forwarder::Fatal::new();
+        assert_eq!(stop_reason(None), None);
+        assert_eq!(stop_reason(Some(&f)), None);
+        f.raise("signature-failed: x");
+        assert_eq!(stop_reason(Some(&f)).as_deref(), Some("signature-failed: x"));
+    }
+
+    #[test]
+    fn new_session_ids_are_twelve_lowercase_hex() {
+        let a = new_session_id();
+        assert_eq!(a.len(), 12);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{a}");
+        assert_ne!(a, new_session_id());
     }
 
     #[test]
@@ -1180,6 +1248,8 @@ mod tests {
             host: f.clone(), runner: Some(f.clone()),
             env: vec![("HOME".into(), "/fake/home".into()), ("MVM_HOME".into(), d.join("mvm").to_string_lossy().into_owned())],
             rts: "/x/rts".into(),
+            session_id: None,
+            fatal: None,
         };
         let mut cfg = session_cfg(&sessions, &d, serve(MODELS_OK));
         cfg.opencode = "/nonexistent-opencode-rss-test".into();
@@ -1198,7 +1268,7 @@ mod tests {
             s if s.starts_with("machine create") => out(1, "", "image pull failed"),
             _ => healthy(a),
         });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into() };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         let calls = f.calls();
         assert!(calls.iter().any(|c| c.starts_with("machine rm rts-") && c.ends_with(" --force --yes")), "{calls:?}");
