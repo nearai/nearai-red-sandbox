@@ -44,6 +44,32 @@ test("the release workflow assesses CLI binaries as notarized, not as apps", () 
   expect(wf).toContain("source=Notarized Developer ID")
 })
 
+test("GNU tools go first on PATH only for the test gate, never for later steps", () => {
+  const wf = readFileSync(join(ROOT, ".github", "workflows", "release.yml"), "utf8")
+  // A GITHUB_PATH write lasts for every later step, so the supervisor build,
+  // signing and packaging would run with GNU stat and tar.
+  const code = wf.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n")
+  expect(/GITHUB_PATH/.test(code)).toBe(false)
+  const [before, rest = ""] = code.split("- name: Test gate")
+  const gate = rest.split("- name:")[0]
+  const after = rest.slice(gate.length)
+  expect(gate).toContain("libexec/gnubin")
+  expect(before.includes("gnubin") || after.includes("gnubin")).toBe(false)
+  expect(gate).toContain("bash scripts/release/check-tests.sh")
+})
+
+test("release scripts call BSD stat and tar by absolute path", () => {
+  const files = ["install.sh", "scripts/build-patched-mvm-supervisor.sh", "scripts/package-release.sh",
+    "scripts/release/check-tests.sh", "scripts/release/render-formula.sh"]
+  for (const file of files) {
+    const text = readFileSync(join(ROOT, file), "utf8")
+    for (const [i, line] of text.split("\n").entries()) {
+      if (/^\s*#/.test(line)) continue
+      expect(`${file}:${i + 1}: ${line}`).not.toMatch(/(^|[^\/\w-])(stat|tar) -/)
+    }
+  }
+})
+
 test("a substring of an allowed name is not allowed", () => {
   const r = run("scripts/release/check-tests.sh", ["--parse", join(FIXTURES, "substring.log")])
   expect(r.status).toBe(1)

@@ -100,19 +100,18 @@ jobs:
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
-      # GNU coreutils and tar first on PATH, as opencode/README.md asks, so the
-      # runner's test baseline matches the local one; shellcheck for the gate.
       - name: Install test tools
+        run: brew install coreutils gnu-tar shellcheck
+
+      # GNU coreutils and tar first on PATH, as opencode/README.md asks, so the
+      # runner's test baseline matches the local one. For this step only:
+      # never through GITHUB_PATH, which would hand GNU stat and tar to the
+      # supervisor build, signing and packaging steps below.
+      - name: Test gate
         run: |
           set -euo pipefail
-          brew install coreutils gnu-tar shellcheck
-          {
-            echo "$(brew --prefix coreutils)/libexec/gnubin"
-            echo "$(brew --prefix gnu-tar)/libexec/gnubin"
-          } >> "$GITHUB_PATH"
-
-      - name: Test gate
-        run: bash scripts/release/check-tests.sh
+          PATH="$(brew --prefix coreutils)/libexec/gnubin:$(brew --prefix gnu-tar)/libexec/gnubin:$PATH" \
+            bash scripts/release/check-tests.sh
 
       - name: Build rts
         run: cargo build --release --locked

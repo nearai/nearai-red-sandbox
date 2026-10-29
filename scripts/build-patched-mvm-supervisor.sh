@@ -76,8 +76,11 @@ if [[ -n "$source_dir" ]]; then
 fi
 [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || die "Apple-silicon macOS is required (other targets build a stub)"
 [[ -f "$PATCH" && ! -L "$PATCH" ]] || die "missing regular repository patch: $PATCH"
-for command in git cargo shasum tar; do command -v "$command" >/dev/null || die "missing command: $command"; done
+for command in git cargo shasum; do command -v "$command" >/dev/null || die "missing command: $command"; done
 [[ -x /usr/bin/codesign ]] || die "codesign is required"
+# BSD stat and tar by absolute path: a GNU coreutils or gnu-tar first on PATH
+# reads `stat -f` as --file-system.
+[[ -x /usr/bin/stat && -x /usr/bin/tar ]] || die "/usr/bin/stat and /usr/bin/tar are required"
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/rts-mvm-build.XXXXXXXX")
 if [[ -z "$source_dir" ]]; then
@@ -91,7 +94,7 @@ fi
 # git archive excludes untracked/ignored files and leaves the supplied tree alone.
 mkdir "$work/source"
 git -C "$source_dir" archive --format=tar "$REV" > "$work/source.tar"
-tar -xf "$work/source.tar" -C "$work/source"
+/usr/bin/tar -xf "$work/source.tar" -C "$work/source"
 cp "$PATCH" "$work/reviewed.patch"
 git -C "$work/source" apply --check --whitespace=error-all "$work/reviewed.patch"
 git -C "$work/source" apply --whitespace=error-all "$work/reviewed.patch"
@@ -110,7 +113,7 @@ binary="$work/target/aarch64-apple-darwin/release/mvm-hvf-supervisor"
 
 check_install_path
 mkdir -p "$install_dir"
-[[ -O "$install_dir" && "$(stat -f %Lp "$install_dir")" == 700 ]] || die "install directory must be owned by you with mode 700: $install_dir"
+[[ -O "$install_dir" && "$(/usr/bin/stat -f %Lp "$install_dir")" == 700 ]] || die "install directory must be owned by you with mode 700: $install_dir"
 staged=$(mktemp "$install_dir/.mvm-supervisor.XXXXXXXX")
 staged_info=$(mktemp "$install_dir/.mvm-supervisor-info.XXXXXXXX")
 cp "$binary" "$staged"
