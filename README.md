@@ -14,7 +14,7 @@ per session, with guest networking disabled, inputs copied into the guest, and
 results exported through `/out`. Inference runs on the host so provider
 credentials stay outside the guest.
 
-▁▁▂▃▄▅▄▃▂▁▁▁▂▂▃▃▂▁▁▁▁▂▃▄▅▆▅▄▃▂▁▁▁▂▃▃▂▂▁▁▁▂▃▄▃▂▁▁▁▁▂▂▃▄▅▄▃▂▁▁
+<p align="center"><img src="docs/assets/dunes.svg" width="672" alt=""></p>
 
 ## <img src="docs/assets/ramp.svg" alt="" height="16"> Quick start
 
@@ -46,4 +46,4 @@ stored in the host's native credential store and stay outside the guest. See
 the [sign-in guide](docs/authentication.md) for account selection and external
 provider configuration.
 
-▁▁▂▃▄▅▄▃▂▁▁▁▂▂▃▃▂▁▁▁▁▂▃▄▅▆▅▄▃▂▁▁▁▂▃▃▂▂▁▁▁▂▃▄▃▂▁▁▁▁▂▂▃▄▅▄▃▂▁▁
+<p align="center"><img src="docs/assets/dunes.svg" width="672" alt=""></p>
