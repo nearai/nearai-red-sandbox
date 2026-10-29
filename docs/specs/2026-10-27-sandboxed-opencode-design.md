@@ -694,6 +694,20 @@ Each is a short probe. None is assumed.
    certificate below is the attested `tls_cert_fingerprint`, and whether
    every gateway instance shares it. Repeat against production after the
    2026-10-29 launch, before the default config points there.
+   - Done 2026-10-29 against production, for attestation only
+     (`tests/live_attest.rs`; facts in `opencode/README.md`): the report is
+     served without an API key and has the shape above; model entries carry
+     `model_name` equal to the requested ID and their own
+     `tls_cert_fingerprint`; both quotes are `UpToDate` with no advisories;
+     NRAS answers overall `true`; both compose hashes are pinned and each
+     equals the entry's `info.compose_hash` (which `rts` does not read: the
+     measured `mr_config_id` is what it checks). `tls_cert_fingerprint` is
+     sha256 of the leaf's SubjectPublicKeyInfo, and the live leaf's matches
+     the gateway's, so the forwarder pins on SPKI. Whether every gateway
+     instance shares the key was not measured beyond repeated handshakes.
+   - Still open, needing an API key: the signature receipt latency (the 10 s
+     window), the receipt `text` format against the exact relayed bytes, and
+     `signature_kind`; and one real completion through the forwarder.
 7. Done 2026-10-28, for attestation and the forwarder:
    - `cloud-api.near.ai` presented leaf sha256 (of the whole DER)
      `5664580137f5b2abc8b2cc9ef53dc2bd7cd79b6ffc9f840dbbfca708a2c51022` on

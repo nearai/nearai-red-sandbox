@@ -111,7 +111,9 @@ pub struct Attestor {
     pub quotes: Arc<dyn QuoteVerifier>,
     pub gpus: Arc<dyn GpuVerifier>,
     pub base_url: String,
-    pub key: HostSecret,
+    /// Sent as the bearer on the report fetch when present. NEAR AI
+    /// production serves the report without one (2026-10-29).
+    pub key: Option<HostSecret>,
     pub models: Vec<String>,
     pub options: AttestOptions,
     pub policy: Policy,
@@ -131,7 +133,7 @@ impl Attestor {
     /// `BlockingHttp` must not run on a Tokio runtime thread: call `attest`
     /// from a plain thread.
     pub fn real(
-        key: HostSecret,
+        key: Option<HostSecret>,
         models: &[String],
         options: AttestOptions,
     ) -> Result<Attestor, String> {
@@ -175,7 +177,7 @@ impl Attestor {
         let url = report::report_url(&self.base_url, model, &nonce);
         let resp = self
             .http
-            .get(&url, Some(&self.key))
+            .get(&url, self.key.as_ref())
             .map_err(|e| format!("attestation report request failed: {e}"))?;
         if resp.status != 200 {
             return Err(format!("attestation report returned HTTP {}", resp.status));
@@ -370,6 +372,7 @@ mod tests {
         gpu: Result<GpuVerdict, String>,
         options: AttestOptions,
         policy: Policy,
+        keyless: bool,
     }
 
     impl Case {
@@ -405,6 +408,7 @@ mod tests {
                 policy: Policy {
                     compose_hashes: BTreeSet::from([sha(&[COMPOSE.as_bytes()])]),
                 },
+                keyless: false,
             }
         }
     }
@@ -459,7 +463,7 @@ mod tests {
             quotes: Arc::new(FakeQuotes(quotes)),
             gpus: gpu.clone(),
             base_url: BASE.into(),
-            key: DUMMY_KEY.to_string().into(),
+            key: (!first.keyless).then(|| DUMMY_KEY.to_string().into()),
             models: models.iter().map(|m| m.to_string()).collect(),
             options: first.options,
             policy: first.policy.clone(),
@@ -505,6 +509,17 @@ mod tests {
 
     fn run_one(case: Case) -> Run {
         run_cases(&["m"], vec![for_model(case, "m")])
+    }
+
+    /// Production serves the report without an API key, so attestation can
+    /// run keyless; it still verifies, and no bearer is sent.
+    #[test]
+    fn a_keyless_attestor_fetches_the_report_without_a_bearer() {
+        let mut case = Case::good([1; 32]);
+        case.keyless = true;
+        let run = run_one(case);
+        assert_eq!(run.result.unwrap().fingerprints, BTreeSet::from([FP]));
+        assert_eq!(run.http.bearers(), vec![false]);
     }
 
     #[test]

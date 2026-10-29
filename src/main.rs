@@ -291,7 +291,7 @@ fn launch(
             };
             let attestor = Arc::new(
                 attest::Attestor::real(
-                    credential.key.clone(),
+                    Some(credential.key.clone()),
                     &cfg.provider.models,
                     attest_options,
                 )
