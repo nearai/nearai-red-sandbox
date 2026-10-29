@@ -22,13 +22,15 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::{Frame, Incoming};
-use hyper::header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use hyper::header::{
+    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderValue,
+};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use sha2::{Digest, Sha256};
@@ -37,7 +39,7 @@ use tokio::sync::oneshot;
 use crate::attest::Attested;
 use crate::attest::record::AttestationRecord;
 use pin::{PinSet, Rejected};
-use signature::{Exchange, InferenceLine, SignaturePolicy, SseId};
+use signature::{Exchange, FetchError, InferenceLine, SignaturePolicy, SseId};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -639,6 +641,21 @@ async fn fatal_raised(fatal: &Fatal) {
     }
 }
 
+/// True unless `Content-Encoding` is absent or only `identity`. The receipt
+/// covers the bytes NEAR AI sent, which the forwarder must hash as received;
+/// it asks for `identity`, so any other coding fails closed.
+fn is_encoded(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all(CONTENT_ENCODING)
+        .iter()
+        .any(|v| match v.to_str() {
+            Err(_) => true,
+            Ok(v) => v
+                .split(',')
+                .any(|coding| !coding.trim().eq_ignore_ascii_case("identity")),
+        })
+}
+
 fn is_event_stream(content_type: Option<&HeaderValue>) -> bool {
     content_type
         .and_then(|v| v.to_str().ok())
@@ -653,6 +670,7 @@ fn relay(state: Arc<State>, mut upstream: reqwest::Response, sent: Sent) -> Out 
     let status = upstream.status();
     let content_type = upstream.headers().get(CONTENT_TYPE).cloned();
     let streamed = is_event_stream(content_type.as_ref());
+    let encoded = is_encoded(upstream.headers());
     let id = state
         .next_check
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -674,35 +692,40 @@ fn relay(state: Arc<State>, mut upstream: reqwest::Response, sent: Sent) -> Out 
         let mut kept = Vec::new();
         let keep = !streamed && status.is_success();
         let mut client = Some(tx);
-        let relayed = loop {
-            let next = tokio::select! {
-                biased;
-                () = fatal_raised(&state.fatal) => break Relayed::Stopped,
-                next = upstream.chunk() => next,
-            };
-            let chunk = match next {
-                Ok(Some(chunk)) => chunk,
-                Ok(None) => break Relayed::Complete,
-                Err(_) => break Relayed::Failed("upstream stream failed".into()),
-            };
-            if keep {
-                if kept.len() + chunk.len() > signature::MAX_ID_SCAN_BYTES {
-                    break Relayed::Failed(format!(
-                        "response over {} bytes",
-                        signature::MAX_ID_SCAN_BYTES
-                    ));
+        let relayed = if encoded {
+            // Nothing is relayed: the body is not what the receipt covers.
+            Relayed::Failed("upstream sent a Content-Encoding other than identity".into())
+        } else {
+            loop {
+                let next = tokio::select! {
+                    biased;
+                    () = fatal_raised(&state.fatal) => break Relayed::Stopped,
+                    next = upstream.chunk() => next,
+                };
+                let chunk = match next {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break Relayed::Complete,
+                    Err(_) => break Relayed::Failed("upstream stream failed".into()),
+                };
+                if keep {
+                    if kept.len() + chunk.len() > signature::MAX_ID_SCAN_BYTES {
+                        break Relayed::Failed(format!(
+                            "response over {} bytes",
+                            signature::MAX_ID_SCAN_BYTES
+                        ));
+                    }
+                    kept.extend_from_slice(&chunk);
+                } else if streamed {
+                    sse.push(&chunk);
                 }
-                kept.extend_from_slice(&chunk);
-            } else if streamed {
-                sse.push(&chunk);
-            }
-            hasher.update(&chunk);
-            if let Some(tx) = &client
-                && tx.send(Ok(chunk)).await.is_err()
-            {
-                // The client went away: keep reading so the hash covers the
-                // whole response.
-                client = None;
+                hasher.update(&chunk);
+                if let Some(tx) = &client
+                    && tx.send(Ok(chunk)).await.is_err()
+                {
+                    // The client went away: keep reading so the hash covers the
+                    // whole response.
+                    client = None;
+                }
             }
         };
         if let Some(tx) = client {
@@ -774,7 +797,9 @@ async fn check(
         ),
         Checked::NotSigned => (format!("not-signed (HTTP {})", status.as_u16()), None, None),
         Checked::Stopped => ("failed: session stopped".to_string(), None, None),
-        Checked::Failed(reason) => (format!("failed: {reason}"), None, None),
+        Checked::Failed(reason) | Checked::PinFailed(reason) => {
+            (format!("failed: {reason}"), None, None)
+        }
     };
     let line = InferenceLine {
         ts: now_secs(),
@@ -793,8 +818,14 @@ async fn check(
         return;
     }
     let written = write_line(state, &line);
-    if let Checked::Failed(reason) = &outcome {
-        stop(&state.fatal, &state.record, "signature-failed", reason);
+    match &outcome {
+        Checked::Failed(reason) => {
+            stop(&state.fatal, &state.record, "signature-failed", reason);
+        }
+        Checked::PinFailed(reason) => {
+            stop(&state.fatal, &state.record, "pin-failed", reason);
+        }
+        _ => {}
     }
     unwritten(state, written);
     drop(pending);
@@ -805,6 +836,8 @@ enum Checked {
     NotSigned,
     Stopped,
     Failed(String),
+    /// Upstream's certificate was refused during the receipt fetch.
+    PinFailed(String),
 }
 
 fn attested_keys(state: &State, model: &str) -> BTreeSet<[u8; 32]> {
@@ -817,16 +850,62 @@ fn attested_keys(state: &State, model: &str) -> BTreeSet<[u8; 32]> {
         .unwrap_or_default()
 }
 
-/// Fetches and checks the receipt. A key not attested for the model gets one
-/// re-attestation, then the check runs again.
+/// Fetches and checks the receipt. A certificate the fetch sees refused is
+/// handled as one a completion sees: an unpinned one is learned (`learn`,
+/// at most once per fetch) and the fetch retried within what is left of the
+/// window; an untrusted one, or one still refused, is `pin-failed`. A key
+/// not attested for the model gets one re-attestation, then the check runs
+/// again.
 async fn verify(state: &State, ex: &Exchange, auth: &HeaderValue) -> Checked {
-    let (receipt, took) =
-        match signature::fetch_receipt(&state.client, &state.upstream, auth, ex, state.signatures)
-            .await
-        {
-            Ok(fetched) => fetched,
-            Err(e) => return Checked::Failed(format!("signature: {e}")),
+    let start = Instant::now();
+    let deadline = start + state.signatures.window;
+    let mut learned = false;
+    let (receipt, took) = loop {
+        let policy = SignaturePolicy {
+            window: deadline.saturating_duration_since(Instant::now()),
+            ..state.signatures
         };
+        if policy.window.is_zero() {
+            return Checked::Failed(format!(
+                "signature: no signature within {} ms (re-attested for a rotated certificate)",
+                state.signatures.window.as_millis()
+            ));
+        }
+        let fetched = signature::fetch_receipt(
+            &state.client,
+            &state.upstream,
+            auth,
+            ex,
+            policy,
+            &state.pins,
+        )
+        .await;
+        match fetched {
+            // The fetch that answered: signature_ms stays the fetch time.
+            Ok(fetched) => break fetched,
+            Err(FetchError::Failed(e)) => return Checked::Failed(format!("signature: {e}")),
+            Err(FetchError::Rejected(Rejected::Untrusted(fp))) => {
+                return Checked::PinFailed(format!(
+                    "pin: upstream certificate {} does not chain to a trusted root",
+                    hex::encode(fp)
+                ));
+            }
+            Err(FetchError::Rejected(Rejected::Unpinned(fp))) if learned => {
+                return Checked::PinFailed(format!(
+                    "pin: upstream certificate {} refused after re-attestation",
+                    hex::encode(fp)
+                ));
+            }
+            Err(FetchError::Rejected(Rejected::Unpinned(fp))) => {
+                learned = true;
+                match learn(state, fp).await {
+                    Ok(()) => {}
+                    Err(Unlearned::Stopped) => return Checked::Stopped,
+                    Err(Unlearned::Failed(reason)) => return Checked::PinFailed(reason),
+                }
+            }
+        }
+    };
     if let Ok(key) = signature::receipt_key(&receipt)
         && !attested_keys(state, &ex.model).contains(&key)
     {
@@ -949,6 +1028,8 @@ mod tests {
     /// What the test upstream answers to a completion.
     enum Answer {
         Whole(u16, Vec<u8>),
+        /// 200 JSON with `Content-Encoding: <the str>`; the bytes as given.
+        Encoded(&'static str, Vec<u8>),
         /// `text/event-stream`, chunked: `pauses[i]` before chunk i; the time
         /// just before the last chunk is written goes to `last_sent`.
         Sse {
@@ -961,7 +1042,7 @@ mod tests {
     impl Answer {
         fn bytes(&self) -> Vec<u8> {
             match self {
-                Answer::Whole(_, b) => b.clone(),
+                Answer::Whole(_, b) | Answer::Encoded(_, b) => b.clone(),
                 Answer::Sse { chunks, .. } => chunks.concat(),
             }
         }
@@ -1197,6 +1278,14 @@ mod tests {
                     let _ = write!(
                         tls,
                         "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{close}\r\n",
+                        out.len()
+                    );
+                    let _ = tls.write_all(&out);
+                }
+                Answer::Encoded(encoding, out) => {
+                    let _ = write!(
+                        tls,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: {encoding}\r\nContent-Length: {}\r\n{close}\r\n",
                         out.len()
                     );
                     let _ = tls.write_all(&out);
@@ -1514,6 +1603,47 @@ mod tests {
         assert_eq!(rig.fatal.reason(), None);
     }
 
+    /// Review finding: a certificate rotated between a completion and its
+    /// receipt fetch is first seen by the fetch. It is learned like one seen
+    /// by a completion (re-attestation), and the fetch is retried.
+    #[test]
+    fn a_certificate_rotated_before_the_receipt_fetch_is_learned() {
+        let up = upstream(|i| if i == 0 { "a" } else { "b" }, true, ok_reply);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig(&up, &["a"], reattest(&["a", "b"], &calls), 1 << 20);
+        assert_eq!(rig.post(BODY), (200, REPLY.to_vec()));
+        let lines = rig.wait_lines(1);
+        assert_eq!(lines[0]["result"], "verified", "{lines:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(up.signature_requests().len(), 1);
+        let doc = rig.doc();
+        assert_eq!(doc["status"], "verified");
+        assert_eq!(doc["reattestations"].as_array().unwrap().len(), 1);
+        assert_eq!(rig.fatal.reason(), None);
+        no_key_in(&rig);
+    }
+
+    /// As above, but re-attestation never attests the new certificate: the
+    /// session ends `pin-failed`, not `signature-failed`.
+    #[test]
+    fn a_rotated_certificate_the_receipt_fetch_cannot_learn_is_a_pin_failure() {
+        let up = upstream(|i| if i == 0 { "a" } else { "b" }, true, ok_reply);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        assert_eq!(rig.post(BODY), (200, REPLY.to_vec()));
+        let lines = rig.wait_lines(1);
+        let result = lines[0]["result"].as_str().unwrap();
+        assert!(result.starts_with("failed: pin"), "{result}");
+        // `stop` raises fatal, then writes the record.
+        wait_for("pin-failed", || rig.doc()["status"] == "pin-failed");
+        let reason = rig.fatal.reason().expect("fatal");
+        assert!(reason.starts_with("pin-failed"), "{reason}");
+        assert_eq!(rig.doc()["status"], "pin-failed");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(up.signature_requests().is_empty());
+        no_key_in(&rig);
+    }
+
     #[test]
     fn a_pinned_certificate_from_an_untrusted_ca_is_refused() {
         let up = upstream(|_| "c", false, ok_reply);
@@ -1733,11 +1863,18 @@ mod tests {
         let (first_tx, first_rx) = std::sync::mpsc::channel();
         let first_tx = Mutex::new(first_tx);
         let counted = calls.clone();
+        let seen = up.handshakes.clone();
         let slow: Reattest = Arc::new(move || {
             if counted.fetch_add(1, Ordering::SeqCst) == 0 {
                 let _ = first_tx.lock().unwrap().send(());
+                // A's first re-attestation holds the lock until B's own
+                // handshake has been refused, so B is always parked behind
+                // A rather than arriving after the fatal (no fixed sleep).
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while seen.lock().unwrap().len() < 2 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
-            std::thread::sleep(Duration::from_millis(300));
             Ok(Attested {
                 fingerprints: fps(&["a"]),
                 ..Attested::default()
@@ -1749,8 +1886,9 @@ mod tests {
             let base = base.clone();
             std::thread::spawn(move || post_to(&base, BODY))
         };
-        // B starts while A is inside its first re-attestation, so B takes
-        // its own Unpinned rejection and parks on the lock.
+        // B starts while A is inside its first re-attestation, which waits
+        // for B's refused handshake, so B takes its own Unpinned rejection
+        // and parks on the lock.
         first_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let b = std::thread::spawn(move || post_to(&base, BODY));
         assert_eq!(a.join().unwrap(), 502);
@@ -1970,6 +2108,58 @@ mod tests {
         assert_eq!(l["chat_id"], "chatcmpl-d");
         assert!(last_sent.lock().unwrap().is_some());
         assert_eq!(rig.fatal.reason(), None);
+    }
+
+    /// Review finding: the receipt covers the bytes as NEAR AI sent them, so
+    /// an encoded body (which the forwarder never asked for) fails closed,
+    /// even with a receipt that matches; `identity` is no encoding.
+    #[test]
+    fn an_encoded_response_ends_the_session() {
+        let up = upstream(|_| "a", false, |_| Answer::Encoded("gzip", REPLY.to_vec()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let encoded = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        let resp = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap()
+            .post(format!("{}/chat/completions", encoded.fw().base_url()))
+            .bearer_auth(DUMMY_KEY)
+            .body(BODY.to_vec())
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        // Nothing is relayed: the client's body ends in an error.
+        assert!(resp.bytes().is_err(), "an encoded body reached the client");
+        let lines = encoded.wait_lines(1);
+        let result = lines[0]["result"].as_str().unwrap();
+        assert!(
+            result.starts_with("failed: ") && result.contains("Content-Encoding"),
+            "{result}"
+        );
+        // `stop` raises fatal, then writes the record.
+        wait_for("signature-failed", || {
+            encoded.doc()["status"] == "signature-failed"
+        });
+        assert!(
+            encoded
+                .fatal
+                .reason()
+                .unwrap()
+                .starts_with("signature-failed")
+        );
+        assert_eq!(encoded.doc()["status"], "signature-failed");
+        no_key_in(&encoded);
+
+        let up = upstream(
+            |_| "a",
+            false,
+            |_| Answer::Encoded("identity", REPLY.to_vec()),
+        );
+        let plain = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        assert_eq!(plain.post(BODY), (200, REPLY.to_vec()));
+        assert_eq!(plain.wait_lines(1)[0]["result"], "verified");
+        assert_eq!(plain.fatal.reason(), None);
     }
 
     #[test]

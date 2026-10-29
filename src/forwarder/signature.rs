@@ -14,9 +14,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signature, VerifyingKey};
-use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
+use super::pin::{PinSet, Rejected};
 use crate::attest::report::hex32;
 
 /// A receipt body is small; anything larger is refused.
@@ -55,42 +55,7 @@ pub fn usable_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// The top-level string `key` of a JSON object. A repeated `key` is refused:
-/// parsers disagree on which one wins.
-pub(crate) fn top_level_string(body: &[u8], key: &str) -> Option<String> {
-    struct Found(Option<String>);
-    struct Seek<'k>(&'k str);
-    impl<'de> serde::de::DeserializeSeed<'de> for Seek<'_> {
-        type Value = Found;
-        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Found, D::Error> {
-            d.deserialize_map(self)
-        }
-    }
-    impl<'de> Visitor<'de> for Seek<'_> {
-        type Value = Found;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a JSON object")
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Found, A::Error> {
-            let mut found = None;
-            while let Some(k) = map.next_key::<std::borrow::Cow<'de, str>>()? {
-                if k == self.0 {
-                    if found.is_some() {
-                        return Err(serde::de::Error::custom("duplicate key"));
-                    }
-                    found = Some(map.next_value::<String>()?);
-                } else {
-                    map.next_value::<IgnoredAny>()?;
-                }
-            }
-            Ok(Found(found))
-        }
-    }
-    let mut de = serde_json::Deserializer::from_slice(body);
-    let found = serde::de::DeserializeSeed::deserialize(Seek(key), &mut de).ok()?;
-    de.end().ok()?;
-    found.0
-}
+pub(crate) use crate::json::top_level_string;
 
 /// `id` of a non-streamed chat completion.
 pub fn chat_id_from_json(body: &[u8]) -> Option<String> {
@@ -143,7 +108,7 @@ impl SseId {
         if line.is_empty() {
             // End of event.
             if let Some(data) = self.data.take()
-                && serde_json::from_slice::<IgnoredAny>(&data).is_ok()
+                && serde_json::from_slice::<serde::de::IgnoredAny>(&data).is_ok()
             {
                 self.id = chat_id_from_json(&data);
                 self.give_up();
@@ -257,19 +222,54 @@ impl Default for SignaturePolicy {
     }
 }
 
+/// Why a receipt fetch ended without a receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchError {
+    /// The pinned verifier refused upstream's certificate. The caller treats
+    /// it as it treats a refusal seen by a completion: learn or `pin-failed`.
+    Rejected(Rejected),
+    Failed(String),
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::Rejected(Rejected::Unpinned(fp)) => write!(
+                f,
+                "signature fetch: upstream certificate {} is not attested",
+                hex::encode(fp)
+            ),
+            FetchError::Rejected(Rejected::Untrusted(fp)) => write!(
+                f,
+                "signature fetch: upstream certificate {} does not chain to a trusted root",
+                hex::encode(fp)
+            ),
+            FetchError::Failed(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl From<String> for FetchError {
+    fn from(reason: String) -> Self {
+        FetchError::Failed(reason)
+    }
+}
+
 /// GET {upstream}/signature/{chat_id}?model=<id>&signing_algo=ed25519 with
 /// `authorization`. 404, 429 and 5xx retry with doubling backoff until
 /// `window`; other non-2xx fail at once; a body over 16 KiB or not a Receipt
-/// fails. Errors never include `authorization`.
+/// fails. A transport error for which `pins` holds a certificate refusal
+/// returns that refusal at once. Errors never include `authorization`.
 pub async fn fetch_receipt(
     client: &reqwest::Client,
     upstream: &str,
     authorization: &reqwest::header::HeaderValue,
     ex: &Exchange,
     policy: SignaturePolicy,
-) -> Result<(Receipt, Duration), String> {
+    pins: &PinSet,
+) -> Result<(Receipt, Duration), FetchError> {
     if !usable_id(&ex.chat_id) {
-        return Err("signature fetch: unusable chat ID".into());
+        return Err("signature fetch: unusable chat ID".to_string().into());
     }
     let start = Instant::now();
     let deadline = start + policy.window;
@@ -286,7 +286,8 @@ pub async fn fetch_receipt(
             return Err(format!(
                 "no signature within {} ms (last: {last})",
                 policy.window.as_millis()
-            ));
+            )
+            .into());
         }
         let attempt = client
             .get(&url)
@@ -308,14 +309,24 @@ pub async fn fetch_receipt(
                 if code == 404 || code == 429 || status.is_server_error() {
                     last = format!("HTTP {code}");
                 } else {
-                    return Err(format!("signature fetch: HTTP {code}"));
+                    return Err(format!("signature fetch: HTTP {code}").into());
                 }
             }
-            // Transport errors and timeouts retry inside the window. The
+            // A refused certificate is the caller's to handle. Other
+            // transport errors and timeouts retry inside the window. The
             // error text is not used: it is generic here and could only
             // carry the URL.
-            Err(e) if e.is_timeout() => last = "timed out".into(),
-            Err(_) => last = "request failed".into(),
+            Err(e) => {
+                if let Some(r) = pins.take_rejected() {
+                    return Err(FetchError::Rejected(r));
+                }
+                last = if e.is_timeout() {
+                    "timed out"
+                } else {
+                    "request failed"
+                }
+                .into();
+            }
         }
         let pause = backoff.min(deadline.saturating_duration_since(Instant::now()));
         tokio::time::sleep(pause).await;
@@ -610,6 +621,11 @@ mod tests {
         reqwest::Client::builder().no_proxy().build().unwrap()
     }
 
+    /// Plain HTTP never consults the pins.
+    fn no_pins() -> std::sync::Arc<PinSet> {
+        PinSet::new(BTreeSet::new())
+    }
+
     fn fast(window_ms: u64) -> SignaturePolicy {
         SignaturePolicy {
             window: Duration::from_millis(window_ms),
@@ -631,7 +647,7 @@ mod tests {
                 (200, receipt_json())
             }
         });
-        let (r, _) = fetch_receipt(&client(), &url, &auth, &exchange(), fast(5000))
+        let (r, _) = fetch_receipt(&client(), &url, &auth, &exchange(), fast(5000), &no_pins())
             .await
             .unwrap();
         assert_eq!(r.text, good_text());
@@ -652,9 +668,10 @@ mod tests {
 
         let (url, heads) = plain_server(|_| (404, b"{}".to_vec()));
         let start = Instant::now();
-        let e = fetch_receipt(&client(), &url, &auth, &exchange(), fast(300))
+        let e = fetch_receipt(&client(), &url, &auth, &exchange(), fast(300), &no_pins())
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("no signature within"), "{e}");
         assert!(!e.contains("dummy"), "{e}");
         assert!(start.elapsed() < Duration::from_secs(3));
@@ -662,9 +679,10 @@ mod tests {
 
         for status in [401, 400, 403] {
             let (url, heads) = plain_server(move |_| (status, b"{}".to_vec()));
-            let e = fetch_receipt(&client(), &url, &auth, &exchange(), fast(5000))
+            let e = fetch_receipt(&client(), &url, &auth, &exchange(), fast(5000), &no_pins())
                 .await
-                .unwrap_err();
+                .unwrap_err()
+                .to_string();
             assert!(e.contains(&status.to_string()), "{e}");
             assert!(!e.contains("dummy"), "{e}");
             assert_eq!(heads.lock().unwrap().len(), 1, "{status}");
@@ -677,7 +695,7 @@ mod tests {
             _ => (200, receipt_json()),
         });
         assert!(
-            fetch_receipt(&client(), &url, &auth, &exchange(), fast(5000))
+            fetch_receipt(&client(), &url, &auth, &exchange(), fast(5000), &no_pins())
                 .await
                 .is_ok()
         );
@@ -686,14 +704,14 @@ mod tests {
         // Too large, or not a receipt: refused at once.
         let (url, heads) = plain_server(|_| (200, vec![b' '; MAX_RECEIPT_BYTES + 1]));
         assert!(
-            fetch_receipt(&client(), &url, &auth, &exchange(), fast(5000))
+            fetch_receipt(&client(), &url, &auth, &exchange(), fast(5000), &no_pins())
                 .await
                 .is_err()
         );
         assert_eq!(heads.lock().unwrap().len(), 1);
         let (url, _) = plain_server(|_| (200, br#"{"text":"x"}"#.to_vec()));
         assert!(
-            fetch_receipt(&client(), &url, &auth, &exchange(), fast(5000))
+            fetch_receipt(&client(), &url, &auth, &exchange(), fast(5000), &no_pins())
                 .await
                 .is_err()
         );
@@ -703,7 +721,7 @@ mod tests {
         let mut ex = exchange();
         ex.chat_id = "../attestation/report".into();
         assert!(
-            fetch_receipt(&client(), &url, &auth, &ex, fast(5000))
+            fetch_receipt(&client(), &url, &auth, &ex, fast(5000), &no_pins())
                 .await
                 .is_err()
         );
