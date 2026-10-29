@@ -32,7 +32,7 @@ Trigger: a pushed tag `v<semver>`. A `workflow_dispatch` run with
 not touch the tap; it is how the signing secrets are validated. The run
 refuses when the tag differs from the `Cargo.toml` version.
 
-Runner: GitHub-hosted Apple silicon (`macos-14` or later).
+Runner: GitHub-hosted `macos-26`, as trace-commons uses.
 
 Steps:
 
@@ -74,10 +74,10 @@ Steps:
 10. Update the tap: commit `Formula/rts.rb` with the new version, URL and
     sha256 to `nearai/homebrew-tap` using `HOMEBREW_TAP_TOKEN`.
 
-Repository secrets: `APPLE_DEVELOPER_ID_P12` (base64), `APPLE_DEVELOPER_ID_P12_PASSWORD`,
-`APPLE_TEAM_ID`, `APPLE_NOTARY_KEY_P8` (base64), `APPLE_NOTARY_KEY_ID`,
-`APPLE_NOTARY_ISSUER_ID`, `HOMEBREW_TAP_TOKEN` (fine-grained, contents
-write on `nearai/homebrew-tap` only). The certificate is imported into a
+Repository secrets, named as in TraceCommons/trace-commons so the values can be copied: `MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD`,
+`MACOS_SIGNING_IDENTITY`, `MACOS_NOTARY_ASC_KEY_P8_BASE64`, `MACOS_NOTARY_ASC_KEY_ID`,
+`MACOS_NOTARY_ASC_ISSUER_ID`, `HOMEBREW_TAP_TOKEN` (fine-grained, contents and pull-request
+write on `nearai/homebrew-tap` only). The workflow follows trace-commons' `release-contributor.yml`: `environment: release` on the signing job, a separate publish job with `contents: write`, a `release-config` preflight, runner `macos-26`, notarization accepted only on a JSON status of `Accepted`, checksums recomputed after signing, and the tap updated by a pull request the workflow merges. The certificate is imported into a
 temporary keychain that the job deletes at the end.
 
 ## Install layout and path discovery
