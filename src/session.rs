@@ -21,7 +21,7 @@ use crate::sandbox::{CopyOutResult, CreateSpec, Exec, ExecOptions, Sandbox, sv};
 use crate::sys;
 use crate::terminal::Terminal;
 
-pub const OPENCODE_VERSION: &str = "2.1.4";
+pub const OPENCODE_VERSION: &str = "2.2.2";
 
 const INIT_GUEST_STORAGE: &str = r#"set -eu
 tmp=$1; input=$2; output=$3
@@ -86,7 +86,7 @@ pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderCo
     };
     json!({
         "$schema": "https://opencode.ai/config.json",
-        // v1 tuple form; v2.1.4 normalizes it to { package, options } (core/src/config/normalize.ts).
+        // v1 tuple form; v2.2.2 normalizes it to { package, options } (core/src/config/normalize.ts).
         "plugin": [[plugin_dir.to_string_lossy(), plugin_options]],
         "provider": {
             &p.id: {
@@ -104,7 +104,7 @@ pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderCo
 }
 
 pub fn write_opencode_config(dir: &Path, plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig) -> Result<PathBuf, String> {
-    // v2.1.4 skips a plugin configured as a file path with only a warning.
+    // v2.2.2 skips a plugin configured as a file path with only a warning.
     if !plugin_dir.is_dir() {
         return Err(format!("plugin path must be a directory: {}", plugin_dir.display()));
     }
@@ -899,7 +899,7 @@ mod tests {
 
     fn healthy(argv: &[String]) -> RunOutput {
         match argv.last().map(String::as_str) {
-            Some("--version") => out(0, "2.1.4\n", ""),
+            Some("--version") => out(0, "2.2.2\n", ""),
             Some("--rts-vsock-drain-fix-version") => out(0, "rts-vsock-drain-v1\n", ""),
             _ => out(0, "", ""),
         }

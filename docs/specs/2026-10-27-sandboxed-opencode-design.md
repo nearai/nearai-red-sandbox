@@ -744,6 +744,49 @@ Each is a short probe. None is assumed.
    - Carried from the earlier TypeScript design: bun 1.3.3 `fetch` skipped
      `tls.checkServerIdentity` on a pooled connection (the reason the
      verifier sits on the client here).
+8. Done 2026-10-29: opencode v2.2.2 (`opencode-darwin-arm64.zip`, sha256
+   `c1c901a6379d667b7a30a3eea5a8f6e93416dba43e889e834771f6fb174f35c9`) passes
+   the same probes, and the pin moved from 2.1.4 to 2.2.2.
+   - Tools: a probe plugin loaded before ours records `ctx.tool.transform`'s
+     list (`tests/contain/session.rs`,
+     `opencode_offers_exactly_the_recorded_built_in_tools`). v2.2.2 offers
+     the same 20 IDs as v2.1.4: `shell`, `read`, `write`, `edit`, `glob`,
+     `grep`, `question`, `patch`, `webfetch`, `websearch`, `skill`,
+     `subagent`, `opencode_list_mcp_resources`, `opencode_read_mcp_resource`,
+     `opencode_models`, `opencode_session_move`, `opencode_session_rename`,
+     `opencode_worktree_create`, `opencode_worktree_list`,
+     `opencode_worktree_remove`. The session and MCP-resource IDs differ from
+     the stand-ins the unit test used before; the families are the same.
+   - MCP: a local server in the global config
+     (`an_mcp_server_in_the_global_config_never_spawns`, new) and in a project
+     `opencode.json` never spawn, and `debug.json` reports `mcp: []`.
+     Control, run once and not kept: with our plugin removed from the
+     config, the global-config server spawned and wrote its sentinel, on both
+     2.1.4 and 2.2.2.
+   - Models: at plugin setup `ctx.model.list()` still lists no provider
+     models on 2.2.2 (`debug.json` `providerModels` 0, as on 2.1.4), so the
+     plugin's extras-only check and `rts`'s presence check stand unchanged.
+   - Handshake: the ready file holds the nonce, exactly the seven tools
+     remain, a second plugin's tool is removed, and the plugin configured as
+     a file path is skipped with no ready file; `--standalone` probing works;
+     the TUI handshakes over the gated PTY
+     (`terminal::tests::pinned_opencode_tui_starts_and_handshakes_over_the_gated_pty`).
+   - Plugin API: `packages/plugin/src/promise/{tool,mcp,model}.ts`,
+     `core/src/config/discovery.ts`, `core/src/v1/config/{plugin,provider}.ts`
+     and `core/src/config/variable.ts` are byte-identical between tags
+     `v2.1.4` and `v2.2.2`; `promise/plugin.ts` adds
+     `experimental.generate` (stateless generation, no tools) to the plugin
+     `Context`, and `config/normalize.ts` adds `timezone` and three
+     `experimental` keys. Neither touches the plugin, provider or MCP shapes
+     the launcher writes, so `plugin/index.ts` is unchanged.
+   - Containment suite on 2.2.2 (`cargo test --test contain -- --ignored
+     --test-threads=1`): `test result: ok. 22 passed; 0 failed; 0 ignored;
+     0 measured; 5 filtered out; finished in 51.27s`, including the leak
+     check. No `rts-*` machine remained.
+   - Found on the way: since plugin options gained the required `models`
+     list, the suite's and the terminal test's hand-written options lacked
+     it, so the plugin failed setup and every opencode test failed on 2.1.4
+     as well. Both now pass `models` as the launcher does.
 
 ## Host setup notes (measured 2026-10-27)
 

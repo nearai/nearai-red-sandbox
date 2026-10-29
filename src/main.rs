@@ -606,7 +606,7 @@ mod tests {
         struct StockSupervisor;
         impl session::Host for StockSupervisor {
             fn run(&self, argv: &[String], _: std::time::Duration) -> std::io::Result<rts::mvm::RunOutput> {
-                let stdout = if argv.last().map(String::as_str) == Some("--version") { "2.1.4\n" } else { "stock supervisor\n" };
+                let stdout = if argv.last().map(String::as_str) == Some("--version") { "2.2.2\n" } else { "stock supervisor\n" };
                 Ok(rts::mvm::RunOutput { code: Some(0), stdout: stdout.as_bytes().to_vec(), ..Default::default() })
             }
         }

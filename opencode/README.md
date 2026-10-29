@@ -31,7 +31,8 @@ export PATH="$(brew --prefix coreutils)/libexec/gnubin:$(brew --prefix gnu-tar)/
 Tests: `RUSTFLAGS="-D warnings" CARGO_INCREMENTAL=0 cargo test` (unit),
 `bun test tests/unit` (the plugin shim), and
 `RUSTFLAGS="-D warnings" CARGO_INCREMENTAL=0 cargo test --test contain -- --ignored --test-threads=1` on a host with
-mvm, the patched supervisor, and opencode 2.1.4. These tests create real VMs
+mvm, the patched supervisor, and opencode 2.2.2 (on `PATH` or at
+`RTS_OPENCODE`). These tests create real VMs
 and fail when a prerequisite is missing.
 
 ## Inference through embedded IronWire
@@ -67,11 +68,18 @@ accepted only to `127.0.0.1` or `localhost` with an explicit port.
 
 ## Pin
 
-opencode **v2.1.4** (`opencode --version` must print `2.1.4`; the launcher
-refuses anything else). The plugin targets the v2.1.4 promise plugin API:
+opencode **v2.2.2** (`opencode --version` must print `2.2.2`; the launcher
+refuses anything else). The plugin targets the v2.2.2 promise plugin API:
 `{ id, setup(ctx) }` using `ctx.tool`, `ctx.mcp` and `ctx.model`
-(`packages/plugin/src/promise/{plugin,tool,mcp,model}.ts` at tag `v2.1.4`
-of `anomalyco/opencode`).
+(`packages/plugin/src/promise/{plugin,tool,mcp,model}.ts` at tag `v2.2.2`
+of `anomalyco/opencode`). Release asset `opencode-darwin-arm64.zip`, sha256
+`c1c901a6379d667b7a30a3eea5a8f6e93416dba43e889e834771f6fb174f35c9`.
+
+The pin moved from 2.1.4 on 2026-10-29 after the containment suite and the
+tool, MCP and model probes passed on 2.2.2 (design spec, check 8). Between
+the two tags `promise/{tool,mcp,model}.ts` are unchanged and
+`promise/plugin.ts` only adds `experimental.generate`, which the plugin does
+not use.
 
 ## NEAR AI facts (Task 8, Step 0)
 
@@ -125,13 +133,15 @@ completed a handshake with only the attested set; with a `[0; 32]` pin it
 refused the same leaf as unpinned. Completions and signature receipts need
 an API key and are not covered (spec check 6).
 
-## Config shape accepted by v2.1.4
+## Config shape accepted by v2.2.2
 
 Read from `packages/core/src/config/normalize.ts` and
-`packages/core/src/v1/config/{plugin,provider}.ts` at tag `v2.1.4`:
+`packages/core/src/v1/config/{plugin,provider}.ts` at tag `v2.2.2` (the
+previous pin's copies differ only in `normalize.ts` gaining `timezone` and
+new `experimental` keys):
 
 - The native v2 keys are `plugins` (entries `string | { package, options }`)
-  and `providers`. v2.1.4 still accepts the v1 keys and migrates them:
+  and `providers`. v2.2.2 still accepts the v1 keys and migrates them:
   `plugin` entries may be `string | [path, options]` and are rewritten to
   `{ package: path, options }`; a v1 `provider` block (`npm`, `name`,
   `options.baseURL`, `options.apiKey`, `models`) is migrated to `providers`.
@@ -155,6 +165,7 @@ The launcher writes this to `<runtime>/xdg/config/opencode/opencode.json`
     "readyFile": "<runtime>/ready",
     "auditFile": "sessions/<id>/tools.jsonl",
     "provider": "nearai-red-embedded",
+    "models": ["z-ai/glm-5.3-flash"],
     "rts": "/abs/path/to/rts",
     "bridge": {
       "machine": "rts-0123456789ab",
@@ -189,7 +200,7 @@ There is deliberately no `mcp` key. The plugin also removes every MCP server
 in `ctx.mcp.transform` and checks `ctx.mcp.list()` is empty before it writes
 the ready file.
 
-## Isolation details found while reading v2.1.4
+## Isolation details found while reading v2.2.2
 
 - Config discovery (`core/src/config/discovery.ts`) walks up from the working
   directory to `/`, loading `opencode.json(c)`, `.opencode/`, `.claude/` and
@@ -205,8 +216,9 @@ the ready file.
   preferences (`/Library/Managed Preferences/.../ai.opencode.managed.plist`).
   The launcher cannot redirect those; the plugin's allowlist and model checks
   still apply after them.
-- v2.1.4's own shell plugin rewrites the `shell` tool description at session
-  time to say commands run on the host OS. The plugin sets sandbox-specific
+- v2.2.2's own shell plugin (`core/src/tool/plugin/shell.ts`) rewrites the
+  `shell` tool description at session time to say commands run on the host
+  OS. The plugin sets sandbox-specific
   descriptions in its transform, but that hook may overwrite the `shell` one.
   This affects only what the model is told, not where commands run.
 

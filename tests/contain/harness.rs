@@ -1,6 +1,6 @@
 //! Shared setup for the real-mvm suite. Explicitly requested real-VM tests
 //! fail when the patched supervisor or mvmctl prerequisites are unavailable.
-//! Requested OpenCode tests fail when opencode 2.1.4 is unavailable on PATH
+//! Requested OpenCode tests fail when opencode 2.2.2 is unavailable on PATH
 //! (or at RTS_OPENCODE); missing prerequisites never count as validation.
 
 use std::fs;
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn the_pinned_opencode_is_accepted_with_a_bounded_argv_probe() {
-        let host = FakeHost { output: rts::mvm::RunOutput { code: Some(0), stdout: b"2.1.4\n".to_vec(), ..Default::default() }, calls: Default::default() };
+        let host = FakeHost { output: rts::mvm::RunOutput { code: Some(0), stdout: b"2.2.2\n".to_vec(), ..Default::default() }, calls: Default::default() };
         let path = "/fake path/opencode";
         assert_eq!(checked_opencode(path.into(), &host), Some(path.into()));
         assert_eq!(*host.calls.lock().unwrap(), [(vec![path.into(), "--version".into()], Duration::from_secs(30))]);
@@ -228,7 +228,7 @@ mod tests {
             }
         }
         assert!(std::panic::catch_unwind(|| checked_opencode("/fake/opencode".into(), &MissingHost)).is_err(), "missing opencode must fail the requested test");
-        for (code, version, killed) in [(0, "2.2.0\n", false), (0, "2.1.40\n", false), (1, "2.1.4\n", false), (0, "2.1.4\n", true)] {
+        for (code, version, killed) in [(0, "2.2.0\n", false), (0, "2.2.20\n", false), (1, "2.2.2\n", false), (0, "2.2.2\n", true)] {
             let host = FakeHost { output: rts::mvm::RunOutput { code: Some(code), stdout: version.as_bytes().to_vec(), killed, ..Default::default() }, calls: Default::default() };
             assert!(std::panic::catch_unwind(|| checked_opencode("/fake/opencode".into(), &host)).is_err(), "wrong opencode {version:?} must fail the requested test");
         }
