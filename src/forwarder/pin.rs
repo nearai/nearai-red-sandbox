@@ -14,21 +14,50 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{CertificateError, DigitallySignedStruct, Error, SignatureScheme};
 use sha2::{Digest, Sha256};
 
-pub fn sha256_der(der: &[u8]) -> [u8; 32] {
-    Sha256::digest(der).into()
+/// SHA-256 of the certificate's SubjectPublicKeyInfo DER: the full
+/// SEQUENCE (algorithm and subject public key), as
+/// `openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER` writes it.
+/// This is what NEAR AI attests as `tls_cert_fingerprint`; it is not the hash
+/// of the whole certificate. None when the certificate does not parse.
+pub fn spki_sha256(cert: &CertificateDer<'_>) -> Option<[u8; 32]> {
+    let ee = webpki::EndEntityCert::try_from(cert).ok()?;
+    // rustls-webpki keeps only the SEQUENCE's contents and re-wraps them in
+    // the SEQUENCE tag and length here.
+    let spki = ee.subject_public_key_info();
+    Some(Sha256::digest(spki.as_ref()).into())
 }
 
-/// Why the verifier last refused a certificate, with its SHA-256 fingerprint.
+/// Why the verifier last refused a certificate, with its SPKI SHA-256
+/// fingerprint (`spki_sha256`); None when it does not parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rejected {
     /// Chains to a trusted root but is not attested: re-attestation may
     /// learn it (a rotated certificate).
     Unpinned([u8; 32]),
     /// Does not chain to a trusted root for the name, whether pinned or not.
-    Untrusted([u8; 32]),
+    Untrusted(Option<[u8; 32]>),
 }
 
-/// The attested end-entity certificate fingerprints. It only grows.
+impl Rejected {
+    /// The refused certificate as a reason names it: by its SPKI SHA-256,
+    /// or as one that does not parse.
+    pub fn certificate(&self) -> String {
+        let fp = match self {
+            Rejected::Unpinned(fp) => Some(fp),
+            Rejected::Untrusted(fp) => fp.as_ref(),
+        };
+        match fp {
+            Some(fp) => format!(
+                "upstream certificate with public key sha256 {}",
+                hex::encode(fp)
+            ),
+            None => "upstream certificate that does not parse".to_string(),
+        }
+    }
+}
+
+/// The attested end-entity certificate fingerprints, each the SHA-256 of a
+/// SubjectPublicKeyInfo. It only grows.
 pub struct PinSet {
     pins: RwLock<BTreeSet<[u8; 32]>>,
     last: Mutex<Option<Rejected>>,
@@ -109,7 +138,7 @@ impl ServerCertVerifier for PinnedVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        let fp = sha256_der(end_entity.as_ref());
+        let fp = spki_sha256(end_entity);
         if let Err(e) = self.webpki.verify_server_cert(
             end_entity,
             intermediates,
@@ -120,6 +149,11 @@ impl ServerCertVerifier for PinnedVerifier {
             self.pins.reject(Rejected::Untrusted(fp));
             return Err(e);
         }
+        // WebPKI parsed it, so this is unreachable; refuse rather than assume.
+        let Some(fp) = fp else {
+            self.pins.reject(Rejected::Untrusted(None));
+            return Err(Error::InvalidCertificate(CertificateError::BadEncoding));
+        };
         if !self.pins.contains(&fp) {
             self.pins.reject(Rejected::Unpinned(fp));
             return Err(Error::InvalidCertificate(
@@ -209,13 +243,90 @@ mod tests {
         Arc::new(store)
     }
 
+    fn spki(c: &CertificateDer<'_>) -> [u8; 32] {
+        spki_sha256(c).expect("parses")
+    }
+
+    /// The live cloud-api.near.ai leaf, taken from the production report's
+    /// `tls_certificate` on 2026-10-29. NEAR AI's gateway attested
+    /// `tls_cert_fingerprint` 73862c25... for it, which is sha256 of its
+    /// SubjectPublicKeyInfo:
+    /// `openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER | shasum -a 256`.
     #[test]
-    fn sha256_der_is_the_sha256_of_the_der_bytes() {
-        // printf abc | shasum -a 256
+    fn the_production_leaf_hashes_to_its_attested_spki_fingerprint() {
+        let leaf = cert(include_bytes!(
+            "../../tests/fixtures/near-prod/cloud-api-leaf.pem"
+        ));
         assert_eq!(
-            hex::encode(sha256_der(b"abc")),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            hex::encode(spki(&leaf)),
+            "73862c254372091cc6895b900111503860694f8916ebf0c63b18d245ba8ba5ad"
         );
+    }
+
+    /// Regression: the pin is not sha256 of the whole leaf DER. That hash
+    /// (5664...) is what the forwarder used to compute, and it never
+    /// matches what production attests.
+    #[test]
+    fn the_leaf_der_hash_is_not_the_pin() {
+        let leaf = cert(include_bytes!(
+            "../../tests/fixtures/near-prod/cloud-api-leaf.pem"
+        ));
+        let der: [u8; 32] = Sha256::digest(leaf.as_ref()).into();
+        assert_eq!(
+            hex::encode(der),
+            "5664580137f5b2abc8b2cc9ef53dc2bd7cd79b6ffc9f840dbbfca708a2c51022"
+        );
+        assert_ne!(spki(&leaf), der);
+
+        // A verifier pinned to the leaf-DER hash refuses the certificate.
+        let pins = PinSet::new(BTreeSet::from([der]));
+        let v = PinnedVerifier::new(roots(), pins.clone()).unwrap();
+        let a = cert(include_bytes!("../../tests/fixtures/tls/a.pem"));
+        pins.extend(&BTreeSet::from([Sha256::digest(a.as_ref()).into()]));
+        let name = ServerName::try_from("127.0.0.1").unwrap();
+        assert!(
+            v.verify_server_cert(&a, &[], &name, &[], UnixTime::now())
+                .is_err()
+        );
+        assert_eq!(pins.take_rejected(), Some(Rejected::Unpinned(spki(&a))));
+    }
+
+    /// The openssl-generated test certificates, fingerprinted by SPKI as
+    /// openssl computes it.
+    #[test]
+    fn the_test_certificates_are_fingerprinted_by_spki() {
+        for (pem, want) in [
+            (
+                &include_bytes!("../../tests/fixtures/tls/a.pem")[..],
+                "37e84e0fb98ff9dd3644b50b55b1c95051550e4dbe14d3410ef9b77e31573b80",
+            ),
+            (
+                &include_bytes!("../../tests/fixtures/tls/b.pem")[..],
+                "95426bdf061eaee3c2680eb1183f5b6e5e54096f4bc18c6889ffb85f28afce2a",
+            ),
+            (
+                &include_bytes!("../../tests/fixtures/tls/c.pem")[..],
+                "b21ddeb494ff2a89e1e2144ae531bdf17f409795c32c21f3f24db680ba239359",
+            ),
+        ] {
+            assert_eq!(hex::encode(spki(&cert(pem))), want);
+        }
+    }
+
+    /// Bytes that are not a certificate have no fingerprint, and the
+    /// verifier refuses them as untrusted.
+    #[test]
+    fn a_certificate_that_does_not_parse_is_untrusted() {
+        let junk = CertificateDer::from(b"not a certificate".to_vec());
+        assert_eq!(spki_sha256(&junk), None);
+        let pins = PinSet::new(BTreeSet::from([[1; 32]]));
+        let v = PinnedVerifier::new(roots(), pins.clone()).unwrap();
+        let name = ServerName::try_from("127.0.0.1").unwrap();
+        assert!(
+            v.verify_server_cert(&junk, &[], &name, &[], UnixTime::now())
+                .is_err()
+        );
+        assert_eq!(pins.take_rejected(), Some(Rejected::Untrusted(None)));
     }
 
     #[test]
@@ -234,10 +345,7 @@ mod tests {
         let a = cert(include_bytes!("../../tests/fixtures/tls/a.pem"));
         let b = cert(include_bytes!("../../tests/fixtures/tls/b.pem"));
         let c = cert(include_bytes!("../../tests/fixtures/tls/c.pem"));
-        let pins = PinSet::new(BTreeSet::from([
-            sha256_der(a.as_ref()),
-            sha256_der(c.as_ref()),
-        ]));
+        let pins = PinSet::new(BTreeSet::from([spki(&a), spki(&c)]));
         let v = PinnedVerifier::new(roots(), pins.clone()).unwrap();
         let name = ServerName::try_from("127.0.0.1").unwrap();
         let now = UnixTime::now();
@@ -245,20 +353,17 @@ mod tests {
         assert_eq!(pins.take_rejected(), None);
 
         assert!(v.verify_server_cert(&b, &[], &name, &[], now).is_err());
-        assert_eq!(
-            pins.take_rejected(),
-            Some(Rejected::Unpinned(sha256_der(b.as_ref())))
-        );
+        assert_eq!(pins.take_rejected(), Some(Rejected::Unpinned(spki(&b))));
         assert_eq!(pins.take_rejected(), None, "taken once");
 
         assert!(v.verify_server_cert(&b, &[], &name, &[], now).is_err());
-        assert_eq!(pins.take_unknown(), Some(sha256_der(b.as_ref())));
+        assert_eq!(pins.take_unknown(), Some(spki(&b)));
 
         // Pinned, but self-signed: the chain check runs first and fails.
         assert!(v.verify_server_cert(&c, &[], &name, &[], now).is_err());
         assert_eq!(
             pins.take_rejected(),
-            Some(Rejected::Untrusted(sha256_der(c.as_ref())))
+            Some(Rejected::Untrusted(Some(spki(&c))))
         );
         assert!(v.verify_server_cert(&c, &[], &name, &[], now).is_err());
         assert_eq!(pins.take_unknown(), None, "untrusted is not unknown");
@@ -267,7 +372,7 @@ mod tests {
         let other = ServerName::try_from("cloud-api.near.ai").unwrap();
         assert!(v.verify_server_cert(&a, &[], &other, &[], now).is_err());
 
-        pins.extend(&BTreeSet::from([sha256_der(b.as_ref())]));
+        pins.extend(&BTreeSet::from([spki(&b)]));
         assert!(v.verify_server_cert(&b, &[], &name, &[], now).is_ok());
     }
 

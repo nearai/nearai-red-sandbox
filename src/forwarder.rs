@@ -507,14 +507,11 @@ async fn handle(state: &Arc<State>, req: Request<Incoming>) -> Out {
                     "rts forwarder: upstream request failed",
                 );
             }
-            Some(Rejected::Untrusted(fp)) => {
+            Some(r @ Rejected::Untrusted(_)) => {
                 return fatal_reply(
                     state,
                     "pin-failed",
-                    format!(
-                        "pin: upstream certificate {} does not chain to a trusted root",
-                        hex::encode(fp)
-                    ),
+                    format!("pin: {} does not chain to a trusted root", r.certificate()),
                 );
             }
             Some(Rejected::Unpinned(fp)) => {
@@ -532,16 +529,10 @@ async fn handle(state: &Arc<State>, req: Request<Incoming>) -> Out {
                     Ok(resp) => resp,
                     Err(_) => {
                         if let Some(r) = state.pins.take_rejected() {
-                            let fp = match r {
-                                Rejected::Unpinned(fp) | Rejected::Untrusted(fp) => fp,
-                            };
                             return fatal_reply(
                                 state,
                                 "pin-failed",
-                                format!(
-                                    "pin: upstream certificate {} refused after re-attestation",
-                                    hex::encode(fp)
-                                ),
+                                format!("pin: {} refused after re-attestation", r.certificate()),
                             );
                         }
                         return local(
@@ -584,7 +575,7 @@ async fn learn(state: &State, fp: [u8; 32]) -> Result<(), Unlearned> {
         return Ok(());
     }
     Err(Unlearned::Failed(format!(
-        "pin: upstream certificate {} is not attested after {REATTEST_ATTEMPTS} re-attestations",
+        "pin: upstream certificate with public key sha256 {} is not attested after {REATTEST_ATTEMPTS} re-attestations",
         hex::encode(fp)
     )))
 }
@@ -884,16 +875,16 @@ async fn verify(state: &State, ex: &Exchange, auth: &HeaderValue) -> Checked {
             // The fetch that answered: signature_ms stays the fetch time.
             Ok(fetched) => break fetched,
             Err(FetchError::Failed(e)) => return Checked::Failed(format!("signature: {e}")),
-            Err(FetchError::Rejected(Rejected::Untrusted(fp))) => {
+            Err(FetchError::Rejected(r @ Rejected::Untrusted(_))) => {
                 return Checked::PinFailed(format!(
-                    "pin: upstream certificate {} does not chain to a trusted root",
-                    hex::encode(fp)
+                    "pin: {} does not chain to a trusted root",
+                    r.certificate()
                 ));
             }
-            Err(FetchError::Rejected(Rejected::Unpinned(fp))) if learned => {
+            Err(FetchError::Rejected(r @ Rejected::Unpinned(_))) if learned => {
                 return Checked::PinFailed(format!(
-                    "pin: upstream certificate {} refused after re-attestation",
-                    hex::encode(fp)
+                    "pin: {} refused after re-attestation",
+                    r.certificate()
                 ));
             }
             Err(FetchError::Rejected(Rejected::Unpinned(fp))) => {
@@ -1074,7 +1065,7 @@ mod tests {
     }
 
     fn fp(name: &str) -> [u8; 32] {
-        pin::sha256_der(cert(name).as_ref())
+        pin::spki_sha256(&cert(name)).expect("parses")
     }
 
     fn fps(names: &[&str]) -> BTreeSet<[u8; 32]> {

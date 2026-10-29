@@ -111,7 +111,9 @@ pub struct Attestor {
     pub quotes: Arc<dyn QuoteVerifier>,
     pub gpus: Arc<dyn GpuVerifier>,
     pub base_url: String,
-    pub key: HostSecret,
+    /// Sent as the bearer on the report fetch when present. NEAR AI
+    /// production serves the report without one (2026-10-29).
+    pub key: Option<HostSecret>,
     pub models: Vec<String>,
     pub options: AttestOptions,
     pub policy: Policy,
@@ -131,7 +133,7 @@ impl Attestor {
     /// `BlockingHttp` must not run on a Tokio runtime thread: call `attest`
     /// from a plain thread.
     pub fn real(
-        key: HostSecret,
+        key: Option<HostSecret>,
         models: &[String],
         options: AttestOptions,
     ) -> Result<Attestor, String> {
@@ -175,7 +177,7 @@ impl Attestor {
         let url = report::report_url(&self.base_url, model, &nonce);
         let resp = self
             .http
-            .get(&url, Some(&self.key))
+            .get(&url, self.key.as_ref())
             .map_err(|e| format!("attestation report request failed: {e}"))?;
         if resp.status != 200 {
             return Err(format!("attestation report returned HTTP {}", resp.status));
@@ -370,6 +372,7 @@ mod tests {
         gpu: Result<GpuVerdict, String>,
         options: AttestOptions,
         policy: Policy,
+        keyless: bool,
     }
 
     impl Case {
@@ -405,6 +408,7 @@ mod tests {
                 policy: Policy {
                     compose_hashes: BTreeSet::from([sha(&[COMPOSE.as_bytes()])]),
                 },
+                keyless: false,
             }
         }
     }
@@ -459,7 +463,7 @@ mod tests {
             quotes: Arc::new(FakeQuotes(quotes)),
             gpus: gpu.clone(),
             base_url: BASE.into(),
-            key: DUMMY_KEY.to_string().into(),
+            key: (!first.keyless).then(|| DUMMY_KEY.to_string().into()),
             models: models.iter().map(|m| m.to_string()).collect(),
             options: first.options,
             policy: first.policy.clone(),
@@ -505,6 +509,17 @@ mod tests {
 
     fn run_one(case: Case) -> Run {
         run_cases(&["m"], vec![for_model(case, "m")])
+    }
+
+    /// Production serves the report without an API key, so attestation can
+    /// run keyless; it still verifies, and no bearer is sent.
+    #[test]
+    fn a_keyless_attestor_fetches_the_report_without_a_bearer() {
+        let mut case = Case::good([1; 32]);
+        case.keyless = true;
+        let run = run_one(case);
+        assert_eq!(run.result.unwrap().fingerprints, BTreeSet::from([FP]));
+        assert_eq!(run.http.bearers(), vec![false]);
     }
 
     #[test]
@@ -731,6 +746,148 @@ mod tests {
             ev.contains(&hex::encode(sha(&[COMPOSE.as_bytes()]))),
             "{ev}"
         );
+    }
+
+    /// The production compose hashes measured on 2026-10-29: the gateway
+    /// (dstack-0.5.12) and the abliterated DeepSeek model entry
+    /// (dstack-nvidia-0.5.11), each sha256(info.tcb_info.app_compose).
+    #[test]
+    fn the_committed_policy_pins_the_production_composes() {
+        let policy = load_policy(POLICY_JSON).unwrap();
+        for h in [
+            "f571e5dafe8f96baf116a271b4be9cba228b447dd6ebe502bbda81ede7bcc7ce",
+            "ae66f844658a7aee331dcb9fb59bd40323d71d192d37719e022cc4af8389265b",
+        ] {
+            assert!(
+                policy.compose_hashes.contains(&report::hex32(h).unwrap()),
+                "{h} is not pinned"
+            );
+        }
+        assert_eq!(policy.compose_hashes.len(), 2);
+    }
+
+    /// The production evidence recorded by tests/live_attest.rs on
+    /// 2026-10-29 (report, PCS collateral, root CRL, NRAS answer and the
+    /// JWKS key it names), replayed through the real quote and GPU
+    /// verifiers at the recorded time.
+    fn production_replay(
+        now: u64,
+        policy: Policy,
+        key: Option<HostSecret>,
+    ) -> Result<Attested, String> {
+        use base64::Engine;
+        let run: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/near-prod/live-run-2026-10-29.json"
+        ))
+        .unwrap();
+        let http = FakeHttp::new();
+        for e in run["exchanges"].as_array().unwrap() {
+            let headers = e["headers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| {
+                    (
+                        h[0].as_str().unwrap().to_string(),
+                        h[1].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            http.route(
+                e["method"].as_str().unwrap(),
+                e["url"].as_str().unwrap(),
+                HttpResponse {
+                    status: e["status"].as_u64().unwrap() as u16,
+                    headers,
+                    body: base64::engine::general_purpose::STANDARD
+                        .decode(e["body_b64"].as_str().unwrap())
+                        .unwrap(),
+                },
+            );
+        }
+        let nonce = report::hex32(run["nonces"][0].as_str().unwrap()).unwrap();
+        let http: Arc<dyn Http> = http;
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(now));
+        Attestor {
+            quotes: Arc::new(PcsQuoteVerifier { http: http.clone() }),
+            gpus: Arc::new(NrasGpuVerifier {
+                http: http.clone(),
+                clock: clock.clone(),
+            }),
+            http,
+            clock,
+            base_url: run["base_url"].as_str().unwrap().into(),
+            key,
+            models: vec![crate::config::DEFAULT_MODELS[0].to_string()],
+            options: AttestOptions::default(),
+            policy,
+            nonce: Arc::new(move || nonce),
+        }
+        .attest()
+    }
+
+    const PRODUCTION_RECORDED_AT: u64 = 1_793_309_354;
+
+    #[test]
+    fn the_recorded_production_evidence_attests_under_the_default_options() {
+        let a = production_replay(
+            PRODUCTION_RECORDED_AT,
+            load_policy(POLICY_JSON).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            a.fingerprints,
+            BTreeSet::from([
+                report::hex32("73862c254372091cc6895b900111503860694f8916ebf0c63b18d245ba8ba5ad")
+                    .unwrap(),
+                report::hex32("4066aed3031802c9de0197e0e849a18133e445f2bb085b036c2a18ab47796408")
+                    .unwrap(),
+            ])
+        );
+        // The live leaf's SPKI hash is the gateway's attested fingerprint.
+        use rustls::pki_types::pem::PemObject;
+        let leaf = rustls::pki_types::CertificateDer::from_pem_slice(include_bytes!(
+            "../tests/fixtures/near-prod/cloud-api-leaf.pem"
+        ))
+        .unwrap();
+        assert!(
+            a.fingerprints
+                .contains(&crate::forwarder::pin::spki_sha256(&leaf).unwrap())
+        );
+        assert_eq!(
+            a.keys[crate::config::DEFAULT_MODELS[0]],
+            BTreeSet::from([report::hex32(
+                "88fbc43bdd80a7cc51c3f47ac7ec88b37efe2471b4e20a651281fbd81adcee78"
+            )
+            .unwrap()])
+        );
+        let entries = a.evidence[0]["entries"].as_array().unwrap();
+        assert!(entries.iter().all(|e| e["tcb_status"] == "UpToDate"));
+    }
+
+    #[test]
+    fn the_recorded_production_evidence_is_refused_without_its_pinned_composes() {
+        let e = production_replay(
+            PRODUCTION_RECORDED_AT,
+            Policy {
+                compose_hashes: BTreeSet::new(),
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(e.contains("not pinned"), "{e}");
+    }
+
+    #[test]
+    fn the_recorded_production_evidence_is_refused_once_the_nras_token_expires() {
+        let e = production_replay(
+            PRODUCTION_RECORDED_AT + 7 * 24 * 3600,
+            load_policy(POLICY_JSON).unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert!(e.contains("GPU attestation"), "{e}");
     }
 
     #[test]

@@ -146,11 +146,14 @@ export async function setupWith(ctx: any, makeImpl: (o: PluginOptions) => Record
 
   const kept = listOf(await ctx.model.list()).filter((m: any) => m.providerID === o.provider && m.enabled !== false)
   const keptIds = kept.map((m: any) => String(m.id))
+  // Only extras are fatal here. opencode v2.1.4 loads provider models after
+  // plugin setup, so an allowlisted model may not be listed yet; the model
+  // transform above still filters anything loaded later, rts checks that
+  // every allowlisted model exists upstream before opencode starts, and the
+  // forwarder refuses any other model.
   const extraModels = keptIds.filter((id) => !allowed.has(id))
-  const missingModels = [...allowed].filter((id) => !keptIds.includes(id))
-  if (extraModels.length || missingModels.length) {
-    const parts = [...extraModels.map((id) => `${o.provider}/${id}`), ...missingModels.map((id) => `missing ${o.provider}/${id}`)]
-    throw new Error(`model allowlist mismatch: ${parts.join(", ")}`)
+  if (extraModels.length) {
+    throw new Error(`model allowlist mismatch: ${extraModels.map((id) => `${o.provider}/${id}`).join(", ")}`)
   }
 
   const providerModels = kept.length
