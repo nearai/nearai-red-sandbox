@@ -519,6 +519,16 @@ pub fn network_children(host: &dyn Host, attach_pid: u32) -> Result<Vec<u32>, St
 
 // --- the session ---
 
+/// The wall clock the session limit is measured with; tests inject one.
+pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
+
+/// `Some(stop reason)` once `hours` of wall-clock time have passed since
+/// `boot`. A clock that steps back before boot reads as no time passed.
+pub fn session_limit(boot: SystemTime, now: SystemTime, hours: u32) -> Option<String> {
+    let elapsed = now.duration_since(boot).unwrap_or(Duration::ZERO);
+    (elapsed >= Duration::from_secs(u64::from(hours) * 3600)).then(|| format!("session-limit: {hours}h since boot"))
+}
+
 pub struct Deps {
     pub host: Arc<dyn Host>,
     /// None: mvmctl from the config, with the operator's HOME.
@@ -533,6 +543,8 @@ pub struct Deps {
     pub fatal: Option<Arc<crate::forwarder::Fatal>>,
     /// Resolves allowlisted names on the host before launch.
     pub resolver: Arc<dyn crate::network::Resolver>,
+    /// Measures `limits.sessionHours` from boot. `Deps::real` uses `SystemTime::now`.
+    pub clock: Clock,
 }
 
 impl Deps {
@@ -545,6 +557,7 @@ impl Deps {
             session_id: Some(session_id),
             fatal,
             resolver: Arc::new(crate::network::SystemResolver),
+            clock: Arc::new(SystemTime::now),
         })
     }
 }
@@ -764,7 +777,10 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     live.machine_attempted = true;
     live.audit_dir = Some(root.join("audit"));
     let hosts = plan.allow_hosts();
-    let egress = (!plan.is_empty()).then(|| crate::sandbox::Egress { allow_hosts: &hosts, attach_log: &p.attach_log });
+    let egress = (!plan.is_empty()).then(|| crate::sandbox::Egress { allow_hosts: &hosts, attach_log: &p.attach_log, session_hours: cfg.limits.session_hours });
+    // Read before create, so this limit ends no later than the attach `--ttl`.
+    let boot = (deps.clock)();
+    let limit = || session_limit(boot, (deps.clock)(), cfg.limits.session_hours);
     // A signal during create only sets a flag: create finishes, then teardown removes it.
     live.sb
         .create(&CreateSpec { name: &p.machine, image: &cfg.image, memory_mib: cfg.limits.memory_mib, cpus: cfg.limits.cpus, egress })
@@ -783,7 +799,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         live.sb.copy_in(inputs, "/in").map_err(|e| e.to_string())?;
         live.log.log(&format!("copied {} to /in", inputs.display()));
     }
-    if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)).or_else(|| live.sb.network_lost()) {
+    if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)).or_else(|| live.sb.network_lost()).or_else(limit) {
         return Err(format!("{why} before opencode started"));
     }
 
@@ -822,7 +838,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
             transport_error = terminal.pump().err().map(|e| format!("terminal relay failed: {e}"));
         }
         if signalled.is_none() {
-            signalled = interrupted(live.log).or_else(|| stopped(deps, live.log)).or_else(|| live.sb.network_lost());
+            signalled = interrupted(live.log).or_else(|| stopped(deps, live.log)).or_else(|| live.sb.network_lost()).or_else(limit);
         }
         transport_error.is_some() || signalled.is_some() || child.try_wait().ok().flatten().is_some()
     })
@@ -836,7 +852,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             return Ok(status.code().unwrap_or(1));
         }
-        if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)).or_else(|| live.sb.network_lost()) {
+        if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)).or_else(|| live.sb.network_lost()).or_else(limit) {
             return Err(why);
         }
         if Instant::now() >= next_sample {
@@ -1329,7 +1345,7 @@ mod tests {
     fn external_sessions_refuse_an_unpatched_supervisor_before_any_vm_command() {
         let d = tempdir("unpatched");
         let f = Fake::new(|a| if a.last().map(String::as_str) == Some(SUPERVISOR_PROBE) { out(0, "stock", "") } else { healthy(a) });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None, resolver: Arc::new(NoResolve) };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None, resolver: Arc::new(NoResolve), clock: Arc::new(SystemTime::now) };
         let external = ProviderConfig { base_url: "https://cloud-api.near.ai/v1".into(), ..provider() };
         assert_eq!(run_session(&session_cfg(&d, &d, external), deps), 1);
         assert_eq!(f.calls(), ["opencode --version", "/fake/home/.local/share/nearai-red-sandbox/mvm-hvf-supervisor --rts-vsock-drain-fix-version"]);
@@ -1493,7 +1509,7 @@ mod tests {
     fn a_session_refuses_before_any_vm_exists_when_opencode_is_the_wrong_version() {
         let d = tempdir("sess");
         let f = Fake::new(|a| if a.last().map(String::as_str) == Some("--version") { out(0, "1.0.0", "") } else { out(0, "", "") });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None, resolver: Arc::new(NoResolve) };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None, resolver: Arc::new(NoResolve), clock: Arc::new(SystemTime::now) };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         assert!(!f.calls().iter().any(|c| c.starts_with("machine")), "{:?}", f.calls());
         fs::remove_dir_all(d).unwrap();
@@ -1503,7 +1519,7 @@ mod tests {
     fn a_session_uses_the_id_its_caller_chose() {
         let d = tempdir("sess-id");
         let f = Fake::new(|a| if a.last().map(String::as_str) == Some("--version") { out(0, "1.0.0", "") } else { out(0, "", "") });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into(), session_id: Some("0123456789ab".into()), fatal: None, resolver: Arc::new(NoResolve) };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into(), session_id: Some("0123456789ab".into()), fatal: None, resolver: Arc::new(NoResolve), clock: Arc::new(SystemTime::now) };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         let log = fs::read_to_string(d.join("0123456789ab/launcher.log"));
         let entries: Vec<_> = fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -1545,6 +1561,7 @@ mod tests {
             session_id: None,
             fatal: None,
             resolver: Arc::new(NoResolve),
+            clock: Arc::new(SystemTime::now),
         };
         let mut cfg = session_cfg(&sessions, &d, serve(MODELS_OK));
         cfg.opencode = "/nonexistent-opencode-rss-test".into();
@@ -1563,7 +1580,7 @@ mod tests {
             s if s.starts_with("machine create") => out(1, "", "image pull failed"),
             _ => healthy(a),
         });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None, resolver: Arc::new(NoResolve) };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None, resolver: Arc::new(NoResolve), clock: Arc::new(SystemTime::now) };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         let calls = f.calls();
         assert!(calls.iter().any(|c| c.starts_with("machine rm rts-") && c.ends_with(" --force --yes")), "{calls:?}");
@@ -1669,7 +1686,7 @@ mod tests {
     fn net_deps(f: &Arc<Fake>, mvm: &Path, resolver: Arc<dyn crate::network::Resolver>, extra: &[(&str, &str)]) -> Deps {
         let mut env: Vec<(String, String)> = vec![("HOME".into(), "/fake/home".into()), ("MVM_HOME".into(), mvm.to_string_lossy().into_owned()), ("PATH".into(), "/usr/bin:/bin".into())];
         env.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
-        Deps { host: f.clone(), runner: Some(f.clone()), env, rts: "/x/rts".into(), session_id: Some("0123456789ab".into()), fatal: None, resolver }
+        Deps { host: f.clone(), runner: Some(f.clone()), env, rts: "/x/rts".into(), session_id: Some("0123456789ab".into()), fatal: None, resolver, clock: Arc::new(SystemTime::now) }
     }
 
     fn read_log(s: &NetSession) -> String {
@@ -1731,7 +1748,7 @@ mod tests {
         fs::remove_dir_all(&s.d).unwrap();
         let create = calls.iter().find(|c| c.starts_with("machine create ")).expect("no create");
         assert!(create.ends_with("--allow-host 198.51.100.7:8443"), "{create}");
-        assert!(calls.contains(&"attach machine run --name rts-0123456789ab --ttl 30d".to_string()), "{calls:?}");
+        assert!(calls.contains(&"attach machine run --name rts-0123456789ab --ttl 24h".to_string()), "{calls:?}");
         assert!(!calls.iter().any(|c| c.starts_with("machine start")), "{calls:?}");
         for c in &calls {
             for flag in ["--net", "--peer", "--gpu", "--grants-file", "--policy"] {
@@ -1838,5 +1855,102 @@ mod tests {
         let kill = position(&calls, |c| c == "kill -KILL 4243").expect("no kill");
         assert!(rm < kill, "{calls:?}");
         assert!(!calls.iter().any(|c| c == "kill -KILL 4245"), "{calls:?}");
+    }
+
+    // --- session time limit (Task 9a) ---
+
+    const T0: Duration = Duration::from_secs(1_800_000_000);
+
+    /// Boot reads the clock first; every later read is `later` after it.
+    fn jump_clock(later: Duration) -> Clock {
+        let first = std::sync::atomic::AtomicBool::new(true);
+        Arc::new(move || UNIX_EPOCH + T0 + if first.swap(false, std::sync::atomic::Ordering::SeqCst) { Duration::ZERO } else { later })
+    }
+
+    #[test]
+    fn the_session_limit_is_reached_at_exactly_its_hours_since_boot() {
+        let boot = UNIX_EPOCH + T0;
+        let h = Duration::from_secs(3600);
+        assert_eq!(session_limit(boot, boot, 24), None);
+        assert_eq!(session_limit(boot, boot + 24 * h - Duration::from_secs(1), 24), None);
+        assert_eq!(session_limit(boot, boot + 24 * h, 24).as_deref(), Some("session-limit: 24h since boot"));
+        assert!(session_limit(boot, boot + 2 * h, 1).is_some());
+        // A clock that steps back before boot has not used up the limit.
+        assert_eq!(session_limit(boot, boot - h, 24), None);
+    }
+
+    #[test]
+    fn a_session_past_its_limit_stops_with_session_limit_and_tears_down_in_order() {
+        let s = net_session("limit-passed", &[]);
+        let f = Fake::new(net_reply("RTS_PROBE connected", || {}));
+        let mut deps = net_deps(&f, &s.mvm, Arc::new(NoResolve), &[]);
+        deps.clock = jump_clock(Duration::from_secs(24 * 3600));
+        assert_eq!(run_session(&s.cfg, deps), 1);
+        let (calls, log) = (f.calls(), read_log(&s));
+        fs::remove_dir_all(&s.d).unwrap();
+        assert!(log.contains("session-limit: 24h since boot before opencode started"), "{log}");
+        assert!(!log.contains("sampling host RSS"), "{log}");
+        assert!(log.contains("teardown: removed rts-0123456789ab"), "{log}");
+        let export = position(&calls, |c| c.contains("echo NONE")).expect("no export");
+        let rm = position(&calls, |c| c.starts_with("machine rm rts-0123456789ab")).expect("no rm");
+        assert!(export < rm, "{calls:?}");
+    }
+
+    #[test]
+    fn a_network_session_past_its_limit_stops_with_session_limit_and_stops_the_attach_after_rm() {
+        let s = net_session("limit-passed-net", &["198.51.100.7:8443"]);
+        let f = Fake::new(net_reply("RTS_PROBE connected", || {}));
+        let mut deps = net_deps(&f, &s.mvm, Arc::new(NoResolve), &[]);
+        deps.clock = jump_clock(Duration::from_secs(25 * 3600));
+        assert_eq!(run_session(&s.cfg, deps), 1);
+        let (calls, log) = (f.calls(), read_log(&s));
+        fs::remove_dir_all(&s.d).unwrap();
+        assert!(calls.contains(&"attach machine run --name rts-0123456789ab --ttl 24h".to_string()), "{calls:?}");
+        assert!(log.contains("session-limit: 24h since boot"), "{log}");
+        let export = position(&calls, |c| c.contains("echo NONE")).expect("no export");
+        let rm = position(&calls, |c| c.starts_with("machine rm rts-0123456789ab")).expect("no rm");
+        let term = position(&calls, |c| c == "terminate").expect("attach not terminated");
+        assert!(export < rm && rm < term, "{calls:?}");
+    }
+
+    #[test]
+    fn a_session_within_its_limit_is_not_stopped() {
+        let s = net_session("limit-within", &[]);
+        let f = Fake::new(net_reply("RTS_PROBE connected", || {}));
+        let mut deps = net_deps(&f, &s.mvm, Arc::new(NoResolve), &[]);
+        deps.clock = jump_clock(Duration::from_secs(24 * 3600 - 1));
+        assert_eq!(run_session(&s.cfg, deps), 1);
+        let log = read_log(&s);
+        fs::remove_dir_all(&s.d).unwrap();
+        assert!(!log.contains("session-limit"), "{log}");
+        // It got past the pre-opencode check, to the missing opencode.
+        assert!(log.contains("sampling host RSS"), "{log}");
+        assert!(log.contains("/nonexistent-opencode"), "{log}");
+    }
+
+    #[test]
+    fn a_session_limit_reached_during_the_handshake_ends_the_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut s = net_session("limit-handshake", &[]);
+        let started = s.d.join("started");
+        let script = s.d.join("opencode-stand-in");
+        fs::write(&script, format!("#!/bin/sh\n/usr/bin/touch '{}'; exec /bin/sleep 30\n", started.display())).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        s.cfg.opencode = script.to_string_lossy().into_owned();
+        let f = Fake::new(net_reply("RTS_PROBE connected", || {}));
+        let mut deps = net_deps(&f, &s.mvm, Arc::new(NoResolve), &[]);
+        let marker = started.clone();
+        deps.clock = Arc::new(move || UNIX_EPOCH + T0 + if marker.exists() { Duration::from_secs(24 * 3600) } else { Duration::ZERO });
+        let begun = Instant::now();
+        assert_eq!(run_session(&s.cfg, deps), 1);
+        let elapsed = begun.elapsed();
+        let (calls, log) = (f.calls(), read_log(&s));
+        let was_started = started.exists();
+        fs::remove_dir_all(&s.d).unwrap();
+        assert!(was_started, "the opencode stand-in never ran: {log}");
+        assert!(elapsed < Duration::from_millis(s.cfg.limits.handshake_ms / 2), "took {elapsed:?}");
+        assert!(log.contains("session-limit: 24h since boot") && !log.contains("plugin ready"), "{log}");
+        assert!(log.contains("teardown: opencode stopped"), "{log}");
+        assert!(calls.iter().any(|c| c.starts_with("machine rm rts-0123456789ab")), "{calls:?}");
     }
 }

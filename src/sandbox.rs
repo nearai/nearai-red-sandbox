@@ -74,11 +74,13 @@ pub trait Exec {
     fn exec(&self, argv: &[String], opts: &ExecOptions) -> Result<ExecResult>;
 }
 
-/// Guest egress for one machine: the resolved `--allow-host` values, and
-/// the 0600 file that takes the attached `machine run` output.
+/// Guest egress for one machine: the resolved `--allow-host` values, the
+/// 0600 file that takes the attached `machine run` output, and the session
+/// limit that sets its `--ttl`.
 pub struct Egress<'a> {
     pub allow_hosts: &'a [crate::network::AllowHost],
     pub attach_log: &'a Path,
+    pub session_hours: u32,
 }
 
 pub struct CreateSpec<'a> {

@@ -50,7 +50,12 @@ pub struct Limits {
     pub cpus: u32,
     pub host_rss_ceiling_mib: u64,
     pub handshake_ms: u64,
+    /// Wall-clock limit from boot, in hours; also the attach `--ttl`.
+    pub session_hours: u32,
 }
+
+/// mvm v0.22.0's inclusive `MAX_TTL` (30 days), in hours.
+pub const MAX_SESSION_HOURS: u32 = 720;
 
 impl Default for Limits {
     fn default() -> Self {
@@ -61,6 +66,7 @@ impl Default for Limits {
             cpus: 2,
             host_rss_ceiling_mib: 3072,
             handshake_ms: 30_000,
+            session_hours: 24,
         }
     }
 }
@@ -104,6 +110,9 @@ struct RawLimits {
     #[serde(rename = "hostRssCeilingMiB")]
     host_rss_ceiling_mib: Option<u64>,
     handshake_ms: Option<u64>,
+    /// Read as any JSON value so a string or fraction gets this module's
+    /// refusal, not serde's.
+    session_hours: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -201,6 +210,16 @@ fn positive<T: Copy + Default + PartialOrd>(v: Option<T>, d: T, k: &str) -> Resu
     } else {
         Ok(v)
     }
+}
+
+/// `limits.sessionHours`: absent is the default, otherwise an integer from
+/// 1 to [`MAX_SESSION_HOURS`].
+fn session_hours(v: Option<&serde_json::Value>, d: u32) -> Result<u32, String> {
+    let Some(v) = v else { return Ok(d) };
+    v.as_u64()
+        .filter(|h| (1..=u64::from(MAX_SESSION_HOURS)).contains(h))
+        .and_then(|h| u32::try_from(h).ok())
+        .ok_or_else(|| format!("config: limits.sessionHours must be an integer from 1 to {MAX_SESSION_HOURS}"))
 }
 
 /// Paths the config leaves out, from `install::defaults`.
@@ -312,6 +331,7 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
             "hostRssCeilingMiB",
         )?,
         handshake_ms: positive(l.handshake_ms, dl.handshake_ms, "handshakeMs")?,
+        session_hours: session_hours(l.session_hours.as_ref(), dl.session_hours)?,
     };
     let network = raw.network.allow.unwrap_or_default();
     crate::network::expand(&network).map_err(|e| format!("config: network.allow: {e}"))?;
@@ -370,6 +390,22 @@ mod tests {
     }
     fn parse(t: &str) -> Result<OperatorConfig, String> {
         parse_config(t, Path::new("/cfg"), &d())
+    }
+
+    #[test]
+    fn session_hours_defaults_to_24_and_is_refused_outside_1_to_720() {
+        let p = |l: &str| parse(&format!(r#"{{ "provider": {{ "models": ["m"] }}, "limits": {l} }}"#));
+        assert_eq!(p("{}").unwrap().limits.session_hours, 24);
+        assert_eq!(Limits::default().session_hours, 24);
+        assert_eq!(p(r#"{ "sessionHours": 1 }"#).unwrap().limits.session_hours, 1);
+        assert_eq!(p(r#"{ "sessionHours": 720 }"#).unwrap().limits.session_hours, 720);
+        for bad in ["0", "721", "1.5", "\"24\"", "-1", "4294967297"] {
+            assert_eq!(
+                p(&format!(r#"{{ "sessionHours": {bad} }}"#)).unwrap_err(),
+                "config: limits.sessionHours must be an integer from 1 to 720",
+                "{bad}"
+            );
+        }
     }
 
     #[test]

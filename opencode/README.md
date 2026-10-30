@@ -279,6 +279,16 @@ the ready file.
   descriptions in its transform, but that hook may overwrite the `shell` one.
   This affects only what the model is told, not where commands run.
 
+## Session time limit
+
+`limits.sessionHours` (default `24`, an integer from 1 to 720) caps a
+session's wall-clock time from boot. When it is reached the launcher ends the
+session with stop reason `session-limit`: it exports `/out` and removes the
+VM, as for any other stop, with or without network. 720 hours is mvm's 30-day
+`MAX_TTL`. For a session with an allowlist, the attached
+`mvmctl machine run` gets `--ttl <sessionHours>h`, so mvm's own limit matches
+the launcher's.
+
 ## Host RSS sampling and input readiness
 
 The launcher reads `vms/<machine>/hvf.pid` under `MVM_HOME` or

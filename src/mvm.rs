@@ -23,8 +23,11 @@ pub const BACKSTOP: Duration = Duration::from_secs(30);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(180);
 /// Never buffer more than this from one mvmctl stream, whatever the guest does.
 const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
-/// `--ttl` for the attached `machine run`: mvm v0.22.0's inclusive MAX_TTL.
-pub const ATTACH_TTL: &str = "30d";
+/// `--ttl` for the attached `machine run`: the session's wall-clock limit
+/// (`limits.sessionHours`, at most mvm v0.22.0's inclusive 30-day MAX_TTL).
+pub fn attach_ttl(hours: u32) -> String {
+    format!("{hours}h")
+}
 /// How often create polls `machine ps` while a network machine boots.
 const BOOT_POLL: Duration = Duration::from_millis(500);
 /// How long remove gives the attached run between SIGTERM and SIGKILL.
@@ -345,8 +348,9 @@ impl MvmSandbox {
 
     /// Start the attached `machine run` (once more if it exits before
     /// boot) and wait until `machine ps` shows the machine running.
-    fn attached_start(&self, log: &Path) -> Result<()> {
-        let argv = sv(&["machine", "run", "--name", &self.name, "--ttl", ATTACH_TTL]);
+    fn attached_start(&self, log: &Path, session_hours: u32) -> Result<()> {
+        let ttl = attach_ttl(session_hours);
+        let argv = sv(&["machine", "run", "--name", &self.name, "--ttl", &ttl]);
         let refused = || Error::Other(format!("machine run exited before boot (see {})", log.display()));
         for _ in 0..2 {
             let a = self.run.attach(&argv, log).map_err(|e| Error::Other(format!("machine run failed to start: {e} (see {})", log.display())))?;
@@ -466,6 +470,9 @@ impl Sandbox for MvmSandbox {
         if spec.egress.as_ref().is_some_and(|e| e.allow_hosts.is_empty()) {
             return Err("a network machine needs at least one allowed host".into());
         }
+        if let Some(e) = spec.egress.as_ref().filter(|e| !(1..=crate::config::MAX_SESSION_HOURS).contains(&e.session_hours)) {
+            return Err(Error::Other(format!("session limit must be 1 to {} hours, not {}", crate::config::MAX_SESSION_HOURS, e.session_hours)));
+        }
         if let Some(r) = self.dead_reason() {
             return Err(Error::Unavailable(r));
         }
@@ -480,7 +487,7 @@ impl Sandbox for MvmSandbox {
                 self.control(&sv(&["machine", "start", &self.name]), "machine start")?;
                 Ok(())
             }
-            Some(e) => self.attached_start(e.attach_log),
+            Some(e) => self.attached_start(e.attach_log, e.session_hours),
         }
     }
 
@@ -662,14 +669,14 @@ mod tests {
         let (f, h) = fake_with_attach(false, running_ps);
         let sb = MvmSandbox::new(NAME, f).unwrap();
         let log = Path::new("/s/mvm-attach.log");
-        sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &hosts, attach_log: log }) }).unwrap();
+        sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &hosts, attach_log: log, session_hours: 24 }) }).unwrap();
         let calls = argvs(&h.calls);
         assert_eq!(
             calls[0],
             sv(&["machine", "create", NAME, "--image", IMAGE, "--profile", "dev", "--cpus", "2", "--memory", "2048M", "--allow-host", "198.51.100.7:443", "--allow-host", "198.51.100.8:8443"])
         );
         assert!(!calls.iter().any(|a| a.get(1).map(String::as_str) == Some("start")));
-        assert_eq!(h.attaches.lock().unwrap().clone(), vec![(sv(&["machine", "run", "--name", NAME, "--ttl", "30d"]), log.to_path_buf())]);
+        assert_eq!(h.attaches.lock().unwrap().clone(), vec![(sv(&["machine", "run", "--name", NAME, "--ttl", "24h"]), log.to_path_buf())]);
         for a in calls.iter().chain(h.attaches.lock().unwrap().iter().map(|(a, _)| a)) {
             for flag in FORBIDDEN {
                 assert!(!a.contains(&flag.to_string()), "{a:?}");
@@ -680,11 +687,31 @@ mod tests {
     }
 
     #[test]
+    fn attach_ttl_is_the_session_limit_in_hours() {
+        assert_eq!(attach_ttl(24), "24h");
+        assert_eq!(attach_ttl(1), "1h");
+        assert_eq!(attach_ttl(720), "720h");
+    }
+
+    #[test]
+    fn create_with_egress_refuses_a_session_limit_outside_1_to_720_hours_and_runs_nothing() {
+        let hosts = crate::network::test_allow_hosts(&["198.51.100.7:443"]);
+        for hours in [0, 721] {
+            let (f, h) = fake_with_attach(false, running_ps);
+            let sb = MvmSandbox::new(NAME, f).unwrap();
+            let log = Path::new("/s/mvm-attach.log");
+            assert!(sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &hosts, attach_log: log, session_hours: hours }) }).is_err());
+            assert!(h.calls.lock().unwrap().is_empty());
+            assert!(h.attaches.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn create_with_egress_refuses_an_empty_allowlist_and_runs_nothing() {
         let (f, h) = fake_with_attach(false, running_ps);
         let sb = MvmSandbox::new(NAME, f).unwrap();
         let log = Path::new("/s/mvm-attach.log");
-        assert!(sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &[], attach_log: log }) }).is_err());
+        assert!(sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &[], attach_log: log, session_hours: 24 }) }).is_err());
         assert!(h.calls.lock().unwrap().is_empty());
         assert!(h.attaches.lock().unwrap().is_empty());
     }
@@ -695,7 +722,7 @@ mod tests {
         let (f, h) = fake_with_attach(true, |a| if a[1] == "ps" { out(0, "NAME STATUS\n", "") } else { out(0, "", "") });
         let sb = MvmSandbox::new(NAME, f).unwrap();
         let log = Path::new("/s/mvm-attach.log");
-        let e = sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &hosts, attach_log: log }) }).unwrap_err().to_string();
+        let e = sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &hosts, attach_log: log, session_hours: 24 }) }).unwrap_err().to_string();
         let attaches = h.attaches.lock().unwrap().clone();
         assert_eq!(attaches.len(), 2);
         assert!(attaches.iter().all(|(_, l)| l == log), "both runs append to the same log");
@@ -728,7 +755,7 @@ mod tests {
         });
         let sb = MvmSandbox::new(NAME, f).unwrap();
         let log = Path::new("/s/mvm-attach.log");
-        sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &hosts, attach_log: log }) }).unwrap();
+        sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &hosts, attach_log: log, session_hours: 24 }) }).unwrap();
         assert_eq!(sb.network_lost(), None);
         h.exited_flag.store(true, Ordering::SeqCst);
         let lost = sb.network_lost().unwrap();
@@ -758,7 +785,7 @@ mod tests {
         });
         let sb = MvmSandbox::new(NAME, f).unwrap();
         let log = Path::new("/s/mvm-attach.log");
-        sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &hosts, attach_log: log }) }).unwrap();
+        sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &hosts, attach_log: log, session_hours: 24 }) }).unwrap();
         assert!(sb.remove().is_err());
         assert!(h.terminated.load(Ordering::SeqCst));
     }
