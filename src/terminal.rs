@@ -76,6 +76,13 @@ impl Terminal {
         Ok((child, terminal))
     }
 
+    /// Queue an OSC 0 window title ahead of any child output. Control
+    /// characters are dropped so the title cannot end the escape early.
+    pub fn set_title(&mut self, title: &str) {
+        let clean: String = title.chars().filter(|c| !c.is_control()).collect();
+        self.output_queue.extend_from_slice(format!("\x1b]0;{clean}\x07").as_bytes());
+    }
+
     /// Called only after readiness verification. TCSANOW preserves queued
     /// input; neither terminal input nor terminal responses are read earlier.
     pub fn enable_input(&mut self) -> io::Result<()> {
@@ -362,6 +369,36 @@ mod tests {
     }
 
     #[test]
+    fn the_launcher_title_reaches_the_operator_terminal_before_child_output() {
+        let d = tempdir("terminal-title");
+        let out = d.join("out");
+        let (reader, _writer) = UnixStream::pair().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf child"]);
+        let (mut child, mut terminal) =
+            Terminal::spawn_with_io(&mut command, reader.into(), File::create(&out).unwrap().into()).unwrap();
+        // Control characters cannot end the escape early or inject another.
+        terminal.set_title("NEAR AI Red\x07\x1b]0;evil SandBox");
+        // Darwin holds an exiting child until its terminal output drains.
+        let end = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() && Instant::now() < end {
+            terminal.pump().unwrap();
+            thread::sleep(Duration::from_millis(2));
+        }
+        for _ in 0..20 {
+            terminal.pump().unwrap();
+        }
+        let _ = child.kill();
+        child.wait().unwrap();
+        drop(terminal);
+        let written = std::fs::read(&out).unwrap();
+        std::fs::remove_dir_all(d).unwrap();
+        let expected: &[u8] = b"\x1b]0;NEAR AI Red]0;evil SandBox\x07";
+        assert!(written.starts_with(expected), "{:?}", String::from_utf8_lossy(&written));
+        assert!(String::from_utf8_lossy(&written).contains("child"));
+    }
+
+    #[test]
     fn the_child_has_tty_stdio_and_a_controlling_terminal() {
         let d = tempdir("terminal-isatty");
         let receipt = d.join("receipt");
@@ -496,10 +533,11 @@ mod tests {
     #[ignore = "requires RTS_OPENCODE pointing to opencode 2.2.2"]
     fn pinned_opencode_tui_starts_and_handshakes_over_the_gated_pty() {
         use crate::session::{
-            opencode_launch, prepare_session_dirs, session_paths, wait_for_ready,
-            write_opencode_config,
+            TERMINAL_TITLE, opencode_launch, prepare_session_dirs, session_paths, wait_for_ready,
+            write_opencode_config, write_tui_config,
         };
         use serde_json::json;
+        const FOOTER: &str = "NEAR AI Red · SandBox · test-no-inference · attested";
         let binary =
             std::env::var("RTS_OPENCODE").expect("set RTS_OPENCODE to the pinned 2.2.2 binary");
         let d = tempdir("terminal-opencode");
@@ -512,17 +550,27 @@ mod tests {
             models: vec!["test-no-inference".into()],
             api_key_env: None,
         };
-        write_opencode_config(&paths.config_dir, &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin"), &json!({
+        let plugin_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin");
+        write_tui_config(
+            &paths.config_dir,
+            &plugin_dir,
+            &crate::config::model_display_name(&provider.models[0]),
+            true,
+        )
+        .unwrap();
+        crate::brand::theme::install(&plugin_dir, &paths.config_dir).unwrap();
+        write_opencode_config(&paths.config_dir, &plugin_dir, &json!({
             "machine": paths.machine, "nonce": nonce, "readyFile": paths.ready_file,
             "auditFile": paths.audit_file, "provider": "ironwire", "models": provider.models, "rts": "/nonexistent-rts-no-tools-called",
             "bridge": { "machine": paths.machine }, "debugFile": paths.runtime.join("debug.json"),
-        }), &provider).unwrap();
+        }), &provider, false).unwrap();
         let launch = opencode_launch(
             &paths,
             &binary,
             [
                 ("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()),
                 ("TERM".into(), "xterm-256color".into()),
+                ("COLORTERM".into(), "truecolor".into()),
             ],
         );
         let version = Command::new(&binary)
@@ -551,6 +599,7 @@ mod tests {
             .envs(launch.env.iter().cloned());
         let (mut child, mut terminal) =
             Terminal::spawn_with_io(&mut command, reader.into(), output_file.into()).unwrap();
+        terminal.set_title(TERMINAL_TITLE);
         let ready = wait_for_ready(
             &paths.ready_file,
             nonce,
@@ -565,10 +614,18 @@ mod tests {
         if ready.is_ok() {
             terminal.enable_input().unwrap();
             // Plugin initialization finishes before the TUI starts reading.
-            // Send spaced Ctrl-C keys after renderer startup; no prompt is submitted.
-            for tick in 0..500 {
+            // Wait for the home screen's footer (at most 15 s), then send
+            // spaced Ctrl-C keys; no prompt is submitted.
+            let mut home_drawn_at = None;
+            for tick in 0..2000 {
                 terminal.pump().unwrap();
-                if tick >= 100 && tick % 50 == 0 {
+                if home_drawn_at.is_none() && tick % 20 == 0 {
+                    let so_far = std::fs::read(paths.runtime.join("terminal-output")).unwrap();
+                    if tick >= 1500 || screen_text_and_titles(&so_far).0.contains(FOOTER) {
+                        home_drawn_at = Some(tick);
+                    }
+                }
+                if home_drawn_at.is_some_and(|at| tick >= at + 20 && tick % 50 == 0) {
                     writer.write_all(b"\x03").unwrap();
                 }
                 if child.try_wait().unwrap().is_some() {
@@ -598,6 +655,70 @@ mod tests {
             !output.is_empty(),
             "OpenCode emitted no interactive terminal output"
         );
+        let (text, titles) = screen_text_and_titles(&output);
+        // The branding TUI plugin drew the home footer with its options.
+        assert!(text.contains(FOOTER), "footer missing; screen text: {text}");
+        // rts set the title first; with terminal.title off opencode sets none
+        // (at most the empty title its renderer writes on exit).
+        assert_eq!(titles.first().map(String::as_str), Some(TERMINAL_TITLE), "{titles:?}");
+        assert!(
+            titles.iter().all(|t| t == TERMINAL_TITLE || t.is_empty()),
+            "{titles:?}"
+        );
+        // The nearai-red theme is active: opencode's own muted hints use its
+        // pewter textMuted and body text its TOP (opencode's default theme
+        // has neither), on the terminal's own background.
+        let raw = String::from_utf8_lossy(&output);
+        assert!(raw.contains("\x1b[38;2;128;128;136m\x1b[49magents"), "theme textMuted missing");
+        assert!(raw.contains("\x1b[38;2;233;231;225m\x1b[49mctrl+p"), "theme text missing");
+        // The footer is drawn in sand, with "attested" in NEAR AI Red.
+        assert!(
+            raw.contains("\x1b[38;2;161;151;127m\x1b[49mNEAR AI Red · SandBox · test-no-inference · "),
+            "footer not in sand"
+        );
+        assert!(raw.contains("\x1b[38;2;235;25;36m\x1b[49mattested"), "attested not in red");
+        eprintln!("footer found; title escapes: {titles:?}");
+        if let Ok(dump) = std::env::var("RTS_PTY_DUMP") {
+            std::fs::write(dump, &output).unwrap();
+        }
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    /// Terminal output with CSI and OSC escapes removed, and the payloads of
+    /// the OSC 0 and OSC 2 (window title) escapes in order.
+    fn screen_text_and_titles(output: &[u8]) -> (String, Vec<String>) {
+        let (mut text, mut titles) = (Vec::new(), Vec::new());
+        let mut i = 0;
+        while i < output.len() {
+            match (output[i], output.get(i + 1)) {
+                (0x1b, Some(b'[')) => {
+                    i += 2;
+                    while i < output.len() && !(0x40..=0x7e).contains(&output[i]) {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                (0x1b, Some(b']')) => {
+                    let start = i + 2;
+                    let mut end = start;
+                    while end < output.len()
+                        && output[end] != 0x07
+                        && !(output[end] == 0x1b && output.get(end + 1) == Some(&b'\\'))
+                    {
+                        end += 1;
+                    }
+                    let body = String::from_utf8_lossy(&output[start..end]);
+                    if let Some(title) = body.strip_prefix("0;").or_else(|| body.strip_prefix("2;")) {
+                        titles.push(title.to_string());
+                    }
+                    i = end + if output.get(end) == Some(&0x07) { 1 } else { 2 };
+                }
+                (b, _) => {
+                    text.push(b);
+                    i += 1;
+                }
+            }
+        }
+        (String::from_utf8_lossy(&text).into_owned(), titles)
     }
 }

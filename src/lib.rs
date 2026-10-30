@@ -1,4 +1,5 @@
 pub mod attest;
+pub mod brand;
 pub mod bridge;
 pub mod auth;
 pub mod inference;

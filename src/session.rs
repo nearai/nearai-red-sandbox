@@ -13,15 +13,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use crate::config::{OperatorConfig, PLACEHOLDER_API_KEY, ProviderConfig};
+use crate::config::{EMBEDDED_PROVIDER_ID, OperatorConfig, PLACEHOLDER_API_KEY, ProviderConfig, model_display_name};
 use crate::copy::CopyLimits;
 use crate::mvm::{MvmSandbox, RunOutput, Runner, SpawnRunner, StateDir, list_machines, run_captured, tail};
 use crate::protocol::{new_nonce, random_hex};
 use crate::sandbox::{CopyOutResult, CreateSpec, Exec, ExecOptions, Sandbox, sv};
 use crate::sys;
 use crate::terminal::Terminal;
+use crate::brand::progress::Live as Shown;
 
 pub const OPENCODE_VERSION: &str = "2.2.2";
+pub const PRODUCT_NAME: &str = "NEAR AI Red";
+pub const TERMINAL_TITLE: &str = "NEAR AI Red SandBox";
+/// The terminal UI plugin directory inside the plugin shim.
+pub const BRANDING_PLUGIN: &str = "branding";
 
 const INIT_GUEST_STORAGE: &str = r#"set -eu
 tmp=$1; input=$2; output=$3
@@ -68,15 +73,17 @@ impl Host for RealHost {
 
 // --- opencode config ---
 
-pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig) -> Value {
+/// `embedded` is `OperatorConfig::embedded_inference`: only rts's own,
+/// attested NEAR AI inference is shown as NEAR AI Red.
+pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig, embedded: bool) -> Value {
     let models: serde_json::Map<String, Value> = p.models.iter().map(|m| {
-        let model = if p.id == "nearai-red-embedded" {
+        let model = if p.id == EMBEDDED_PROVIDER_ID {
             // Invalid route values must fail closed rather than silently use a
             // different backend or model. Embedded startup validates these IDs.
             let route = crate::inference::route_header(m).unwrap_or_else(|_| "invalid".into());
-            json!({ "name": m, "tool_call": true, "headers": { "x-ironwire-route": route } })
+            json!({ "name": model_display_name(m), "tool_call": true, "headers": { "x-ironwire-route": route } })
         } else {
-            json!({ "name": m, "tool_call": true })
+            json!({ "name": model_display_name(m), "tool_call": true })
         };
         (m.clone(), model)
     }).collect();
@@ -91,7 +98,8 @@ pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderCo
         "provider": {
             &p.id: {
                 "npm": "@ai-sdk/openai-compatible",
-                "name": p.id,
+                // An external provider keeps its own ID as its name.
+                "name": if embedded { PRODUCT_NAME } else { p.id.as_str() },
                 "options": { "baseURL": p.base_url, "apiKey": api_key },
                 "models": models,
             }
@@ -100,17 +108,54 @@ pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderCo
         // A provider policy (deny every other provider) behind the plugin's model transform.
         "enabled_providers": [p.id],
         "share": "disabled",
+        // opencode is pinned by rts setup; never check for or offer updates.
+        "autoupdate": false,
     })
 }
 
-pub fn write_opencode_config(dir: &Path, plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig) -> Result<PathBuf, String> {
+pub fn write_opencode_config(dir: &Path, plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig, embedded: bool) -> Result<PathBuf, String> {
     // v2.2.2 skips a plugin configured as a file path with only a warning.
     if !plugin_dir.is_dir() {
         return Err(format!("plugin path must be a directory: {}", plugin_dir.display()));
     }
     fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     let file = dir.join("opencode.json");
-    let text = serde_json::to_string_pretty(&opencode_config(plugin_dir, plugin_options, p)).unwrap() + "\n";
+    let text = serde_json::to_string_pretty(&opencode_config(plugin_dir, plugin_options, p, embedded)).unwrap() + "\n";
+    write_private(&file, text.as_bytes()).map_err(|e| format!("writing {}: {e}", file.display()))?;
+    Ok(file)
+}
+
+/// opencode's terminal UI reads its own config, `cli.json` beside
+/// opencode.json; the server's `plugin` list does not load TUI plugins.
+/// The branding plugin only draws the home footer: opencode never loads a
+/// TUI-only directory on the server, so tools, MCP and models are untouched.
+pub fn tui_config(plugin_dir: &Path, model_display: &str, attested: bool) -> Value {
+    json!({
+        // rts sets the window title; opencode would overwrite it on every route change.
+        "terminal": { "title": false },
+        "theme": { "name": crate::brand::theme::THEME_NAME },
+        "plugins": [{
+            "package": plugin_dir.join(BRANDING_PLUGIN).to_string_lossy(),
+            "options": { "model": model_display, "attested": attested },
+        }],
+    })
+}
+
+pub fn write_tui_config(dir: &Path, plugin_dir: &Path, model_display: &str, attested: bool) -> Result<PathBuf, String> {
+    // v2.2.2 marks a directory without a tui entry "unsupported" and says so
+    // only in /plugins, so refuse a broken install here instead.
+    let branding = plugin_dir.join(BRANDING_PLUGIN);
+    let missing: Vec<&str> = ["tui.tsx", "footer.ts"].into_iter().filter(|f| !branding.join(f).is_file()).collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "branding plugin {} is missing {}; reinstall rts or fix pluginDir",
+            branding.display(),
+            missing.join(" and ")
+        ));
+    }
+    fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let file = dir.join("cli.json");
+    let text = serde_json::to_string_pretty(&tui_config(plugin_dir, model_display, attested)).unwrap() + "\n";
     write_private(&file, text.as_bytes()).map_err(|e| format!("writing {}: {e}", file.display()))?;
     Ok(file)
 }
@@ -579,7 +624,7 @@ struct Logger {
 
 impl Logger {
     fn log(&self, m: &str) {
-        eprintln!("[rts {}] {m}", self.id);
+        crate::brand::progress::log_line(&self.id, m);
         let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.file) {
             let _ = writeln!(f, "{secs} {m}");
@@ -603,6 +648,7 @@ struct Live<'a> {
 
 impl Live<'_> {
     fn teardown(&mut self, why: &str) {
+        crate::brand::progress::teardown();
         self.log.log(&format!("teardown: {why}"));
         if let Some(mut c) = self.child.take() {
             // Terminal::spawn gives OpenCode its own session and process group.
@@ -791,6 +837,7 @@ pub fn plugin_options(p: &SessionPaths, cfg: &OperatorConfig, rts: &Path, nonce:
 fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operator_home: &str, supervisor: &Path, live: &mut Live) -> Result<i32, String> {
     let p = live.paths;
     let leak_seam_set = deps.env.iter().any(|(k, _)| k == "RTS_TEST_LEAK");
+    let step = crate::brand::progress::step("host check", Shown::Sweep);
     preflight(&PreflightInput {
         host: deps.host.as_ref(),
         run: run.as_ref(),
@@ -804,8 +851,11 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     // Every launch, with or without an allowlist, before any machine command.
     let root = mvm_root(&deps.env)?;
     crate::network::check_mvm_host(&deps.env, &root)?;
+    step.ok("opencode, mvm, supervisor and provider");
+    let step = crate::brand::progress::step("allowlist", Shown::Sweep);
     let plan = crate::network::plan(&cfg.network, deps.resolver.as_ref())?;
     write_session_record(p, &plan, &[], &Pinned::new())?;
+    step.ok(&plan.allowlist_line());
     sweep_orphans(run, &mut |m| live.log.log(m))?;
     if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)) {
         return Err(why);
@@ -818,6 +868,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     // Read before create, so this limit ends no later than the attach `--ttl`.
     let boot = (deps.clock)();
     let limit = || session_limit(boot, (deps.clock)(), cfg.limits.session_hours);
+    let step = crate::brand::progress::step("microVM", Shown::Decode(p.machine.clone()));
     // A signal during create only sets a flag: create finishes, then teardown removes it.
     live.sb
         .create(&CreateSpec { name: &p.machine, image: &cfg.image, memory_mib: cfg.limits.memory_mib, cpus: cfg.limits.cpus, egress })
@@ -828,18 +879,29 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         let attach = live.sb.attach_pid().ok_or("network machine has no attached mvmctl machine run")?;
         live.network_pids = network_children(live.host, attach)?;
     }
+    step.ok(&format!("{} · {} MiB · {} vCPU · {}", p.machine, cfg.limits.memory_mib, cfg.limits.cpus, plan.net_label()));
+    let step = crate::brand::progress::step("probes", Shown::Sweep);
     let probes = crate::network::run_probes(live.sb, &plan)?;
+    step.ok(&crate::network::probes_line(&plan, &probes));
     // mvm resolved each name again when its endpoint started. Its audit log
     // shows those pins only once the guest has used a name, which the probes
     // just did, so the check runs here: before anything else runs in the guest.
+    // An empty plan has no egress to pin, and no status line for it.
+    let pin_line = plan.pinned_line();
+    let step = pin_line.as_ref().map(|_| crate::brand::progress::step("pinned IPs", Shown::Sweep));
     let pinned = wait_for_pins(&plan, &root.join("audit"), &p.machine, &deps.clock)?;
     write_session_record(p, &plan, &probes, &pinned)?;
     crate::network::check_pinned(&plan, &pinned)?;
+    if let (Some(step), Some(line)) = (step, pin_line) {
+        step.ok(&line);
+    }
     live.log.log(&plan.startup_line());
     initialize_guest_storage(live.sb)?;
     if let Some(inputs) = &cfg.inputs_dir {
+        let step = crate::brand::progress::step("copy in", Shown::Sweep);
         live.sb.copy_in(inputs, "/in").map_err(|e| e.to_string())?;
         live.log.log(&format!("copied {} to /in", inputs.display()));
+        step.ok(&format!("{} → /in", inputs.display()));
     }
     if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)).or_else(|| live.sb.network_lost()).or_else(limit) {
         return Err(format!("{why} before opencode started"));
@@ -851,7 +913,11 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
 
     let nonce = new_nonce();
     let plugin_options = plugin_options(p, cfg, &deps.rts, &nonce, operator_home);
-    write_opencode_config(&p.config_dir, &cfg.plugin_dir, &plugin_options, &cfg.provider)?;
+    write_opencode_config(&p.config_dir, &cfg.plugin_dir, &plugin_options, &cfg.provider, cfg.embedded_inference)?;
+    // run_connected reaches the session for embedded inference only after
+    // attestation verified; an external provider is recorded unattested.
+    write_tui_config(&p.config_dir, &cfg.plugin_dir, &model_display_name(&cfg.provider.models[0]), cfg.embedded_inference)?;
+    crate::brand::theme::install(&cfg.plugin_dir, &p.config_dir)?;
     // opencode loads opencode.json, AGENTS.md and .opencode/ from its cwd.
     if fs::read_dir(&p.work).map_err(|e| e.to_string())?.next().is_some() {
         return Err(format!("work directory is not empty: {}", p.work.display()));
@@ -867,8 +933,10 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         .current_dir(&launch.cwd)
         .env_clear()
         .envs(launch.env.iter().map(|(k, v)| (k, v)));
+    crate::brand::progress::hand_off();
     let (child, mut terminal) = Terminal::spawn(&mut command)
         .map_err(|e| format!("starting {} failed: {e}", cfg.opencode))?;
+    terminal.set_title(TERMINAL_TITLE);
     let child = live.child.insert(child);
 
     let mut signalled = None;
@@ -1122,7 +1190,7 @@ mod tests {
 
     #[test]
     fn the_generated_config_loads_the_plugin_directory_with_its_options() {
-        let c = opencode_config(Path::new("/repo/plugin"), &json!({ "nonce": "n" }), &provider());
+        let c = opencode_config(Path::new("/repo/plugin"), &json!({ "nonce": "n" }), &provider(), false);
         assert_eq!(c["plugin"], json!([["/repo/plugin", { "nonce": "n" }]]));
         assert_eq!(c["model"], "ironwire/z-ai/glm-5.3-flash");
         assert_eq!(c["enabled_providers"], json!(["ironwire"]));
@@ -1132,18 +1200,90 @@ mod tests {
 
     #[test]
     fn the_api_key_is_a_placeholder_for_ironwire_and_an_env_reference_otherwise() {
-        let c = opencode_config(Path::new("/p"), &json!({}), &provider());
+        let c = opencode_config(Path::new("/p"), &json!({}), &provider(), false);
         assert_eq!(c["provider"]["ironwire"]["options"]["apiKey"], PLACEHOLDER_API_KEY);
         let direct = ProviderConfig { id: "nearai".into(), base_url: "https://cloud-api.near.ai/v1".into(), api_key_env: Some("NEARAI_API_KEY".into()), ..provider() };
-        let c = opencode_config(Path::new("/p"), &json!({}), &direct);
+        let c = opencode_config(Path::new("/p"), &json!({}), &direct, false);
         assert_eq!(c["provider"]["nearai"]["options"]["apiKey"], "{env:NEARAI_API_KEY}");
+    }
+
+    #[test]
+    fn the_embedded_provider_and_its_models_get_display_names_but_keep_their_ids() {
+        let embedded = ProviderConfig {
+            id: "nearai-red-embedded".into(),
+            models: vec!["deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated".into(), "z-ai/glm-5.3-flash".into()],
+            ..provider()
+        };
+        let c = opencode_config(Path::new("/p"), &json!({}), &embedded, true);
+        let p = &c["provider"]["nearai-red-embedded"];
+        assert_eq!(p["name"], "NEAR AI Red");
+        let deepseek = &p["models"]["deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated"];
+        assert_eq!(deepseek["name"], "DeepSeek V4.1 Flash Abliterated");
+        assert_eq!(deepseek["headers"]["x-ironwire-route"], "nearai:deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated");
+        assert_eq!(p["models"]["z-ai/glm-5.3-flash"]["name"], "glm-5.3-flash");
+        assert_eq!(c["model"], "nearai-red-embedded/deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated");
+        assert_eq!(c["enabled_providers"], json!(["nearai-red-embedded"]));
+        // The name follows embedded inference, not the ID: a config that
+        // somehow carried the embedded ID to an external endpoint is not NEAR AI Red.
+        let c = opencode_config(Path::new("/p"), &json!({}), &embedded, false);
+        assert_eq!(c["provider"]["nearai-red-embedded"]["name"], "nearai-red-embedded");
+        // An external provider is not NEAR AI Red; it keeps its own ID as its name.
+        let c = opencode_config(Path::new("/p"), &json!({}), &provider(), false);
+        assert_eq!(c["provider"]["ironwire"]["name"], "ironwire");
+        assert_eq!(c["provider"]["ironwire"]["models"]["z-ai/glm-5.3-flash"]["name"], "glm-5.3-flash");
+    }
+
+    #[test]
+    fn opencode_never_checks_for_or_offers_its_own_updates() {
+        // rts pins opencode; the "/update to install" notice would offer a
+        // version the launcher refuses. Measured in the stage 2 spike
+        // (2026-10-30): "autoupdate": false removes the notice and the check.
+        for embedded in [true, false] {
+            let c = opencode_config(Path::new("/p"), &json!({}), &provider(), embedded);
+            assert_eq!(c["autoupdate"], json!(false));
+        }
+    }
+
+    #[test]
+    fn the_tui_config_loads_only_the_branding_plugin_and_turns_off_opencode_titles() {
+        let c = tui_config(Path::new("/repo/plugin"), "DeepSeek V4.1 Flash Abliterated", true);
+        assert_eq!(c["terminal"], json!({ "title": false }));
+        // The shipped theme, which session_body copies to <config>/themes/.
+        assert_eq!(c["theme"], json!({ "name": "nearai-red" }));
+        assert_eq!(
+            c["plugins"],
+            json!([{ "package": "/repo/plugin/branding", "options": { "model": "DeepSeek V4.1 Flash Abliterated", "attested": true } }])
+        );
+        assert_eq!(tui_config(Path::new("/p"), "m", false)["plugins"][0]["options"]["attested"], false);
+    }
+
+    #[test]
+    fn writing_the_config_writes_a_private_cli_json_and_needs_the_branding_plugin() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir("sess-cli");
+        let plugin = d.join("plugin");
+        fs::create_dir_all(&plugin).unwrap();
+        let e = write_tui_config(&d.join("cfg"), &plugin, "m", true).unwrap_err();
+        assert!(e.contains(&plugin.join("branding").display().to_string()) && e.contains("reinstall rts or fix pluginDir"), "{e}");
+        fs::create_dir_all(plugin.join("branding")).unwrap();
+        fs::write(plugin.join("branding/tui.tsx"), "").unwrap();
+        // tui.tsx imports footer.ts; one without the other is a broken install.
+        let e = write_tui_config(&d.join("cfg"), &plugin, "m", true).unwrap_err();
+        assert!(e.contains("footer.ts"), "{e}");
+        fs::write(plugin.join("branding/footer.ts"), "").unwrap();
+        let file = write_tui_config(&d.join("cfg"), &plugin, "m", true).unwrap();
+        assert_eq!(file, d.join("cfg/cli.json"));
+        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        let v: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(v, tui_config(&plugin, "m", true));
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn the_plugin_path_must_be_a_directory() {
         let d = tempdir("sess");
         fs::write(d.join("index.ts"), "").unwrap();
-        let e = write_opencode_config(&d.join("cfg"), &d.join("index.ts"), &json!({}), &provider()).unwrap_err();
+        let e = write_opencode_config(&d.join("cfg"), &d.join("index.ts"), &json!({}), &provider(), false).unwrap_err();
         assert!(e.contains("must be a directory"));
         fs::remove_dir_all(d).unwrap();
     }
@@ -1720,6 +1860,16 @@ mod tests {
         fs::create_dir_all(mvm.join("audit")).unwrap();
         fs::write(mvm.join("audit/local.jsonl"), format!("{OTHER_FLOW}\n{OUR_FLOW}\n")).unwrap();
         let mut cfg = session_cfg(&d.join("sessions"), &d, serve(MODELS_OK));
+        // An installed plugin carries the branding TUI files; without them
+        // the launcher refuses the session before the code under test runs.
+        fs::create_dir_all(cfg.plugin_dir.join("branding")).unwrap();
+        for f in ["tui.tsx", "footer.ts"] {
+            fs::write(cfg.plugin_dir.join("branding").join(f), "").unwrap();
+        }
+        // and the shipped opencode theme, which session_body installs.
+        let theme = cfg.plugin_dir.join(crate::brand::theme::THEME_FILE);
+        fs::create_dir_all(theme.parent().unwrap()).unwrap();
+        fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin").join(crate::brand::theme::THEME_FILE), &theme).unwrap();
         cfg.opencode = "/nonexistent-opencode".into();
         cfg.network = network.iter().map(|s| s.to_string()).collect();
         NetSession { session: d.join("sessions/0123456789ab"), d, mvm, cfg }

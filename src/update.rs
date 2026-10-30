@@ -275,7 +275,7 @@ pub fn launch_notice(update_check: bool, log_file: &Path) {
         fetch: Arc::new(fetch),
     });
     if let Some(n) = &outcome.notice {
-        eprintln!("[rts] {n}");
+        crate::brand::progress::message(&format!("[rts] {n}"));
     }
     append_log(log_file, &outcome.log);
 }

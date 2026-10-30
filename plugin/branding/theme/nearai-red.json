@@ -1,0 +1,232 @@
+{
+  "$schema": "https://opencode.ai/theme.json",
+  "defs": {
+    "red": "#EB1924",
+    "redSoft": "#FF5A63",
+    "white": "#FAFAF7",
+    "top": "#E9E7E1",
+    "light": "#D9D9DC",
+    "front": "#B7B7BB",
+    "pewter": "#808088",
+    "side": "#76767D",
+    "crease": "#2B2B30",
+    "ink": "#272727",
+    "panelDark": "#141416",
+    "elementDark": "#1E1E22",
+    "sand0": "#3B362D",
+    "sand1": "#A1977F",
+    "sand2": "#EEE5D1",
+    "pile": "#D6CAB0",
+    "sandInk": "#6E6552",
+    "sage": "#9DB08A",
+    "sageInk": "#4F6B3C",
+    "amber": "#D9A441",
+    "amberInk": "#8A5F12",
+    "addedBgDark": "#1C2219",
+    "removedBgDark": "#2A1214",
+    "addedBgLight": "#E7EEDD",
+    "removedBgLight": "#F9DCDD"
+  },
+  "theme": {
+    "primary": {
+      "dark": "red",
+      "light": "red"
+    },
+    "secondary": {
+      "dark": "sand1",
+      "light": "sandInk"
+    },
+    "accent": {
+      "dark": "red",
+      "light": "red"
+    },
+    "error": {
+      "dark": "redSoft",
+      "light": "red"
+    },
+    "warning": {
+      "dark": "amber",
+      "light": "amberInk"
+    },
+    "success": {
+      "dark": "sage",
+      "light": "sageInk"
+    },
+    "info": {
+      "dark": "light",
+      "light": "side"
+    },
+    "text": {
+      "dark": "top",
+      "light": "ink"
+    },
+    "textMuted": {
+      "dark": "pewter",
+      "light": "pewter"
+    },
+    "background": {
+      "dark": "none",
+      "light": "none"
+    },
+    "backgroundPanel": {
+      "dark": "panelDark",
+      "light": "sand2"
+    },
+    "backgroundElement": {
+      "dark": "elementDark",
+      "light": "top"
+    },
+    "border": {
+      "dark": "side",
+      "light": "front"
+    },
+    "borderActive": {
+      "dark": "red",
+      "light": "red"
+    },
+    "borderSubtle": {
+      "dark": "crease",
+      "light": "light"
+    },
+    "diffAdded": {
+      "dark": "sage",
+      "light": "sageInk"
+    },
+    "diffRemoved": {
+      "dark": "redSoft",
+      "light": "red"
+    },
+    "diffContext": {
+      "dark": "pewter",
+      "light": "pewter"
+    },
+    "diffHunkHeader": {
+      "dark": "sand1",
+      "light": "sandInk"
+    },
+    "diffHighlightAdded": {
+      "dark": "sage",
+      "light": "sageInk"
+    },
+    "diffHighlightRemoved": {
+      "dark": "redSoft",
+      "light": "red"
+    },
+    "diffAddedBg": {
+      "dark": "addedBgDark",
+      "light": "addedBgLight"
+    },
+    "diffRemovedBg": {
+      "dark": "removedBgDark",
+      "light": "removedBgLight"
+    },
+    "diffContextBg": {
+      "dark": "panelDark",
+      "light": "sand2"
+    },
+    "diffLineNumber": {
+      "dark": "pewter",
+      "light": "pewter"
+    },
+    "diffAddedLineNumberBg": {
+      "dark": "addedBgDark",
+      "light": "addedBgLight"
+    },
+    "diffRemovedLineNumberBg": {
+      "dark": "removedBgDark",
+      "light": "removedBgLight"
+    },
+    "markdownText": {
+      "dark": "top",
+      "light": "ink"
+    },
+    "markdownHeading": {
+      "dark": "red",
+      "light": "red"
+    },
+    "markdownLink": {
+      "dark": "sand1",
+      "light": "sandInk"
+    },
+    "markdownLinkText": {
+      "dark": "red",
+      "light": "red"
+    },
+    "markdownCode": {
+      "dark": "pile",
+      "light": "sandInk"
+    },
+    "markdownBlockQuote": {
+      "dark": "pewter",
+      "light": "pewter"
+    },
+    "markdownEmph": {
+      "dark": "sand1",
+      "light": "sandInk"
+    },
+    "markdownStrong": {
+      "dark": "white",
+      "light": "ink"
+    },
+    "markdownHorizontalRule": {
+      "dark": "pewter",
+      "light": "pewter"
+    },
+    "markdownListItem": {
+      "dark": "red",
+      "light": "red"
+    },
+    "markdownListEnumeration": {
+      "dark": "sand1",
+      "light": "sandInk"
+    },
+    "markdownImage": {
+      "dark": "sand1",
+      "light": "sandInk"
+    },
+    "markdownImageText": {
+      "dark": "red",
+      "light": "red"
+    },
+    "markdownCodeBlock": {
+      "dark": "top",
+      "light": "ink"
+    },
+    "syntaxComment": {
+      "dark": "pewter",
+      "light": "pewter"
+    },
+    "syntaxKeyword": {
+      "dark": "red",
+      "light": "red"
+    },
+    "syntaxFunction": {
+      "dark": "top",
+      "light": "ink"
+    },
+    "syntaxVariable": {
+      "dark": "light",
+      "light": "crease"
+    },
+    "syntaxString": {
+      "dark": "pile",
+      "light": "sandInk"
+    },
+    "syntaxNumber": {
+      "dark": "sand2",
+      "light": "amberInk"
+    },
+    "syntaxType": {
+      "dark": "front",
+      "light": "side"
+    },
+    "syntaxOperator": {
+      "dark": "sand1",
+      "light": "sandInk"
+    },
+    "syntaxPunctuation": {
+      "dark": "pewter",
+      "light": "pewter"
+    }
+  }
+}

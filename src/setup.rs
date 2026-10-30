@@ -487,7 +487,7 @@ fn image_step(check: bool, c: &SetupContext) -> Result<Option<String>, String> {
 fn offline_check(c: &SetupContext) -> Result<Vec<String>, String> {
     let mut steps = Steps { check: true, lines: Vec::new(), failures: Vec::new() };
     let plugin = &c.defaults.plugin_dir;
-    let missing: Vec<String> = ["package.json", "index.ts"]
+    let missing: Vec<String> = ["package.json", "index.ts", "branding/tui.tsx", "branding/footer.ts", crate::brand::theme::THEME_FILE]
         .iter()
         .map(|f| plugin.join(f))
         .filter(|p| !fs::metadata(p).map(|m| m.is_file()).unwrap_or(false))
@@ -978,6 +978,11 @@ mod tests {
             fs::create_dir_all(&plugin).unwrap();
             fs::write(plugin.join("package.json"), "{}").unwrap();
             fs::write(plugin.join("index.ts"), "").unwrap();
+            fs::create_dir_all(plugin.join("branding")).unwrap();
+            fs::write(plugin.join("branding/tui.tsx"), "").unwrap();
+            fs::write(plugin.join("branding/footer.ts"), "").unwrap();
+            fs::create_dir_all(plugin.join("branding/theme")).unwrap();
+            fs::write(plugin.join(crate::brand::theme::THEME_FILE), "{}").unwrap();
             let defaults = Defaults {
                 mvmctl: mvm_dir(&home).join("mvmctl"),
                 plugin_dir: plugin,
@@ -1222,6 +1227,18 @@ mod tests {
         let s = r.seams(host_ok, plain_ok, mvm_ok);
         let e = r.run(offline, &s).unwrap_err();
         assert!(e.contains(&r.defaults.plugin_dir.join("index.ts").display().to_string()), "{e}");
+        fs::remove_file(r.defaults.plugin_dir.join("branding/tui.tsx")).unwrap();
+        let s = r.seams(host_ok, plain_ok, mvm_ok);
+        let e = r.run(offline, &s).unwrap_err();
+        assert!(e.contains(&r.defaults.plugin_dir.join("branding/tui.tsx").display().to_string()), "{e}");
+        fs::remove_file(r.defaults.plugin_dir.join("branding/footer.ts")).unwrap();
+        let s = r.seams(host_ok, plain_ok, mvm_ok);
+        let e = r.run(offline, &s).unwrap_err();
+        assert!(e.contains(&r.defaults.plugin_dir.join("branding/footer.ts").display().to_string()), "{e}");
+        fs::remove_file(r.defaults.plugin_dir.join(crate::brand::theme::THEME_FILE)).unwrap();
+        let s = r.seams(host_ok, plain_ok, mvm_ok);
+        let e = r.run(offline, &s).unwrap_err();
+        assert!(e.contains("branding/theme/nearai-red.json"), "{e}");
 
         let s = r.seams(|a| if a[0] == "/usr/bin/codesign" { Ok(out(1, "", "invalid signature")) } else { host_ok(a) }, plain_ok, mvm_ok);
         let e = r.run(offline, &s).unwrap_err();

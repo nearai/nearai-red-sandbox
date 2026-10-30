@@ -72,7 +72,7 @@ info_lines=$(grep -c '^signed_binary_sha256=' -- "$build_info" || true)
 [[ "$info_lines" == 1 ]] || die "--build-info must have exactly one signed_binary_sha256= line, found $info_lines: $build_info"
 placeholders=$(grep -o '@RTS_VERSION@' -- "$install_sh" | wc -l | tr -d ' ' || true)
 [[ "$placeholders" == 1 ]] || die "--install-sh template must hold @RTS_VERSION@ exactly once, found $placeholders: $install_sh"
-for f in LICENSE README.md plugin/index.ts plugin/audit.ts plugin/package.json opencode/session.example.json; do
+for f in LICENSE README.md plugin/index.ts plugin/audit.ts plugin/package.json plugin/branding/tui.tsx plugin/branding/footer.ts plugin/branding/theme/nearai-red.json opencode/session.example.json; do
   [[ -f "$ROOT/$f" ]] || die "repository file missing: $ROOT/$f"
 done
 
@@ -80,7 +80,7 @@ stage=$(mktemp -d "${TMPDIR:-/tmp}/rts-package.XXXXXXXX")
 tree="$stage/tree"
 dist="$stage/dist"
 mkdir -p "$tree/bin" "$tree/libexec/nearai-red-sandbox" \
-  "$tree/share/nearai-red-sandbox/plugin" "$tree/share/nearai-red-sandbox/opencode" "$dist"
+  "$tree/share/nearai-red-sandbox/plugin/branding/theme" "$tree/share/nearai-red-sandbox/opencode" "$dist"
 
 cp -- "$rts" "$tree/bin/rts"
 cp -- "$supervisor" "$tree/libexec/nearai-red-sandbox/mvm-hvf-supervisor"
@@ -88,6 +88,8 @@ supervisor_sha=$(shasum -a 256 "$tree/libexec/nearai-red-sandbox/mvm-hvf-supervi
 awk -v sha="$supervisor_sha" '/^signed_binary_sha256=/ { print "signed_binary_sha256=" sha; next } { print }' \
   "$build_info" > "$tree/libexec/nearai-red-sandbox/mvm-hvf-supervisor.build-info"
 cp -- "$ROOT/plugin/index.ts" "$ROOT/plugin/audit.ts" "$ROOT/plugin/package.json" "$tree/share/nearai-red-sandbox/plugin/"
+cp -- "$ROOT/plugin/branding/tui.tsx" "$ROOT/plugin/branding/footer.ts" "$tree/share/nearai-red-sandbox/plugin/branding/"
+cp -- "$ROOT/plugin/branding/theme/nearai-red.json" "$tree/share/nearai-red-sandbox/plugin/branding/theme/"
 cp -- "$ROOT/opencode/session.example.json" "$tree/share/nearai-red-sandbox/opencode/"
 cp -- "$ROOT/LICENSE" "$ROOT/README.md" "$tree/"
 
