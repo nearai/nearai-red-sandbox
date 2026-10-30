@@ -278,6 +278,9 @@ Updates use a signed release manifest and verify downloaded artifacts. See
 [update verification](docs/operations.md#updates) for the signing key, manual
 verification commands, `--force`, and installation behavior.
 
+Ed25519 update public key:
+`9b4a81b8bd017898c36871c6bd1cb890faf95b6e378e72eb99b9c15841f02ac9`
+
 ## <img src="docs/assets/ramp.svg" alt="" height="16"> Project status
 
 SandBox is under development. Its documented containment results apply to the
