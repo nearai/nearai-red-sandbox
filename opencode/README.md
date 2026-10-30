@@ -359,7 +359,11 @@ the launcher's.
 The launcher reads `vms/<machine>/hvf.pid` under `MVM_HOME` or
 `$HOME/.mvm`, confirms the executable is `mvm-hvf-supervisor`, then samples
 `ps -o rss= -p <pid>` every five seconds. Missing, changed, or unverifiable
-PID/RSS information refuses the session. OpenCode runs on a controlling PTY;
+PID/RSS information refuses the session, and an RSS above
+`limits.hostRssCeilingMiB` ends it. That ceiling defaults to
+`limits.memoryMiB + 1024` (3072 MiB with the defaults) and follows
+`--memory`; a session file that sets it below `memoryMiB` is refused, and
+`--memory` above a ceiling the file set is refused too. OpenCode runs on a controlling PTY;
 operator input is forwarded only after the plugin verifies its tool/model/MCP
 policy and writes the matching readiness nonce.
 

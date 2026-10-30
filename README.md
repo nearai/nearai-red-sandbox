@@ -136,10 +136,19 @@ location is `~/.local/share/nearai-red-sandbox/sessions/ID/`:
 
 Available records depend on how far the session gets and which features it
 uses. The agent's findings and exported files still need your review.
-[`opencode/session.example.json`](opencode/session.example.json) lists the
-session file's limits, including the VM's `cpus` and `memoryMiB`; the
-[launcher guide](opencode/README.md) covers model selection, custom session
-paths, and source builds.
+
+### VM size
+
+Each microVM gets 2 vCPUs and 2048 MiB by default. Change that per launch:
+
+```sh
+rts launch --config ./session.json --cpus 4 --memory 8G
+```
+
+`--memory` takes MiB, or a value ending in `M` or `G`. Neither flag may exceed
+this Mac's CPU count or RAM, and both override `limits.cpus` and
+`limits.memoryMiB` in the session file. Every session-file key, with its
+default, is in the [session file reference](docs/operations.md#session-file).
 
 ## <img src="docs/assets/ramp.svg" alt="" height="16"> Network access
 
