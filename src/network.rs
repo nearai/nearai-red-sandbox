@@ -398,6 +398,35 @@ impl Plan {
         )
     }
 
+    /// `net=none`, or the host count as [`Plan::startup_line`] counts it.
+    pub fn net_label(&self) -> String {
+        net_label(self.entries.len())
+    }
+
+    /// The launch progress detail once the list is validated and resolved.
+    pub fn allowlist_line(&self) -> String {
+        if self.is_empty() {
+            return "none · the guest has no network".into();
+        }
+        let names = match self.resolved.len() {
+            0 => String::new(),
+            1 => " · 1 name resolved".into(),
+            n => format!(" · {n} names resolved"),
+        };
+        format!("{}{names} · TCP only", hosts(self.entries.len(), "validated"))
+    }
+
+    /// The launch progress detail for the pinned-address check, or `None`
+    /// for an empty plan, which has no egress to pin.
+    pub fn pinned_line(&self) -> Option<String> {
+        match self.resolved.len() {
+            _ if self.is_empty() => None,
+            0 => Some("IP entries only; nothing to re-resolve".into()),
+            1 => Some("1 name pinned only to validated addresses".into()),
+            n => Some(format!("{n} names pinned only to validated addresses")),
+        }
+    }
+
     /// The host names mvm resolves again and pins when its endpoint starts.
     /// IP-literal entries pin to themselves and need no check.
     pub fn pinning_names(&self) -> Vec<&str> {
@@ -562,6 +591,24 @@ pub fn probe_argv(target: &str) -> Vec<String> {
 /// the guest proxy.
 pub fn deny_all_argv() -> Vec<String> {
     vec!["sh".into(), "-c".into(), DENY_ALL_SCRIPT.into(), "sh".into(), DENY_ALL_TARGET.into()]
+}
+
+/// `net=none` for no entries, else `net=N host(s)`: the count after
+/// expansion, as [`Plan::startup_line`] gives it.
+pub fn net_label(entries: usize) -> String {
+    if entries == 0 { "net=none".into() } else { format!("net={}", hosts(entries, "").trim_end()) }
+}
+
+fn hosts(n: usize, then: &str) -> String {
+    format!("{n} host{} {then}", if n == 1 { "" } else { "s" })
+}
+
+/// The launch progress detail once [`run_probes`] has passed.
+pub fn probes_line(plan: &Plan, probes: &[Probe]) -> String {
+    if plan.is_empty() {
+        return format!("deny-all held · {DENY_ALL_TARGET} unreachable");
+    }
+    hosts(probes.len(), "reachable")
 }
 
 /// Probe every entry of `plan` from the guest, in order, or deny-all when
@@ -977,6 +1024,40 @@ mod tests {
             many.startup_line(),
             "network: 10 hosts allowed (packages, api.example-target.com, 198.51.100.7:8443, 192.168.1.20:8080); TCP only; every connection is logged"
         );
+    }
+
+    #[test]
+    fn the_progress_lines_for_none_and_an_allowlist() {
+        let r = fake(&[(
+            "api.example-target.com",
+            Ok(vec!["198.51.100.2".parse().unwrap()]),
+        )]);
+        let none = plan(&[], &r).unwrap();
+        assert_eq!(net_label(0), "net=none");
+        assert_eq!(none.net_label(), "net=none");
+        assert_eq!(none.allowlist_line(), "none · the guest has no network");
+        assert_eq!(probes_line(&none, &[Probe { target: DENY_ALL_TARGET.into(), result: "unreachable".into() }]), "deny-all held · 1.1.1.1:443 unreachable");
+        assert_eq!(none.pinned_line(), None);
+
+        let one = plan(&s(&["198.51.100.7:8443"]), &r).unwrap();
+        assert_eq!(one.net_label(), "net=1 host");
+        assert_eq!(one.allowlist_line(), "1 host validated · TCP only");
+        // An IP literal pins to itself: there is nothing for mvm to re-resolve.
+        assert_eq!(one.pinned_line().as_deref(), Some("IP entries only; nothing to re-resolve"));
+
+        let many = plan(
+            &s(&["packages", "api.example-target.com", "198.51.100.7:8443", "192.168.1.20:8080"]),
+            &with_packages(r),
+        )
+        .unwrap();
+        // The same count as startup_line, which says "10 hosts allowed".
+        assert!(many.startup_line().contains("10 hosts allowed"));
+        assert_eq!(net_label(expand(&s(&["packages", "api.example-target.com", "198.51.100.7:8443", "192.168.1.20:8080"])).unwrap().len()), "net=10 hosts");
+        assert_eq!(many.net_label(), "net=10 hosts");
+        assert_eq!(many.allowlist_line(), "10 hosts validated · 8 names resolved · TCP only");
+        let probes: Vec<Probe> = many.entries().iter().map(|e| Probe { target: e.display(), result: "connected".into() }).collect();
+        assert_eq!(probes_line(&many, &probes), "10 hosts reachable");
+        assert_eq!(many.pinned_line().as_deref(), Some("8 names pinned only to validated addresses"));
     }
 
     #[test]

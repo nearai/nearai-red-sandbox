@@ -102,13 +102,15 @@ impl Painter {
     }
 
     /// The small cube beside the product name, the session and its results.
-    pub fn header(&self, session_id: &str, results: &Path) -> Vec<String> {
+    /// `net` is the session's network summary, `net=none` or `net=N hosts`.
+    pub fn header(&self, session_id: &str, net: &str, results: &Path) -> Vec<String> {
+        let net = format!("  ·  {net}");
         let results = truncate(&results.display().to_string(), self.width.saturating_sub(17 + 9));
         let right: [Vec<(&str, Option<Rgb>)>; 6] = [
             vec![("near ", TEXT), ("AI Red", Some(RED)), ("  ·  SandBox", TEXT)],
             vec![("Cybersecurity Program", Some(PEWTER))],
             vec![],
-            vec![("session ", Some(PEWTER)), (session_id, TEXT), ("  ·  net=none", Some(PEWTER))],
+            vec![("session ", Some(PEWTER)), (session_id, TEXT), (net.as_str(), Some(PEWTER))],
             vec![("results  ", Some(PEWTER)), (results.as_str(), TEXT)],
             vec![],
         ];
@@ -278,18 +280,18 @@ impl Progress {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn header(&self, session_id: &str, results: &Path) {
+    pub fn header(&self, session_id: &str, net: &str, results: &Path) {
         let mut s = self.state();
         match s.painter() {
             Some(p) => {
-                for line in p.header(session_id, results) {
+                for line in p.header(session_id, net, results) {
                     s.line(&line);
                 }
                 s.line(&p.dune());
                 s.line("");
             }
             None => s.line(&format!(
-                "[rts] NEAR AI Red SandBox · session {session_id} · net=none · results {}",
+                "[rts] NEAR AI Red SandBox · session {session_id} · {net} · results {}",
                 results.display()
             )),
         }
@@ -508,7 +510,7 @@ mod tests {
 
     /// The same launch, as the real one drives it.
     fn launch(p: &Progress) {
-        p.header("3f9a1c2b7e04", Path::new("/s/3f9a1c2b7e04/out"));
+        p.header("3f9a1c2b7e04", "net=none", Path::new("/s/3f9a1c2b7e04/out"));
         p.heading("LAUNCH");
         p.step("preflight", Live::Sweep).ok("mvm supervisor · opencode 2.2.2");
         let s = p.step("sign-in", Live::Still);
@@ -591,6 +593,95 @@ mod tests {
             assert!(line.ends_with(RESET) || line.ends_with("\x1b[2K"), "{line:?}");
         }
         assert!(out.ends_with(&format!("{RESET}\n")));
+    }
+
+    /// The network part of a launch, as session_body drives it.
+    fn network_launch(p: &Progress, net: &str, allowlist: &str, probes: &str, pinned: Option<&str>) {
+        p.header("3f9a1c2b7e04", net, Path::new("/s/3f9a1c2b7e04/out"));
+        p.heading("LAUNCH");
+        p.step("allowlist", Live::Sweep).ok(allowlist);
+        p.step("microVM", Live::Decode("rts-3f9a1c2b7e04".into())).ok(&format!("rts-3f9a1c2b7e04 · 4096 MiB · 2 vCPU · {net}"));
+        p.step("probes", Live::Sweep).ok(probes);
+        if let Some(pinned) = pinned {
+            p.step("pinned IPs", Live::Sweep).ok(pinned);
+        }
+    }
+
+    fn render(mode: Mode, f: impl Fn(&Progress)) -> (String, Vec<String>) {
+        let buf = Buf::default();
+        f(&Progress::new(mode, Box::new(buf.clone()), false));
+        let out = buf.text();
+        let shown = strip_escapes(&out).split('\n').map(|l| l.rsplit('\r').next().unwrap().trim_end().to_string()).collect();
+        (out, shown)
+    }
+
+    const STYLED: Mode = Mode::Styled { depth: Depth::TrueColor, width: 80 };
+    const NONE: (&str, &str, &str, Option<&str>) = ("net=none", "none · the guest has no network", "deny-all held · 1.1.1.1:443 unreachable", None);
+    const ALLOW: (&str, &str, &str, Option<&str>) = (
+        "net=4 hosts",
+        "4 hosts validated · 2 names resolved · TCP only",
+        "4 hosts reachable",
+        Some("2 names pinned only to validated addresses"),
+    );
+
+    #[test]
+    fn the_network_summary_is_shown_plain_for_none_and_an_allowlist() {
+        let (out, _) = render(Mode::Plain, |p| network_launch(p, NONE.0, NONE.1, NONE.2, NONE.3));
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            [
+                "[rts] NEAR AI Red SandBox · session 3f9a1c2b7e04 · net=none · results /s/3f9a1c2b7e04/out",
+                "[rts] allowlist: none · the guest has no network",
+                "[rts] microVM: rts-3f9a1c2b7e04 · 4096 MiB · 2 vCPU · net=none",
+                "[rts] probes: deny-all held · 1.1.1.1:443 unreachable",
+            ]
+        );
+        let (out, _) = render(Mode::Plain, |p| network_launch(p, ALLOW.0, ALLOW.1, ALLOW.2, ALLOW.3));
+        assert!(!out.contains("net=none"), "{out}");
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            [
+                "[rts] NEAR AI Red SandBox · session 3f9a1c2b7e04 · net=4 hosts · results /s/3f9a1c2b7e04/out",
+                "[rts] allowlist: 4 hosts validated · 2 names resolved · TCP only",
+                "[rts] microVM: rts-3f9a1c2b7e04 · 4096 MiB · 2 vCPU · net=4 hosts",
+                "[rts] probes: 4 hosts reachable",
+                "[rts] pinned IPs: 2 names pinned only to validated addresses",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_network_summary_is_shown_styled_for_none_and_an_allowlist() {
+        let find = |shown: &[String], needle: &str| shown.iter().find(|l| l.contains(needle)).cloned().unwrap_or_else(|| panic!("{needle:?} in {shown:#?}"));
+        let (out, shown) = render(STYLED, |p| network_launch(p, NONE.0, NONE.1, NONE.2, NONE.3));
+        assert!(find(&shown, "session 3f9a1c2b7e04  ·  net=none").contains("session"));
+        assert!(find(&shown, "> allowlist").contains("none · the guest has no network"));
+        assert!(find(&shown, "> microVM").contains("2 vCPU · net=none"));
+        assert!(find(&shown, "> probes").contains("deny-all held"));
+        assert!(!strip_escapes(&out).contains("pinned IPs"));
+
+        let (out, shown) = render(STYLED, |p| network_launch(p, ALLOW.0, ALLOW.1, ALLOW.2, ALLOW.3));
+        assert!(!strip_escapes(&out).contains("net=none"), "{shown:#?}");
+        assert!(find(&shown, "session 3f9a1c2b7e04  ·  net=4 hosts").contains("session"));
+        let a = find(&shown, "> allowlist");
+        // The whole detail fits at 80 columns: nothing is cut off.
+        assert!(a.starts_with("  > allowlist   4 hosts validated · 2 names resolved · TCP only .") && a.ends_with("[ OK ]"), "{a}");
+        assert!(find(&shown, "> microVM").contains("2 vCPU · net=4 hosts"));
+        assert!(find(&shown, "> probes").contains("4 hosts reachable"));
+        assert!(find(&shown, "> pinned IPs").contains("2 names pinned only to validated addresses"));
+    }
+
+    #[test]
+    fn a_failed_network_step_shows_fail_and_leaves_the_reason_to_the_caller() {
+        for (mode, want) in [(Mode::Plain, "[rts] pinned IPs: failed"), (STYLED, "failed; the reason follows")] {
+            let (out, shown) = render(mode, |p| {
+                p.header("3f9a1c2b7e04", "net=1 host", Path::new("/s/3f9a1c2b7e04/out"));
+                drop(p.step("pinned IPs", Live::Sweep));
+            });
+            let line = shown.iter().find(|l| l.contains("pinned IPs")).unwrap_or_else(|| panic!("{out}"));
+            assert!(line.contains(want), "{line}");
+            assert!(mode == Mode::Plain || line.ends_with("[ FAIL ]"), "{line}");
+        }
     }
 
     #[test]

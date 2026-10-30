@@ -848,12 +848,14 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         work_dir: Some(&p.work),
         provider: &cfg.provider,
     })?;
-    step.ok("opencode, mvm, supervisor and provider");
     // Every launch, with or without an allowlist, before any machine command.
     let root = mvm_root(&deps.env)?;
     crate::network::check_mvm_host(&deps.env, &root)?;
+    step.ok("opencode, mvm, supervisor and provider");
+    let step = crate::brand::progress::step("allowlist", Shown::Sweep);
     let plan = crate::network::plan(&cfg.network, deps.resolver.as_ref())?;
     write_session_record(p, &plan, &[], &Pinned::new())?;
+    step.ok(&plan.allowlist_line());
     sweep_orphans(run, &mut |m| live.log.log(m))?;
     if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)) {
         return Err(why);
@@ -877,16 +879,24 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         let attach = live.sb.attach_pid().ok_or("network machine has no attached mvmctl machine run")?;
         live.network_pids = network_children(live.host, attach)?;
     }
+    step.ok(&format!("{} · {} MiB · {} vCPU · {}", p.machine, cfg.limits.memory_mib, cfg.limits.cpus, plan.net_label()));
+    let step = crate::brand::progress::step("probes", Shown::Sweep);
     let probes = crate::network::run_probes(live.sb, &plan)?;
+    step.ok(&crate::network::probes_line(&plan, &probes));
     // mvm resolved each name again when its endpoint started. Its audit log
     // shows those pins only once the guest has used a name, which the probes
     // just did, so the check runs here: before anything else runs in the guest.
+    // An empty plan has no egress to pin, and no status line for it.
+    let pin_line = plan.pinned_line();
+    let step = pin_line.as_ref().map(|_| crate::brand::progress::step("pinned IPs", Shown::Sweep));
     let pinned = wait_for_pins(&plan, &root.join("audit"), &p.machine, &deps.clock)?;
     write_session_record(p, &plan, &probes, &pinned)?;
     crate::network::check_pinned(&plan, &pinned)?;
+    if let (Some(step), Some(line)) = (step, pin_line) {
+        step.ok(&line);
+    }
     live.log.log(&plan.startup_line());
     initialize_guest_storage(live.sb)?;
-    step.ok(&format!("{} · {} MiB · {} vCPU · net=none", p.machine, cfg.limits.memory_mib, cfg.limits.cpus));
     if let Some(inputs) = &cfg.inputs_dir {
         let step = crate::brand::progress::step("copy in", Shown::Sweep);
         live.sb.copy_in(inputs, "/in").map_err(|e| e.to_string())?;

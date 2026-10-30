@@ -382,7 +382,10 @@ fn launch(
     let session_id = session::new_session_id();
     let progress = brand::progress::Progress::new(brand::progress::Mode::for_stderr(&env), Box::new(std::io::stderr()), true);
     brand::progress::install(progress.clone());
-    progress.header(&session_id, &cfg.sessions_dir.join(&session_id).join("out"));
+    // check_launch has expanded the allowlist already; this counts it the
+    // same way, without resolving anything (session_body does that).
+    let net = rts::network::net_label(rts::network::expand(&cfg.network)?.len());
+    progress.header(&session_id, &net, &cfg.sessions_dir.join(&session_id).join("out"));
     progress.heading("LAUNCH");
     rts::update::launch_notice(cfg.update_check, &cfg.sessions_dir.join(&session_id).join("launcher.log"));
     let fatal = forwarder::Fatal::new();
