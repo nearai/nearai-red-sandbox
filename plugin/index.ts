@@ -41,7 +41,7 @@ export type PluginOptions = {
 
 const DESCRIPTIONS: Record<ToolName, string> = {
   shell:
-    "Run a shell command with sh inside this session's isolated Linux microVM (busybox userland, no network). " +
+    "Run a shell command with sh inside this session's isolated Linux microVM (default BusyBox userland; network access follows the session policy). " +
     "Nothing runs on the operator's machine. Inputs are under /in; put results to keep under /out. " +
     "Commands are synchronous; background mode is not supported.",
   read:
