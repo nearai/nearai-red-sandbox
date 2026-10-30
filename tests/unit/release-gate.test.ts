@@ -229,13 +229,90 @@ test("the publish job guards gh release create with check-existing-release", () 
   expect(create).toBeGreaterThan(guard)
 })
 
-test("HOMEBREW_TAP_TOKEN is documented as a repository secret, not an environment secret", () => {
+test("HOMEBREW_TAP_DEPLOY_KEY is documented as a repository secret, not an environment secret", () => {
   const wf = readFileSync(join(ROOT, ".github", "workflows", "release.yml"), "utf8")
   const config = wf.split("release-config:")[1].split("\n  build:")[0]
   expect(config).not.toContain("environment:")
-  expect(config).toContain("missing repository secret HOMEBREW_TAP_TOKEN")
+  expect(config).toContain("${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}")
+  expect(config).toContain("missing repository secret HOMEBREW_TAP_DEPLOY_KEY")
+  expect(config).toContain("private half of the write deploy key on nearai/homebrew-tap")
   const publish = wf.split("\n  publish:")[1]
   expect(publish).not.toContain("environment:")
   const spec = readFileSync(join(ROOT, "docs", "specs", "2026-10-29-release-and-installers-design.md"), "utf8")
-  expect(spec).toContain("`HOMEBREW_TAP_TOKEN` must be a repository or organization secret")
+  expect(spec).toContain("`HOMEBREW_TAP_DEPLOY_KEY` must be a repository or organization secret")
+})
+
+test("no workflow, spec or README still uses HOMEBREW_TAP_TOKEN", () => {
+  for (const rel of [
+    [".github", "workflows", "release.yml"],
+    ["docs", "specs", "2026-10-29-release-and-installers-design.md"],
+    ["README.md"],
+    ["opencode", "README.md"],
+    ["packaging", "homebrew", "rts.rb.template"],
+  ]) {
+    const path = join(ROOT, ...rel)
+    if (!existsSync(path)) continue
+    expect(readFileSync(path, "utf8")).not.toContain("HOMEBREW_TAP_TOKEN")
+  }
+})
+
+// The tap is updated by pushing straight to its main with a deploy key, over
+// SSH pinned to GitHub's published host keys, never force-pushed.
+describe("the tap step", () => {
+  const wf = readFileSync(join(ROOT, ".github", "workflows", "release.yml"), "utf8")
+  const publish = wf.split("\n  publish:")[1]
+  const step = publish.slice(publish.indexOf("- name: Push the formula bump to the tap"))
+  const known = readFileSync(join(FIXTURES, "github_known_hosts"), "utf8").trim().split("\n")
+
+  test("runs after the release is created or verified", () => {
+    expect(publish.indexOf("- name: Publish release")).toBeGreaterThan(-1)
+    expect(publish.indexOf("- name: Push the formula bump to the tap")).toBeGreaterThan(publish.indexOf("- name: Publish release"))
+  })
+
+  test("reads the deploy key, not a token", () => {
+    expect(step).toContain("${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}")
+    expect(publish).not.toContain("HOMEBREW_TAP_TOKEN")
+    expect(publish).not.toContain("gh pr create")
+    expect(publish).not.toContain("gh pr merge")
+    expect(publish).not.toContain("x-access-token")
+  })
+
+  test("writes the key privately and deletes it on exit", () => {
+    const umask = step.indexOf("umask 077")
+    const write = step.indexOf('> "$KEY"')
+    expect(umask).toBeGreaterThan(-1)
+    expect(write).toBeGreaterThan(umask)
+    expect(step).toContain('KEY="$RUNNER_TEMP/')
+    expect(step).toContain('chmod 600 "$KEY"')
+    expect(step).toMatch(/trap '[^']*rm -f "\$KEY"[^']*' EXIT/)
+    expect(step.indexOf("trap ")).toBeLessThan(write)
+  })
+
+  test("pins GitHub's SSH host keys with strict checking", () => {
+    for (const line of known) expect(step).toContain(line)
+    expect(step).toContain("-o IdentitiesOnly=yes")
+    expect(step).toContain('-o UserKnownHostsFile=\\"$KNOWN_HOSTS\\"')
+    expect(step).toContain("-o StrictHostKeyChecking=yes")
+    expect(step).not.toContain("StrictHostKeyChecking=no")
+    expect(step).not.toContain("accept-new")
+    expect(step).not.toContain("ssh-keyscan")
+    expect(step).toContain("GIT_SSH_COMMAND=")
+  })
+
+  test("clones over SSH, commits as the bot and pushes to main without force", () => {
+    expect(step).toContain("git clone --depth 1 --single-branch --branch main git@github.com:nearai/homebrew-tap.git")
+    expect(step).toContain('github-actions[bot]')
+    expect(step).toContain('-m "rts $V"')
+    expect(step).toContain("releases/tag/v$V")
+    expect(step).toContain("$SHA")
+    expect(step).toContain("push origin HEAD:main")
+    expect(step).not.toMatch(/push[^\n]*(--force|-f\b|\+HEAD)/)
+    expect(step).toContain('git -C "$TAP" diff --cached --quiet')
+  })
+
+  test("takes the hash only from this run's SHA256SUMS and checks the rendered formula", () => {
+    expect(step).toContain('"$RUNNER_TEMP/dist/SHA256SUMS"')
+    expect(step).toContain("scripts/release/render-formula.sh")
+    expect(step).toContain('grep -qF "sha256 \\"$SHA\\""')
+  })
 })
