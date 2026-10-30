@@ -3,10 +3,23 @@
 
 export type BrandingOptions = { model?: unknown; attested?: unknown }
 
+const MAX_MODEL_CHARS = 64
+
+// rts sanitizes the name too (src/config.rs model_display_name); this is the
+// second layer. Control and bidi-format characters could reach the terminal or
+// reorder text, and a separator in the name could fake a status segment.
+const STRIP = /[\u0000-\u001f\u007f-\u009f‎‏‪-‮⁦-⁩·•‧∙⋅・･]/g
+
+function cleanModel(model: unknown): string {
+  if (typeof model !== "string") return ""
+  return [...model.replace(STRIP, " ").replace(/\s+/g, " ").trim()].slice(0, MAX_MODEL_CHARS).join("").trim()
+}
+
 export function footerText(o: BrandingOptions | undefined): string {
   const parts = ["NEAR AI Red", "SandBox"]
-  if (typeof o?.model === "string" && o.model.trim() !== "") parts.push(o.model.trim())
+  const model = cleanModel(o?.model)
+  if (model !== "") parts.push(model)
   // Only the exact boolean rts passes after verifying attestation.
-  if (o?.attested === true) parts.push("attested")
+  parts.push(o?.attested === true ? "attested" : "unattested")
   return parts.join(" · ")
 }

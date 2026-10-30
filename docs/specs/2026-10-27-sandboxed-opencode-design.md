@@ -524,12 +524,17 @@ scope for v1, and `edit` and `write` cover the same ground.
 Added 2026-10-29, with no fork of opencode. What the operator sees, and
 nothing the checks above depend on:
 
-- The generated opencode.json names the embedded provider `NEAR AI Red` and
-  gives each model a readable display name (`DeepSeek V4.1 Flash Abliterated`
-  for the default; otherwise the part of the ID after the last `/`). An
-  external provider keeps its ID as its name. Only `name` fields change: the
-  allowlist, the plugin's checks, the `x-ironwire-route` header and the
-  forwarder all use the model ID.
+- The generated opencode.json names the provider `NEAR AI Red` only for
+  embedded (attested) inference, keyed on `embedded_inference`, not the ID;
+  an external provider keeps its ID as its name, and an operator config may
+  not use the reserved ID `nearai-red-embedded`. Each model gets a readable
+  display name (`DeepSeek V4.1 Flash Abliterated` for the default; otherwise
+  the part of the ID after the last `/`), with control and bidi-format
+  characters and the `·` separator (and look-alikes) replaced by spaces and a
+  64-character cap, so an operator model ID cannot fake a footer segment or
+  send terminal escapes. Only `name` fields change: the allowlist, the
+  plugin's checks, the `x-ironwire-route` header and the forwarder all use
+  the model ID.
 - opencode v2.2.2's terminal UI reads its own config, `cli.json` beside
   opencode.json, and loads TUI plugins only from its `plugins` list. rts
   writes it with one entry, the TUI-only directory `plugin/branding/`
@@ -537,8 +542,11 @@ nothing the checks above depend on:
   default model's display name and whether attestation verified as options.
   The plugin appends one muted line to the home screen's `home.footer` slot:
   `NEAR AI Red · SandBox · <model> · attested`, with `attested` only when the
-  session's attestation verified. The server never loads a directory without
-  a server entry, so tools, MCP and models are untouched.
+  session's attestation verified and `unattested` otherwise. `footer.ts`
+  sanitizes the model name again. rts refuses the session if `tui.tsx` or
+  `footer.ts` is missing. The server never loads a directory without a
+  server entry, so tools, MCP and models are untouched; the shim itself has
+  no root `tui.*`, so the TUI never auto-loads it.
 - `cli.json` sets `terminal.title: false`, so opencode stops retitling the
   window on every route change, and rts writes the OSC 0 title
   `NEAR AI Red SandBox` through the PTY relay before any opencode output.

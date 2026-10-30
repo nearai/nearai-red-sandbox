@@ -1229,6 +1229,10 @@ mod tests {
         let s = r.seams(host_ok, plain_ok, mvm_ok);
         let e = r.run(offline, &s).unwrap_err();
         assert!(e.contains(&r.defaults.plugin_dir.join("branding/tui.tsx").display().to_string()), "{e}");
+        fs::remove_file(r.defaults.plugin_dir.join("branding/footer.ts")).unwrap();
+        let s = r.seams(host_ok, plain_ok, mvm_ok);
+        let e = r.run(offline, &s).unwrap_err();
+        assert!(e.contains(&r.defaults.plugin_dir.join("branding/footer.ts").display().to_string()), "{e}");
 
         let s = r.seams(|a| if a[0] == "/usr/bin/codesign" { Ok(out(1, "", "invalid signature")) } else { host_ok(a) }, plain_ok, mvm_ok);
         let e = r.run(offline, &s).unwrap_err();

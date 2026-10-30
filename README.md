@@ -110,8 +110,8 @@ $ rts login     # optional: sign in to NEAR AI Cloud ahead of time
 
 The window is titled `NEAR AI Red SandBox`, and OpenCode's home screen
 ends with a line such as `NEAR AI Red · SandBox · DeepSeek V4.1 Flash
-Abliterated · attested`; `attested` appears only when NEAR AI's attestation
-verified for this session.
+Abliterated · attested`. It says `attested` only when NEAR AI's attestation
+verified for this session, and `unattested` otherwise.
 
 `rts launch --config PATH` takes a session file; see the
 [launcher and inference setup](opencode/README.md) for its options.

@@ -137,7 +137,7 @@ pub fn start_with_endpoint(
     Ok(EmbeddedInference {
         home: home_path,
         provider: crate::config::ProviderConfig {
-            id: "nearai-red-embedded".into(),
+            id: crate::config::EMBEDDED_PROVIDER_ID.into(),
             base_url: format!("http://127.0.0.1:{port}/openai/v1"),
             models: models.to_vec(),
             api_key_env: None,

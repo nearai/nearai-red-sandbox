@@ -132,6 +132,8 @@ A provider reached directly (for example `https://cloud-api.near.ai/v1`)
 still works: set `provider.id`, `provider.baseURL` (https) and
 `provider.apiKeyEnv`, and the key is referenced as `{env:VAR}`. Plain http is
 accepted only to `127.0.0.1` or `localhost` with an explicit port.
+`provider.id` cannot be `nearai-red-embedded`, which is reserved for rts's
+own attested inference.
 
 ## Pin
 

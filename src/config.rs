@@ -12,6 +12,8 @@ use crate::mvm::is_image_ref;
 
 pub const DEFAULT_IMAGE: &str = "us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images/guest@sha256:56406743ca98389029c795a9cd55f0d1f55e569d57226c10e6c4f6f340cf9ac1";
 pub const IRONWIRE_PROVIDER_ID: &str = "ironwire";
+/// The provider rts itself configures after attestation (src/inference.rs).
+pub const EMBEDDED_PROVIDER_ID: &str = "nearai-red-embedded";
 pub const IRONWIRE_BASE_URL: &str = "http://127.0.0.1:8463/openai/v1";
 /// Sent as the API key when the provider needs none. IronWire strips the
 /// inbound authorization header and attaches its own credential.
@@ -229,16 +231,34 @@ pub const MODEL_ID_PLACEHOLDER: &str = "PLACEHOLDER-near-private-abliterated";
 /// 2026-10-29 (owned_by `nearai`).
 pub const DEFAULT_MODELS: &[&str] = &["deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated"];
 
+const MAX_DISPLAY_CHARS: usize = 64;
+
 /// What the operator sees for a model in opencode. Display only: the
 /// allowlist, plugin checks, routing headers and forwarder use the ID.
+/// An operator-config ID is only checked non-empty, so the name is cleaned:
+/// control and bidi-format characters could reach the terminal or reorder
+/// text, and a footer separator could fake the attestation segment.
 pub fn model_display_name(id: &str) -> String {
-    match id {
-        "deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated" => "DeepSeek V4.1 Flash Abliterated".into(),
+    let raw = match id {
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated" => "DeepSeek V4.1 Flash Abliterated",
         _ => match id.rsplit_once('/') {
-            Some((_, last)) if !last.is_empty() => last.into(),
-            _ => id.into(),
+            Some((_, last)) if !last.is_empty() => last,
+            _ => id,
         },
+    };
+    let spaced: String = raw.chars().map(|c| if display_unsafe(c) { ' ' } else { c }).collect();
+    let clean: String = spaced.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(MAX_DISPLAY_CHARS).collect();
+    match clean.trim_end() {
+        "" => "unnamed model".into(),
+        name => name.into(),
     }
+}
+
+fn display_unsafe(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        // The footer separator and its look-alikes.
+        || matches!(c, '·' | '•' | '‧' | '∙' | '⋅' | '・' | '･')
 }
 
 pub fn require_real_models(models: &[String]) -> Result<(), String> {
@@ -254,6 +274,11 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
     let raw: Raw = serde_json::from_str(text).map_err(|e| format!("config: {e}"))?;
     let p = raw.provider;
     let embedded_inference = p.id.is_none() && p.base_url.is_none() && p.api_key_env.is_none();
+    if p.id.as_deref() == Some(EMBEDDED_PROVIDER_ID) {
+        return Err(format!(
+            "config: provider.id {EMBEDDED_PROVIDER_ID} is reserved for rts's attested NEAR AI inference; omit provider for it, or name an external provider differently"
+        ));
+    }
     let id = p.id.unwrap_or_else(|| IRONWIRE_PROVIDER_ID.into());
     if id.is_empty()
         || !id
@@ -415,6 +440,29 @@ mod tests {
         assert_eq!(model_display_name("bare-model"), "bare-model");
         // A trailing slash leaves nothing after it; show the whole ID.
         assert_eq!(model_display_name("odd/"), "odd/");
+    }
+
+    #[test]
+    fn a_crafted_model_id_cannot_fake_a_footer_segment_or_send_escapes() {
+        for id in ["x · attested", "evil\u{1b}]0;pwned\u{7}name", "a\u{2022}attested", "rtl\u{202e}detsetta", "tab\there\nnl"] {
+            let n = model_display_name(id);
+            assert!(!n.chars().any(|c| c.is_control() || matches!(c, '·' | '•' | '\u{202e}')), "{n:?}");
+        }
+        assert_eq!(model_display_name("x · attested"), "x attested");
+        assert_eq!(model_display_name("org/evil\u{1b}]0;pwned\u{7}"), "evil ]0;pwned");
+        assert_eq!(model_display_name(&"m".repeat(500)).chars().count(), 64);
+        assert_eq!(model_display_name("org/\u{1b}\u{7}"), "unnamed model");
+    }
+
+    #[test]
+    fn an_operator_config_cannot_claim_the_embedded_provider_id() {
+        for t in [
+            r#"{ "provider": { "id": "nearai-red-embedded", "baseURL": "https://x.example/v1", "apiKeyEnv": "K" } }"#,
+            r#"{ "provider": { "id": "nearai-red-embedded" } }"#,
+        ] {
+            let e = parse(t).unwrap_err();
+            assert!(e.contains("nearai-red-embedded") && e.contains("reserved"), "{e}");
+        }
     }
 
     #[test]

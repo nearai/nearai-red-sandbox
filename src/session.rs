@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use crate::config::{OperatorConfig, PLACEHOLDER_API_KEY, ProviderConfig, model_display_name};
+use crate::config::{EMBEDDED_PROVIDER_ID, OperatorConfig, PLACEHOLDER_API_KEY, ProviderConfig, model_display_name};
 use crate::copy::CopyLimits;
 use crate::mvm::{MvmSandbox, RunOutput, Runner, SpawnRunner, StateDir, list_machines, run_captured, tail};
 use crate::protocol::{new_nonce, random_hex};
@@ -26,7 +26,6 @@ pub const PRODUCT_NAME: &str = "NEAR AI Red";
 pub const TERMINAL_TITLE: &str = "NEAR AI Red SandBox";
 /// The terminal UI plugin directory inside the plugin shim.
 pub const BRANDING_PLUGIN: &str = "branding";
-const EMBEDDED_PROVIDER_ID: &str = "nearai-red-embedded";
 
 const INIT_GUEST_STORAGE: &str = r#"set -eu
 tmp=$1; input=$2; output=$3
@@ -73,7 +72,9 @@ impl Host for RealHost {
 
 // --- opencode config ---
 
-pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig) -> Value {
+/// `embedded` is `OperatorConfig::embedded_inference`: only rts's own,
+/// attested NEAR AI inference is shown as NEAR AI Red.
+pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig, embedded: bool) -> Value {
     let models: serde_json::Map<String, Value> = p.models.iter().map(|m| {
         let model = if p.id == EMBEDDED_PROVIDER_ID {
             // Invalid route values must fail closed rather than silently use a
@@ -96,9 +97,8 @@ pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderCo
         "provider": {
             &p.id: {
                 "npm": "@ai-sdk/openai-compatible",
-                // Only the attested embedded provider is NEAR AI Red; an
-                // external provider keeps its own ID as its name.
-                "name": if p.id == EMBEDDED_PROVIDER_ID { PRODUCT_NAME } else { p.id.as_str() },
+                // An external provider keeps its own ID as its name.
+                "name": if embedded { PRODUCT_NAME } else { p.id.as_str() },
                 "options": { "baseURL": p.base_url, "apiKey": api_key },
                 "models": models,
             }
@@ -110,14 +110,14 @@ pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderCo
     })
 }
 
-pub fn write_opencode_config(dir: &Path, plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig) -> Result<PathBuf, String> {
+pub fn write_opencode_config(dir: &Path, plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig, embedded: bool) -> Result<PathBuf, String> {
     // v2.2.2 skips a plugin configured as a file path with only a warning.
     if !plugin_dir.is_dir() {
         return Err(format!("plugin path must be a directory: {}", plugin_dir.display()));
     }
     fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     let file = dir.join("opencode.json");
-    let text = serde_json::to_string_pretty(&opencode_config(plugin_dir, plugin_options, p)).unwrap() + "\n";
+    let text = serde_json::to_string_pretty(&opencode_config(plugin_dir, plugin_options, p, embedded)).unwrap() + "\n";
     write_private(&file, text.as_bytes()).map_err(|e| format!("writing {}: {e}", file.display()))?;
     Ok(file)
 }
@@ -140,9 +140,14 @@ pub fn tui_config(plugin_dir: &Path, model_display: &str, attested: bool) -> Val
 pub fn write_tui_config(dir: &Path, plugin_dir: &Path, model_display: &str, attested: bool) -> Result<PathBuf, String> {
     // v2.2.2 marks a directory without a tui entry "unsupported" and says so
     // only in /plugins, so refuse a broken install here instead.
-    let entry = plugin_dir.join(BRANDING_PLUGIN).join("tui.tsx");
-    if !entry.is_file() {
-        return Err(format!("plugin file missing: {}; reinstall rts", entry.display()));
+    let branding = plugin_dir.join(BRANDING_PLUGIN);
+    let missing: Vec<&str> = ["tui.tsx", "footer.ts"].into_iter().filter(|f| !branding.join(f).is_file()).collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "branding plugin {} is missing {}; reinstall rts or fix pluginDir",
+            branding.display(),
+            missing.join(" and ")
+        ));
     }
     fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     let file = dir.join("cli.json");
@@ -729,7 +734,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
 
     let nonce = new_nonce();
     let plugin_options = plugin_options(p, cfg, &deps.rts, &nonce, operator_home);
-    write_opencode_config(&p.config_dir, &cfg.plugin_dir, &plugin_options, &cfg.provider)?;
+    write_opencode_config(&p.config_dir, &cfg.plugin_dir, &plugin_options, &cfg.provider, cfg.embedded_inference)?;
     // run_connected reaches the session for embedded inference only after
     // attestation verified; an external provider is recorded unattested.
     write_tui_config(&p.config_dir, &cfg.plugin_dir, &model_display_name(&cfg.provider.models[0]), cfg.embedded_inference)?;
@@ -933,7 +938,7 @@ mod tests {
 
     #[test]
     fn the_generated_config_loads_the_plugin_directory_with_its_options() {
-        let c = opencode_config(Path::new("/repo/plugin"), &json!({ "nonce": "n" }), &provider());
+        let c = opencode_config(Path::new("/repo/plugin"), &json!({ "nonce": "n" }), &provider(), false);
         assert_eq!(c["plugin"], json!([["/repo/plugin", { "nonce": "n" }]]));
         assert_eq!(c["model"], "ironwire/z-ai/glm-5.3-flash");
         assert_eq!(c["enabled_providers"], json!(["ironwire"]));
@@ -943,10 +948,10 @@ mod tests {
 
     #[test]
     fn the_api_key_is_a_placeholder_for_ironwire_and_an_env_reference_otherwise() {
-        let c = opencode_config(Path::new("/p"), &json!({}), &provider());
+        let c = opencode_config(Path::new("/p"), &json!({}), &provider(), false);
         assert_eq!(c["provider"]["ironwire"]["options"]["apiKey"], PLACEHOLDER_API_KEY);
         let direct = ProviderConfig { id: "nearai".into(), base_url: "https://cloud-api.near.ai/v1".into(), api_key_env: Some("NEARAI_API_KEY".into()), ..provider() };
-        let c = opencode_config(Path::new("/p"), &json!({}), &direct);
+        let c = opencode_config(Path::new("/p"), &json!({}), &direct, false);
         assert_eq!(c["provider"]["nearai"]["options"]["apiKey"], "{env:NEARAI_API_KEY}");
     }
 
@@ -957,7 +962,7 @@ mod tests {
             models: vec!["deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated".into(), "z-ai/glm-5.3-flash".into()],
             ..provider()
         };
-        let c = opencode_config(Path::new("/p"), &json!({}), &embedded);
+        let c = opencode_config(Path::new("/p"), &json!({}), &embedded, true);
         let p = &c["provider"]["nearai-red-embedded"];
         assert_eq!(p["name"], "NEAR AI Red");
         let deepseek = &p["models"]["deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated"];
@@ -966,8 +971,12 @@ mod tests {
         assert_eq!(p["models"]["z-ai/glm-5.3-flash"]["name"], "glm-5.3-flash");
         assert_eq!(c["model"], "nearai-red-embedded/deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated");
         assert_eq!(c["enabled_providers"], json!(["nearai-red-embedded"]));
+        // The name follows embedded inference, not the ID: a config that
+        // somehow carried the embedded ID to an external endpoint is not NEAR AI Red.
+        let c = opencode_config(Path::new("/p"), &json!({}), &embedded, false);
+        assert_eq!(c["provider"]["nearai-red-embedded"]["name"], "nearai-red-embedded");
         // An external provider is not NEAR AI Red; it keeps its own ID as its name.
-        let c = opencode_config(Path::new("/p"), &json!({}), &provider());
+        let c = opencode_config(Path::new("/p"), &json!({}), &provider(), false);
         assert_eq!(c["provider"]["ironwire"]["name"], "ironwire");
         assert_eq!(c["provider"]["ironwire"]["models"]["z-ai/glm-5.3-flash"]["name"], "glm-5.3-flash");
     }
@@ -990,9 +999,13 @@ mod tests {
         let plugin = d.join("plugin");
         fs::create_dir_all(&plugin).unwrap();
         let e = write_tui_config(&d.join("cfg"), &plugin, "m", true).unwrap_err();
-        assert!(e.contains("branding/tui.tsx"), "{e}");
+        assert!(e.contains(&plugin.join("branding").display().to_string()) && e.contains("reinstall rts or fix pluginDir"), "{e}");
         fs::create_dir_all(plugin.join("branding")).unwrap();
         fs::write(plugin.join("branding/tui.tsx"), "").unwrap();
+        // tui.tsx imports footer.ts; one without the other is a broken install.
+        let e = write_tui_config(&d.join("cfg"), &plugin, "m", true).unwrap_err();
+        assert!(e.contains("footer.ts"), "{e}");
+        fs::write(plugin.join("branding/footer.ts"), "").unwrap();
         let file = write_tui_config(&d.join("cfg"), &plugin, "m", true).unwrap();
         assert_eq!(file, d.join("cfg/cli.json"));
         assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
@@ -1005,7 +1018,7 @@ mod tests {
     fn the_plugin_path_must_be_a_directory() {
         let d = tempdir("sess");
         fs::write(d.join("index.ts"), "").unwrap();
-        let e = write_opencode_config(&d.join("cfg"), &d.join("index.ts"), &json!({}), &provider()).unwrap_err();
+        let e = write_opencode_config(&d.join("cfg"), &d.join("index.ts"), &json!({}), &provider(), false).unwrap_err();
         assert!(e.contains("must be a directory"));
         fs::remove_dir_all(d).unwrap();
     }
