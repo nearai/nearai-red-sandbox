@@ -231,12 +231,21 @@ new `experimental` keys):
 - `enabled_providers` is still honored and becomes a `provider.use` deny
   policy for every other provider.
 
+The launcher writes a private `sandbox-context.md` beside the generated config
+and loads it through OpenCode's `instructions` setting. OpenCode adds this to
+its system context on inference requests. It explains the host/guest boundary,
+Linux tools, copied inputs in `/in`, exports in `/out`, writable scratch space,
+and session teardown. The network section reflects whether this session has
+guest network access enabled. This context is guidance; isolation is enforced
+by the sandbox plugin and launcher.
+
 The launcher writes this to `<runtime>/xdg/config/opencode/opencode.json`
 (the global config location under the session's `XDG_CONFIG_HOME`):
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
+  "instructions": ["<runtime>/xdg/config/opencode/sandbox-context.md"],
   "plugin": [["/abs/path/to/redteam-sandbox/plugin", {
     "machine": "rts-0123456789ab",
     "nonce": "<24 hex>",

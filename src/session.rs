@@ -119,8 +119,31 @@ pub fn write_opencode_config(dir: &Path, plugin_dir: &Path, plugin_options: &Val
         return Err(format!("plugin path must be a directory: {}", plugin_dir.display()));
     }
     fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    // Embed the context in rts so installed releases need no additional asset.
+    // Reuse the bridge's effective network mode instead of inferring it from
+    // the host's connectivity (inference works even in an offline guest).
+    let network = if plugin_options["bridge"]["proxy"].as_bool() == Some(true) {
+        "Network access is enabled only for the operator's launch-time allowlist. \
+         Shell calls supply HTTP_PROXY, HTTPS_PROXY and ALL_PROXY for the guest proxy. \
+         Use proxy-aware clients; direct outbound connections are blocked. \
+         Destinations cannot be added from inside this session. If a required \
+         destination is blocked, ask the operator to relaunch with the appropriate --allow-host entry."
+    } else {
+        "Network access is disabled for this session. Downloads, package registries, \
+         and remote targets are unreachable from guest tools. If the task requires \
+         them, ask the operator to relaunch with an appropriate --allow-host entry \
+         or supply the necessary files as inputs."
+    };
+    let context = format!("{}\n## Session network policy\n\n{network}\n", include_str!("sandbox-context.md"));
+    let instructions = dir.join("sandbox-context.md");
+    write_private(&instructions, context.as_bytes()).map_err(|e| format!("writing {}: {e}", instructions.display()))?;
+    let instructions = fs::canonicalize(&instructions).map_err(|e| format!("resolving {}: {e}", instructions.display()))?;
+    let mut config = opencode_config(plugin_dir, plugin_options, p, embedded);
+    // An absolute path is required: OpenCode's empty cwd is separate from
+    // this private config directory. These instructions augment its prompt.
+    config["instructions"] = json!([instructions]);
     let file = dir.join("opencode.json");
-    let text = serde_json::to_string_pretty(&opencode_config(plugin_dir, plugin_options, p, embedded)).unwrap() + "\n";
+    let text = serde_json::to_string_pretty(&config).unwrap() + "\n";
     write_private(&file, text.as_bytes()).map_err(|e| format!("writing {}: {e}", file.display()))?;
     Ok(file)
 }
@@ -1196,6 +1219,29 @@ mod tests {
         assert_eq!(c["enabled_providers"], json!(["ironwire"]));
         assert_eq!(c["provider"]["ironwire"]["options"]["baseURL"], "http://127.0.0.1:8463/openai/v1");
         assert!(c.get("mcp").is_none());
+    }
+
+    #[test]
+    fn written_config_loads_private_sandbox_context_with_the_session_network_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir("sess-instructions");
+        let plugin = d.join("plugin");
+        fs::create_dir_all(&plugin).unwrap();
+        for network in [false, true] {
+            let dir = d.join(if network { "online" } else { "offline" });
+            let file = write_opencode_config(&dir, &plugin, &json!({ "bridge": { "proxy": network } }), &provider(), false).unwrap();
+            let config: Value = serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap();
+            let instructions = config["instructions"].as_array().expect("sandbox instructions must be loaded");
+            assert_eq!(instructions.len(), 1);
+            let path = Path::new(instructions[0].as_str().unwrap());
+            assert!(path.is_absolute() && path.starts_with(fs::canonicalize(&dir).unwrap()));
+            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+            let prompt = fs::read_to_string(path).unwrap();
+            assert!(prompt.contains("/in") && prompt.contains("/out"));
+            assert_eq!(prompt.contains("Network access is disabled for this session."), !network);
+            assert_eq!(prompt.contains("Network access is enabled only for the operator's launch-time allowlist."), network);
+        }
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
