@@ -87,17 +87,33 @@ Steps:
    assets are exactly the files `SHA256SUMS` lists plus `SHA256SUMS` itself,
    with GitHub sha256 digests equal to this run's (`SHA256SUMS` lines, and
    the hash of `SHA256SUMS` itself); fail otherwise.
-10. Update the tap: commit `Formula/rts.rb` with the new version, URL and
-    sha256 to `nearai/homebrew-tap` using `HOMEBREW_TAP_TOKEN`.
+10. Update the tap: render `Formula/rts.rb` with the new version, URL and the
+    tarball sha256 from this run's `SHA256SUMS`, and push it to
+    `nearai/homebrew-tap`'s `main` over SSH with the deploy key in
+    `HOMEBREW_TAP_DEPLOY_KEY`. The key is written under `umask 077` to a
+    `chmod 600` file in `$RUNNER_TEMP` and deleted in an EXIT trap; SSH runs
+    with `IdentitiesOnly=yes`, `StrictHostKeyChecking=yes` and a known_hosts
+    file pinned to GitHub's published host keys (from
+    `https://api.github.com/meta`, fetched 2026-10-30). The commit is
+    `rts <version>` by `github-actions[bot]`, with the release URL and the
+    tarball sha256 in its body. If the rendered formula is unchanged (a
+    re-run), nothing is committed. A rejected push gets one fresh clone and
+    retry; the workflow never force-pushes. No pull request is opened: `main`
+    is not branch-protected, and a deploy key cannot open one.
 
 Secrets, named as in TraceCommons/trace-commons so the values can be copied: `MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD`,
 `MACOS_SIGNING_IDENTITY`, `MACOS_NOTARY_ASC_KEY_P8_BASE64`, `MACOS_NOTARY_ASC_KEY_ID`,
-`MACOS_NOTARY_ASC_ISSUER_ID`, `HOMEBREW_TAP_TOKEN` (fine-grained, contents and pull-request
-write on `nearai/homebrew-tap` only). The `MACOS_*` secrets are read only by
+`MACOS_NOTARY_ASC_ISSUER_ID`, and `HOMEBREW_TAP_DEPLOY_KEY`: the private half of
+the write deploy key on `nearai/homebrew-tap` (key id 168148229, ED25519,
+`SHA256:okZzvgWEKuW/hdYEvaE2ouX6w2VOdF5sOg/jFKloEuA`, titled
+"nearai-red-sandbox release workflow", added 2026-10-30). A deploy key
+replaces the fine-grained token first planned because the operator is not an
+admin of the `nearai` org and cannot create one for the tap; the key reaches
+only that one repository. The `MACOS_*` secrets are read only by
 the signing job, so they may live in the `release` environment (or at
-repository or organization level). `HOMEBREW_TAP_TOKEN` must be a repository or organization secret: the `release-config` preflight and the publish job
+repository or organization level). `HOMEBREW_TAP_DEPLOY_KEY` must be a repository or organization secret: the `release-config` preflight and the publish job
 read it and run without an environment, so an environment secret is invisible
-to them. The workflow follows trace-commons' `release-contributor.yml`: `environment: release` on the signing job, a separate publish job with `contents: write`, a `release-config` preflight, runner `macos-26`, notarization accepted only on a JSON status of `Accepted`, checksums recomputed after signing, and the tap updated by a pull request the workflow merges. The certificate is imported into a
+to them. The workflow follows trace-commons' `release-contributor.yml`: `environment: release` on the signing job, a separate publish job with `contents: write`, a `release-config` preflight, runner `macos-26`, notarization accepted only on a JSON status of `Accepted`, checksums recomputed after signing, except that the tap is updated by a direct push with a deploy key rather than a pull request the workflow merges. The certificate is imported into a
 temporary keychain that the job deletes at the end.
 
 ### Recovering a partly published release
@@ -117,7 +133,9 @@ fails after the release exists:
    (`gh release download v<version> --repo nearai/nearai-red-sandbox` then
    `shasum -a 256 -c SHA256SUMS`), with
    `scripts/release/render-formula.sh --version <version> --sha256 <hex> --out Formula/rts.rb`
-   in a `nearai/homebrew-tap` checkout and a pull request; or, if nobody can
+   in a `nearai/homebrew-tap` checkout, committed and pushed to `main` (by
+   anyone with write access to the tap; the deploy key stays in the secret);
+   or, if nobody can
    have installed it yet, delete the release (`gh release delete v<version>
    --repo nearai/nearai-red-sandbox --yes`, keeping the tag) and use "Re-run
    all jobs" on the tag's workflow run.
@@ -281,7 +299,7 @@ sha256, written by the release workflow; the tap commit is the trust anchor.
 
 ## Open items
 
-- Create `nearai/homebrew-tap` and the `HOMEBREW_TAP_TOKEN` repository (or organization) secret.
+- Done 2026-10-30: `nearai/homebrew-tap` exists (default branch `main`, not branch-protected) with write deploy key 168148229, and its private half is the repository secret `HOMEBREW_TAP_DEPLOY_KEY`.
 - Add the Apple signing and notary secrets; confirm the exact Developer ID
   Application identity name and team ID.
 - Make the repository public before the first tag; the installers cannot

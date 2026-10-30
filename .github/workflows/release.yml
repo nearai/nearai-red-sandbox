@@ -1,7 +1,7 @@
 # Build, sign, notarize and publish an rts release for aarch64-apple-darwin.
 #
 # A pushed tag v<X.Y.Z> (equal to Cargo.toml's version) publishes the GitHub
-# release and merges a formula bump into nearai/homebrew-tap.
+# release and pushes a formula bump to nearai/homebrew-tap's main branch.
 #
 # A workflow_dispatch with dry_run (the default) builds, signs, notarizes,
 # packages and attests, and uploads dist/ as the run artifact `dist`, but
@@ -13,11 +13,13 @@
 # Conventions follow TraceCommons/trace-commons release-contributor.yml:
 # secret names, environment: release on the signing job, contents: write only
 # on the publish job, a release-config preflight, notarization accepted only
-# on a JSON status of Accepted, and a tap pull request the workflow merges.
+# on a JSON status of Accepted. Unlike trace-commons, the tap is updated by
+# pushing to its main branch with an SSH deploy key, not by a pull request.
 #
 # Secrets: the MACOS_* signing and notary secrets are read only by the build
 # job, which runs in the `release` environment, so they may live there (or at
-# repository or organization level). HOMEBREW_TAP_TOKEN is read by
+# repository or organization level). HOMEBREW_TAP_DEPLOY_KEY (the private
+# half of the write deploy key on nearai/homebrew-tap) is read by
 # release-config and publish, which run without an environment, so it must be
 # a repository or organization secret: an environment secret is invisible to
 # them.
@@ -66,16 +68,16 @@ jobs:
           exit 1
 
       # Fail a tag push here rather than after the release is already public.
-      # No environment on this job: HOMEBREW_TAP_TOKEN must be a repository or
-      # organization secret, as publish reads it the same way.
+      # No environment on this job: HOMEBREW_TAP_DEPLOY_KEY must be a
+      # repository or organization secret, as publish reads it the same way.
       - name: Confirm tag-release credentials are configured
         if: github.event_name == 'push'
         env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
         run: |
           set -euo pipefail
-          if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
-            echo "refusing to release: missing repository secret HOMEBREW_TAP_TOKEN (contents and pull-request write on nearai/homebrew-tap); set it as a repository or organization secret, not in the release environment, which this job and publish do not use" >&2
+          if [ -z "$HOMEBREW_TAP_DEPLOY_KEY" ]; then
+            echo "refusing to release: missing repository secret HOMEBREW_TAP_DEPLOY_KEY (the private half of the write deploy key on nearai/homebrew-tap); set it as a repository or organization secret, not in the release environment, which this job and publish do not use" >&2
             exit 1
           fi
 
@@ -403,12 +405,15 @@ jobs:
           only a release whose latest.json is signed with the update key in
           README.md."
 
-      # HOMEBREW_TAP_TOKEN: fine-grained, contents and pull-request write on
-      # nearai/homebrew-tap only. github.token cannot reach another repository.
-      # A repository or organization secret: this job has no environment.
-      - name: Bump and merge the formula
+      # HOMEBREW_TAP_DEPLOY_KEY: the private half of the write deploy key on
+      # nearai/homebrew-tap (github.token cannot reach another repository). A
+      # repository or organization secret: this job has no environment. The
+      # bump is pushed straight to the tap's main branch (not branch-protected),
+      # never force-pushed. SSH trusts only GitHub's published host keys
+      # (https://api.github.com/meta, fetched 2026-10-30), pinned below.
+      - name: Push the formula bump to the tap
         env:
-          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           V: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
@@ -418,31 +423,45 @@ jobs:
             echo "refusing: no tarball sha256 in this run's SHA256SUMS" >&2
             exit 1
           fi
-          # Token in the remote URL: GH_TOKEN authenticates gh, not git push.
-          # Default branch only, so the bump branch is rebuilt from it each run
-          # and nothing an earlier attempt pushed survives the force-push.
-          git clone --depth 1 --single-branch \
-            "https://x-access-token:${GH_TOKEN}@github.com/nearai/homebrew-tap.git" "$RUNNER_TEMP/tap"
-          BASE="$(git -C "$RUNNER_TEMP/tap" symbolic-ref --short HEAD)"
-          BRANCH="bump-rts-$V"
-          git -C "$RUNNER_TEMP/tap" switch -c "$BRANCH"
-          mkdir -p "$RUNNER_TEMP/tap/Formula"
-          bash scripts/release/render-formula.sh --version "$V" --sha256 "$SHA" --out "$RUNNER_TEMP/tap/Formula/rts.rb"
-          cd "$RUNNER_TEMP/tap"
-          grep -qF "sha256 \"$SHA\"" Formula/rts.rb || { echo "refusing: the rendered formula lacks this run's sha256" >&2; exit 1; }
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/rts.rb
-          if git diff --cached --quiet; then
-            echo "the tap already carries rts $V with this sha256; nothing to bump."
-            exit 0
+          KEY="$RUNNER_TEMP/tap_deploy_key"
+          KNOWN_HOSTS="$RUNNER_TEMP/github_known_hosts"
+          TAP="$RUNNER_TEMP/tap"
+          umask 077
+          trap 'rm -f "$KEY"' EXIT
+          printf '%s\n' "$TAP_DEPLOY_KEY" > "$KEY"
+          chmod 600 "$KEY"
+          cat > "$KNOWN_HOSTS" <<'EOF'
+          github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl
+          github.com ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=
+          github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=
+          EOF
+          export GIT_SSH_COMMAND="ssh -i \"$KEY\" -o IdentitiesOnly=yes -o UserKnownHostsFile=\"$KNOWN_HOSTS\" -o StrictHostKeyChecking=yes"
+          # Clone the tap's main, render the formula and commit it. Exits 0
+          # when the tap already carries this version and sha256 (a re-run).
+          bump() {
+            rm -rf "$TAP"
+            git clone --depth 1 --single-branch --branch main git@github.com:nearai/homebrew-tap.git "$TAP"
+            mkdir -p "$TAP/Formula"
+            bash scripts/release/render-formula.sh --version "$V" --sha256 "$SHA" --out "$TAP/Formula/rts.rb"
+            grep -qF "sha256 \"$SHA\"" "$TAP/Formula/rts.rb" || { echo "refusing: the rendered formula lacks this run's sha256" >&2; exit 1; }
+            git -C "$TAP" add Formula/rts.rb
+            if git -C "$TAP" diff --cached --quiet; then
+              echo "the tap already carries rts $V with this sha256; nothing to push."
+              exit 0
+            fi
+            git -C "$TAP" -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "rts $V" \
+              -m "Release: https://github.com/nearai/nearai-red-sandbox/releases/tag/v$V" \
+              -m "Tarball sha256 (rts-$V-aarch64-apple-darwin.tar.gz): $SHA" \
+              -m "Pushed by the nearai/nearai-red-sandbox release workflow, run $GITHUB_RUN_ID."
+          }
+          bump
+          # A rejection (main moved under us) gets one fresh clone and retry.
+          # Never force-push: a second failure fails the job.
+          if ! git -C "$TAP" push origin HEAD:main; then
+            echo "push to nearai/homebrew-tap main was rejected; re-cloning and retrying once" >&2
+            bump
+            git -C "$TAP" push origin HEAD:main
           fi
-          git commit -m "rts $V"
-          git push --force -u origin "$BRANCH"
-          PR_URL="$(gh pr list --repo nearai/homebrew-tap --head "$BRANCH" --state open --json url --jq '.[0].url // empty')"
-          if [ -z "$PR_URL" ]; then
-            PR_URL="$(gh pr create --repo nearai/homebrew-tap --base "$BASE" --head "$BRANCH" \
-              --title "rts $V" --body "Formula bump from the nearai/nearai-red-sandbox release workflow, run $GITHUB_RUN_ID.")"
-          fi
-          gh pr merge "$PR_URL" --repo nearai/homebrew-tap --squash --delete-branch
-          echo "formula merged: $PR_URL"
+          echo "formula pushed to nearai/homebrew-tap main: rts $V ($SHA)"
