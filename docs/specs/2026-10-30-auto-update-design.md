@@ -7,8 +7,10 @@ Status: draft for review
 
 An operator who installed `rts` from a release learns, at launch, that a
 newer release exists, and installs it with one command, `rts update`. The
-release is accepted only when a manifest signed with a key that GitHub does
-not hold says so. Today an installed `rts` never learns about new releases,
+release is accepted only when a manifest signed with the dedicated update key
+says so. That key is not the release-publishing credential: its private half
+is an environment secret readable only by the `release` environment's signing
+job, so write access to releases alone cannot produce a valid manifest. Today an installed `rts` never learns about new releases,
 and upgrading means re-running the curl installer by hand.
 
 This is notify plus an explicit command, not a silent self-update: `rts`
@@ -298,7 +300,12 @@ throwaway key and never the release key.
 
 Assets on GitHub releases are integrity-checked by `SHA256SUMS`, which lives
 in the same release, so an attacker who can write releases can rewrite both.
-The update key adds authenticity that does not depend on GitHub.
+The update key adds authenticity that does not depend on release write
+access. It does still depend on GitHub as a custodian: the private half is a
+`release`-environment secret, so anyone who can run the release job in that
+environment (deployments are limited to `main` and `v*` tags) or read its
+secrets can sign a manifest. Keeping an offline copy and moving signing off
+GitHub is out of scope for v1.
 
 An attacker who controls GitHub releases (or the network path to them) but
 not the update key:
