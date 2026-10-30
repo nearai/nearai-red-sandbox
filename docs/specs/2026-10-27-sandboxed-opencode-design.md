@@ -259,7 +259,12 @@ attested keys. The session is refused unless every check holds:
   be in the future, and `x-nvidia-overall-att-result` must be `true`.
 
 The result is the session's verified state: the set of gateway TLS
-fingerprints, and for each model the set of attested ed25519 signing keys.
+fingerprints, for each model the set of attested ed25519 signing keys, and
+the set of attested gateway ed25519 signing keys. A gateway key is taken only
+from a gateway entry with `signing_algo` `ed25519` that passed every check
+above (TDX quote and TCB policy, `report_data` binding of the key, TLS
+fingerprint and nonce, compose), and only when the whole report passed; a
+gateway entry with another algorithm pins TLS only.
 
 **Quote collateral.** `dcap-qvl` is built without `report`, so it has no
 network code. `rts` mirrors what `dcap-qvl` 0.7.0's own collateral client
@@ -332,7 +337,7 @@ refuses until the operator passes `--allow-tcb-out-of-date`.
 
 **Record.** `sessions/<id>/attestation.json` holds every report as received,
 the nonces, the verified fingerprints, the signing keys per model, the
-compose hashes, the TCB statuses, the NRAS `kid`s and verdicts, the
+gateway signing keys (`gateway_keys`), the compose hashes, the TCB statuses, the NRAS `kid`s and verdicts, the
 overrides in force, and a `status`: `pending` (written when the record is
 created, before attestation has finished; a record left at `pending` was
 never attested), `verified`, `refused` (with the reason),
@@ -430,12 +435,25 @@ with a forwarder between IronWire and NEAR AI, instead of patching IronWire.
   It takes the chat ID from `id` in the JSON body, or from the first SSE
   `data:` event. After the response ends, off the response path, it fetches
   `GET /v1/signature/{id}?model=<id>&signing_algo=ed25519` over the pinned
-  client, retrying 404 with backoff inside a 10 s window (to be measured in
-  check 6). It then requires: `signing_algo` is `ed25519`; `text` is
+  client, retrying 404 with backoff inside a 10 s window (production receipts
+  arrived 89 to 106 ms after the response ended, measured in check 6). It then
+  requires: `signing_algo` is `ed25519`; `text` is
   `<model>:<request sha256>:<response sha256>` (or the two-part form without
   a model) with the model equal to the request's and both hashes equal to its
-  own; `signing_address` is a key attested for that model this session; and
-  `ed25519-dalek`'s `verify_strict` accepts `signature` over `text`. The
+  own (in the two-part form the model is still bound, through the request
+  hash, because the request body names it); `signing_address` is a key attested this session either for that
+  model or for the gateway (any allowed model); and `ed25519-dalek`'s
+  `verify_strict` accepts `signature` over `text`. A key attested neither way
+  triggers exactly one re-attestation, merged into both sets, and the check
+  then runs again and fails closed. The gateway key is accepted because NEAR
+  AI production signs receipts with it: on 2026-10-29 a production session's
+  first receipt was signed by `40599fb2...a711ad4acb`, the attested gateway's
+  ed25519 `signing_address` in that session's report, not the model entry's
+  `88fbc43b...1adcee78`, and the session ended `signature-failed` when only
+  model keys were accepted. A gateway-signed receipt proves that the attested
+  gateway saw exactly those request and response bytes; it does not prove
+  which model node produced the response, which rests on the gateway's
+  attested code routing only to attested model entries. The
   receipt shape matches IronWire's `RawReceipt`
   (`ironwire_upstream/src/receipt.rs`). Any failure, including a missing
   signature at the end of the window or a broken upstream stream, is fatal:
@@ -449,7 +467,7 @@ with a forwarder between IronWire and NEAR AI, instead of patching IronWire.
   they arrive, and a failure ends the session.
 - **Audit.** `sessions/<id>/inference.jsonl`, one line per completion: time,
   chat ID, model, streamed or not, request and response sha256, signing key,
-  and result.
+  which role signed (`signer`: `gateway` or `model`), and result.
 
 ### Sandbox plugin (`plugin/`)
 
@@ -551,12 +569,14 @@ Every failure ends in a refusal or a tool error. Nothing falls back to the host.
   name, call ID, SHA-256 of the input, status, and duration. Inputs and outputs
   are not stored in this log.
 - `sessions/<id>/attestation.json`: every report as received, the nonces, the
-  verified fingerprints and per-model signing keys, compose hashes, TCB
+  verified fingerprints, per-model signing keys and gateway signing keys,
+  compose hashes, TCB
   statuses, NRAS results, any re-attestations, the overrides in force
   (`--allow-tcb-out-of-date`, `--compose-policy`,
   `--allow-unattested-provider`), and the final status.
 - `sessions/<id>/inference.jsonl`: one line per completion, with chat ID,
-  model, request and response hashes, signing key, and signature result.
+  model, request and response hashes, signing key, signer role (`gateway` or
+  `model`), and signature result.
   Prompts and completions are not stored.
 
 ## Testing
@@ -705,9 +725,27 @@ Each is a short probe. None is assumed.
      sha256 of the leaf's SubjectPublicKeyInfo, and the live leaf's matches
      the gateway's, so the forwarder pins on SPKI. Whether every gateway
      instance shares the key was not measured beyond repeated handshakes.
-   - Still open, needing an API key: the signature receipt latency (the 10 s
-     window), the receipt `text` format against the exact relayed bytes, and
-     `signature_kind`; and one real completion through the forwarder.
+   - Measured 2026-10-29 on production, in one real session through the
+     forwarder: receipts are signed with the attested gateway's ed25519 key
+     (`40599fb2...`), not the model entry's (`88fbc43b...`). The forwarder
+     now accepts the gateway key for any allowed model (see Per-response
+     signatures).
+   - Measured 2026-10-29 on production, in a full session after the gateway
+     key was accepted (`sessions/d158ee49af81`, 10 streamed completions with
+     tool calls): every receipt verified with `verify_strict` against the
+     attested gateway key (`signer: gateway` in `inference.jsonl`); the
+     receipt `text` hashes matched the exact request and response bytes the
+     forwarder relayed (with `Accept-Encoding: identity`), and its model name
+     matched the request's; each receipt was available 89 to 106 ms after its
+     response ended (median 95 ms), so the 10 s window has ample margin and is
+     kept. The earlier failed session (`sessions/d493b14cec32`) had already
+     shown the `text` shape, model name and both hashes matching; only its
+     signer was rejected.
+   - Still open: which `signature_kind` production receipts carry (the field
+     is parsed but not recorded), whether every gateway instance shares the
+     signing key, and a captured production receipt as an offline test
+     fixture, so `check_receipt` is exercised against a real signature in the
+     default suite.
 7. Done 2026-10-28, for attestation and the forwarder:
    - `cloud-api.near.ai` presented leaf sha256 (of the whole DER)
      `5664580137f5b2abc8b2cc9ef53dc2bd7cd79b6ffc9f840dbbfca708a2c51022` on
