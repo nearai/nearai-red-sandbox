@@ -600,6 +600,77 @@ pub fn run_probes(sb: &dyn crate::sandbox::Exec, plan: &Plan) -> Result<Vec<Prob
     Ok(probes)
 }
 
+/// Event prefixes copied from mvm's audit log into `network.jsonl`.
+const AUDIT_PREFIXES: [&str; 4] = ["host.flow.", "dns.", "icmp.", "host.route."];
+
+/// Copy the audit lines for `vm_name` from mvm's audit log in `audit_dir`
+/// to `out`, byte for byte, and return how many were written. Sources are
+/// every `local.seg-*.jsonl`, sorted by name, then `local.jsonl`. A line is
+/// kept only when it parses as JSON, `entry.labels.vm_name` equals
+/// `vm_name` exactly and `entry.event` starts with one of
+/// [`AUDIT_PREFIXES`]; unparseable lines are skipped. mvm's files are only
+/// ever opened for reading. `out` is created 0600 and truncated.
+pub fn extract_audit(audit_dir: &std::path::Path, vm_name: &str, out: &std::path::Path) -> Result<usize, String> {
+    use std::io::{BufRead, Write};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let current = audit_dir.join("local.jsonl");
+    if !audit_dir.is_dir() || !current.is_file() {
+        return Err(format!("mvm audit log not found at {}", current.display()));
+    }
+    let read_err = |p: &std::path::Path, e: io::Error| format!("reading mvm audit log {}: {e}", p.display());
+    let mut segments: Vec<std::path::PathBuf> = Vec::new();
+    for ent in std::fs::read_dir(audit_dir).map_err(|e| read_err(audit_dir, e))? {
+        let ent = ent.map_err(|e| read_err(audit_dir, e))?;
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("local.seg-") && name.ends_with(".jsonl") {
+            segments.push(ent.path());
+        }
+    }
+    segments.sort();
+    segments.push(current);
+
+    let write_err = |e: io::Error| format!("writing {}: {e}", out.display());
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(out)
+        .map_err(write_err)?;
+    // `mode` applies only on creation; an existing file is narrowed too.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(write_err)?;
+    let mut w = io::BufWriter::new(file);
+    let mut kept = 0;
+    for src in &segments {
+        let mut r = io::BufReader::new(std::fs::File::open(src).map_err(|e| read_err(src, e))?);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            if r.read_until(b'\n', &mut buf).map_err(|e| read_err(src, e))? == 0 {
+                break;
+            }
+            let line = buf.strip_suffix(b"\n").unwrap_or(&buf);
+            if audit_line_matches(line, vm_name) {
+                w.write_all(line).and_then(|()| w.write_all(b"\n")).map_err(write_err)?;
+                kept += 1;
+            }
+        }
+    }
+    w.flush().map_err(write_err)?;
+    Ok(kept)
+}
+
+fn audit_line_matches(line: &[u8], vm_name: &str) -> bool {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return false;
+    };
+    let entry = &v["entry"];
+    entry["labels"]["vm_name"].as_str() == Some(vm_name)
+        && entry["event"].as_str().is_some_and(|ev| AUDIT_PREFIXES.iter().any(|p| ev.starts_with(p)))
+}
+
 /// `--allow-host` values for tests in other modules. IP literals need no
 /// lookup; a name resolves to a fixed public test address.
 #[cfg(test)]
@@ -1140,5 +1211,22 @@ mod tests {
             std::fs::remove_dir_all(d).unwrap();
         }
         assert_eq!(deny_all_argv()[4], DENY_ALL_TARGET);
+    }
+
+    #[test]
+    fn audit_entries_are_filtered_by_vm_name_and_event_across_a_rotated_segment() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = crate::testutil::tempdir("audit");
+        let line = |vm: &str, ev: &str| format!(r#"{{"entry":{{"event":"{ev}","labels":{{"vm_name":"{vm}","target":"x:443"}}}},"canonical":"Y2Fu","prev_hash":"cA","signature":"c2ln"}}"#);
+        let me = "rts-0123456789ab";
+        std::fs::write(d.join("local.seg-0001.jsonl"), [line(me, "host.flow.allowed"), line("rts-ffffffffffff", "host.flow.denied"), "not json".into()].join("\n") + "\n").unwrap();
+        std::fs::write(d.join("local.jsonl"), [line(me, "dns.resolved"), line(me, "plan.signed"), line(&format!("{me}x"), "host.flow.denied"), line(me, "host.route.decided"), line(me, "icmp.refused")].join("\n") + "\n").unwrap();
+        let out = d.join("network.jsonl");
+        assert_eq!(extract_audit(&d, me, &out).unwrap(), 4);
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(text.lines().collect::<Vec<_>>(), [line(me, "host.flow.allowed"), line(me, "dns.resolved"), line(me, "host.route.decided"), line(me, "icmp.refused")]);
+        assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(extract_audit(&d.join("missing"), me, &out).is_err());
+        std::fs::remove_dir_all(d).unwrap();
     }
 }
