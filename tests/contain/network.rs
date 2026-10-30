@@ -322,3 +322,94 @@ fn killing_the_attach_mid_session_ends_the_launcher_with_network_lost() {
     assert!(record["network"]["pinned"]["pypi.org"].as_array().is_some_and(|a| !a.is_empty()), "{record}");
     fs::remove_dir_all(root).unwrap();
 }
+
+/// The 9a session limit on real mvm, with `sessionHours: 1` and an injected
+/// clock instead of an hour's wait: the attach runs with `--ttl 1h`, the
+/// session gets to `plugin ready`, and once the clock passes the hour the
+/// session ends with `session-limit` and leaves no machine or network process.
+/// It also checks Task 9b on real mvm: `session.json` records pinned IPs for
+/// the allowed host, all among the ones `rts` resolved and validated.
+#[test]
+#[ignore = "real mvm and opencode"]
+fn a_session_past_its_hour_ends_with_session_limit_and_leaves_nothing() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::SystemTime;
+    let (Some(h), Some(oc)) = (mvm(), opencode()) else { return };
+    let root = tempdir("e2e-limit");
+    let cfg_file = root.join("session.json");
+    let model = "z-ai/glm-5.3-flash";
+    let config = json!({
+        "provider": { "baseURL": fake_ironwire(model), "models": [model] },
+        "sessionsDir": root.join("sessions"),
+        "mvmctl": h.mvmctl,
+        "opencode": oc,
+        "limits": { "handshakeMs": 60_000, "sessionHours": 1 },
+        "network": { "allow": ["pypi.org"] },
+    });
+    fs::write(&cfg_file, config.to_string()).unwrap();
+    let cfg = rts::config::load_config(&cfg_file, &rts::config::Defaults::from_env()).unwrap();
+    assert_eq!(cfg.limits.session_hours, 1);
+    let id = rts::session::new_session_id();
+    let machine = format!("rts-{id}");
+    let session = root.join("sessions").join(&id);
+    let log_file = session.join("launcher.log");
+
+    let mut deps = rts::session::Deps::real(id.clone(), None).unwrap();
+    // The test binary is not rts; the plugin shim spawns this for tool calls.
+    deps.rts = env!("CARGO_BIN_EXE_rts").into();
+    // Real time (so the 10 s pin wait still ends) plus an hour once jumped.
+    let jumped = Arc::new(AtomicBool::new(false));
+    let j = jumped.clone();
+    deps.clock = Arc::new(move || SystemTime::now() + if j.load(Ordering::SeqCst) { Duration::from_secs(3600) } else { Duration::ZERO });
+
+    // Watch the session from beside it: once the plugin is ready, record the
+    // attach's argv and network processes, then pass the hour.
+    let (m, l) = (machine.clone(), log_file.clone());
+    let watcher = thread::spawn(move || -> Result<(String, Vec<u32>), String> {
+        let deadline = Instant::now() + Duration::from_secs(180);
+        while !fs::read_to_string(&l).unwrap_or_default().contains("plugin ready") {
+            if Instant::now() >= deadline {
+                jumped.store(true, Ordering::SeqCst);
+                return Err(format!("no plugin ready within 180 s: {}", fs::read_to_string(&l).unwrap_or_default()));
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        let pg = Command::new("pgrep").args(["-f", &format!("machine run --name {m}")]).output().unwrap();
+        let pids: Vec<u32> = String::from_utf8_lossy(&pg.stdout).split_whitespace().map(|p| p.parse().unwrap()).collect();
+        let argv = pids.first().map(|p| {
+            let o = Command::new("ps").args(["-o", "command=", "-p", &p.to_string()]).output().unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        });
+        let children = pids.first().map(|p| network_children(&RealHost, *p).unwrap_or_default()).unwrap_or_default();
+        jumped.store(true, Ordering::SeqCst);
+        if pids.len() != 1 {
+            return Err(format!("attach processes for {m}: {pids:?}"));
+        }
+        Ok((argv.unwrap_or_default(), children))
+    });
+    let begun = Instant::now();
+    let code = rts::session::run_session(&cfg, deps);
+    let elapsed = begun.elapsed();
+    let (argv, children) = watcher.join().unwrap().unwrap();
+    let log = fs::read_to_string(&log_file).unwrap();
+    eprintln!("[contain] attach argv: {argv}\n[contain] session took {elapsed:?}\n{log}");
+
+    assert_eq!(code, 1, "{log}");
+    assert!(argv.contains(&format!("machine run --name {machine}")) && argv.contains("--ttl 1h"), "attach argv: {argv}");
+    assert!(log.contains("plugin ready"), "{log}");
+    assert!(log.contains("session-limit: 1h since boot"), "{log}");
+    assert!(log.contains("network: 1 host allowed (pypi.org); TCP only; every connection is logged"), "{log}");
+    assert!(log.contains(&format!("teardown: removed {machine}")), "{log}");
+    assert_gone(h, &machine);
+    for c in &children {
+        let c_comm = comm(*c);
+        assert!(!matches!(c_comm.as_deref(), Some("mvm-network-endpoint" | "mvm-hvf-supervisor")), "pid {c} ({c_comm:?}) outlived teardown");
+    }
+    let record: Value = serde_json::from_str(&fs::read_to_string(session.join("session.json")).unwrap()).unwrap();
+    let pinned = record["network"]["pinned"]["pypi.org"].as_array().cloned().unwrap_or_default();
+    let resolved = record["network"]["resolved"]["pypi.org"].as_array().cloned().unwrap_or_default();
+    assert!(!pinned.is_empty() && pinned.iter().all(|ip| resolved.contains(ip)), "{record}");
+    eprintln!("[contain] session.json network: {}", record["network"]);
+    assert!(fs::metadata(session.join("network.jsonl")).is_ok(), "no network.jsonl");
+    fs::remove_dir_all(root).unwrap();
+}
