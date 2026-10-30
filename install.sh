@@ -4,7 +4,9 @@
 #
 # Environment: RTS_VERSION (default: the release this file came from),
 # RTS_RELEASE_BASE (default: that release's download URL), RTS_INSTALL_PREFIX
-# (default: ~/.local). Needs no sudo and never edits shell profiles.
+# (default: ~/.local), RTS_TARBALL_SHA256 (optional: the tarball's sha256
+# from the signed update manifest, set by rts update; checked in addition to
+# SHA256SUMS). Needs no sudo and never edits shell profiles.
 #
 # The whole body is one function called on the last line, so a truncated
 # download defines nothing it can run.
@@ -54,6 +56,10 @@ main() {
   if [[ "$prefix" != /* ]]; then
     die "RTS_INSTALL_PREFIX must be an absolute path: $prefix"
   fi
+  local signed_sha="${RTS_TARBALL_SHA256:-}"
+  if [[ -n "$signed_sha" && ! "$signed_sha" =~ ^[0-9a-f]{64}$ ]]; then
+    die "RTS_TARBALL_SHA256 must be 64 lowercase hex characters"
+  fi
   local tarball="rts-$version-$target.tar.gz"
 
   trap cleanup EXIT
@@ -75,6 +81,13 @@ main() {
   fi
   if ! (cd "$download_dir" && shasum -a 256 -c tarball.sha256 >/dev/null 2>&1); then
     die "$tarball from $base does not match its SHA256SUMS entry; refusing to install it (re-run; if it persists, report it)"
+  fi
+  if [[ -n "$signed_sha" ]]; then
+    local actual
+    actual=$(shasum -a 256 "$download_dir/$tarball" | awk '{print $1}')
+    if [[ "$actual" != "$signed_sha" ]]; then
+      die "$tarball from $base does not match RTS_TARBALL_SHA256 (the signed update manifest); refusing to install it"
+    fi
   fi
 
   if command -v gh >/dev/null 2>&1; then

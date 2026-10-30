@@ -1,6 +1,7 @@
 //! Update notices and `rts update`: the compiled-in update key, the
 //! install channel and the launch check.
 
+pub mod apply;
 pub mod manifest;
 
 use std::io::Write;

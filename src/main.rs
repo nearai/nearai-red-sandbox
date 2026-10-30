@@ -3,6 +3,7 @@
 //!   rts launch [--config <path>] start one session (operator entry point)
 //!   rts login                    sign in through the system browser
 //!   rts setup [--check [--offline]]  install and check mvm, opencode and the guest image
+//!   rts update [--check | --force]  install the newest signed release
 //!   rts --version                print the version
 //!   rts tool <name>              one sandboxed tool call, spawned by the plugin shim
 
@@ -18,6 +19,7 @@ enum Action {
     Help,
     Version,
     Setup(setup::SetupOptions),
+    Update(rts::update::apply::UpdateOptions),
     Tool(String),
     Login(auth::LoginOptions),
     Launch {
@@ -36,6 +38,9 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
     }
     if let ["setup", flags @ ..] = args {
         return parse_setup(flags);
+    }
+    if let ["update", flags @ ..] = args {
+        return parse_update(flags);
     }
     if let ["tool", name] = args {
         return Ok(Action::Tool((*name).into()));
@@ -154,6 +159,27 @@ fn parse_setup(flags: &[&str]) -> Result<Action, String> {
     Ok(Action::Setup(o))
 }
 
+fn parse_update(flags: &[&str]) -> Result<Action, String> {
+    if flags.iter().any(|flag| matches!(*flag, "--help" | "-h")) {
+        return Ok(Action::Help);
+    }
+    let mut o = rts::update::apply::UpdateOptions::default();
+    for &flag in flags {
+        let seen = match flag {
+            "--check" => std::mem::replace(&mut o.check, true),
+            "--force" => std::mem::replace(&mut o.force, true),
+            _ => return Err(format!("Unknown option for update: {flag}")),
+        };
+        if seen {
+            return Err(format!("Duplicate option: {flag}"));
+        }
+    }
+    if o.check && o.force {
+        return Err("--check and --force cannot be combined".into());
+    }
+    Ok(Action::Update(o))
+}
+
 fn run_connected<G>(
     cfg: &mut config::OperatorConfig,
     preflight: impl FnOnce(&config::OperatorConfig) -> Result<(), String>,
@@ -171,7 +197,7 @@ fn run_connected<G>(
     Ok(run(cfg))
 }
 
-const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider]\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.";
+const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider]\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
 
 /// A private temp directory holding an empty Git config for mvmctl.
 fn private_git_config(prefix: &str) -> Result<(tempfile::TempDir, PathBuf), String> {
@@ -454,6 +480,7 @@ fn main() -> ExitCode {
             return code(out.code);
         }
         Action::Setup(options) => setup_command(&options),
+        Action::Update(options) => rts::update::apply::command(&options),
         Action::Version => {
             println!("rts {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
@@ -916,6 +943,29 @@ mod tests {
         let e = parse_args(&["setup", "--offline"]).unwrap_err();
         assert!(e.contains("--offline requires --check"), "{e}");
         assert!(USAGE.contains("rts setup [--check [--offline]]") && USAGE.contains("rts --version"));
+    }
+
+    #[test]
+    fn update_parses_its_flags() {
+        use rts::update::apply::UpdateOptions;
+        for (args, want) in [
+            (vec!["update"], UpdateOptions::default()),
+            (vec!["update", "--check"], UpdateOptions { check: true, force: false }),
+            (vec!["update", "--force"], UpdateOptions { check: false, force: true }),
+        ] {
+            assert!(matches!(parse_args(&args), Ok(Action::Update(o)) if o == want), "{args:?}");
+        }
+        for (args, want) in [
+            (vec!["update", "--check", "--force"], "--check and --force cannot be combined"),
+            (vec!["update", "--force", "--check"], "--check and --force cannot be combined"),
+            (vec!["update", "--check", "--check"], "Duplicate option: --check"),
+            (vec!["update", "--yes"], "Unknown option for update: --yes"),
+        ] {
+            assert_eq!(parse_args(&args).unwrap_err(), want, "{args:?}");
+        }
+        assert!(matches!(parse_args(&["update", "--help"]), Ok(Action::Help)));
+        assert!(matches!(parse_args(&["update", "-h"]), Ok(Action::Help)));
+        assert!(USAGE.contains("rts update [--check | --force]"));
     }
 
     #[test]
