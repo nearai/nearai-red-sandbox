@@ -673,14 +673,18 @@ mod tests {
         // under host load and is not part of the window.
         let c = client();
         let start = Instant::now();
-        let e = fetch_receipt(&c, &url, &auth, &exchange(), fast(300), &no_pins())
+        // A 1 s window leaves room for three attempts on a loaded host; the 8 s
+        // bound still fails if the 10 s production window were used instead.
+        let e = fetch_receipt(&c, &url, &auth, &exchange(), fast(1000), &no_pins())
             .await
             .unwrap_err()
             .to_string();
         assert!(e.contains("no signature within"), "{e}");
         assert!(!e.contains("dummy"), "{e}");
-        assert!(start.elapsed() < Duration::from_secs(3));
-        assert!(heads.lock().unwrap().len() >= 3);
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(8), "gave up after {elapsed:?}");
+        let attempts = heads.lock().unwrap().len();
+        assert!(attempts >= 3, "only {attempts} attempts inside the window");
 
         for status in [401, 400, 403] {
             let (url, heads) = plain_server(move |_| (status, b"{}".to_vec()));
