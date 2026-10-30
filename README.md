@@ -113,6 +113,12 @@ ends with a line such as `NEAR AI Red · SandBox · DeepSeek V4.1 Flash
 Abliterated · attested`; `attested` appears only when NEAR AI's attestation
 verified for this session.
 
+On an interactive terminal, `rts launch` first shows a short splash (about
+1.5 s; any key skips it, `--no-splash` turns it off), then draws its launch
+progress as styled status lines. With `NO_COLOR` set, `TERM=dumb`, or output
+that is not a terminal, it prints the same steps as plain `[rts]` lines. The
+session's `launcher.log` is always plain text.
+
 `rts launch --config PATH` takes a session file; see the
 [launcher and inference setup](opencode/README.md) for its options.
 

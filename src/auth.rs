@@ -58,7 +58,7 @@ fn login_with(
     let api = cloud::CloudApi::live(deadline)?;
     let callback = browser::Callback::bind()?;
     let url = api.authorize_url(options.provider, &callback.url())?;
-    eprintln!("Opening your browser to sign in to NEAR AI Cloud…");
+    crate::brand::progress::message("Opening your browser to sign in to NEAR AI Cloud…");
     browser::open(&url)?;
     callback.receive(
         deadline,

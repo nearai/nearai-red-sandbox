@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use rts::brand::{self, progress::Live};
 use rts::{attest, auth, bridge, config, forwarder, inference, session, setup};
 
 #[derive(Debug)]
@@ -26,6 +27,7 @@ enum Action {
         file: Option<PathBuf>,
         login: auth::LoginOptions,
         attest: attest::AttestOptions,
+        no_splash: bool,
     },
 }
 
@@ -55,6 +57,7 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
     let mut file = None;
     let mut login = auth::LoginOptions::default();
     let mut attest = attest::AttestOptions::default();
+    let mut no_splash = false;
     let mut seen = std::collections::HashSet::new();
     let mut flags = flags.iter();
     while let Some(&flag) = flags.next() {
@@ -64,6 +67,7 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
                 | "--allow-tcb-out-of-date"
                 | "--compose-policy"
                 | "--allow-unattested-provider"
+                | "--no-splash"
         );
         if !matches!(
             flag,
@@ -74,6 +78,7 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
                 | "--allow-tcb-out-of-date"
                 | "--compose-policy"
                 | "--allow-unattested-provider"
+                | "--no-splash"
         ) || (launch_only && *command != "launch")
         {
             return Err(format!("Unknown option for {command}: {flag}"));
@@ -87,6 +92,10 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
         }
         if flag == "--allow-unattested-provider" {
             attest.allow_unattested_provider = true;
+            continue;
+        }
+        if flag == "--no-splash" {
+            no_splash = true;
             continue;
         }
         let value = flags
@@ -134,6 +143,7 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
             file,
             login,
             attest,
+            no_splash,
         }
     })
 }
@@ -197,7 +207,7 @@ fn run_connected<G>(
     Ok(run(cfg))
 }
 
-const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider]\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
+const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--no-splash]\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
 
 /// A private temp directory holding an empty Git config for mvmctl.
 fn private_git_config(prefix: &str) -> Result<(tempfile::TempDir, PathBuf), String> {
@@ -317,6 +327,7 @@ fn launch(
     file: Option<&Path>,
     login: &auth::LoginOptions,
     attest_options: attest::AttestOptions,
+    no_splash: bool,
 ) -> Result<i32, String> {
     let defaults = config::Defaults::from_env();
     let mut cfg = if let Some(file) = file {
@@ -328,8 +339,15 @@ fn launch(
             &defaults,
         )?
     };
-    check_launch(&cfg, &std::env::vars().collect::<Vec<_>>(), &attest_options)?;
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    check_launch(&cfg, &env, &attest_options)?;
+    let (stdin_tty, stdout_tty) = brand::stdin_stdout_are_ttys();
+    brand::splash::show(brand::splash_wanted(stdin_tty, stdout_tty, &env, no_splash), brand::Depth::from_env(&env))?;
     let session_id = session::new_session_id();
+    let progress = brand::progress::Progress::new(brand::progress::Mode::for_stderr(&env), Box::new(std::io::stderr()), true);
+    brand::progress::install(progress.clone());
+    progress.header(&session_id, &cfg.sessions_dir.join(&session_id).join("out"));
+    progress.heading("LAUNCH");
     rts::update::launch_notice(cfg.update_check, &cfg.sessions_dir.join(&session_id).join("launcher.log"));
     let fatal = forwarder::Fatal::new();
     let deps = session::Deps::real(session_id.clone(), Some(fatal.clone()))?;
@@ -340,12 +358,20 @@ fn launch(
     let preflight_host = deps.host.clone();
     run_connected(
         &mut cfg,
-        |cfg| local_preflight(cfg, preflight_host.as_ref(), &preflight_env),
+        |cfg| {
+            let step = progress.step("preflight", Live::Sweep);
+            local_preflight(cfg, preflight_host.as_ref(), &preflight_env)?;
+            step.ok(&format!("mvm supervisor · opencode {}", session::OPENCODE_VERSION));
+            Ok(())
+        },
         // Runs on the main thread, outside any Tokio runtime: attestation
         // uses blocking HTTP, and IronWire's runtime starts on its own thread
         // only after attestation succeeds.
         |cfg| {
+            // Sign-in may print its own lines (the browser notice): no animation.
+            let step = progress.step("sign-in", Live::Still);
             let credential = auth::load_or_login(login)?;
+            step.ok("NEAR AI Cloud");
             let record = attest::record::AttestationRecord::create(
                 &cfg.sessions_dir,
                 &session_id,
@@ -363,7 +389,14 @@ fn launch(
                 )
                 .map_err(refused)?,
             );
+            let step = progress.step("attestation", Live::Decode(cfg.provider.models.join(", ")));
             let attested = attestor.attest().map_err(refused)?;
+            step.ok(&format!(
+                "{} · TLS keys pinned: {}",
+                plural(cfg.provider.models.len(), "model", "verified"),
+                attested.fingerprints.len()
+            ));
+            let step = progress.step("inference", Live::Sweep);
             let (forwarder, inference) = start_connected(
                 &record,
                 attested,
@@ -393,6 +426,7 @@ fn launch(
                     )
                 },
             )?;
+            step.ok(&format!("IronWire {} · pinned forwarder", inference.provider().base_url));
             Ok((
                 inference.provider(),
                 Connected {
@@ -403,6 +437,11 @@ fn launch(
         },
         |cfg| session::run_session(cfg, deps),
     )
+}
+
+/// "1 model verified", "3 models verified".
+fn plural(n: usize, noun: &str, verb: &str) -> String {
+    format!("{n} {noun}{} {verb}", if n == 1 { "" } else { "s" })
 }
 
 fn setup_command(o: &setup::SetupOptions) -> Result<i32, String> {
@@ -466,7 +505,8 @@ fn main() -> ExitCode {
             file,
             login,
             attest,
-        } => launch(file.as_deref(), &login, attest),
+            no_splash,
+        } => launch(file.as_deref(), &login, attest, no_splash),
         Action::Login(options) => auth::login(&options).map(|_| {
             println!("Signed in to NEAR AI Cloud.");
             0
@@ -808,6 +848,7 @@ mod tests {
             file,
             login,
             attest,
+            ..
         } = parse_args(&["launch"]).unwrap()
         else {
             panic!("not launch")
@@ -862,6 +903,29 @@ mod tests {
         };
         assert_eq!(attest, AttestOptions::default());
         assert_eq!(file, Some("c.json".into()));
+    }
+
+    #[test]
+    fn no_splash_is_a_launch_only_switch() {
+        let Action::Launch { no_splash, .. } = parse_args(&["launch"]).unwrap() else {
+            panic!("not launch")
+        };
+        assert!(!no_splash);
+        let Action::Launch { no_splash, file, .. } =
+            parse_args(&["launch", "--no-splash", "--config", "c.json"]).unwrap()
+        else {
+            panic!("not launch")
+        };
+        assert!(no_splash);
+        assert_eq!(file, Some("c.json".into()));
+        for args in [
+            vec!["login", "--no-splash"],
+            vec!["launch", "--no-splash", "--no-splash"],
+            vec!["launch", "--no-splash", "yes"],
+        ] {
+            assert!(parse_args(&args).is_err(), "accepted {args:?}");
+        }
+        assert!(USAGE.contains("[--no-splash]") && USAGE.contains("--no-splash skips"));
     }
 
     #[test]

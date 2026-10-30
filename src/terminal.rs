@@ -558,6 +558,7 @@ mod tests {
             true,
         )
         .unwrap();
+        crate::brand::theme::install(&plugin_dir, &paths.config_dir).unwrap();
         write_opencode_config(&paths.config_dir, &plugin_dir, &json!({
             "machine": paths.machine, "nonce": nonce, "readyFile": paths.ready_file,
             "auditFile": paths.audit_file, "provider": "ironwire", "models": provider.models, "rts": "/nonexistent-rts-no-tools-called",
@@ -569,6 +570,7 @@ mod tests {
             [
                 ("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()),
                 ("TERM".into(), "xterm-256color".into()),
+                ("COLORTERM".into(), "truecolor".into()),
             ],
         );
         let version = Command::new(&binary)
@@ -663,7 +665,22 @@ mod tests {
             titles.iter().all(|t| t == TERMINAL_TITLE || t.is_empty()),
             "{titles:?}"
         );
+        // The nearai-red theme is active: opencode's own muted hints use its
+        // pewter textMuted and body text its TOP (opencode's default theme
+        // has neither), on the terminal's own background.
+        let raw = String::from_utf8_lossy(&output);
+        assert!(raw.contains("\x1b[38;2;128;128;136m\x1b[49magents"), "theme textMuted missing");
+        assert!(raw.contains("\x1b[38;2;233;231;225m\x1b[49mctrl+p"), "theme text missing");
+        // The footer is drawn in sand, with "attested" in NEAR AI Red.
+        assert!(
+            raw.contains("\x1b[38;2;161;151;127m\x1b[49mNEAR AI Red · SandBox · test-no-inference · "),
+            "footer not in sand"
+        );
+        assert!(raw.contains("\x1b[38;2;235;25;36m\x1b[49mattested"), "attested not in red");
         eprintln!("footer found; title escapes: {titles:?}");
+        if let Ok(dump) = std::env::var("RTS_PTY_DUMP") {
+            std::fs::write(dump, &output).unwrap();
+        }
         std::fs::remove_dir_all(d).unwrap();
     }
 

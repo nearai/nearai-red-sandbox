@@ -20,6 +20,7 @@ use crate::protocol::{new_nonce, random_hex};
 use crate::sandbox::{CopyOutResult, CreateSpec, Exec, ExecOptions, Sandbox, sv};
 use crate::sys;
 use crate::terminal::Terminal;
+use crate::brand::progress::Live as Shown;
 
 pub const OPENCODE_VERSION: &str = "2.2.2";
 pub const PRODUCT_NAME: &str = "NEAR AI Red";
@@ -130,6 +131,7 @@ pub fn tui_config(plugin_dir: &Path, model_display: &str, attested: bool) -> Val
     json!({
         // rts sets the window title; opencode would overwrite it on every route change.
         "terminal": { "title": false },
+        "theme": { "name": crate::brand::theme::THEME_NAME },
         "plugins": [{
             "package": plugin_dir.join(BRANDING_PLUGIN).to_string_lossy(),
             "options": { "model": model_display, "attested": attested },
@@ -545,7 +547,7 @@ struct Logger {
 
 impl Logger {
     fn log(&self, m: &str) {
-        eprintln!("[rts {}] {m}", self.id);
+        crate::brand::progress::log_line(&self.id, m);
         let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.file) {
             let _ = writeln!(f, "{secs} {m}");
@@ -564,6 +566,7 @@ struct Live<'a> {
 
 impl Live<'_> {
     fn teardown(&mut self, why: &str) {
+        crate::brand::progress::teardown();
         self.log.log(&format!("teardown: {why}"));
         if let Some(mut c) = self.child.take() {
             // Terminal::spawn gives OpenCode its own session and process group.
@@ -692,6 +695,7 @@ pub fn plugin_options(p: &SessionPaths, cfg: &OperatorConfig, rts: &Path, nonce:
 fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operator_home: &str, supervisor: &Path, live: &mut Live) -> Result<i32, String> {
     let p = live.paths;
     let leak_seam_set = deps.env.iter().any(|(k, _)| k == "RTS_TEST_LEAK");
+    let step = crate::brand::progress::step("host check", Shown::Sweep);
     preflight(&PreflightInput {
         host: deps.host.as_ref(),
         run: run.as_ref(),
@@ -702,12 +706,14 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         work_dir: Some(&p.work),
         provider: &cfg.provider,
     })?;
+    step.ok("opencode, mvm, supervisor and provider");
     sweep_orphans(run, &mut |m| live.log.log(m))?;
     if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)) {
         return Err(why);
     }
 
     live.machine_attempted = true;
+    let step = crate::brand::progress::step("microVM", Shown::Decode(p.machine.clone()));
     // A signal during create only sets a flag: create finishes, then teardown removes it.
     live.sb
         .create(&CreateSpec { name: &p.machine, image: &cfg.image, memory_mib: cfg.limits.memory_mib, cpus: cfg.limits.cpus })
@@ -715,9 +721,12 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     live.machine_created = true;
     live.log.log(&format!("created {}", p.machine));
     initialize_guest_storage(live.sb)?;
+    step.ok(&format!("{} · {} MiB · {} vCPU · net=none", p.machine, cfg.limits.memory_mib, cfg.limits.cpus));
     if let Some(inputs) = &cfg.inputs_dir {
+        let step = crate::brand::progress::step("copy in", Shown::Sweep);
         live.sb.copy_in(inputs, "/in").map_err(|e| e.to_string())?;
         live.log.log(&format!("copied {} to /in", inputs.display()));
+        step.ok(&format!("{} → /in", inputs.display()));
     }
     if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)) {
         return Err(format!("{why} before opencode started"));
@@ -733,6 +742,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     // run_connected reaches the session for embedded inference only after
     // attestation verified; an external provider is recorded unattested.
     write_tui_config(&p.config_dir, &cfg.plugin_dir, &model_display_name(&cfg.provider.models[0]), cfg.embedded_inference)?;
+    crate::brand::theme::install(&cfg.plugin_dir, &p.config_dir)?;
     // opencode loads opencode.json, AGENTS.md and .opencode/ from its cwd.
     if fs::read_dir(&p.work).map_err(|e| e.to_string())?.next().is_some() {
         return Err(format!("work directory is not empty: {}", p.work.display()));
@@ -748,6 +758,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         .current_dir(&launch.cwd)
         .env_clear()
         .envs(launch.env.iter().map(|(k, v)| (k, v)));
+    crate::brand::progress::hand_off();
     let (child, mut terminal) = Terminal::spawn(&mut command)
         .map_err(|e| format!("starting {} failed: {e}", cfg.opencode))?;
     terminal.set_title(TERMINAL_TITLE);
@@ -976,6 +987,8 @@ mod tests {
     fn the_tui_config_loads_only_the_branding_plugin_and_turns_off_opencode_titles() {
         let c = tui_config(Path::new("/repo/plugin"), "DeepSeek V4.1 Flash Abliterated", true);
         assert_eq!(c["terminal"], json!({ "title": false }));
+        // The shipped theme, which session_body copies to <config>/themes/.
+        assert_eq!(c["theme"], json!({ "name": "nearai-red" }));
         assert_eq!(
             c["plugins"],
             json!([{ "package": "/repo/plugin/branding", "options": { "model": "DeepSeek V4.1 Flash Abliterated", "attested": true } }])
