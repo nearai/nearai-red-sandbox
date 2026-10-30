@@ -490,8 +490,11 @@ impl Keys for StdinKeys {
 impl Drop for StdinKeys {
     fn drop(&mut self) {
         if let Some(t) = self.original {
-            // SAFETY: restores the attributes read in new().
-            unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) };
+            // SAFETY: restores the attributes read in new(). TCSAFLUSH also
+            // discards keys typed after the last poll, so nothing pressed
+            // during the splash (a Ctrl-C byte included, since ISIG was off)
+            // can reach sign-in or opencode.
+            unsafe { libc::tcsetattr(0, libc::TCSAFLUSH, &t) };
         }
     }
 }

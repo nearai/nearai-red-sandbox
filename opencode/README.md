@@ -263,7 +263,8 @@ The launcher writes this to `<runtime>/xdg/config/opencode/opencode.json`
   },
   "model": "nearai-red-embedded/z-ai/glm-5.3-flash",
   "enabled_providers": ["nearai-red-embedded"],
-  "share": "disabled"
+  "share": "disabled",
+  "autoupdate": false
 }
 ```
 
