@@ -476,6 +476,130 @@ pub fn check_mvm_host(env: &[(String, String)], mvm_root: &std::path::Path) -> R
     Ok(())
 }
 
+/// The address the deny-all probe must not reach, directly or through the
+/// guest proxy.
+pub const DENY_ALL_TARGET: &str = "1.1.1.1:443";
+
+/// One probe exec: the wrapper's limit, which bounds every `nc` below.
+const PROBE_TIMEOUT_MS: u64 = 15_000;
+const PROBE_MAX_OUTPUT: u64 = 4096;
+/// The longest guest-written text an error string carries.
+const PROBE_ERROR_CHARS: usize = 200;
+
+/// Shared start of both probe scripts. With no `nc` it prints `no-nc`
+/// before any other command runs. `first_line TARGET` sends an HTTP CONNECT
+/// for TARGET to the guest proxy and sets `line` to the first response
+/// line, without its CR. It reads through a FIFO and then kills `nc`,
+/// because a CONNECT that succeeds leaves the tunnel open and `nc` would
+/// otherwise outlive the exec. It returns non-zero only if it could not set
+/// up, so a setup failure never reads as "no answer".
+macro_rules! probe_prelude {
+    () => {
+        r#"command -v nc >/dev/null 2>&1 || { echo 'RTS_PROBE no-nc'; exit 0; }
+first_line() {
+  line=
+  d=$(mktemp -d /tmp/rts-probe.XXXXXX) || return 1
+  printf 'CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n' "$1" "$1" >"$d/req" && mkfifo "$d/out" || { rm -rf "$d"; return 1; }
+  nc -w 10 127.0.0.1 1080 <"$d/req" >"$d/out" 2>/dev/null &
+  p=$!
+  IFS= read -r line <"$d/out"
+  kill "$p" 2>/dev/null
+  wait "$p" 2>/dev/null
+  rm -rf "$d"
+  cr=$(printf '\r')
+  line=${line%"$cr"}
+  return 0
+}
+"#
+    };
+}
+
+/// `$1` is `host:port` (IPv6 bracketed, as HTTP CONNECT takes it).
+const PROBE_SCRIPT: &str = concat!(
+    probe_prelude!(),
+    r#"first_line "$1" || { echo 'RTS_PROBE error setup'; exit 0; }
+case $line in
+  'HTTP/1.'?' 200'*) echo 'RTS_PROBE connected' ;;
+  *) printf 'RTS_PROBE refused %.200s\n' "$line" ;;
+esac
+"#
+);
+
+/// `$1` is an IPv4 `a.b.c.d:port`. A direct `nc` that exits 0 connected;
+/// one that never exits runs into the exec limit, which fails the probe.
+const DENY_ALL_SCRIPT: &str = concat!(
+    probe_prelude!(),
+    r#"if nc -w 5 "${1%:*}" "${1##*:}" </dev/null >/dev/null 2>&1; then
+  echo 'RTS_PROBE reachable-direct'
+  exit 0
+fi
+first_line "$1" || { echo 'RTS_PROBE error setup'; exit 0; }
+case $line in
+  'HTTP/1.'?' 200'*) echo 'RTS_PROBE reachable-proxy' ;;
+  *) echo 'RTS_PROBE unreachable' ;;
+esac
+"#
+);
+
+/// Probe `target` (`name:port`, `a.b.c.d:port` or `[v6]:port`) from the
+/// guest through the proxy on `127.0.0.1:1080`.
+pub fn probe_argv(target: &str) -> Vec<String> {
+    vec!["sh".into(), "-c".into(), PROBE_SCRIPT.into(), "sh".into(), target.into()]
+}
+
+/// Probe that [`DENY_ALL_TARGET`] is unreachable both directly and through
+/// the guest proxy.
+pub fn deny_all_argv() -> Vec<String> {
+    vec!["sh".into(), "-c".into(), DENY_ALL_SCRIPT.into(), "sh".into(), DENY_ALL_TARGET.into()]
+}
+
+/// Probe every entry of `plan` from the guest, in order, or deny-all when
+/// the plan is empty. The first probe that does not print exactly the
+/// expected marker as its last line, or does not exit 0, ends the run.
+pub fn run_probes(sb: &dyn crate::sandbox::Exec, plan: &Plan) -> Result<Vec<Probe>, String> {
+    let jobs: Vec<(String, Vec<String>, &str)> = if plan.is_empty() {
+        vec![(DENY_ALL_TARGET.to_string(), deny_all_argv(), "unreachable")]
+    } else {
+        plan.entries()
+            .iter()
+            .map(|e| {
+                let target = e.display();
+                let argv = probe_argv(&target);
+                (target, argv, "connected")
+            })
+            .collect()
+    };
+    let opts = crate::sandbox::ExecOptions::new(PROBE_TIMEOUT_MS, PROBE_MAX_OUTPUT);
+    let mut probes = Vec::with_capacity(jobs.len());
+    for (target, argv, want) in jobs {
+        let fail = |what: String| format!("network probe {target} failed: {what}");
+        let r = sb.exec(&argv, &opts).map_err(|e| fail(e.to_string()))?;
+        if r.timed_out {
+            return Err(fail("timed out".into()));
+        }
+        if r.exit_code != 0 {
+            return Err(fail(format!("exit {}", r.exit_code)));
+        }
+        if r.truncated {
+            return Err(fail("output truncated".into()));
+        }
+        let out = r.stdout.strip_suffix(b"\n").unwrap_or(&r.stdout);
+        let last = out.rsplit(|&b| b == b'\n').next().unwrap_or(b"");
+        if last != format!("RTS_PROBE {want}").as_bytes() {
+            let shown: String = String::from_utf8_lossy(last)
+                .chars()
+                .take(PROBE_ERROR_CHARS)
+                .collect::<String>()
+                .escape_debug()
+                .collect();
+            let shown = if shown.is_empty() { "no output".to_string() } else { shown };
+            return Err(fail(shown));
+        }
+        probes.push(Probe { target, result: want.to_string() });
+    }
+    Ok(probes)
+}
+
 /// `--allow-host` values for tests in other modules. IP literals need no
 /// lookup; a name resolves to a fixed public test address.
 #[cfg(test)]
@@ -829,5 +953,192 @@ mod tests {
         std::fs::create_dir(&cfg).unwrap(); // exists, unreadable as a file
         assert!(check_mvm_host(&[], &root).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // ---- Task 7: post-boot probes ----
+
+    use crate::testutil::{Recorder, reply, run_wrapped_locally};
+
+    fn empty_plan() -> Plan {
+        plan(&[], &fake(&[])).unwrap()
+    }
+
+    /// The script operand of a probe argv: `sh -c <script> sh <target>`.
+    fn script_of(argv: &[String]) -> String {
+        assert_eq!(&argv[..2], &["sh".to_string(), "-c".to_string()]);
+        argv[2].clone()
+    }
+
+    /// A directory holding only a fake `nc` with this body.
+    fn fake_nc(tag: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let d = crate::testutil::tempdir(tag);
+        let nc = d.join("nc");
+        std::fs::write(&nc, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&nc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        d
+    }
+
+    /// Run `argv`'s script on the host under `PATH`, through the real guest
+    /// wrapper with a 5-second limit, and return (exit code, stdout).
+    fn run_script(argv: &[String], path: &str) -> (u32, String) {
+        let mut cmd = s(&["env", &format!("PATH={path}"), "/bin/sh", "-c"]);
+        cmd.push(script_of(argv));
+        cmd.extend(argv[3..].iter().cloned());
+        let r = run_wrapped_locally(&cmd, 5, 4096, None);
+        (r.exit_code, String::from_utf8(r.stdout).unwrap())
+    }
+
+    #[test]
+    fn the_deny_all_probe_fails_closed_without_nc_or_on_odd_output() {
+        for (stdout, passes) in [
+            ("RTS_PROBE unreachable\n", true),
+            ("RTS_PROBE no-nc\n", false),
+            ("", false),
+            ("RTS_PROBE reachable-direct\n", false),
+            ("RTS_PROBE reachable-proxy\n", false),
+            ("RTS_PROBE unreachable\nRTS_PROBE connected\n", false),
+            ("rts_probe unreachable\n", false),
+            ("RTS_PROBE unreachable \n", false),
+        ] {
+            let rec = Recorder::new(move |_, _| reply(0, stdout.as_bytes(), b""));
+            let r = run_probes(&rec, &empty_plan());
+            assert_eq!(r.is_ok(), passes, "{stdout:?}: {r:?}");
+            let execs = rec.execs.lock().unwrap();
+            assert_eq!(execs.len(), 1);
+            assert_eq!(execs[0].0, deny_all_argv());
+            assert_eq!(execs[0].1.timeout_ms, 15_000);
+            if passes {
+                assert_eq!(
+                    r.unwrap(),
+                    vec![Probe { target: DENY_ALL_TARGET.into(), result: "unreachable".into() }]
+                );
+            } else {
+                assert!(r.unwrap_err().starts_with("network probe 1.1.1.1:443 failed: "));
+            }
+        }
+    }
+
+    #[test]
+    fn a_probe_that_exits_non_zero_or_times_out_fails_even_with_the_marker() {
+        for code in [1, 137] {
+            let rec = Recorder::new(move |_, _| reply(code, b"RTS_PROBE unreachable\n", b""));
+            assert!(run_probes(&rec, &empty_plan()).is_err(), "exit {code}");
+            let rec = Recorder::new(move |_, _| reply(code, b"RTS_PROBE connected\n", b""));
+            let p = plan(&s(&["198.51.100.7:443"]), &fake(&[])).unwrap();
+            assert!(run_probes(&rec, &p).is_err(), "exit {code}");
+        }
+    }
+
+    #[test]
+    fn each_allowed_entry_is_probed_in_order_and_the_first_failure_names_it() {
+        let p = plan(
+            &s(&["198.51.100.7:443", "198.51.100.8:8443", "198.51.100.9:443"]),
+            &fake(&[]),
+        )
+        .unwrap();
+        let rec = Recorder::new(|argv, _| {
+            if argv[4] == "198.51.100.8:8443" {
+                reply(0, b"RTS_PROBE refused HTTP/1.1 403 Forbidden\n", b"")
+            } else {
+                reply(0, b"RTS_PROBE connected\n", b"")
+            }
+        });
+        let e = run_probes(&rec, &p).unwrap_err();
+        assert!(e.contains("198.51.100.8:8443") && e.contains("refused"), "{e}");
+        let execs = rec.execs.lock().unwrap();
+        assert_eq!(execs.len(), 2, "stops at the first failure");
+        for ((argv, o), target) in execs.iter().zip(["198.51.100.7:443", "198.51.100.8:8443"]) {
+            assert_eq!(o.timeout_ms, 15_000);
+            assert_eq!(o.max_output_bytes, 4096);
+            assert_eq!(argv, &probe_argv(target));
+            assert_eq!(argv[4], target);
+        }
+    }
+
+    #[test]
+    fn every_allowed_entry_that_connects_is_recorded_by_its_target() {
+        let p = plan(
+            &s(&["a.example", "198.51.100.7:8443", "[2001:db8::7]:443"]),
+            &fake(&[("a.example", Ok(vec!["198.51.100.1".parse().unwrap()]))]),
+        )
+        .unwrap();
+        let rec = Recorder::new(|_, _| reply(0, b"RTS_PROBE connected\n", b""));
+        let probes = run_probes(&rec, &p).unwrap();
+        let targets: Vec<&str> = probes.iter().map(|p| p.target.as_str()).collect();
+        assert_eq!(targets, ["a.example:443", "198.51.100.7:8443", "[2001:db8::7]:443"]);
+        assert!(probes.iter().all(|p| p.result == "connected"));
+        assert_eq!(rec.argvs().iter().map(|a| a[4].clone()).collect::<Vec<_>>(), targets);
+    }
+
+    #[test]
+    fn guest_output_in_a_probe_error_is_escaped_and_capped() {
+        let p = plan(&s(&["198.51.100.7:443"]), &fake(&[])).unwrap();
+        let long = format!("RTS_PROBE refused \x1b[2J{}\n", "x".repeat(5000));
+        let rec = Recorder::new(move |_, _| reply(0, long.as_bytes(), b""));
+        let e = run_probes(&rec, &p).unwrap_err();
+        assert!(!e.contains('\x1b'), "{e:?}");
+        assert!(e.len() < 400, "{}", e.len());
+    }
+
+    #[test]
+    fn the_probe_script_reports_no_nc_when_nc_is_missing() {
+        for argv in [probe_argv("a.example:443"), deny_all_argv()] {
+            assert_eq!(run_script(&argv, "/nonexistent"), (0, "RTS_PROBE no-nc\n".into()));
+        }
+    }
+
+    #[test]
+    fn the_probe_takes_the_first_line_without_waiting_for_the_tunnel_to_close() {
+        // The proxy answers 200 and then holds the tunnel open, as a real
+        // CONNECT does. The probe must not wait for nc to exit.
+        let d = fake_nc("probe-200", "printf 'HTTP/1.1 200 Connection established\\r\\n\\r\\n'\nexec sleep 60");
+        let path = format!("{}:/usr/bin:/bin", d.display());
+        assert_eq!(run_script(&probe_argv("a.example:443"), &path), (0, "RTS_PROBE connected\n".into()));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn the_probe_reports_a_refusal_with_its_status_line() {
+        let d = fake_nc("probe-403", "cat >/dev/null; printf 'HTTP/1.1 403 Forbidden\\r\\n\\r\\n'");
+        let path = format!("{}:/usr/bin:/bin", d.display());
+        assert_eq!(
+            run_script(&probe_argv("a.example:443"), &path),
+            (0, "RTS_PROBE refused HTTP/1.1 403 Forbidden\n".into())
+        );
+        std::fs::remove_dir_all(d).unwrap();
+        // Nothing answers at all.
+        let d = fake_nc("probe-none", "exit 1");
+        let path = format!("{}:/usr/bin:/bin", d.display());
+        assert_eq!(run_script(&probe_argv("a.example:443"), &path), (0, "RTS_PROBE refused \n".into()));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn the_probe_sends_a_connect_for_its_target_to_the_guest_proxy() {
+        let d = fake_nc(
+            "probe-req",
+            "[ \"$*\" = '-w 10 127.0.0.1 1080' ] || exit 1\nIFS= read -r l\n[ \"$l\" = \"$(printf 'CONNECT [2001:db8::7]:443 HTTP/1.1\\r')\" ] || exit 1\nprintf 'HTTP/1.0 200 OK\\r\\n'",
+        );
+        let path = format!("{}:/usr/bin:/bin", d.display());
+        assert_eq!(run_script(&probe_argv("[2001:db8::7]:443"), &path), (0, "RTS_PROBE connected\n".into()));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn the_deny_all_script_passes_only_when_neither_path_connects() {
+        // $4 is the port: 443 for the direct try, 1080 for the proxy.
+        for (body, want) in [
+            ("[ \"$4\" = 443 ] && exit 1\nprintf 'HTTP/1.1 403 Forbidden\\r\\n'", "RTS_PROBE unreachable\n"),
+            ("exit 1", "RTS_PROBE unreachable\n"),
+            ("[ \"$4\" = 443 ] && exit 0\nprintf 'HTTP/1.1 403 Forbidden\\r\\n'", "RTS_PROBE reachable-direct\n"),
+            ("[ \"$4\" = 443 ] && exit 1\nprintf 'HTTP/1.1 200 OK\\r\\n'\nexec sleep 60", "RTS_PROBE reachable-proxy\n"),
+        ] {
+            let d = fake_nc("deny-all", body);
+            let path = format!("{}:/usr/bin:/bin", d.display());
+            assert_eq!(run_script(&deny_all_argv(), &path), (0, want.into()), "{body}");
+            std::fs::remove_dir_all(d).unwrap();
+        }
+        assert_eq!(deny_all_argv()[4], DENY_ALL_TARGET);
     }
 }
