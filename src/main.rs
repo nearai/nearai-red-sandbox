@@ -13,6 +13,13 @@ use std::sync::Arc;
 
 use rts::{attest, auth, bridge, config, forwarder, inference, session, setup};
 
+/// `--allow-host` entries in the order given, and `--no-network`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct NetworkFlags {
+    allow: Vec<String>,
+    none: bool,
+}
+
 #[derive(Debug)]
 enum Action {
     Help,
@@ -24,6 +31,7 @@ enum Action {
         file: Option<PathBuf>,
         login: auth::LoginOptions,
         attest: attest::AttestOptions,
+        network: NetworkFlags,
     },
 }
 
@@ -50,6 +58,7 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
     let mut file = None;
     let mut login = auth::LoginOptions::default();
     let mut attest = attest::AttestOptions::default();
+    let mut network = NetworkFlags::default();
     let mut seen = std::collections::HashSet::new();
     let mut flags = flags.iter();
     while let Some(&flag) = flags.next() {
@@ -59,6 +68,8 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
                 | "--allow-tcb-out-of-date"
                 | "--compose-policy"
                 | "--allow-unattested-provider"
+                | "--allow-host"
+                | "--no-network"
         );
         if !matches!(
             flag,
@@ -69,12 +80,19 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
                 | "--allow-tcb-out-of-date"
                 | "--compose-policy"
                 | "--allow-unattested-provider"
+                | "--allow-host"
+                | "--no-network"
         ) || (launch_only && *command != "launch")
         {
             return Err(format!("Unknown option for {command}: {flag}"));
         }
-        if !seen.insert(flag) {
+        // --allow-host is the one repeatable option.
+        if flag != "--allow-host" && !seen.insert(flag) {
             return Err(format!("Duplicate option: {flag}"));
+        }
+        if flag == "--no-network" {
+            network.none = true;
+            continue;
         }
         if flag == "--allow-tcb-out-of-date" {
             attest.allow_tcb_out_of_date = true;
@@ -91,6 +109,7 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
             .ok_or_else(|| format!("{flag} needs a value"))?;
         match flag {
             "--config" => file = Some(PathBuf::from(value)),
+            "--allow-host" => network.allow.push(value.into()),
             "--compose-policy" => {
                 attest.compose_policy = match value {
                     "pinned" => attest::ComposePolicy::Pinned,
@@ -122,6 +141,9 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
             _ => unreachable!(),
         }
     }
+    if network.none && !network.allow.is_empty() {
+        return Err("--no-network cannot be combined with --allow-host".into());
+    }
     Ok(if *command == "login" {
         Action::Login(login)
     } else {
@@ -129,6 +151,7 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
             file,
             login,
             attest,
+            network,
         }
     })
 }
@@ -171,7 +194,7 @@ fn run_connected<G>(
     Ok(run(cfg))
 }
 
-const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider]\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.";
+const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network]\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.";
 
 /// A private temp directory holding an empty Git config for mvmctl.
 fn private_git_config(prefix: &str) -> Result<(tempfile::TempDir, PathBuf), String> {
@@ -234,10 +257,21 @@ fn check_launch(
         ));
     }
     config::require_real_models(&cfg.provider.models)?;
+    rts::network::expand(&cfg.network)?;
     if !cfg.embedded_inference && !opts.allow_unattested_provider {
         return Err("the config names an external provider (provider.id, baseURL or apiKeyEnv), which rts cannot attest; pass --allow-unattested-provider to use it anyway".into());
     }
     Ok(())
+}
+
+/// `--no-network` clears the config's entries; otherwise `--allow-host`
+/// entries follow the config's.
+fn apply_network(cfg: &mut config::OperatorConfig, flags: &NetworkFlags) {
+    if flags.none {
+        cfg.network.clear();
+    } else {
+        cfg.network.extend(flags.allow.iter().cloned());
+    }
 }
 
 /// For an allowed external provider: attestation.json says it is unattested.
@@ -291,6 +325,7 @@ fn launch(
     file: Option<&Path>,
     login: &auth::LoginOptions,
     attest_options: attest::AttestOptions,
+    network: &NetworkFlags,
 ) -> Result<i32, String> {
     let defaults = config::Defaults::from_env();
     let mut cfg = if let Some(file) = file {
@@ -302,6 +337,7 @@ fn launch(
             &defaults,
         )?
     };
+    apply_network(&mut cfg, network);
     check_launch(&cfg, &std::env::vars().collect::<Vec<_>>(), &attest_options)?;
     let session_id = session::new_session_id();
     let fatal = forwarder::Fatal::new();
@@ -439,7 +475,8 @@ fn main() -> ExitCode {
             file,
             login,
             attest,
-        } => launch(file.as_deref(), &login, attest),
+            network,
+        } => launch(file.as_deref(), &login, attest, &network),
         Action::Login(options) => auth::login(&options).map(|_| {
             println!("Signed in to NEAR AI Cloud.");
             0
@@ -780,6 +817,7 @@ mod tests {
             file,
             login,
             attest,
+            network,
         } = parse_args(&["launch"]).unwrap()
         else {
             panic!("not launch")
@@ -787,6 +825,7 @@ mod tests {
         assert_eq!(file, None);
         assert_eq!(login.provider, Provider::Github);
         assert_eq!(attest, rts::attest::AttestOptions::default());
+        assert_eq!(network, NetworkFlags::default());
         let Action::Launch { file, login, .. } = parse_args(&[
             "launch",
             "--workspace",
@@ -849,6 +888,82 @@ mod tests {
     }
 
     #[test]
+    fn allow_host_repeats_and_no_network_conflicts() {
+        let Action::Launch { network, .. } = parse_args(&[
+            "launch",
+            "--allow-host",
+            "packages",
+            "--allow-host",
+            "a.example:8443",
+        ])
+        .unwrap() else {
+            panic!("not launch")
+        };
+        assert_eq!(
+            network,
+            NetworkFlags {
+                allow: vec!["packages".into(), "a.example:8443".into()],
+                none: false
+            }
+        );
+        let Action::Launch { network, .. } = parse_args(&["launch", "--no-network"]).unwrap()
+        else {
+            panic!("not launch")
+        };
+        assert!(network.none);
+        assert!(
+            parse_args(&["launch", "--no-network", "--allow-host", "a.example"])
+                .unwrap_err()
+                .contains("--no-network")
+        );
+        assert!(
+            parse_args(&["launch", "--allow-host", "a.example", "--no-network"])
+                .unwrap_err()
+                .contains("--no-network")
+        );
+        assert!(
+            parse_args(&["launch", "--allow-host"])
+                .unwrap_err()
+                .contains("needs a value")
+        );
+        assert!(parse_args(&["login", "--allow-host", "a.example"]).is_err());
+        assert!(parse_args(&["login", "--no-network"]).is_err());
+        assert!(
+            parse_args(&["launch", "--no-network", "--no-network"])
+                .unwrap_err()
+                .contains("Duplicate")
+        );
+    }
+
+    #[test]
+    fn flags_merge_with_the_config_and_bad_entries_stop_before_credentials() {
+        let mut cfg = real_models();
+        cfg.network = vec!["packages".into()];
+        apply_network(
+            &mut cfg,
+            &NetworkFlags {
+                allow: vec!["a.example".into()],
+                none: false,
+            },
+        );
+        assert_eq!(cfg.network, ["packages", "a.example"]);
+        apply_network(
+            &mut cfg,
+            &NetworkFlags {
+                allow: vec![],
+                none: true,
+            },
+        );
+        assert!(cfg.network.is_empty());
+        cfg.network = vec!["a.example:22".into()];
+        assert!(
+            check_launch(&cfg, &[], &rts::attest::AttestOptions::default())
+                .unwrap_err()
+                .contains("port 22")
+        );
+    }
+
+    #[test]
     fn malformed_arguments_fail_before_config_or_credentials_are_touched() {
         for args in [
             vec!["launch", "--config"],
@@ -892,6 +1007,8 @@ mod tests {
             vec!["setup", "--config", "x"],
             vec!["setup", "extra"],
             vec!["--version", "x"],
+            vec!["launch", "--allow-host", "--no-network"],
+            vec!["launch", "--allow-host", ""],
         ] {
             assert!(parse_args(&args).is_err(), "accepted {args:?}");
         }

@@ -78,6 +78,9 @@ pub struct OperatorConfig {
     pub mvmctl: PathBuf,
     /// The opencode plugin shim (a directory holding package.json).
     pub plugin_dir: PathBuf,
+    /// Guest egress allowlist entries as written (`network.allow`, then any
+    /// `--allow-host` flags). Empty means no network.
+    pub network: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -103,6 +106,12 @@ struct RawLimits {
     handshake_ms: Option<u64>,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawNetwork {
+    allow: Option<Vec<String>>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Raw {
@@ -116,6 +125,8 @@ struct Raw {
     opencode: Option<String>,
     mvmctl: Option<String>,
     plugin_dir: Option<String>,
+    #[serde(default)]
+    network: RawNetwork,
 }
 
 fn is_env_name(s: &str) -> bool {
@@ -302,6 +313,8 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
         )?,
         handshake_ms: positive(l.handshake_ms, dl.handshake_ms, "handshakeMs")?,
     };
+    let network = raw.network.allow.unwrap_or_default();
+    crate::network::expand(&network).map_err(|e| format!("config: network.allow: {e}"))?;
     let path = |v: Option<String>, k: &str| -> Result<Option<PathBuf>, String> {
         match v {
             None => Ok(None),
@@ -323,6 +336,7 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
             .unwrap_or_else(|| d.opencode.clone()),
         mvmctl: path(raw.mvmctl, "mvmctl")?.unwrap_or_else(|| d.mvmctl.clone()),
         plugin_dir: path(raw.plugin_dir, "pluginDir")?.unwrap_or_else(|| d.plugin_dir.clone()),
+        network,
     })
 }
 
@@ -356,6 +370,19 @@ mod tests {
     }
     fn parse(t: &str) -> Result<OperatorConfig, String> {
         parse_config(t, Path::new("/cfg"), &d())
+    }
+
+    #[test]
+    fn network_allow_is_read_validated_and_defaults_to_none() {
+        assert!(parse("{}").unwrap().network.is_empty());
+        let c = parse(r#"{ "network": { "allow": ["packages", "192.168.1.20:8080"] } }"#).unwrap();
+        assert_eq!(c.network, ["packages", "192.168.1.20:8080"]);
+        assert!(
+            parse(r#"{ "network": { "allow": ["127.0.0.1:8463"] } }"#)
+                .unwrap_err()
+                .starts_with("config: network.allow: ")
+        );
+        assert!(parse(r#"{ "network": { "allow": [], "peer": [] } }"#).is_err());
     }
 
     #[test]
