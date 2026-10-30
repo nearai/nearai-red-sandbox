@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
 import { spawnSync } from "node:child_process"
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -66,6 +66,17 @@ test("release scripts call BSD stat and tar by absolute path", () => {
     for (const [i, line] of text.split("\n").entries()) {
       if (/^\s*#/.test(line)) continue
       expect(`${file}:${i + 1}: ${line}`).not.toMatch(/(^|[^\/\w-])(stat|tar) -/)
+    }
+  }
+})
+
+test("unit tests that parse tar or stat output call the BSD tools by absolute path", () => {
+  // The CI test gate runs with GNU coreutils and tar first on PATH, and GNU
+  // tar -tv prints owner/group as one column.
+  for (const file of readdirSync(join(ROOT, "tests", "unit")).filter((n) => n.endsWith(".ts"))) {
+    const text = readFileSync(join(ROOT, "tests", "unit", file), "utf8")
+    for (const [i, line] of text.split("\n").entries()) {
+      expect(`${file}:${i + 1}: ${line}`).not.toMatch(/(sh|spawnSync|execFileSync)\(\s*"(tar|stat)"/)
     }
   }
 })

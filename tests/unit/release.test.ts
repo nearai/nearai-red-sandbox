@@ -52,7 +52,7 @@ function sh(cmd: string, args: string[], cwd?: string) {
 }
 
 function tarList(tarball: string): string[] {
-  return sh("tar", ["-tzf", tarball]).split("\n").filter(Boolean).map((l) => l.replace(/\/$/, "")).sort()
+  return sh("/usr/bin/tar", ["-tzf", tarball]).split("\n").filter(Boolean).map((l) => l.replace(/\/$/, "")).sort()
 }
 
 const sha256 = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex")
@@ -75,7 +75,7 @@ test("binaries are executable and build-info names the packaged supervisor", () 
   const out = pkg("0.1.0")
   const tarball = join(out, TARBALL("0.1.0"))
   const modes = new Map<string, string>()
-  for (const line of sh("tar", ["-tvzf", tarball]).split("\n").filter(Boolean)) {
+  for (const line of sh("/usr/bin/tar", ["-tvzf", tarball]).split("\n").filter(Boolean)) {
     const f = line.split(/\s+/)
     expect(f[2]).toBe("root")
     expect(f[3]).toBe("wheel")
@@ -89,7 +89,7 @@ test("binaries are executable and build-info names the packaged supervisor", () 
   }
   const x = join(dir, "x")
   mkdirSync(x)
-  sh("tar", ["-xzf", tarball, "-C", x])
+  sh("/usr/bin/tar", ["-xzf", tarball, "-C", x])
   const supervisor = join(x, "libexec/nearai-red-sandbox/mvm-hvf-supervisor")
   expect(readFileSync(supervisor, "utf8")).toBe(readFileSync(join(dir, "mvm-hvf-supervisor"), "utf8"))
   const info = readFileSync(join(x, "libexec/nearai-red-sandbox/mvm-hvf-supervisor.build-info"), "utf8")
