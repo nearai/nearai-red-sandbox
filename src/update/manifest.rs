@@ -7,6 +7,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::{Signature, VerifyingKey};
 
+use crate::setup::{Fetch, download};
+
 pub const MANIFEST_URL: &str =
     "https://github.com/nearai/nearai-red-sandbox/releases/latest/download/latest.json";
 pub const SIGNATURE_URL: &str =
@@ -34,6 +36,16 @@ pub struct SignedManifest {
     pub tarball: Tarball,
     pub install_sh: InstallSh,
     pub published: chrono::DateTime<chrono::Utc>,
+}
+
+/// Both URLs through `setup::download` (exact GitHub host allowlist on every
+/// hop, size caps), then [`verify`] over the bytes exactly as fetched.
+pub fn fetch(f: &dyn Fetch, key: &[u8; 32]) -> Result<SignedManifest, String> {
+    let mut manifest = Vec::new();
+    download(f, MANIFEST_URL, MAX_MANIFEST_BYTES, &mut manifest)?;
+    let mut signature = Vec::new();
+    download(f, SIGNATURE_URL, MAX_SIGNATURE_BYTES, &mut signature)?;
+    verify(&manifest, &signature, key)
 }
 
 /// Signature first (exact bytes, `verify_strict`), then parse, then the
@@ -225,6 +237,53 @@ mod tests {
     fn unknown_fields_are_accepted() {
         let text = GOOD.replacen("{\n", "{\n  \"channel\": \"stable\",\n", 1);
         assert!(signed(&text).is_ok());
+    }
+
+    fn served(manifest: &[u8], signature: &[u8]) -> crate::setup::FakeFetch {
+        let f = crate::setup::FakeFetch::new();
+        f.body(MANIFEST_URL, manifest.to_vec());
+        f.body(SIGNATURE_URL, signature.to_vec());
+        f
+    }
+
+    #[test]
+    fn fetch_reads_both_urls_and_verifies() {
+        let f = served(GOOD.as_bytes(), &sig(GOOD.as_bytes(), &key()));
+        let m = fetch(&f, &public()).unwrap();
+        assert_eq!(m.manifest.latest, "0.2.0");
+        assert_eq!(f.calls(), vec![MANIFEST_URL.to_string(), SIGNATURE_URL.to_string()]);
+    }
+
+    #[test]
+    fn a_missing_signature_is_refused() {
+        let f = crate::setup::FakeFetch::new();
+        f.body(MANIFEST_URL, GOOD.as_bytes().to_vec());
+        let e = fetch(&f, &public()).unwrap_err();
+        assert!(e.contains("latest.json.sig"), "{e}");
+    }
+
+    #[test]
+    fn oversized_bodies_are_refused() {
+        let big = vec![b' '; (64 << 10) + 1];
+        let f = served(&big, &sig(&big, &key()));
+        let e = fetch(&f, &public()).unwrap_err();
+        assert!(e.contains("exceeds"), "{e}");
+        assert!(e.contains("latest.json "), "{e}");
+
+        let f = served(GOOD.as_bytes(), &[b'A'; 1025]);
+        let e = fetch(&f, &public()).unwrap_err();
+        assert!(e.contains("exceeds"), "{e}");
+        assert!(e.contains("latest.json.sig"), "{e}");
+    }
+
+    #[test]
+    fn a_redirect_off_github_is_refused() {
+        let f = served(GOOD.as_bytes(), &sig(GOOD.as_bytes(), &key()));
+        f.redirect(MANIFEST_URL, "https://evil.example/latest.json");
+        f.body("https://evil.example/latest.json", GOOD.as_bytes().to_vec());
+        let e = fetch(&f, &public()).unwrap_err();
+        assert!(e.contains("not allowed"), "{e}");
+        assert!(!f.calls().iter().any(|c| c.contains("evil")), "{:?}", f.calls());
     }
 
     #[test]

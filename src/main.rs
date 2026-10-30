@@ -304,6 +304,7 @@ fn launch(
     };
     check_launch(&cfg, &std::env::vars().collect::<Vec<_>>(), &attest_options)?;
     let session_id = session::new_session_id();
+    rts::update::launch_notice(cfg.update_check, &cfg.sessions_dir.join(&session_id).join("launcher.log"));
     let fatal = forwarder::Fatal::new();
     let deps = session::Deps::real(session_id.clone(), Some(fatal.clone()))?;
     if !cfg.embedded_inference {
