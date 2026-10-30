@@ -291,7 +291,6 @@ for the tested scope and the patched supervisor requirement.
 - [Implementation plan](docs/plans/2026-10-27-sandboxed-opencode.md)
 - [Network design and measurements](docs/specs/2026-10-29-sandbox-network-access-design.md)
 - [Attested inference plan](docs/plans/2026-10-28-attested-inference.md)
-- [Marketing archive: launch posts and media](docs/marketing/README.md)
 
 ## <img src="docs/assets/ramp.svg" alt="" height="16"> NEAR AI Cloud access
 
