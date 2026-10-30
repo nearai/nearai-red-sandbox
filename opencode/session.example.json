@@ -9,7 +9,6 @@
     "maxOutputBytes": 65536,
     "memoryMiB": 2048,
     "cpus": 2,
-    "hostRssCeilingMiB": 3072,
     "handshakeMs": 30000,
     "sessionHours": 24
   }
