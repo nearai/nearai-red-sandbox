@@ -197,3 +197,251 @@ test("the entitlements file grants only the hypervisor", () => {
   const json = sh("plutil", ["-convert", "json", "-o", "-", join(ROOT, "packaging/macos/mvm-hvf-supervisor.entitlements")])
   expect(JSON.parse(json)).toEqual({ "com.apple.security.hypervisor": true })
 })
+
+// --- scripts/release/sign-manifest.sh ---
+
+const SIGN = join(ROOT, "scripts", "release", "sign-manifest.sh")
+const OPENSSL = process.env.RTS_OPENSSL ?? "/opt/homebrew/opt/openssl@3/bin/openssl"
+const PUBLISHED = "2026-11-02T18:04:11Z"
+
+// A throwaway Ed25519 key: the PEM in base64, as the release secret holds it,
+// and the public key as 64 lowercase hex characters.
+function throwawayKey(name: string): { pemBase64: string; publicHex: string; pem: string } {
+  const pem = join(dir, `${name}.pem`)
+  sh(OPENSSL, ["genpkey", "-algorithm", "ed25519", "-out", pem])
+  const der = spawnSync(OPENSSL, ["pkey", "-in", pem, "-pubout", "-outform", "DER"])
+  expect(der.status).toBe(0)
+  return {
+    pem,
+    pemBase64: readFileSync(pem).toString("base64"),
+    publicHex: Buffer.from(der.stdout).subarray(-32).toString("hex"),
+  }
+}
+
+function signRun(dist: string, key: { pemBase64: string; publicHex: string }, overrides: Record<string, string | null> = {}, env: Record<string, string> = {}) {
+  const tmp = join(dir, "sign-tmp")
+  mkdirSync(tmp, { recursive: true })
+  const flags: Record<string, string | null> = {
+    "--version": "0.2.0",
+    "--dir": dist,
+    "--public-key-hex": key.publicHex,
+    "--published": PUBLISHED,
+    "--openssl": OPENSSL,
+    ...overrides,
+  }
+  const args = Object.entries(flags).flatMap(([k, v]) => (v === null ? [] : [k, v]))
+  const r = spawnSync("bash", [SIGN, ...args], {
+    encoding: "utf8",
+    env: { ...process.env, TMPDIR: tmp, RTS_UPDATE_SIGNING_KEY_PEM_BASE64: key.pemBase64, ...env },
+  })
+  return { ...r, tmp }
+}
+
+function signDist(overrides: Record<string, string | null> = {}) {
+  const dist = pkg("0.2.0")
+  const key = throwawayKey("signing")
+  const before = snapshot(dist)
+  const r = signRun(dist, key, overrides)
+  return { dist, key, before, r }
+}
+
+function snapshot(d: string): Record<string, string> {
+  return Object.fromEntries(readdirSync(d).sort().map((f) => [f, sha256(join(d, f))]))
+}
+
+const haveOpenSSL3 = (() => {
+  const r = spawnSync(OPENSSL, ["version"], { encoding: "utf8" })
+  return r.status === 0 && /^OpenSSL [3-9]/.test(r.stdout)
+})()
+
+test.skipIf(!haveOpenSSL3)("the manifest has the exact layout and names the packaged digests", () => {
+  const { dist, r } = signDist()
+  expect(r.stderr).toBe("")
+  expect(r.status).toBe(0)
+  expect(readFileSync(join(dist, "latest.json"), "utf8")).toBe(
+    `{
+  "latest": "0.2.0",
+  "published": "${PUBLISHED}",
+  "tarball": {
+    "name": "${TARBALL("0.2.0")}",
+    "sha256": "${sha256(join(dist, TARBALL("0.2.0")))}"
+  },
+  "install_sh": {
+    "sha256": "${sha256(join(dist, "install.sh"))}"
+  }
+}
+`,
+  )
+})
+
+test.skipIf(!haveOpenSSL3)("the signature verifies with OpenSSL against the public key", () => {
+  const { dist, key, r } = signDist()
+  expect(r.status).toBe(0)
+  const b64 = readFileSync(join(dist, "latest.json.sig"), "utf8")
+  expect(b64).toMatch(/^[A-Za-z0-9+/]+=*$/)
+  const sig = Buffer.from(b64, "base64")
+  expect(sig.length).toBe(64)
+  writeFileSync(join(dir, "sig.bin"), sig)
+  // Verify against the public key alone, rebuilt from its hex as rts does.
+  writeFileSync(join(dir, "pub.der"), Buffer.from("302a300506032b6570032100" + key.publicHex, "hex"))
+  sh(OPENSSL, ["pkey", "-pubin", "-inform", "DER", "-in", join(dir, "pub.der"), "-out", join(dir, "pub.pem")])
+  const ok = spawnSync(OPENSSL, ["pkeyutl", "-verify", "-pubin", "-inkey", join(dir, "pub.pem"), "-rawin",
+    "-in", join(dist, "latest.json"), "-sigfile", join(dir, "sig.bin")], { encoding: "utf8" })
+  expect(ok.status).toBe(0)
+  // One appended byte breaks it: the signature is over the exact bytes.
+  writeFileSync(join(dir, "tampered.json"), readFileSync(join(dist, "latest.json"), "utf8") + "\n")
+  const bad = spawnSync(OPENSSL, ["pkeyutl", "-verify", "-pubin", "-inkey", join(dir, "pub.pem"), "-rawin",
+    "-in", join(dir, "tampered.json"), "-sigfile", join(dir, "sig.bin")], { encoding: "utf8" })
+  expect(bad.status).not.toBe(0)
+})
+
+test.skipIf(!haveOpenSSL3)("--minimum writes minimum_supported", () => {
+  const { dist, r } = signDist({ "--minimum": "0.1.0" })
+  expect(r.stderr).toBe("")
+  expect(r.status).toBe(0)
+  const lines = readFileSync(join(dist, "latest.json"), "utf8").split("\n")
+  expect(lines.slice(0, 4)).toEqual(["{", '  "latest": "0.2.0",', '  "minimum_supported": "0.1.0",', `  "published": "${PUBLISHED}",`])
+})
+
+test.skipIf(!haveOpenSSL3)("SHA256SUMS gains exactly the two manifest lines and still checks", () => {
+  const { dist, r } = signDist()
+  expect(r.status).toBe(0)
+  const lines = readFileSync(join(dist, "SHA256SUMS"), "utf8").split("\n").filter(Boolean)
+  expect(lines).toEqual([
+    `${sha256(join(dist, TARBALL("0.2.0")))}  ${TARBALL("0.2.0")}`,
+    `${sha256(join(dist, "install.sh"))}  install.sh`,
+    `${sha256(join(dist, "latest.json"))}  latest.json`,
+    `${sha256(join(dist, "latest.json.sig"))}  latest.json.sig`,
+  ])
+  sh("shasum", ["-a", "256", "-c", "SHA256SUMS"], dist)
+  expect(readdirSync(dist).sort()).toEqual(["SHA256SUMS", "install.sh", "latest.json", "latest.json.sig", TARBALL("0.2.0")])
+})
+
+test.skipIf(!haveOpenSSL3)("a signing key that does not match the public key is refused and leaves nothing", () => {
+  const dist = pkg("0.2.0")
+  const key = throwawayKey("signing")
+  const other = throwawayKey("other")
+  const before = snapshot(dist)
+  const r = signRun(dist, { pemBase64: key.pemBase64, publicHex: other.publicHex })
+  expect(r.status).toBe(1)
+  expect(r.stderr).toContain("sign-manifest: refusing:")
+  expect(existsSync(join(dist, "latest.json"))).toBe(false)
+  expect(existsSync(join(dist, "latest.json.sig"))).toBe(false)
+  expect(snapshot(dist)).toEqual(before)
+  expect(readdirSync(r.tmp)).toEqual([])
+})
+
+const libressl = (() => {
+  const r = spawnSync("/usr/bin/openssl", ["version"], { encoding: "utf8" })
+  return r.status === 0 && r.stdout.startsWith("LibreSSL")
+})()
+
+test.skipIf(!haveOpenSSL3 || !libressl)("LibreSSL is refused", () => {
+  const { dist, before, r } = signDist({ "--openssl": "/usr/bin/openssl" })
+  expect(r.status).toBe(1)
+  expect(r.stderr).toContain("sign-manifest: refusing:")
+  expect(r.stderr).toContain("LibreSSL")
+  expect(snapshot(dist)).toEqual(before)
+})
+
+const refusals: [string, (k: { pemBase64: string; publicHex: string }) => { overrides?: Record<string, string | null>; env?: Record<string, string> }][] = [
+  ["an empty signing key", () => ({ env: { RTS_UPDATE_SIGNING_KEY_PEM_BASE64: "" } })],
+  ["a signing key that is not a PEM", () => ({ env: { RTS_UPDATE_SIGNING_KEY_PEM_BASE64: Buffer.from("not a key\n").toString("base64") } })],
+  ["a short public key", (k) => ({ overrides: { "--public-key-hex": k.publicHex.slice(2) } })],
+  ["an uppercase public key", (k) => ({ overrides: { "--public-key-hex": k.publicHex.toUpperCase() } })],
+  ["--version v0.2.0", () => ({ overrides: { "--version": "v0.2.0" } })],
+  ["a missing --version", () => ({ overrides: { "--version": null } })],
+  ["a missing --dir", () => ({ overrides: { "--dir": null } })],
+  ["a missing --public-key-hex", () => ({ overrides: { "--public-key-hex": null } })],
+  ["--minimum above --version", () => ({ overrides: { "--minimum": "0.10.0" } })],
+  ["a malformed --minimum", () => ({ overrides: { "--minimum": "0.1" } })],
+  ["a malformed --published", () => ({ overrides: { "--published": "2026-11-02 18:04:11" } })],
+  ["a version that differs from the tarball", () => ({ overrides: { "--version": "0.3.0" } })],
+  ["a missing OpenSSL", () => ({ overrides: { "--openssl": "/nonexistent/openssl" } })],
+]
+for (const [label, change] of refusals) {
+  test.skipIf(!haveOpenSSL3)(`${label} is refused`, () => {
+    const dist = pkg("0.2.0")
+    const key = throwawayKey("signing")
+    const before = snapshot(dist)
+    const { overrides, env } = change(key)
+    const r = signRun(dist, key, overrides, env)
+    expect(r.status).toBe(1)
+    expect(r.stderr).toContain("sign-manifest: refusing:")
+    expect(snapshot(dist)).toEqual(before)
+    expect(readdirSync(r.tmp)).toEqual([])
+  })
+}
+
+test.skipIf(!haveOpenSSL3)("a SHA256SUMS that no longer checks is refused", () => {
+  const dist = pkg("0.2.0")
+  const key = throwawayKey("signing")
+  writeFileSync(join(dist, "install.sh"), "changed\n")
+  const before = snapshot(dist)
+  const r = signRun(dist, key)
+  expect(r.status).toBe(1)
+  expect(r.stderr).toContain("sign-manifest: refusing:")
+  expect(snapshot(dist)).toEqual(before)
+})
+
+test.skipIf(!haveOpenSSL3)("an existing manifest is refused, not overwritten", () => {
+  const dist = pkg("0.2.0")
+  const key = throwawayKey("signing")
+  writeFileSync(join(dist, "latest.json"), "{}\n")
+  const before = snapshot(dist)
+  const r = signRun(dist, key)
+  expect(r.status).toBe(1)
+  expect(r.stderr).toContain("sign-manifest: refusing:")
+  expect(snapshot(dist)).toEqual(before)
+})
+
+test.skipIf(!haveOpenSSL3)("no key material is left behind", () => {
+  const { r } = signDist()
+  expect(r.status).toBe(0)
+  expect(readdirSync(r.tmp)).toEqual([])
+})
+
+test("the release workflow signs the manifest after packaging and before attesting", () => {
+  const wf = readFileSync(join(ROOT, ".github", "workflows", "release.yml"), "utf8")
+  const pack = wf.indexOf("- name: Package")
+  const sign = wf.indexOf("- name: Sign the update manifest")
+  const attest = wf.indexOf("actions/attest-build-provenance@")
+  const upload = wf.indexOf("name: dist")
+  expect(pack).toBeGreaterThan(-1)
+  expect(sign).toBeGreaterThan(pack)
+  expect(attest).toBeGreaterThan(sign)
+  expect(upload).toBeGreaterThan(attest)
+
+  const signStep = wf.slice(sign).split("\n      - ")[0]
+  expect(signStep).toContain("bash scripts/release/sign-manifest.sh")
+  expect(signStep).toContain("RTS_UPDATE_SIGNING_KEY_PEM_BASE64: ${{ secrets.RTS_UPDATE_SIGNING_KEY_PEM_BASE64 }}")
+  expect(signStep).toContain("RTS_UPDATE_PUBLIC_KEY_HEX: ${{ vars.RTS_UPDATE_PUBLIC_KEY_HEX }}")
+  expect(signStep).toContain("^[0-9a-f]{64}$")
+
+  const attestBlock = wf.slice(attest).split("\n      - ")[0]
+  expect(attestBlock).toContain("dist/latest.json\n")
+  expect(attestBlock).toContain("dist/latest.json.sig\n")
+
+  const loop = wf.split("\n").find((l) => l.includes('for f in "rts-$V-aarch64-apple-darwin.tar.gz"'))
+  expect(loop).toContain("install.sh SHA256SUMS latest.json latest.json.sig; do")
+
+  const build = wf.split("- name: Build rts")[1].split("\n      - ")[0]
+  expect(build).toContain("RTS_UPDATE_PUBLIC_KEY_HEX: ${{ vars.RTS_UPDATE_PUBLIC_KEY_HEX }}")
+  // The test gate never sees the release key.
+  const gate = wf.split("- name: Test gate")[1].split("\n      - ")[0]
+  expect(gate).not.toContain("RTS_UPDATE_PUBLIC_KEY_HEX")
+
+  const config = wf.split("release-config:")[1].split("\n  build:")[0]
+  expect(config).toContain("- name: Confirm the update public key is configured")
+  expect(config).toContain("RTS_UPDATE_PUBLIC_KEY_HEX: ${{ vars.RTS_UPDATE_PUBLIC_KEY_HEX }}")
+  expect(config).toContain("refusing to release: repository variable RTS_UPDATE_PUBLIC_KEY_HEX is unset or not 64 lowercase hex characters")
+  const confirm = config.split("- name: Confirm the update public key is configured")[1]
+  expect(confirm).toContain("if: github.event_name == 'push'")
+
+  const buildJob = wf.split("\n  build:")[1].split("\n  publish:")[0]
+  expect(buildJob).toContain("environment: release")
+  expect(buildJob).toContain("brew install coreutils gnu-tar shellcheck openssl@3")
+  // Only the build job, which runs in the release environment, reads the signing secret.
+  expect(wf.split("secrets.RTS_UPDATE_SIGNING_KEY_PEM_BASE64").length).toBe(2)
+  expect(buildJob).toContain("secrets.RTS_UPDATE_SIGNING_KEY_PEM_BASE64")
+})
