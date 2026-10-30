@@ -122,6 +122,16 @@ jobs:
           PATH="$(brew --prefix coreutils)/libexec/gnubin:$(brew --prefix gnu-tar)/libexec/gnubin:$PATH" \
             bash scripts/release/check-tests.sh
 
+      # The gate's logs hold each failing test's panic message; without them a
+      # CI-only failure cannot be diagnosed.
+      - name: Upload test gate logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-gate-logs
+          path: target/check-tests-*.log
+          retention-days: 7
+
       - name: Build rts
         run: cargo build --release --locked
 
