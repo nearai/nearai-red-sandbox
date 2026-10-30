@@ -406,7 +406,9 @@ fn launch(
     };
     apply_network(&mut cfg, network);
     apply_vm_size(&mut cfg, vm)?;
-    let host_cpus = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    let host_cpus = std::thread::available_parallelism()
+        .map_err(|e| format!("cannot read this host's CPU count: {e}"))?
+        .get() as u32;
     let host_memory_mib = rts::sys::host_memory_mib().ok_or("cannot read this host's physical memory")?;
     config::check_host_fit(&cfg.limits, host_cpus, host_memory_mib)?;
     let env: Vec<(String, String)> = std::env::vars().collect();

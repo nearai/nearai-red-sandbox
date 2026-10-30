@@ -835,5 +835,9 @@ mod tests {
         let c = load_config(&file, &d()).unwrap();
         assert_eq!(c.provider.id, "ironwire");
         assert!(c.provider.loopback().is_some());
+        // Copying the example and adding --memory must not trip a pinned ceiling.
+        let mut l = c.limits;
+        l.resize(None, Some(8192)).unwrap();
+        assert_eq!(l.host_rss_ceiling_mib, 8192 + RSS_HEADROOM_MIB);
     }
 }

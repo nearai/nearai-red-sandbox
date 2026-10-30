@@ -186,8 +186,9 @@ adds to `network.allow`, and `--no-network` clears it.
 | `image` | the pinned guest image | Guest image, pinned by digest (`name@sha256:...`). |
 | `opencode`, `mvmctl`, `pluginDir` | installed copies | Paths to other builds, for development. |
 
-[`opencode/session.example.json`](opencode/session.example.json) lists every
-limit at its default. The [launcher and inference setup](opencode/README.md)
+[`opencode/session.example.json`](opencode/session.example.json) lists the
+limits at their defaults. It leaves out `hostRssCeilingMiB` so the ceiling
+keeps following memory; set it only to pin a ceiling of your own. The [launcher and inference setup](opencode/README.md)
 covers what each part does in more depth.
 
 ## <img src="docs/assets/ramp.svg" alt="" height="16"> Network access
