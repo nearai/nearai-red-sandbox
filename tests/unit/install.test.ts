@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
 import { spawnSync } from "node:child_process"
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { appendFileSync, chmodSync, statSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 
@@ -114,6 +114,29 @@ test("a missing prefix directory is created", () => {
   const r = install("0.1.0")
   expect(r.status).toBe(0)
   expect(existsSync(join(prefix, "bin/rts"))).toBe(true)
+})
+
+const mode = (path: string) => (statSync(path).mode & 0o777).toString(8)
+
+// scripts/build-patched-mvm-supervisor.sh refuses ~/.local/share/nearai-red-sandbox
+// unless it is mode 700, so the installer must not create it with the umask default.
+test("directories the installer creates on the supervisor's path are private", () => {
+  prefix = join(dir, "fresh", ".local")
+  const r = install("0.1.0")
+  expect(r.status).toBe(0)
+  for (const d of [prefix, join(prefix, "share"), join(prefix, "share/nearai-red-sandbox")]) expect([d, mode(d)]).toEqual([d, "700"])
+  expect(mode(join(dir, "fresh"))).toBe("700")
+})
+
+test("existing directories keep their modes", () => {
+  mkdirSync(join(prefix, "share"), { recursive: true })
+  chmodSync(prefix, 0o755)
+  chmodSync(join(prefix, "share"), 0o755)
+  const r = install("0.1.0")
+  expect(r.status).toBe(0)
+  expect(mode(prefix)).toBe("755")
+  expect(mode(join(prefix, "share"))).toBe("755")
+  expect(mode(join(prefix, "share/nearai-red-sandbox"))).toBe("700")
 })
 
 test("a tampered tarball is refused before unpacking", () => {

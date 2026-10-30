@@ -85,7 +85,11 @@ main() {
     printf 'rts install: provenance not checked: install the GitHub CLI (gh) to verify the release attestation\n' >&2
   fi
 
-  if ! mkdir -p -- "$prefix"; then
+  # Directories created here, the prefix chain included, are 0700:
+  # scripts/build-patched-mvm-supervisor.sh refuses
+  # ~/.local/share/nearai-red-sandbox unless it is mode 700. Directories that
+  # already exist keep their modes.
+  if ! (umask 077 && mkdir -p -- "$prefix/share/nearai-red-sandbox"); then
     die "could not create the install prefix $prefix; create it or set RTS_INSTALL_PREFIX"
   fi
   # Same filesystem as the prefix, so the moves below are renames.
