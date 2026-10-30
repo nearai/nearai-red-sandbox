@@ -8,6 +8,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -15,7 +16,8 @@ use std::time::Duration;
 use rts::config::DEFAULT_IMAGE;
 use rts::mvm::{MvmSandbox, Runner, SpawnRunner};
 use rts::protocol::random_hex;
-use rts::sandbox::{CreateSpec, ExecOptions, Sandbox};
+use rts::network::{Plan, SystemResolver};
+use rts::sandbox::{CreateSpec, Egress, ExecOptions, Sandbox};
 use rts::session::{Host, RealHost, OPENCODE_VERSION, SUPERVISOR_FIX_VERSION, initialize_guest_storage, mvm_environment, supervisor_path};
 use serde_json::{Value, json};
 
@@ -119,6 +121,28 @@ pub fn fresh_machine(h: &Harness) -> Machine {
     m
 }
 
+/// The session limit a containment network machine is created with. One
+/// hour is the shortest mvm `--ttl` rts asks for, so a machine left behind
+/// by an aborted run stops on its own soon after.
+pub const NETWORK_TEST_HOURS: u32 = 1;
+
+/// A machine with egress to `allow`, created the way a session creates
+/// one: the entries go through `network::plan` with the host's resolver,
+/// `machine create` gets one `--allow-host` per entry, and the supervised
+/// `machine run` writes to `mvm-attach.log` in the returned temp dir.
+pub fn fresh_network_machine(h: &Harness, allow: &[&str]) -> (Machine, Plan, PathBuf) {
+    let written: Vec<String> = allow.iter().map(|a| a.to_string()).collect();
+    let plan = rts::network::plan(&written, &SystemResolver).expect("allowlist resolves and validates");
+    let hosts = plan.allow_hosts();
+    let dir = tempdir("net");
+    let name = format!("rts-{}", random_hex(6));
+    let m = Machine(MvmSandbox::new(&name, Box::new(h.run.clone())).unwrap());
+    let egress = Egress { allow_hosts: &hosts, attach_log: &dir.join("mvm-attach.log"), session_hours: NETWORK_TEST_HOURS };
+    m.create(&CreateSpec { name: &name, image: &h.image, memory_mib: 512, cpus: 1, egress: Some(egress) }).expect("network machine create");
+    initialize_guest_storage(&m.0).expect("guest input/output storage");
+    (m, plan, dir)
+}
+
 pub fn tempdir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("rts-{tag}-{}", random_hex(6)));
     fs::create_dir_all(&d).unwrap();
@@ -127,7 +151,13 @@ pub fn tempdir(tag: &str) -> PathBuf {
 
 /// The options `rts tool` needs for a machine, as the launcher writes them.
 pub fn bridge_options(h: &Harness, machine: &str, state_dir: &Path) -> Value {
-    json!({
+    bridge_options_with(h, machine, state_dir, false)
+}
+
+/// As [`bridge_options`], with `"proxy": true` for a network session, as
+/// the launcher writes it only when the session has an allowlist.
+pub fn bridge_options_with(h: &Harness, machine: &str, state_dir: &Path, proxy: bool) -> Value {
+    let mut o = json!({
         "machine": machine,
         "mvmctl": h.mvmctl,
         "emptyGitConfig": h.empty_git_config,
@@ -135,7 +165,11 @@ pub fn bridge_options(h: &Harness, machine: &str, state_dir: &Path) -> Value {
         "timeoutMs": 120_000,
         "maxOutputBytes": 65_536,
         "mvmHome": std::env::var("HOME").unwrap_or_default(),
-    })
+    });
+    if proxy {
+        o["proxy"] = json!(true);
+    }
+    o
 }
 
 /// One call through the built `rts tool` binary: exactly what the plugin shim spawns.
@@ -155,11 +189,19 @@ pub fn rts_tool(options: &Value, tool: &str, input: Value) -> (i32, String, Stri
 /// A stand-in for IronWire's OpenAI façade that only answers /models, so a
 /// launcher preflight passes without inference.
 pub fn fake_ironwire(model: &str) -> String {
+    fake_ironwire_counted(model).0
+}
+
+/// [`fake_ironwire`], plus how many connections it has accepted.
+pub fn fake_ironwire_counted(model: &str) -> (String, Arc<AtomicUsize>) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     let body = json!({ "object": "list", "data": [{ "id": model, "object": "model" }] }).to_string();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
     thread::spawn(move || {
         for s in l.incoming().flatten() {
+            counter.fetch_add(1, Ordering::SeqCst);
             let mut s = s;
             let (mut req, mut buf) = (vec![], [0u8; 1024]);
             while !req.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -171,7 +213,7 @@ pub fn fake_ironwire(model: &str) -> String {
             let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
         }
     });
-    format!("http://127.0.0.1:{port}/openai/v1")
+    (format!("http://127.0.0.1:{port}/openai/v1"), accepted)
 }
 
 #[cfg(test)]
