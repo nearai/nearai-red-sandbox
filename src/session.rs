@@ -719,9 +719,46 @@ fn stopped(deps: &Deps, log: &Logger) -> Option<String> {
     stop_reason(deps.fatal.as_deref()).inspect(|why| log.log(&format!("stopping: {why}")))
 }
 
-fn write_session_record(p: &SessionPaths, plan: &crate::network::Plan, probes: &[crate::network::Probe]) -> Result<(), String> {
-    let text = serde_json::to_string_pretty(&json!({ "network": plan.record(probes) })).unwrap() + "\n";
+type Pinned = std::collections::BTreeMap<String, std::collections::BTreeSet<std::net::IpAddr>>;
+
+fn write_session_record(p: &SessionPaths, plan: &crate::network::Plan, probes: &[crate::network::Probe], pinned: &Pinned) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(&json!({ "network": plan.record(probes, pinned) })).unwrap() + "\n";
     write_private(&p.session_record, text.as_bytes()).map_err(|e| format!("writing {}: {e}", p.session_record.display()))
+}
+
+/// How long to wait for mvm's audit log to show a pin for every name.
+const PIN_WAIT: Duration = Duration::from_secs(10);
+
+/// Read this VM's pins from mvm's audit log in `audit_dir` until every name
+/// in `plan` has one, or until [`PIN_WAIT`] has passed on `clock`. A plan
+/// with no names reads nothing. A missing log counts as no pins yet, and
+/// ends the session if it is still missing at the deadline; an unreadable
+/// or malformed one ends it at once.
+fn wait_for_pins(plan: &crate::network::Plan, audit_dir: &Path, machine: &str, clock: &Clock) -> Result<Pinned, String> {
+    let names = plan.pinning_names();
+    if names.is_empty() {
+        return Ok(Pinned::new());
+    }
+    let deadline = clock() + PIN_WAIT;
+    let log = audit_dir.join("local.jsonl");
+    loop {
+        let found = log.is_file();
+        let pinned = if found {
+            crate::network::read_pinned(audit_dir, machine).map_err(|e| format!("network-mismatch: {e}"))?
+        } else {
+            Pinned::new()
+        };
+        if names.iter().all(|n| pinned.get(*n).is_some_and(|ips| !ips.is_empty())) {
+            return Ok(pinned);
+        }
+        if clock() >= deadline {
+            if !found {
+                return Err(format!("network-mismatch: mvm audit log never appeared at {}, so its pinned addresses cannot be checked", log.display()));
+            }
+            return Ok(pinned);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// The options opencode passes to the sandbox plugin (plugin/index.ts).
@@ -768,7 +805,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     let root = mvm_root(&deps.env)?;
     crate::network::check_mvm_host(&deps.env, &root)?;
     let plan = crate::network::plan(&cfg.network, deps.resolver.as_ref())?;
-    write_session_record(p, &plan, &[])?;
+    write_session_record(p, &plan, &[], &Pinned::new())?;
     sweep_orphans(run, &mut |m| live.log.log(m))?;
     if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)) {
         return Err(why);
@@ -792,7 +829,12 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         live.network_pids = network_children(live.host, attach)?;
     }
     let probes = crate::network::run_probes(live.sb, &plan)?;
-    write_session_record(p, &plan, &probes)?;
+    // mvm resolved each name again when its endpoint started. Its audit log
+    // shows those pins only once the guest has used a name, which the probes
+    // just did, so the check runs here: before anything else runs in the guest.
+    let pinned = wait_for_pins(&plan, &root.join("audit"), &p.machine, &deps.clock)?;
+    write_session_record(p, &plan, &probes, &pinned)?;
+    crate::network::check_pinned(&plan, &pinned)?;
     live.log.log(&plan.startup_line());
     initialize_guest_storage(live.sb)?;
     if let Some(inputs) = &cfg.inputs_dir {
@@ -1729,7 +1771,7 @@ mod tests {
         let audit_exists = s.session.join("network.jsonl").is_file();
         fs::remove_dir_all(&s.d).unwrap();
         let record: Value = serde_json::from_str(&record.unwrap()).unwrap();
-        assert_eq!(record, json!({"network": {"allow": [], "expanded": [], "resolved": {}, "probes": [{"target": "1.1.1.1:443", "result": "unreachable"}]}}));
+        assert_eq!(record, json!({"network": {"allow": [], "expanded": [], "resolved": {}, "pinned": {}, "probes": [{"target": "1.1.1.1:443", "result": "unreachable"}]}}));
         assert!(log.contains("network: none"), "{log}");
         assert!(calls.iter().any(|c| c == "machine start rts-0123456789ab"), "{calls:?}");
         assert!(!calls.iter().any(|c| c.contains("machine run") || c.contains("--allow-host")), "{calls:?}");
@@ -1808,6 +1850,99 @@ mod tests {
         assert!(elapsed < Duration::from_millis(s.cfg.limits.handshake_ms / 2), "took {elapsed:?}");
         assert!(log.contains("network-lost") && !log.contains("plugin ready"), "{log}");
         assert!(log.contains("teardown: opencode stopped"), "{log}");
+        assert!(calls.iter().any(|c| c.starts_with("machine rm rts-0123456789ab")), "{calls:?}");
+    }
+
+    /// Every name resolves to 198.51.100.7.
+    struct ResolvesTo7;
+    impl crate::network::Resolver for ResolvesTo7 {
+        fn resolve(&self, _: &str) -> io::Result<Vec<std::net::IpAddr>> {
+            Ok(vec!["198.51.100.7".parse().unwrap()])
+        }
+    }
+
+    const TARGET: &str = "api.example-target.com";
+
+    /// A network session for TARGET whose mvm audit log holds `lines`.
+    fn pinned_session(name: &str, lines: &[String]) -> NetSession {
+        let s = net_session(name, &[TARGET]);
+        fs::write(s.mvm.join("audit/local.jsonl"), lines.join("\n") + "\n").unwrap();
+        s
+    }
+
+    fn pin_flow(vm: &str, ips: &str) -> String {
+        format!(r#"{{"entry":{{"event":"host.flow.allowed","labels":{{"vm_name":"{vm}","target":"{TARGET}:443","resolved_ips":"{ips}"}}}}}}"#)
+    }
+
+    #[test]
+    fn matching_pinned_ips_are_recorded_and_the_session_proceeds() {
+        let s = pinned_session("net-pin-ok", &[pin_flow("rts-0123456789ab", "198.51.100.7")]);
+        let f = Fake::new(net_reply("RTS_PROBE connected", || {}));
+        assert_eq!(run_session(&s.cfg, net_deps(&f, &s.mvm, Arc::new(ResolvesTo7), &[])), 1);
+        let log = read_log(&s);
+        let record = fs::read_to_string(s.session.join("session.json"));
+        fs::remove_dir_all(&s.d).unwrap();
+        assert!(!log.contains("network-mismatch"), "{log}");
+        assert!(log.contains("network: 1 host allowed (api.example-target.com)"), "{log}");
+        assert!(log.contains("sampling host RSS"), "{log}");
+        let record: Value = serde_json::from_str(&record.unwrap()).unwrap();
+        assert_eq!(record["network"]["resolved"], json!({ TARGET: ["198.51.100.7"] }));
+        assert_eq!(record["network"]["pinned"], json!({ TARGET: ["198.51.100.7"] }));
+    }
+
+    #[test]
+    fn a_pinned_lan_ip_ends_the_session_with_network_mismatch_and_still_exports_and_removes() {
+        let s = pinned_session(
+            "net-pin-lan",
+            &[pin_flow("rts-0123456789ab", "192.168.1.10"), pin_flow("rts-ffffffffffff", "198.51.100.7")],
+        );
+        let f = Fake::new(net_reply("RTS_PROBE connected", || {}));
+        assert_eq!(run_session(&s.cfg, net_deps(&f, &s.mvm, Arc::new(ResolvesTo7), &[])), 1);
+        let (calls, log) = (f.calls(), read_log(&s));
+        let record = fs::read_to_string(s.session.join("session.json"));
+        fs::remove_dir_all(&s.d).unwrap();
+        assert!(log.contains("network-mismatch") && log.contains("192.168.1.10") && log.contains(TARGET), "{log}");
+        assert!(!log.contains("network: 1 host allowed") && !log.contains("sampling host RSS"), "{log}");
+        assert!(log.contains("teardown: removed"), "{log}");
+        assert!(calls.iter().any(|c| c.contains("echo NONE")), "no export: {calls:?}");
+        assert!(calls.iter().any(|c| c.starts_with("machine rm rts-0123456789ab")), "{calls:?}");
+        let record: Value = serde_json::from_str(&record.unwrap()).unwrap();
+        assert_eq!(record["network"]["pinned"], json!({ TARGET: ["192.168.1.10"] }));
+    }
+
+    #[test]
+    fn a_name_mvm_never_pinned_ends_the_session_with_network_mismatch_after_the_wait() {
+        let s = pinned_session("net-pin-none", &[OTHER_FLOW.to_string()]);
+        let f = Fake::new(net_reply("RTS_PROBE connected", || {}));
+        // Each read of the clock is one second later, so the 10 s wait ends in a few polls.
+        let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let start = SystemTime::now();
+        let mut deps = net_deps(&f, &s.mvm, Arc::new(ResolvesTo7), &[]);
+        deps.clock = Arc::new(move || start + Duration::from_secs(ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+        let begun = Instant::now();
+        assert_eq!(run_session(&s.cfg, deps), 1);
+        let elapsed = begun.elapsed();
+        let (calls, log) = (f.calls(), read_log(&s));
+        fs::remove_dir_all(&s.d).unwrap();
+        assert!(elapsed < Duration::from_secs(8), "took {elapsed:?}");
+        assert!(log.contains("network-mismatch") && log.contains("no pinned address") && log.contains(TARGET), "{log}");
+        assert!(!log.contains("sampling host RSS"), "{log}");
+        assert!(calls.iter().any(|c| c.starts_with("machine rm rts-0123456789ab")), "{calls:?}");
+    }
+
+    #[test]
+    fn a_missing_mvm_audit_log_ends_the_session_naming_the_log() {
+        let s = pinned_session("net-pin-nolog", &[]);
+        fs::remove_file(s.mvm.join("audit/local.jsonl")).unwrap();
+        let f = Fake::new(net_reply("RTS_PROBE connected", || {}));
+        let ticks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let start = SystemTime::now();
+        let mut deps = net_deps(&f, &s.mvm, Arc::new(ResolvesTo7), &[]);
+        deps.clock = Arc::new(move || start + Duration::from_secs(ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst)));
+        assert_eq!(run_session(&s.cfg, deps), 1);
+        let (calls, log) = (f.calls(), read_log(&s));
+        fs::remove_dir_all(&s.d).unwrap();
+        assert!(log.contains("network-mismatch") && log.contains("audit log never appeared"), "{log}");
         assert!(calls.iter().any(|c| c.starts_with("machine rm rts-0123456789ab")), "{calls:?}");
     }
 

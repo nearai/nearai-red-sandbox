@@ -4,7 +4,7 @@
 //! Only [`plan`] looks a name up, and only through a [`Resolver`]. Every
 //! check fails closed and names the entry as the operator wrote it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
@@ -398,19 +398,30 @@ impl Plan {
         )
     }
 
-    pub fn record(&self, probes: &[Probe]) -> serde_json::Value {
-        let resolved: serde_json::Map<String, serde_json::Value> = self
-            .resolved
+    /// The host names mvm resolves again and pins when its endpoint starts.
+    /// IP-literal entries pin to themselves and need no check.
+    pub fn pinning_names(&self) -> Vec<&str> {
+        self.resolved.keys().map(String::as_str).collect()
+    }
+
+    /// `pinned` is what mvm pinned for this plan's names (see
+    /// [`read_pinned`]), recorded next to what `rts` resolved.
+    pub fn record(&self, probes: &[Probe], pinned: &BTreeMap<String, BTreeSet<IpAddr>>) -> serde_json::Value {
+        fn ips_json<'a>(ips: impl Iterator<Item = &'a IpAddr>) -> serde_json::Value {
+            serde_json::Value::Array(ips.map(|ip| ip.to_string().into()).collect())
+        }
+        let resolved: serde_json::Map<String, serde_json::Value> =
+            self.resolved.iter().map(|(name, ips)| (name.clone(), ips_json(ips.iter()))).collect();
+        let pinned: serde_json::Map<String, serde_json::Value> = pinned
             .iter()
-            .map(|(name, ips)| {
-                let ips = ips.iter().map(|ip| ip.to_string().into()).collect();
-                (name.clone(), serde_json::Value::Array(ips))
-            })
+            .filter(|(name, _)| self.resolved.contains_key(*name))
+            .map(|(name, ips)| (name.clone(), ips_json(ips.iter())))
             .collect();
         serde_json::json!({
             "allow": self.written,
             "expanded": self.entries.iter().map(Entry::display).collect::<Vec<_>>(),
             "resolved": resolved,
+            "pinned": pinned,
             "probes": probes
                 .iter()
                 .map(|p| serde_json::json!({"target": p.target, "result": p.result}))
@@ -611,26 +622,10 @@ const AUDIT_PREFIXES: [&str; 4] = ["host.flow.", "dns.", "icmp.", "host.route."]
 /// [`AUDIT_PREFIXES`]; unparseable lines are skipped. mvm's files are only
 /// ever opened for reading. `out` is created 0600 and truncated.
 pub fn extract_audit(audit_dir: &std::path::Path, vm_name: &str, out: &std::path::Path) -> Result<usize, String> {
-    use std::io::{BufRead, Write};
+    use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    let current = audit_dir.join("local.jsonl");
-    if !audit_dir.is_dir() || !current.is_file() {
-        return Err(format!("mvm audit log not found at {}", current.display()));
-    }
-    let read_err = |p: &std::path::Path, e: io::Error| format!("reading mvm audit log {}: {e}", p.display());
-    let mut segments: Vec<std::path::PathBuf> = Vec::new();
-    for ent in std::fs::read_dir(audit_dir).map_err(|e| read_err(audit_dir, e))? {
-        let ent = ent.map_err(|e| read_err(audit_dir, e))?;
-        let name = ent.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.starts_with("local.seg-") && name.ends_with(".jsonl") {
-            segments.push(ent.path());
-        }
-    }
-    segments.sort();
-    segments.push(current);
-
+    let segments = audit_sources(audit_dir)?;
     let write_err = |e: io::Error| format!("writing {}: {e}", out.display());
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -643,23 +638,138 @@ pub fn extract_audit(audit_dir: &std::path::Path, vm_name: &str, out: &std::path
     file.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(write_err)?;
     let mut w = io::BufWriter::new(file);
     let mut kept = 0;
-    for src in &segments {
-        let mut r = io::BufReader::new(std::fs::File::open(src).map_err(|e| read_err(src, e))?);
+    for_each_audit_line(&segments, &mut |line| {
+        if audit_line_matches(line, vm_name) {
+            w.write_all(line).and_then(|()| w.write_all(b"\n")).map_err(write_err)?;
+            kept += 1;
+        }
+        Ok(())
+    })?;
+    w.flush().map_err(write_err)?;
+    Ok(kept)
+}
+
+fn audit_read_err(p: &std::path::Path, e: io::Error) -> String {
+    format!("reading mvm audit log {}: {e}", p.display())
+}
+
+/// mvm's audit files in `audit_dir`, oldest first: every
+/// `local.seg-*.jsonl`, sorted by name, then `local.jsonl`.
+fn audit_sources(audit_dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    let current = audit_dir.join("local.jsonl");
+    if !audit_dir.is_dir() || !current.is_file() {
+        return Err(format!("mvm audit log not found at {}", current.display()));
+    }
+    let mut segments: Vec<std::path::PathBuf> = Vec::new();
+    for ent in std::fs::read_dir(audit_dir).map_err(|e| audit_read_err(audit_dir, e))? {
+        let ent = ent.map_err(|e| audit_read_err(audit_dir, e))?;
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("local.seg-") && name.ends_with(".jsonl") {
+            segments.push(ent.path());
+        }
+    }
+    segments.sort();
+    segments.push(current);
+    Ok(segments)
+}
+
+/// Call `f` with each line of `sources`, without its newline. mvm's files
+/// are only ever opened for reading.
+fn for_each_audit_line(
+    sources: &[std::path::PathBuf],
+    f: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
+    use std::io::BufRead;
+    for src in sources {
+        let mut r = io::BufReader::new(std::fs::File::open(src).map_err(|e| audit_read_err(src, e))?);
         let mut buf = Vec::new();
         loop {
             buf.clear();
-            if r.read_until(b'\n', &mut buf).map_err(|e| read_err(src, e))? == 0 {
+            if r.read_until(b'\n', &mut buf).map_err(|e| audit_read_err(src, e))? == 0 {
                 break;
             }
-            let line = buf.strip_suffix(b"\n").unwrap_or(&buf);
-            if audit_line_matches(line, vm_name) {
-                w.write_all(line).and_then(|()| w.write_all(b"\n")).map_err(write_err)?;
-                kept += 1;
+            f(buf.strip_suffix(b"\n").unwrap_or(&buf))?;
+        }
+    }
+    Ok(())
+}
+
+/// The IPs mvm pinned for each host name, as this VM's audit entries show
+/// them: `dns.resolved` keyed by `labels.qname`, and `host.flow.allowed`
+/// keyed by the host half of `labels.target`, each with
+/// `labels.resolved_ips` (comma-separated, as mvm v0.22.0 writes it, or a
+/// JSON array). Names are lowercased without a trailing dot; answers for
+/// one name are merged. A line for this VM whose `resolved_ips` does not
+/// parse fails the read. Field names are from the research notes and are
+/// confirmed against a real run in Task 10.
+pub fn read_pinned(audit_dir: &std::path::Path, vm_name: &str) -> Result<BTreeMap<String, BTreeSet<IpAddr>>, String> {
+    let sources = audit_sources(audit_dir)?;
+    let mut out: BTreeMap<String, BTreeSet<IpAddr>> = BTreeMap::new();
+    for_each_audit_line(&sources, &mut |line| {
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+            return Ok(());
+        };
+        let labels = &v["entry"]["labels"];
+        if labels["vm_name"].as_str() != Some(vm_name) {
+            return Ok(());
+        }
+        let name = match v["entry"]["event"].as_str() {
+            Some("dns.resolved") => labels["qname"].as_str().map(str::to_string),
+            Some("host.flow.allowed") => labels["target"].as_str().and_then(target_host),
+            _ => None,
+        };
+        let Some(name) = name else { return Ok(()) };
+        let name = name.trim_end_matches('.').to_ascii_lowercase();
+        let raw: Vec<String> = match &labels["resolved_ips"] {
+            serde_json::Value::String(s) => s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
+            serde_json::Value::Array(a) => a.iter().map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string())).collect(),
+            other => return Err(format!("mvm audit entry for {name}: resolved_ips is not a list ({other})")),
+        };
+        let set = out.entry(name.clone()).or_default();
+        for ip in raw {
+            let parsed = ip
+                .parse::<IpAddr>()
+                .map_err(|_| format!("mvm audit entry for {name}: pinned address {ip:?} is not an IP address"))?;
+            set.insert(parsed);
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// The host half of a flow target: `name:port`, `a.b.c.d:port` or `[v6]:port`.
+fn target_host(target: &str) -> Option<String> {
+    let (host, _port) = target.rsplit_once(':')?;
+    Some(host.trim_start_matches('[').trim_end_matches(']').to_string())
+}
+
+/// Compare what mvm pinned (`pinned`, from [`read_pinned`]) with what `rts`
+/// resolved and validated before boot. Every host name in `plan` needs a
+/// non-empty pinning entry, no pinned IP may be in a refused range, and
+/// every pinned IP must be one `rts` resolved for that name; mvm may pin
+/// fewer. IP-literal entries pin to themselves and pass. Names in `pinned`
+/// that the plan does not hold are ignored.
+pub fn check_pinned(plan: &Plan, pinned: &BTreeMap<String, BTreeSet<IpAddr>>) -> Result<(), String> {
+    for (name, ours) in &plan.resolved {
+        let theirs = match pinned.get(name) {
+            Some(set) if !set.is_empty() => set,
+            _ => return Err(format!("network-mismatch: mvm recorded no pinned address for {name}")),
+        };
+        for ip in theirs {
+            if let Some(range) = refused_range(*ip) {
+                return Err(format!(
+                    "network-mismatch: mvm pinned {ip} for {name}, and {range} addresses are always refused"
+                ));
+            }
+            if !ours.contains(ip) {
+                return Err(format!(
+                    "network-mismatch: mvm pinned {ip} for {name}, which rts did not resolve and validate"
+                ));
             }
         }
     }
-    w.flush().map_err(write_err)?;
-    Ok(kept)
+    Ok(())
 }
 
 fn audit_line_matches(line: &[u8], vm_name: &str) -> bool {
@@ -876,13 +986,17 @@ mod tests {
             &fake(&[("a.example", Ok(vec!["198.51.100.1".parse().unwrap()]))]),
         )
         .unwrap();
-        let r = p.record(&[Probe {
-            target: "a.example:443".into(),
-            result: "connected".into(),
-        }]);
+        let pinned = pins(&[("a.example", &["198.51.100.1"])]);
+        let r = p.record(
+            &[Probe {
+                target: "a.example:443".into(),
+                result: "connected".into(),
+            }],
+            &pinned,
+        );
         assert_eq!(
             r,
-            serde_json::json!({"allow": ["a.example"], "expanded": ["a.example:443"], "resolved": {"a.example": ["198.51.100.1"]}, "probes": [{"target": "a.example:443", "result": "connected"}]})
+            serde_json::json!({"allow": ["a.example"], "expanded": ["a.example:443"], "resolved": {"a.example": ["198.51.100.1"]}, "pinned": {"a.example": ["198.51.100.1"]}, "probes": [{"target": "a.example:443", "result": "connected"}]})
         );
     }
 
@@ -1228,5 +1342,138 @@ mod tests {
         assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o600);
         assert!(extract_audit(&d.join("missing"), me, &out).is_err());
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    fn pins(v: &[(&str, &[&str])]) -> BTreeMap<String, BTreeSet<IpAddr>> {
+        v.iter()
+            .map(|(n, ips)| (n.to_string(), ips.iter().map(|ip| ip.parse().unwrap()).collect()))
+            .collect()
+    }
+
+    fn two_ip_plan() -> Plan {
+        plan(
+            &s(&["a.example", "198.51.100.9:8443"]),
+            &fake(&[(
+                "a.example",
+                Ok(vec!["198.51.100.1".parse().unwrap(), "2001:db8::1".parse().unwrap()]),
+            )]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn identical_pinned_sets_pass() {
+        let p = two_ip_plan();
+        check_pinned(&p, &pins(&[("a.example", &["198.51.100.1", "2001:db8::1"])])).unwrap();
+    }
+
+    #[test]
+    fn a_subset_of_the_validated_ips_passes() {
+        let p = two_ip_plan();
+        check_pinned(&p, &pins(&[("a.example", &["198.51.100.1"])])).unwrap();
+    }
+
+    #[test]
+    fn a_pinned_ip_rts_did_not_validate_fails_naming_host_and_ip() {
+        let p = two_ip_plan();
+        let e = check_pinned(&p, &pins(&[("a.example", &["198.51.100.1", "203.0.113.5"])])).unwrap_err();
+        assert!(e.starts_with("network-mismatch: "), "{e}");
+        assert!(e.contains("a.example") && e.contains("203.0.113.5"), "{e}");
+    }
+
+    #[test]
+    fn a_pinned_lan_ip_for_a_public_name_fails() {
+        let p = two_ip_plan();
+        let e = check_pinned(&p, &pins(&[("a.example", &["192.168.1.10"])])).unwrap_err();
+        assert!(e.starts_with("network-mismatch: "), "{e}");
+        assert!(e.contains("a.example") && e.contains("192.168.1.10"), "{e}");
+    }
+
+    #[test]
+    fn a_pinned_ip_in_a_refused_range_fails_even_if_rts_resolved_it() {
+        // rts keeps a name whose answers are only partly refused; mvm must not pin those.
+        let p = plan(
+            &s(&["mixed.example"]),
+            &fake(&[(
+                "mixed.example",
+                Ok(vec!["198.51.100.1".parse().unwrap(), "127.0.0.1".parse().unwrap()]),
+            )]),
+        )
+        .unwrap();
+        let e = check_pinned(&p, &pins(&[("mixed.example", &["127.0.0.1"])])).unwrap_err();
+        assert!(e.contains("mixed.example") && e.contains("127.0.0.1") && e.contains("loopback"), "{e}");
+    }
+
+    #[test]
+    fn a_name_with_no_pinning_entry_fails() {
+        let p = two_ip_plan();
+        let e = check_pinned(&p, &pins(&[])).unwrap_err();
+        assert!(e.starts_with("network-mismatch: ") && e.contains("a.example"), "{e}");
+        let e = check_pinned(&p, &pins(&[("a.example", &[])])).unwrap_err();
+        assert!(e.contains("a.example"), "{e}");
+    }
+
+    #[test]
+    fn ip_literal_entries_pass_trivially() {
+        let p = plan(&s(&["198.51.100.9:8443", "[2001:db8::9]:443"]), &fake(&[])).unwrap();
+        check_pinned(&p, &pins(&[])).unwrap();
+        assert!(p.pinning_names().is_empty());
+    }
+
+    fn audit_dir(tag: &str, lines: &[&str]) -> std::path::PathBuf {
+        let d = crate::testutil::tempdir(tag);
+        std::fs::write(d.join("local.jsonl"), lines.join("\n") + "\n").unwrap();
+        d
+    }
+
+    #[test]
+    fn pinned_ips_are_read_from_dns_and_flow_events_for_this_vm_only() {
+        let d = audit_dir(
+            "pinned-read",
+            &[
+                r#"{"entry":{"event":"dns.resolved","labels":{"vm_name":"rts-a","qname":"A.Example.","qtype":"A","resolved_ips":"198.51.100.1"}}}"#,
+                r#"{"entry":{"event":"host.flow.allowed","labels":{"vm_name":"rts-a","target":"a.example:443","resolved_ips":"198.51.100.1,2001:db8::1"}}}"#,
+                r#"{"entry":{"event":"host.flow.allowed","labels":{"vm_name":"rts-a","target":"b.example:443","resolved_ips":["198.51.100.2"]}}}"#,
+                r#"{"entry":{"event":"host.flow.allowed","labels":{"vm_name":"rts-ab","target":"c.example:443","resolved_ips":"198.51.100.3"}}}"#,
+                r#"{"entry":{"event":"host.flow.denied","labels":{"vm_name":"rts-a","target":"d.example:443","reason":"policy_denied"}}}"#,
+                r#"not json"#,
+            ],
+        );
+        let got = read_pinned(&d, "rts-a");
+        std::fs::remove_dir_all(&d).unwrap();
+        assert_eq!(
+            got.unwrap(),
+            pins(&[("a.example", &["198.51.100.1", "2001:db8::1"]), ("b.example", &["198.51.100.2"])])
+        );
+    }
+
+    #[test]
+    fn an_unparseable_pinned_ip_fails_the_read() {
+        let d = audit_dir(
+            "pinned-bad",
+            &[r#"{"entry":{"event":"dns.resolved","labels":{"vm_name":"rts-a","qname":"a.example","resolved_ips":"198.51.100.1,banana"}}}"#],
+        );
+        let got = read_pinned(&d, "rts-a");
+        std::fs::remove_dir_all(&d).unwrap();
+        let e = got.unwrap_err();
+        assert!(e.contains("a.example") && e.contains("banana"), "{e}");
+    }
+
+    #[test]
+    fn pinned_ips_are_read_across_a_rotated_segment() {
+        let d = audit_dir(
+            "pinned-seg",
+            &[r#"{"entry":{"event":"dns.resolved","labels":{"vm_name":"rts-a","qname":"a.example","resolved_ips":"198.51.100.1"}}}"#],
+        );
+        std::fs::write(
+            d.join("local.seg-0001.jsonl"),
+            r#"{"entry":{"event":"dns.resolved","labels":{"vm_name":"rts-a","qname":"a.example","resolved_ips":"2001:db8::1"}}}"#.to_string() + "\n",
+        )
+        .unwrap();
+        let got = read_pinned(&d, "rts-a");
+        let missing = read_pinned(&d.join("missing"), "rts-a");
+        std::fs::remove_dir_all(&d).unwrap();
+        assert_eq!(got.unwrap(), pins(&[("a.example", &["198.51.100.1", "2001:db8::1"])]));
+        assert!(missing.is_err());
     }
 }
