@@ -273,12 +273,17 @@ Beside it rts writes `cli.json`, the terminal UI's own config:
 ```json
 {
   "terminal": { "title": false },
+  "theme": { "name": "nearai-red" },
   "plugins": [{ "package": "<plugin dir>/branding", "options": { "model": "glm-5.3-flash", "attested": true } }]
 }
 ```
 
 It loads the home-footer plugin in `plugin/branding/` and stops opencode
-retitling the window, which rts titles `NEAR AI Red SandBox`.
+retitling the window, which rts titles `NEAR AI Red SandBox`. It selects the
+`nearai-red` theme, which rts copies from `plugin/branding/theme/nearai-red.json`
+to `<runtime>/xdg/config/opencode/themes/`, where opencode's TUI discovers
+custom themes (`packages/tui/src/theme/discovery.ts`): red accent, sand and
+pewter neutrals, dark and light, on the terminal's own background.
 
 `bridge` is passed to `rts tool` unchanged. `stateDir` holds an exec lock,
 so one exec reaches the machine at a time across tool processes, and an

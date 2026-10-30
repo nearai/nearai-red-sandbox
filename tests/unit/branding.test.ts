@@ -48,3 +48,19 @@ test("the TUI plugin is a separate directory from the server shim", () => {
   // the TUI then auto-loads without options.
   expect(readdirSync(join(ROOT, "plugin")).filter((f) => /^tui(\.|$)/.test(f))).toEqual([])
 })
+
+// Presentation only: tui.tsx draws footerText's exact text, in the splash's
+// muted sand, with the trailing "attested" in NEAR AI Red.
+test("the footer is drawn in sand with attested in red, from footerText's text", () => {
+  const tui = readFileSync(join(ROOT, "plugin/branding/tui.tsx"), "utf8")
+  expect(tui).toContain('const SAND = "#A1977F"')
+  expect(tui).toContain('const RED = "#EB1924"')
+  expect(tui).toContain("const text = footerText(context.options)")
+  expect(tui).toContain('const TAIL = " · attested"')
+  expect(tui).toContain("context.options.attested === true && text.endsWith(TAIL)")
+  expect(tui).toContain("<span style={{ fg: RED }}>attested</span>")
+  // The split pieces join back to the footer text.
+  const text = footerText({ model: "m", attested: true })
+  const TAIL = " · attested"
+  expect(text.slice(0, -TAIL.length) + " · " + "attested").toBe(text)
+})
