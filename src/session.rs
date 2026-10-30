@@ -1837,6 +1837,12 @@ mod tests {
         fs::create_dir_all(mvm.join("audit")).unwrap();
         fs::write(mvm.join("audit/local.jsonl"), format!("{OTHER_FLOW}\n{OUR_FLOW}\n")).unwrap();
         let mut cfg = session_cfg(&d.join("sessions"), &d, serve(MODELS_OK));
+        // An installed plugin carries the branding TUI files; without them
+        // the launcher refuses the session before the code under test runs.
+        fs::create_dir_all(cfg.plugin_dir.join("branding")).unwrap();
+        for f in ["tui.tsx", "footer.ts"] {
+            fs::write(cfg.plugin_dir.join("branding").join(f), "").unwrap();
+        }
         cfg.opencode = "/nonexistent-opencode".into();
         cfg.network = network.iter().map(|s| s.to_string()).collect();
         NetSession { session: d.join("sessions/0123456789ab"), d, mvm, cfg }
