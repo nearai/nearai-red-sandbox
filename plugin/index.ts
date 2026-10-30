@@ -1,4 +1,4 @@
-// opencode V2 plugin (v2.1.4 promise API): replaces the six file and shell
+// opencode V2 plugin (v2.2.2 promise API): replaces the six file and shell
 // tools with sandboxed implementations, removes every other tool, every
 // MCP server and every model that is not an exact ID in the configured
 // provider's allowlist, then proves it loaded by writing the launcher's
@@ -8,7 +8,7 @@
 // thin shim: each sandboxed tool call spawns `rts tool <name>` (the Rust
 // binary that launched the session) and returns its output.
 //
-// No imports from @opencode/*: the shapes used are the v2.1.4 `Context`
+// No imports from @opencode/*: the shapes used are the v2.2.2 `Context`
 // domains `tool`, `mcp` and `model` (packages/plugin/src/promise/*.ts).
 
 import { spawn } from "node:child_process"
@@ -146,7 +146,7 @@ export async function setupWith(ctx: any, makeImpl: (o: PluginOptions) => Record
 
   const kept = listOf(await ctx.model.list()).filter((m: any) => m.providerID === o.provider && m.enabled !== false)
   const keptIds = kept.map((m: any) => String(m.id))
-  // Only extras are fatal here. opencode v2.1.4 loads provider models after
+  // Only extras are fatal here. opencode v2.2.2 loads provider models after
   // plugin setup, so an allowlisted model may not be listed yet; the model
   // transform above still filters anything loaded later, rts checks that
   // every allowlisted model exists upstream before opencode starts, and the

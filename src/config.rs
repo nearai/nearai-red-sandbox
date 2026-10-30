@@ -192,24 +192,29 @@ fn positive<T: Copy + Default + PartialOrd>(v: Option<T>, d: T, k: &str) -> Resu
     }
 }
 
-/// Paths the config leaves out. `repo` is where this checkout lives.
+/// Paths the config leaves out, from `install::defaults`.
 pub struct Defaults {
-    pub repo: PathBuf,
     pub mvmctl: PathBuf,
+    pub plugin_dir: PathBuf,
+    pub opencode: String,
+    pub sessions_dir: PathBuf,
 }
 
 impl Defaults {
+    /// From HOME (empty if unset), RTS_MVMCTL, the install prefix of the
+    /// running binary, and the checkout it was built from.
     pub fn from_env() -> Self {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default();
-        let mvmctl = std::env::var_os("RTS_MVMCTL")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/mvm/v0.22.0/mvmctl"));
-        Self {
-            repo: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
-            mvmctl,
-        }
+        let rts_mvmctl = std::env::var_os("RTS_MVMCTL").map(PathBuf::from);
+        let prefix = crate::install::current_prefix();
+        crate::install::defaults(&crate::install::Lookup {
+            source: Path::new(env!("CARGO_MANIFEST_DIR")),
+            prefix: prefix.as_deref(),
+            home: &home,
+            rts_mvmctl: rts_mvmctl.as_deref(),
+        })
     }
 }
 
@@ -311,13 +316,13 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
         provider,
         limits,
         sessions_dir: path(raw.sessions_dir, "sessionsDir")?
-            .unwrap_or_else(|| d.repo.join("sessions")),
+            .unwrap_or_else(|| d.sessions_dir.clone()),
         opencode: raw
             .opencode
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "opencode".into()),
+            .unwrap_or_else(|| d.opencode.clone()),
         mvmctl: path(raw.mvmctl, "mvmctl")?.unwrap_or_else(|| d.mvmctl.clone()),
-        plugin_dir: path(raw.plugin_dir, "pluginDir")?.unwrap_or_else(|| d.repo.join("plugin")),
+        plugin_dir: path(raw.plugin_dir, "pluginDir")?.unwrap_or_else(|| d.plugin_dir.clone()),
     })
 }
 
@@ -334,8 +339,10 @@ mod tests {
 
     fn d() -> Defaults {
         Defaults {
-            repo: "/repo".into(),
             mvmctl: "/home/op/.local/mvm/v0.22.0/mvmctl".into(),
+            plugin_dir: "/repo/plugin".into(),
+            opencode: "opencode".into(),
+            sessions_dir: "/repo/sessions".into(),
         }
     }
 
@@ -349,6 +356,31 @@ mod tests {
     }
     fn parse(t: &str) -> Result<OperatorConfig, String> {
         parse_config(t, Path::new("/cfg"), &d())
+    }
+
+    #[test]
+    fn config_values_win_over_installed_defaults() {
+        let installed = Defaults {
+            plugin_dir: "/p/plugin".into(),
+            sessions_dir: "/p/sessions".into(),
+            opencode: "/p/opencode".into(),
+            mvmctl: "/p/mvmctl".into(),
+        };
+        let c = parse_config(
+            r#"{ "pluginDir": "pl", "sessionsDir": "s", "opencode": "/oc", "mvmctl": "/m", "provider": { "models": ["m"] } }"#,
+            Path::new("/cfg"),
+            &installed,
+        )
+        .unwrap();
+        assert_eq!(c.plugin_dir, PathBuf::from("/cfg/pl"));
+        assert_eq!(c.sessions_dir, PathBuf::from("/cfg/s"));
+        assert_eq!(c.opencode, "/oc");
+        assert_eq!(c.mvmctl, PathBuf::from("/m"));
+        let c = parse_config("{}", Path::new("/cfg"), &installed).unwrap();
+        assert_eq!(c.plugin_dir, PathBuf::from("/p/plugin"));
+        assert_eq!(c.sessions_dir, PathBuf::from("/p/sessions"));
+        assert_eq!(c.opencode, "/p/opencode");
+        assert_eq!(c.mvmctl, PathBuf::from("/p/mvmctl"));
     }
 
     #[test]

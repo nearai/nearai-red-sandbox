@@ -1,4 +1,4 @@
-//! Containment through real opencode 2.1.4. Plugin-loading checks run
+//! Containment through real opencode 2.2.2. Plugin-loading checks run
 //! `opencode run --standalone --model none/none`: plugins load, then the run
 //! fails at model resolution before any inference request, so no endpoint
 //! or tokens are needed.
@@ -22,6 +22,14 @@ use serde_json::{Value, json};
 use crate::harness::{Harness, bridge_options, fake_ironwire, fresh_machine, limits, mvm, opencode, rts_tool, tempdir};
 
 const ALLOWED_TOOLS: [&str; 7] = ["edit", "glob", "grep", "question", "read", "shell", "write"];
+
+/// Every tool real opencode offers before our plugin's transform runs, as
+/// `opencode_offers_exactly_the_recorded_built_in_tools` measures it.
+const BUILTIN_TOOLS: &[&str] = &[
+    "shell", "read", "write", "edit", "glob", "grep", "question", "patch", "webfetch", "websearch", "skill", "subagent",
+    "opencode_list_mcp_resources", "opencode_read_mcp_resource", "opencode_models", "opencode_session_move",
+    "opencode_session_rename", "opencode_worktree_create", "opencode_worktree_list", "opencode_worktree_remove",
+];
 
 fn plugin_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin")
@@ -57,6 +65,7 @@ fn options(h: &Harness, p: &SessionPaths, machine: &str, nonce: &str) -> Value {
         "readyFile": p.ready_file,
         "auditFile": p.audit_file,
         "provider": "ironwire",
+        "models": provider().models,
         "rts": env!("CARGO_BIN_EXE_rts"),
         "bridge": bridge_options(h, machine, &p.state_dir),
         "debugFile": p.runtime.join("debug.json"),
@@ -154,6 +163,62 @@ fn the_plugin_configured_as_a_file_path_is_skipped_so_no_ready_file_appears() {
     edit_config(&file, |c| c["plugin"][0][0] = json!(plugin_dir().join("index.ts")));
     probe(&oc, &s.p);
     assert!(!ready_holds(&s.p, &nonce));
+}
+
+/// A plugin at `dir` with `index.ts` holding `source`, loaded by its directory.
+fn local_plugin(dir: &Path, name: &str, source: &str) {
+    fs::create_dir(dir).unwrap();
+    fs::write(dir.join("package.json"), json!({ "name": name, "version": "0.0.0", "type": "module", "main": "index.ts", "exports": { ".": "./index.ts" } }).to_string()).unwrap();
+    fs::write(dir.join("index.ts"), source).unwrap();
+}
+
+#[test]
+#[ignore = "real mvm and opencode"]
+fn opencode_offers_exactly_the_recorded_built_in_tools() {
+    let (Some(h), Some(oc)) = (mvm(), opencode()) else { return };
+    let m = fresh_machine(h);
+    let s = session();
+    let out = s.root.join("tools.json");
+    let inventory = s.root.join("inventory-plugin");
+    // Loads before ours, so it sees every tool opencode offers.
+    local_plugin(
+        &inventory,
+        "inventory",
+        &format!(
+            "import {{ writeFileSync }} from \"node:fs\"\nexport default {{ id: \"inventory\", setup: async (ctx) => {{ await ctx.tool.transform((e) => {{ writeFileSync({}, JSON.stringify(e.list().map((t) => t.id ?? t.name))) }}) }} }}\n",
+            json!(out)
+        ),
+    );
+    let nonce = new_nonce();
+    let file = configure(h, &s.p, &m.name, &nonce);
+    edit_config(&file, |c| c["plugin"].as_array_mut().unwrap().insert(0, json!([inventory, {}])));
+    let err = probe(&oc, &s.p);
+    let mut seen: Vec<String> = serde_json::from_str(&fs::read_to_string(&out).unwrap_or_else(|e| panic!("no tools.json ({e}): {err}"))).unwrap();
+    seen.sort();
+    let mut want: Vec<String> = BUILTIN_TOOLS.iter().map(|t| t.to_string()).collect();
+    want.sort();
+    assert_eq!(seen, want, "{err}");
+    assert!(ready_holds(&s.p, &nonce), "{err}");
+}
+
+#[test]
+#[ignore = "real mvm and opencode"]
+fn an_mcp_server_in_the_global_config_never_spawns() {
+    let (Some(h), Some(oc)) = (mvm(), opencode()) else { return };
+    let m = fresh_machine(h);
+    let s = session();
+    let sentinel = s.root.join("mcp-global");
+    let nonce = new_nonce();
+    let file = configure(h, &s.p, &m.name, &nonce);
+    edit_config(&file, |c| {
+        c["mcp"] = json!({ "evil": { "type": "local", "command": ["sh", "-c", format!("touch '{}'; sleep 5", sentinel.display())] } })
+    });
+    let err = probe(&oc, &s.p);
+    thread::sleep(Duration::from_secs(2));
+    assert!(!sentinel.exists());
+    assert!(ready_holds(&s.p, &nonce), "{err}");
+    let debug: Value = serde_json::from_str(&fs::read_to_string(s.p.runtime.join("debug.json")).unwrap()).unwrap();
+    assert_eq!(debug["mcp"], json!([]));
 }
 
 /// The leak check reruns this test with RTS_TEST_LEAK=shell and requires

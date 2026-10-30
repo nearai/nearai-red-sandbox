@@ -1,0 +1,4 @@
+running 236 tests
+test config::tests::defaults_apply ... ok
+
+test result: ok. 235 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.44s

@@ -1,0 +1,24 @@
+running 236 tests
+test config::tests::defaults_apply ... ok
+test copy::tests::a_long_name_is_refused ... FAILED
+test copy::tests::a_symlink_to_a_host_path_is_refused ... FAILED
+test copy::tests::a_hardlink_is_refused ... FAILED
+test copy::tests::copy_out_is_byte_exact_across_slices ... FAILED
+test copy::tests::an_oversized_file_is_refused ... FAILED
+test session::tests::x ... ok
+
+failures:
+
+---- copy::tests::a_long_name_is_refused stdout ----
+assertion failed
+
+failures:
+    copy::tests::a_long_name_is_refused
+    copy::tests::a_symlink_to_a_host_path_is_refused
+    copy::tests::a_hardlink_is_refused
+    copy::tests::copy_out_is_byte_exact_across_slices
+    copy::tests::an_oversized_file_is_refused
+
+test result: FAILED. 230 passed; 5 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.44s
+
+error: test failed, to rerun pass `--lib`

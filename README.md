@@ -16,6 +16,37 @@ credentials stay outside the guest.
 
 <p align="center"><img src="docs/assets/dunes.svg" width="672" alt=""></p>
 
+## <img src="docs/assets/ramp.svg" alt="" height="16"> Install
+
+macOS on Apple silicon only. Either one-liner places a signed, notarized
+`rts` and the patched mvm supervisor from a GitHub release:
+
+```sh
+curl -fsSL https://github.com/nearai/nearai-red-sandbox/releases/latest/download/install.sh | bash
+```
+
+```sh
+brew install nearai/tap/rts
+rts setup
+```
+
+The curl installer installs under `~/.local` (`RTS_INSTALL_PREFIX`
+overrides), checks the tarball against the release's `SHA256SUMS` and, when
+`gh` is installed, its build-provenance attestation, then runs `rts setup`.
+Homebrew cannot write to your home directory during install, so run
+`rts setup` once yourself.
+
+`rts setup` downloads mvm v0.22.0 to `~/.local/mvm/v0.22.0/` and opencode
+v2.2.2 to `~/.local/share/nearai-red-sandbox/opencode/2.2.2/`, each pinned by
+sha256 and checked before it is unpacked; then it runs `mvmctl env sign`,
+`mvmctl doctor`, the supervisor probes and `opencode --version`, and pulls
+the pinned guest image. It never replaces an existing copy that fails
+verification; it names the path to remove instead. `rts setup --check`
+re-checks everything and downloads and changes nothing; `rts setup --check
+--offline` checks only the installed plugin, supervisor and code signatures,
+without mvmctl or the network. See the [launcher guide](opencode/README.md#installed-layout)
+for where an installed `rts` finds its files.
+
 ## <img src="docs/assets/ramp.svg" alt="" height="16"> Quick start
 
 ```console
@@ -38,7 +69,7 @@ flowchart TB
 
     subgraph host["Host (macOS) - holds credentials, never runs tool calls"]
         launch["rts launch<br/>preflight, attestation, VM lifecycle"]
-        opencode["opencode v2.1.4<br/>standalone, isolated config"]
+        opencode["opencode v2.2.2<br/>standalone, isolated config"]
         plugin["sandbox plugin<br/>7-tool and exact-ID model allowlists"]
         tool["rts tool<br/>shell, read, write, edit, glob, grep"]
         ironwire["embedded IronWire<br/>holds the NEAR AI key"]
@@ -88,9 +119,9 @@ and can only return files through `/out`.
 
 ## <img src="docs/assets/ramp.svg" alt="" height="16"> Project status
 
-The implementation is under development. On macOS, build the patched mvm
-supervisor described in the [setup guide](docs/mvm-supervisor.md) before
-launching. The pinned guest image is in a public Google Artifact Registry
+The implementation is under development. Source builds on macOS need the
+patched mvm supervisor described in the [setup guide](docs/mvm-supervisor.md)
+before launching; releases ship it. The pinned guest image is in a public Google Artifact Registry
 repository; see the launcher guide for access and setup.
 
 - [Design](docs/specs/2026-10-27-sandboxed-opencode-design.md)

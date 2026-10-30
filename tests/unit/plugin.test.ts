@@ -5,21 +5,21 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin, { ALLOWED_TOOLS, makePluginTools, setupWith, type PluginOptions } from "../../plugin/index.ts"
 
-// The 20 v2.1.4 tool IDs from probe 2 (the spec names the families; the
-// exact session, MCP-resource and remaining IDs here are stand-ins).
-const V214_TOOLS = [
-  "shell", "read", "write", "edit", "glob", "grep", "question", "patch", "webfetch", "websearch",
-  "opencode_worktree_create", "opencode_worktree_remove", "subagent", "skill",
-  "opencode_session_list", "opencode_session_read", "opencode_session_fork", "opencode_models",
-  "mcp_resource_list", "mcp_resource_read",
+// The 20 tool IDs opencode v2.2.2 offers before the plugin's transform, as
+// measured by tests/contain/session.rs
+// opencode_offers_exactly_the_recorded_built_in_tools (unchanged from the previous pin).
+const BUILTIN_TOOLS = [
+  "shell", "read", "write", "edit", "glob", "grep", "question", "patch", "webfetch", "websearch", "skill", "subagent",
+  "opencode_list_mcp_resources", "opencode_read_mcp_resource", "opencode_models", "opencode_session_move",
+  "opencode_session_rename", "opencode_worktree_create", "opencode_worktree_list", "opencode_worktree_remove",
 ]
 
 type Stubborn = { tool?: string; mcp?: string; model?: string; modelId?: string; modelsNotLoaded?: boolean }
 
-// A fake v2.1.4 plugin Context with just the domains the plugin uses.
+// A fake v2.2.2 plugin Context with just the domains the plugin uses.
 function fakeCtx(options: Record<string, unknown>, stubborn: Stubborn = {}) {
   const tools = new Map<string, any>(
-    V214_TOOLS.map((id) => [id, { id, name: id, description: `orig ${id}`, input: { schemaOf: id }, output: { out: id }, execute: async () => ({ content: `host ${id}` }) }]),
+    BUILTIN_TOOLS.map((id) => [id, { id, name: id, description: `orig ${id}`, input: { schemaOf: id }, output: { out: id }, execute: async () => ({ content: `host ${id}` }) }]),
   )
   const servers = new Map<string, any>([["g", { type: "local" }], ["p", { type: "local" }]])
   // Real opencode loads provider models after plugin setup; modelsNotLoaded
@@ -84,7 +84,7 @@ function fakeCtx(options: Record<string, unknown>, stubborn: Stubborn = {}) {
         cb(mcpEditor)
         return { dispose: async () => {} }
       },
-      // Shaped like the v2.1.4 client: { location, data: McpServer[] }
+      // Shaped like the v2.2.2 client: { location, data: McpServer[] }
       list: async () => ({ location: {}, data: [...servers.keys()].map((name) => ({ name, status: { type: "connected" } })) }),
     },
     model: {
@@ -205,7 +205,7 @@ test("a provider model outside the allowlist that survives makes setup throw", a
   await expect(setupWith(f.ctx, fakeImpl)).rejects.toThrow("model allowlist mismatch: ironwire/other-nearai-model")
   expect(existsSync(options.readyFile as string)).toBe(false)
 })
-// opencode v2.1.4 loads provider models after plugin setup (model.updated
+// opencode v2.2.2 loads provider models after plugin setup (model.updated
 // follows the plugin load), so an allowlisted model may not be listed yet.
 // Presence is checked by rts against IronWire's /models before opencode starts.
 test("an allowlisted model that opencode has not listed yet does not fail setup", async () => {

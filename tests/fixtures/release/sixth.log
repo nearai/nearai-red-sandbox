@@ -1,0 +1,13 @@
+running 236 tests
+test copy::tests::a_long_name_is_refused ... FAILED
+test copy::tests::a_symlink_to_a_host_path_is_refused ... FAILED
+test copy::tests::a_hardlink_is_refused ... FAILED
+test copy::tests::copy_out_is_byte_exact_across_slices ... FAILED
+test copy::tests::an_oversized_file_is_refused ... FAILED
+test session::tests::x ... FAILED
+
+failures:
+    copy::tests::a_long_name_is_refused
+    session::tests::x
+
+test result: FAILED. 229 passed; 6 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.44s

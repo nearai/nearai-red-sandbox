@@ -493,7 +493,7 @@ mod tests {
     /// No VM or credentials: validates the pinned application's interactive
     /// startup through the real sandbox plugin, then exits without a prompt.
     #[test]
-    #[ignore = "requires RTS_OPENCODE pointing to opencode 2.1.4"]
+    #[ignore = "requires RTS_OPENCODE pointing to opencode 2.2.2"]
     fn pinned_opencode_tui_starts_and_handshakes_over_the_gated_pty() {
         use crate::session::{
             opencode_launch, prepare_session_dirs, session_paths, wait_for_ready,
@@ -501,7 +501,7 @@ mod tests {
         };
         use serde_json::json;
         let binary =
-            std::env::var("RTS_OPENCODE").expect("set RTS_OPENCODE to the pinned 2.1.4 binary");
+            std::env::var("RTS_OPENCODE").expect("set RTS_OPENCODE to the pinned 2.2.2 binary");
         let d = tempdir("terminal-opencode");
         let paths = session_paths("0123456789ab", &d.join("sessions"), &d.join("runtime"));
         prepare_session_dirs(&paths).unwrap();
@@ -514,7 +514,7 @@ mod tests {
         };
         write_opencode_config(&paths.config_dir, &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin"), &json!({
             "machine": paths.machine, "nonce": nonce, "readyFile": paths.ready_file,
-            "auditFile": paths.audit_file, "provider": "ironwire", "rts": "/nonexistent-rts-no-tools-called",
+            "auditFile": paths.audit_file, "provider": "ironwire", "models": provider.models, "rts": "/nonexistent-rts-no-tools-called",
             "bridge": { "machine": paths.machine }, "debugFile": paths.runtime.join("debug.json"),
         }), &provider).unwrap();
         let launch = opencode_launch(
@@ -539,7 +539,7 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&version.stdout)
                 .split_whitespace()
-                .any(|part| part.trim_start_matches('v') == "2.1.4")
+                .any(|part| part.trim_start_matches('v') == "2.2.2")
         );
         let (reader, mut writer) = UnixStream::pair().unwrap();
         let output_file = File::create(paths.runtime.join("terminal-output")).unwrap();
