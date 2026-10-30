@@ -639,6 +639,19 @@ fn stopped(deps: &Deps, log: &Logger) -> Option<String> {
 
 /// The options opencode passes to the sandbox plugin (plugin/index.ts).
 pub fn plugin_options(p: &SessionPaths, cfg: &OperatorConfig, rts: &Path, nonce: &str, operator_home: &str) -> Value {
+    let mut bridge = json!({
+        "machine": p.machine,
+        "mvmctl": cfg.mvmctl,
+        "emptyGitConfig": p.empty_git_config,
+        "stateDir": p.state_dir,
+        "timeoutMs": cfg.limits.tool_timeout_ms,
+        "maxOutputBytes": cfg.limits.max_output_bytes,
+        "mvmHome": operator_home,
+    });
+    // Only a network session carries the key, so a no-network bridge is unchanged.
+    if !cfg.network.is_empty() {
+        bridge["proxy"] = json!(true);
+    }
     json!({
         "machine": p.machine,
         "nonce": nonce,
@@ -647,15 +660,7 @@ pub fn plugin_options(p: &SessionPaths, cfg: &OperatorConfig, rts: &Path, nonce:
         "provider": cfg.provider.id,
         "models": cfg.provider.models,
         "rts": rts,
-        "bridge": {
-            "machine": p.machine,
-            "mvmctl": cfg.mvmctl,
-            "emptyGitConfig": p.empty_git_config,
-            "stateDir": p.state_dir,
-            "timeoutMs": cfg.limits.tool_timeout_ms,
-            "maxOutputBytes": cfg.limits.max_output_bytes,
-            "mvmHome": operator_home,
-        },
+        "bridge": bridge,
     })
 }
 
@@ -779,6 +784,10 @@ mod tests {
         assert_eq!(o["models"], serde_json::json!(["m-one", "m-two"]));
         assert_eq!(o["provider"], serde_json::json!(cfg.provider.id));
         assert_eq!(o["bridge"]["machine"], serde_json::json!("rts-0123456789ab"));
+        assert_eq!(o["bridge"].get("proxy"), None);
+        cfg.network = vec!["a.example".into()];
+        let o = plugin_options(&p, &cfg, Path::new("/x/rts"), &"ab".repeat(12), "/home/op");
+        assert_eq!(o["bridge"].get("proxy"), Some(&serde_json::json!(true)));
     }
 
     fn provider() -> ProviderConfig {

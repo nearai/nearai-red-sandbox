@@ -424,6 +424,22 @@ impl Plan {
 /// through any of them.
 pub const PROXY_VARS: [&str; 6] = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
 
+/// The guest proxy mvm's network endpoint listens on inside the VM.
+const GUEST_PROXY: &str = "127.0.0.1:1080";
+
+/// The environment a sandboxed `shell` call runs under in a network
+/// session, as `KEY=value` strings for `env`: the same eight variables
+/// mvm's guest agent sets (`guest_netd.rs:102-123`), upper case first.
+/// `machine exec` inherits none of them, so `rts` sets them itself.
+pub fn proxy_env() -> Vec<String> {
+    let http = format!("http://{GUEST_PROXY}");
+    let socks = format!("socks5h://{GUEST_PROXY}");
+    let no_proxy = "localhost,127.0.0.1,::1";
+    let upper = [("HTTPS_PROXY", http.as_str()), ("HTTP_PROXY", http.as_str()), ("ALL_PROXY", socks.as_str()), ("NO_PROXY", no_proxy)];
+    let lower = upper.iter().map(|(k, v)| (k.to_lowercase(), *v));
+    upper.iter().map(|(k, v)| format!("{k}={v}")).chain(lower.map(|(k, v)| format!("{k}={v}"))).collect()
+}
+
 /// Refuse an mvm host whose settings could grant guest egress outside
 /// `rts`'s control: any proxy variable mvm reads (even if empty) in the
 /// environment `rts` passes to `mvmctl`, or a host config at
@@ -775,6 +791,18 @@ mod tests {
             .chain(["one-more.example".into()])
             .collect();
         assert!(expand(&over).unwrap_err().contains("64"));
+    }
+
+    #[test]
+    fn proxy_env_is_the_guest_proxy_in_both_cases_upper_first() {
+        let e = proxy_env();
+        assert_eq!(e.len(), 8);
+        assert_eq!(e[..4], ["HTTPS_PROXY=http://127.0.0.1:1080", "HTTP_PROXY=http://127.0.0.1:1080", "ALL_PROXY=socks5h://127.0.0.1:1080", "NO_PROXY=localhost,127.0.0.1,::1"]);
+        for (upper, lower) in e[..4].iter().zip(&e[4..]) {
+            let (uk, uv) = upper.split_once('=').unwrap();
+            let (lk, lv) = lower.split_once('=').unwrap();
+            assert_eq!((uk.to_lowercase().as_str(), uv), (lk, lv));
+        }
     }
 
     #[test]
