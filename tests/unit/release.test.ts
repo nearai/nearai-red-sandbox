@@ -445,3 +445,11 @@ test("the release workflow signs the manifest after packaging and before attesti
   expect(wf.split("secrets.RTS_UPDATE_SIGNING_KEY_PEM_BASE64").length).toBe(2)
   expect(buildJob).toContain("secrets.RTS_UPDATE_SIGNING_KEY_PEM_BASE64")
 })
+
+test("the README publishes the update public key", () => {
+  // The repository variable RTS_UPDATE_PUBLIC_KEY_HEX, as pinned in the plan.
+  const KEY = "9b4a81b8bd017898c36871c6bd1cb890faf95b6e378e72eb99b9c15841f02ac9"
+  const readme = readFileSync(join(ROOT, "README.md"), "utf8")
+  expect(readme.split(KEY).length - 1).toBe(1)
+  expect(readme).toContain("rts update")
+})

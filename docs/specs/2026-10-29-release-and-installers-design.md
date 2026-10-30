@@ -71,11 +71,20 @@ Steps:
 
 7. Render `install.sh` from the repository template with the version baked
    in.
-8. `SHA256SUMS` over the tarball and `install.sh`; attest both with
+8. `SHA256SUMS` over the tarball and `install.sh`. Then sign the update
+   manifest with `scripts/release/sign-manifest.sh` (added 2026-10-30; see
+   `docs/specs/2026-10-30-auto-update-design.md`, "Signing in CI"): it writes
+   `latest.json` naming the tarball's and `install.sh`'s digests, signs it
+   with the `RTS_UPDATE_SIGNING_KEY_PEM_BASE64` secret into
+   `latest.json.sig`, verifies that signature against the
+   `RTS_UPDATE_PUBLIC_KEY_HEX` repository variable that `cargo build`
+   compiled in (refusing on mismatch), and appends both files to
+   `SHA256SUMS`. Attest all four files with
    `actions/attest-build-provenance`.
-9. Create the GitHub release with the tarball, `install.sh` and `SHA256SUMS`.
-   If release `v<version>` already exists (a re-run after a later step
-   failed), skip creation only when its assets are exactly those three files
+9. Create the GitHub release with the tarball, `install.sh`, `SHA256SUMS`,
+   `latest.json` and `latest.json.sig`. If release `v<version>` already
+   exists (a re-run after a later step failed), skip creation only when its
+   assets are exactly the files `SHA256SUMS` lists plus `SHA256SUMS` itself,
    with GitHub sha256 digests equal to this run's (`SHA256SUMS` lines, and
    the hash of `SHA256SUMS` itself); fail otherwise.
 10. Update the tap: commit `Formula/rts.rb` with the new version, URL and
@@ -280,5 +289,7 @@ sha256, written by the release workflow; the tap commit is the trust anchor.
 
 ## Out of scope for v1
 
-Intel Macs, Linux, homebrew-core, auto-update, and uninstall beyond the
-caveats text.
+Intel Macs, Linux, homebrew-core, and uninstall beyond the caveats text.
+Update notices and `rts update` have their own spec,
+`docs/specs/2026-10-30-auto-update-design.md`; automatic (silent)
+installation stays out of scope there.
