@@ -122,8 +122,73 @@ narrower than 60 columns, it prints the same steps as plain `[rts]` lines. The
 session's `launcher.log` is always plain text. opencode's own update check is
 turned off, because `rts setup` pins its version.
 
-`rts launch --config PATH` takes a session file; see the
-[launcher and inference setup](opencode/README.md) for its options.
+## <img src="docs/assets/ramp.svg" alt="" height="16"> VM size
+
+Each session's microVM gets 2 vCPUs and 2048 MiB by default. Change that per
+launch, or set it in a [session file](#session-file):
+
+```console
+$ rts launch --cpus 4 --memory 8G     # 4 vCPUs, 8192 MiB
+$ rts launch --memory 4096            # a bare number is MiB; M and G suffixes work too
+```
+
+`--cpus` must be at least 1 and `--memory` at least 64 MiB, and neither may
+exceed this host's logical CPU count or physical RAM. The flags override
+`limits.cpus` and `limits.memoryMiB` from the session file. The launch
+progress line confirms what the VM got, for example
+`rts-3f9a1c2b7e04 · 8192 MiB · 4 vCPU · net=none`.
+
+While a session runs, `rts` watches the memory of the host process that runs
+the VM and ends the session if it passes `limits.hostRssCeilingMiB`. That
+ceiling follows the VM's memory, at memory plus 1024 MiB, unless the session
+file sets it; a ceiling set below the VM's memory is refused.
+
+## <img src="docs/assets/ramp.svg" alt="" height="16"> Session file
+
+Everything about a session can also come from a JSON file, passed with
+`rts launch --config PATH`. Every key is optional; an unknown key is refused,
+and relative paths are resolved against the file's own directory. Flags win
+over the file: `--cpus` and `--memory` replace its values, `--allow-host`
+adds to `network.allow`, and `--no-network` clears it.
+
+```json
+{
+  "inputsDir": "./inputs",
+  "provider": {
+    "models": ["deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated"]
+  },
+  "limits": {
+    "cpus": 4,
+    "memoryMiB": 8192,
+    "sessionHours": 8
+  },
+  "network": {
+    "allow": ["packages", "api.example-target.com"]
+  }
+}
+```
+
+| Key | Default | What it does |
+|---|---|---|
+| `inputsDir` | none | A host directory copied into the guest at `/in` before the session starts. |
+| `provider.models` | DeepSeek V4.1 Flash Abliterated | NEAR AI models the session may use. Each one's attestation is verified at launch. |
+| `provider.id`, `provider.baseURL`, `provider.apiKeyEnv` | NEAR AI through IronWire | An external OpenAI-compatible provider instead of NEAR AI. It is unattested, so launching needs `--allow-unattested-provider`. |
+| `network.allow` | none | The guest's egress allowlist; see [Network access](#network-access). |
+| `limits.cpus` | `2` | vCPUs for the VM. |
+| `limits.memoryMiB` | `2048` | VM memory in MiB. |
+| `limits.hostRssCeilingMiB` | `memoryMiB + 1024` | Ends the session if the host process running the VM uses more memory than this. Must be at least `memoryMiB`. |
+| `limits.sessionHours` | `24` | Wall-clock limit from boot, 1 to 720. |
+| `limits.toolTimeoutMs` | `120000` | Time limit for one tool call. |
+| `limits.maxOutputBytes` | `65536` | Output kept from one tool call. |
+| `limits.handshakeMs` | `30000` | How long OpenCode's plugin has to report ready. |
+| `sessionsDir` | `~/.local/share/nearai-red-sandbox/sessions` | Where each session's logs, audit files and `/out` export land. |
+| `updateCheck` | `true` | `false` skips the release check at launch. |
+| `image` | the pinned guest image | Guest image, pinned by digest (`name@sha256:...`). |
+| `opencode`, `mvmctl`, `pluginDir` | installed copies | Paths to other builds, for development. |
+
+[`opencode/session.example.json`](opencode/session.example.json) lists every
+limit at its default. The [launcher and inference setup](opencode/README.md)
+covers what each part does in more depth.
 
 ## <img src="docs/assets/ramp.svg" alt="" height="16"> Network access
 

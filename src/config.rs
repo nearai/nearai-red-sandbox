@@ -54,10 +54,19 @@ pub struct Limits {
     pub handshake_ms: u64,
     /// Wall-clock limit from boot, in hours; also the attach `--ttl`.
     pub session_hours: u32,
+    /// The session file set `hostRssCeilingMiB`; otherwise it follows memory.
+    rss_ceiling_set: bool,
 }
 
 /// mvm v0.22.0's inclusive `MAX_TTL` (30 days), in hours.
 pub const MAX_SESSION_HOURS: u32 = 720;
+
+/// The default host RSS ceiling is the guest's memory plus this much, for
+/// the HVF supervisor's own overhead.
+pub const RSS_HEADROOM_MIB: u64 = 1024;
+
+/// mvm's floor for guest memory.
+pub const MIN_MEMORY_MIB: u32 = 64;
 
 impl Default for Limits {
     fn default() -> Self {
@@ -66,11 +75,71 @@ impl Default for Limits {
             max_output_bytes: 65_536,
             memory_mib: 2048,
             cpus: 2,
-            host_rss_ceiling_mib: 3072,
+            host_rss_ceiling_mib: 2048 + RSS_HEADROOM_MIB,
             handshake_ms: 30_000,
             session_hours: 24,
+            rss_ceiling_set: false,
         }
     }
+}
+
+impl Limits {
+    /// Apply `--cpus` and `--memory`. A ceiling the session file did not set
+    /// moves with memory; one it did set must still cover memory.
+    pub fn resize(&mut self, cpus: Option<u32>, memory_mib: Option<u32>) -> Result<(), String> {
+        if let Some(c) = cpus {
+            self.cpus = c;
+        }
+        if let Some(m) = memory_mib {
+            self.memory_mib = m;
+            if !self.rss_ceiling_set {
+                self.host_rss_ceiling_mib = u64::from(m) + RSS_HEADROOM_MIB;
+            } else if u64::from(m) > self.host_rss_ceiling_mib {
+                return Err(format!(
+                    "--memory {m} MiB is above limits.hostRssCeilingMiB ({}) in the session file; raise or remove that limit",
+                    self.host_rss_ceiling_mib
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `--memory`: whole MiB, as `N`, `NM` or `NG` (either case), at least 64 MiB.
+pub fn parse_memory(s: &str) -> Result<u32, String> {
+    let bad = || format!("--memory must be a whole number of MiB, or end in M or G (for example 8192 or 8G), and at least {MIN_MEMORY_MIB} MiB: {s}");
+    let (digits, scale) = match s.as_bytes().last() {
+        Some(b'G' | b'g') => (&s[..s.len() - 1], 1024),
+        Some(b'M' | b'm') => (&s[..s.len() - 1], 1),
+        _ => (s, 1),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let mib = digits
+        .parse::<u32>()
+        .ok()
+        .and_then(|n| n.checked_mul(scale))
+        .ok_or_else(bad)?;
+    if mib < MIN_MEMORY_MIB {
+        return Err(bad());
+    }
+    Ok(mib)
+}
+
+/// Refuse a VM larger than the host: more vCPUs than logical CPUs, or more
+/// memory than physical RAM.
+pub fn check_host_fit(l: &Limits, host_cpus: u32, host_memory_mib: u64) -> Result<(), String> {
+    if l.cpus > host_cpus {
+        return Err(format!("the VM asks for {} vCPUs but this host has {host_cpus}", l.cpus));
+    }
+    if u64::from(l.memory_mib) > host_memory_mib {
+        return Err(format!(
+            "the VM asks for {} MiB but this host has {host_memory_mib} MiB",
+            l.memory_mib
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,18 +429,26 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
     }
     let dl = Limits::default();
     let l = raw.limits;
+    let memory_mib = positive(l.memory_mib, dl.memory_mib, "memoryMiB")?;
+    let host_rss_ceiling_mib = positive(
+        l.host_rss_ceiling_mib,
+        u64::from(memory_mib) + RSS_HEADROOM_MIB,
+        "hostRssCeilingMiB",
+    )?;
+    if host_rss_ceiling_mib < u64::from(memory_mib) {
+        return Err(format!(
+            "config: limits.hostRssCeilingMiB ({host_rss_ceiling_mib}) must be at least limits.memoryMiB ({memory_mib}); omit it to use memoryMiB + {RSS_HEADROOM_MIB}"
+        ));
+    }
     let limits = Limits {
         tool_timeout_ms: positive(l.tool_timeout_ms, dl.tool_timeout_ms, "toolTimeoutMs")?,
         max_output_bytes: positive(l.max_output_bytes, dl.max_output_bytes, "maxOutputBytes")?,
-        memory_mib: positive(l.memory_mib, dl.memory_mib, "memoryMiB")?,
+        memory_mib,
         cpus: positive(l.cpus, dl.cpus, "cpus")?,
-        host_rss_ceiling_mib: positive(
-            l.host_rss_ceiling_mib,
-            dl.host_rss_ceiling_mib,
-            "hostRssCeilingMiB",
-        )?,
+        host_rss_ceiling_mib,
         handshake_ms: positive(l.handshake_ms, dl.handshake_ms, "handshakeMs")?,
         session_hours: session_hours(l.session_hours.as_ref(), dl.session_hours)?,
+        rss_ceiling_set: l.host_rss_ceiling_mib.is_some(),
     };
     let network = raw.network.allow.unwrap_or_default();
     crate::network::expand(&network).map_err(|e| format!("config: network.allow: {e}"))?;
@@ -439,6 +516,59 @@ mod tests {
     }
     fn parse(t: &str) -> Result<OperatorConfig, String> {
         parse_config(t, Path::new("/cfg"), &d())
+    }
+
+    #[test]
+    fn the_rss_ceiling_follows_memory_unless_set() {
+        let p = |l: &str| parse(&format!(r#"{{ "limits": {l} }}"#));
+        let l = p("{}").unwrap().limits;
+        assert_eq!((l.memory_mib, l.host_rss_ceiling_mib), (2048, 3072));
+        assert_eq!(Limits::default().host_rss_ceiling_mib, 3072);
+        let l = p(r#"{ "memoryMiB": 8192 }"#).unwrap().limits;
+        assert_eq!(l.host_rss_ceiling_mib, 8192 + RSS_HEADROOM_MIB);
+        let l = p(r#"{ "memoryMiB": 8192, "hostRssCeilingMiB": 10000 }"#).unwrap().limits;
+        assert_eq!(l.host_rss_ceiling_mib, 10000);
+        assert_eq!(
+            p(r#"{ "memoryMiB": 8192, "hostRssCeilingMiB": 4096 }"#).unwrap_err(),
+            "config: limits.hostRssCeilingMiB (4096) must be at least limits.memoryMiB (8192); omit it to use memoryMiB + 1024"
+        );
+    }
+
+    #[test]
+    fn resize_overrides_size_and_moves_only_a_default_ceiling() {
+        let mut l = Limits::default();
+        l.resize(Some(4), Some(8192)).unwrap();
+        assert_eq!((l.cpus, l.memory_mib, l.host_rss_ceiling_mib), (4, 8192, 9216));
+        l.resize(None, None).unwrap();
+        assert_eq!((l.cpus, l.memory_mib, l.host_rss_ceiling_mib), (4, 8192, 9216));
+        let p = |t: &str| parse(t).unwrap().limits;
+        let mut l = p(r#"{ "limits": { "hostRssCeilingMiB": 6000 } }"#);
+        l.resize(None, Some(4096)).unwrap();
+        assert_eq!(l.host_rss_ceiling_mib, 6000);
+        let e = l.resize(None, Some(8192)).unwrap_err();
+        assert!(e.contains("--memory 8192 MiB is above limits.hostRssCeilingMiB (6000)"), "{e}");
+    }
+
+    #[test]
+    fn memory_sizes_parse_as_mib() {
+        for (s, mib) in [("64", 64), ("8192", 8192), ("8192M", 8192), ("8192m", 8192), ("8G", 8192), ("1g", 1024)] {
+            assert_eq!(parse_memory(s), Ok(mib), "{s}");
+        }
+        for bad in ["", "0", "63", "8GB", "8 G", "1.5G", "-1", "G", "8T", "4194304G", "99999999999"] {
+            assert!(parse_memory(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn host_fit_refuses_more_than_the_host_has() {
+        let mut l = Limits::default();
+        assert_eq!(check_host_fit(&l, 8, 16384), Ok(()));
+        l.resize(Some(9), None).unwrap();
+        assert_eq!(check_host_fit(&l, 8, 16384).unwrap_err(), "the VM asks for 9 vCPUs but this host has 8");
+        l.resize(Some(8), Some(16384)).unwrap();
+        assert_eq!(check_host_fit(&l, 8, 16384), Ok(()));
+        l.resize(None, Some(16385)).unwrap();
+        assert_eq!(check_host_fit(&l, 8, 16384).unwrap_err(), "the VM asks for 16385 MiB but this host has 16384 MiB");
     }
 
     #[test]

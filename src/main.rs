@@ -22,6 +22,13 @@ struct NetworkFlags {
     none: bool,
 }
 
+/// `--cpus` and `--memory`, overriding the session file's limits.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct VmSize {
+    cpus: Option<u32>,
+    memory_mib: Option<u32>,
+}
+
 #[derive(Debug)]
 enum Action {
     Help,
@@ -35,6 +42,7 @@ enum Action {
         login: auth::LoginOptions,
         attest: attest::AttestOptions,
         network: NetworkFlags,
+        vm: VmSize,
         no_splash: bool,
     },
 }
@@ -66,6 +74,7 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
     let mut login = auth::LoginOptions::default();
     let mut attest = attest::AttestOptions::default();
     let mut network = NetworkFlags::default();
+    let mut vm = VmSize::default();
     let mut no_splash = false;
     let mut seen = std::collections::HashSet::new();
     let mut flags = flags.iter();
@@ -79,6 +88,8 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
                 | "--allow-host"
                 | "--no-network"
                 | "--no-splash"
+                | "--cpus"
+                | "--memory"
         );
         if !matches!(
             flag,
@@ -92,6 +103,8 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
                 | "--allow-host"
                 | "--no-network"
                 | "--no-splash"
+                | "--cpus"
+                | "--memory"
         ) || (launch_only && *command != "launch")
         {
             return Err(format!("Unknown option for {command}: {flag}"));
@@ -124,6 +137,16 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
         match flag {
             "--config" => file = Some(PathBuf::from(value)),
             "--allow-host" => network.allow.push(value.into()),
+            "--cpus" => {
+                vm.cpus = Some(
+                    value
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|n| *n >= 1 && value.bytes().all(|b| b.is_ascii_digit()))
+                        .ok_or("--cpus must be a whole number of at least 1")?,
+                )
+            }
+            "--memory" => vm.memory_mib = Some(config::parse_memory(value)?),
             "--compose-policy" => {
                 attest.compose_policy = match value {
                     "pinned" => attest::ComposePolicy::Pinned,
@@ -166,6 +189,7 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
             login,
             attest,
             network,
+            vm,
             no_splash,
         }
     })
@@ -230,7 +254,7 @@ fn run_connected<G>(
     Ok(run(cfg))
 }
 
-const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network] [--no-splash]\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nThe guest has no network unless the session file's network.allow or --allow-host names entries\n(HOST, HOST:PORT, IP:PORT or [IPv6]:PORT, port 443 by default, or the preset packages);\n--no-network drops them all. TCP only, and every connection is logged. A session stops with\nsession-limit after limits.sessionHours (default 24), network-lost when the attached\nmvmctl machine run that keeps egress up exits, and network-mismatch when mvm pinned an address\nrts did not validate; /out is exported and the VM removed in every case.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
+const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network] [--no-splash]\n                  [--cpus N] [--memory SIZE]\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts launch --cpus 4 --memory 8G             # a bigger VM (default 2 vCPUs, 2048 MiB)\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nThe guest has no network unless the session file's network.allow or --allow-host names entries\n(HOST, HOST:PORT, IP:PORT or [IPv6]:PORT, port 443 by default, or the preset packages);\n--no-network drops them all. TCP only, and every connection is logged. A session stops with\nsession-limit after limits.sessionHours (default 24), network-lost when the attached\nmvmctl machine run that keeps egress up exits, and network-mismatch when mvm pinned an address\nrts did not validate; /out is exported and the VM removed in every case.\n--cpus and --memory (MiB, or with an M or G suffix) override limits.cpus and limits.memoryMiB,\nup to this host's CPU count and RAM; the host RSS watchdog follows memory unless the session\nfile sets limits.hostRssCeilingMiB.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
 
 /// A private temp directory holding an empty Git config for mvmctl.
 fn private_git_config(prefix: &str) -> Result<(tempfile::TempDir, PathBuf), String> {
@@ -302,6 +326,11 @@ fn check_launch(
 
 /// `--no-network` clears the config's entries; otherwise `--allow-host`
 /// entries follow the config's.
+/// Apply `--cpus` and `--memory` over the session file's limits.
+fn apply_vm_size(cfg: &mut config::OperatorConfig, vm: &VmSize) -> Result<(), String> {
+    cfg.limits.resize(vm.cpus, vm.memory_mib)
+}
+
 fn apply_network(cfg: &mut config::OperatorConfig, flags: &NetworkFlags) {
     if flags.none {
         cfg.network.clear();
@@ -362,6 +391,7 @@ fn launch(
     login: &auth::LoginOptions,
     attest_options: attest::AttestOptions,
     network: &NetworkFlags,
+    vm: &VmSize,
     no_splash: bool,
 ) -> Result<i32, String> {
     let defaults = config::Defaults::from_env();
@@ -375,6 +405,10 @@ fn launch(
         )?
     };
     apply_network(&mut cfg, network);
+    apply_vm_size(&mut cfg, vm)?;
+    let host_cpus = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    let host_memory_mib = rts::sys::host_memory_mib().ok_or("cannot read this host's physical memory")?;
+    config::check_host_fit(&cfg.limits, host_cpus, host_memory_mib)?;
     let env: Vec<(String, String)> = std::env::vars().collect();
     check_launch(&cfg, &env, &attest_options)?;
     let (stdin_tty, stdout_tty) = brand::stdin_stdout_are_ttys();
@@ -545,8 +579,9 @@ fn main() -> ExitCode {
             login,
             attest,
             network,
+            vm,
             no_splash,
-        } => launch(file.as_deref(), &login, attest, &network, no_splash),
+        } => launch(file.as_deref(), &login, attest, &network, &vm, no_splash),
         Action::Login(options) => auth::login(&options).map(|_| {
             println!("Signed in to NEAR AI Cloud.");
             0
@@ -968,6 +1003,46 @@ mod tests {
             assert!(parse_args(&args).is_err(), "accepted {args:?}");
         }
         assert!(USAGE.contains("[--no-splash]") && USAGE.contains("--no-splash skips"));
+    }
+
+    #[test]
+    fn cpus_and_memory_are_launch_only_and_override_the_session_file() {
+        let Action::Launch { vm, .. } = parse_args(&["launch"]).unwrap() else {
+            panic!("not launch")
+        };
+        assert_eq!(vm, VmSize::default());
+        let Action::Launch { vm, .. } =
+            parse_args(&["launch", "--cpus", "4", "--memory", "8G"]).unwrap()
+        else {
+            panic!("not launch")
+        };
+        assert_eq!(vm, VmSize { cpus: Some(4), memory_mib: Some(8192) });
+        for args in [
+            vec!["login", "--cpus", "2"],
+            vec!["login", "--memory", "4G"],
+            vec!["launch", "--cpus", "2", "--cpus", "3"],
+            vec!["launch", "--memory", "4G", "--memory", "8G"],
+            vec!["launch", "--cpus", "0"],
+            vec!["launch", "--cpus", "two"],
+            vec!["launch", "--cpus", "1.5"],
+            vec!["launch", "--cpus"],
+            vec!["launch", "--memory", "1T"],
+            vec!["launch", "--memory", "32"],
+            vec!["launch", "--memory"],
+        ] {
+            assert!(parse_args(&args).is_err(), "accepted {args:?}");
+        }
+
+        let mut cfg = default_config();
+        apply_vm_size(&mut cfg, &VmSize { cpus: Some(6), memory_mib: Some(12288) }).unwrap();
+        let l = cfg.limits;
+        assert_eq!((l.cpus, l.memory_mib, l.host_rss_ceiling_mib), (6, 12288, 13312));
+        let mut cfg = default_config();
+        apply_vm_size(&mut cfg, &VmSize::default()).unwrap();
+        assert_eq!(cfg.limits, default_config().limits);
+
+        assert!(USAGE.contains("[--cpus N] [--memory SIZE]"));
+        assert!(USAGE.contains("rts launch --cpus 4 --memory 8G"));
     }
 
     #[test]

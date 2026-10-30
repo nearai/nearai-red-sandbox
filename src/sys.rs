@@ -43,3 +43,23 @@ pub fn take_signal() -> Option<i32> {
         s => Some(s),
     }
 }
+
+/// Physical memory in MiB, from sysconf (macOS and Linux).
+pub fn host_memory_mib() -> Option<u64> {
+    // SAFETY: sysconf only reads system configuration values.
+    let (pages, page) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+    if pages <= 0 || page <= 0 {
+        return None;
+    }
+    Some((pages as u64).checked_mul(page as u64)? / (1024 * 1024))
+}
+
+#[cfg(test)]
+mod memory_tests {
+    #[test]
+    fn host_memory_is_read_in_mib() {
+        let mib = super::host_memory_mib().expect("sysconf reports physical memory");
+        // Any machine that runs this has between 512 MiB and 64 TiB.
+        assert!((512..64 * 1024 * 1024).contains(&mib), "{mib}");
+    }
+}
