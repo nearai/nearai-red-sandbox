@@ -146,6 +146,12 @@ pub struct SessionPaths {
     pub out_dir: PathBuf,
     pub audit_file: PathBuf,
     pub log_file: PathBuf,
+    /// The attached `machine run`'s stdout and stderr (0600, never shown).
+    pub attach_log: PathBuf,
+    /// `{"network": ...}`: the allowlist, its resolution and the probes.
+    pub session_record: PathBuf,
+    /// This VM's entries from mvm's signed audit log, copied at teardown.
+    pub network_audit: PathBuf,
 }
 
 pub fn session_paths(id: &str, sessions_dir: &Path, runtime: &Path) -> SessionPaths {
@@ -168,6 +174,9 @@ pub fn session_paths(id: &str, sessions_dir: &Path, runtime: &Path) -> SessionPa
         out_dir: session_dir.join("out"),
         audit_file: session_dir.join("tools.jsonl"),
         log_file: session_dir.join("launcher.log"),
+        attach_log: session_dir.join("mvm-attach.log"),
+        session_record: session_dir.join("session.json"),
+        network_audit: session_dir.join("network.jsonl"),
         session_dir,
     }
 }
@@ -458,15 +467,54 @@ impl Supervisor {
     }
 }
 
-pub fn host_rss_mib(host: &dyn Host, pid: u32) -> Option<u64> {
+/// The basename of `pid`'s executable from `ps -o comm=` (macOS prints a
+/// full path), or None if `ps` fails or prints nothing.
+fn process_name(host: &dyn Host, pid: u32) -> Option<String> {
     let command = host.run(&sv(&["ps", "-o", "comm=", "-p", &pid.to_string()]), Duration::from_secs(5)).ok()?;
+    if command.code != Some(0) {
+        return None;
+    }
     let executable = String::from_utf8_lossy(&command.stdout);
-    if command.code != Some(0) || Path::new(executable.trim()).file_name()?.to_str()? != "mvm-hvf-supervisor" {
+    Some(Path::new(executable.trim()).file_name()?.to_str()?.to_string())
+}
+
+pub fn host_rss_mib(host: &dyn Host, pid: u32) -> Option<u64> {
+    if process_name(host, pid)? != "mvm-hvf-supervisor" {
         return None;
     }
     let r = host.run(&sv(&["ps", "-o", "rss=", "-p", &pid.to_string()]), Duration::from_secs(5)).ok()?;
     let kib: u64 = String::from_utf8_lossy(&r.stdout).trim().parse().ok()?;
     (r.code == Some(0) && kib > 0).then_some(kib.div_ceil(1024))
+}
+
+// --- network processes ---
+
+const ENDPOINT: &str = "mvm-network-endpoint";
+const NETWORK_PROCESSES: [&str; 2] = [ENDPOINT, "mvm-hvf-supervisor"];
+
+/// The children of the attached `machine run` (`attach_pid`) that are mvm's
+/// network endpoint or HVF supervisor, by `pgrep -P` and `ps -o comm=`.
+/// Refuses unless an endpoint is among them: without it the network path
+/// cannot be confirmed, or confirmed gone at teardown.
+pub fn network_children(host: &dyn Host, attach_pid: u32) -> Result<Vec<u32>, String> {
+    let fail = |why: String| format!("cannot find the network processes of mvmctl machine run (pid {attach_pid}): {why}");
+    let r = host.run(&sv(&["pgrep", "-P", &attach_pid.to_string()]), Duration::from_secs(5)).map_err(|e| fail(format!("pgrep failed: {e}")))?;
+    if r.killed || r.code != Some(0) {
+        return Err(fail(format!("pgrep exit {:?}", r.code)));
+    }
+    let mut kept = vec![];
+    let mut endpoint = false;
+    for pid in String::from_utf8_lossy(&r.stdout).split_whitespace() {
+        let pid: u32 = pid.parse().ok().filter(|&p| p > 0 && p <= i32::MAX as u32).ok_or_else(|| fail(format!("pgrep printed {pid:?}")))?;
+        if let Some(name) = process_name(host, pid).filter(|n| NETWORK_PROCESSES.contains(&n.as_str())) {
+            endpoint |= name == ENDPOINT;
+            kept.push(pid);
+        }
+    }
+    if !endpoint {
+        return Err(fail(format!("no {ENDPOINT} among its children")));
+    }
+    Ok(kept)
 }
 
 // --- the session ---
@@ -483,6 +531,8 @@ pub struct Deps {
     pub session_id: Option<String>,
     /// Raised by the attested forwarder; the session ends when it is set.
     pub fatal: Option<Arc<crate::forwarder::Fatal>>,
+    /// Resolves allowlisted names on the host before launch.
+    pub resolver: Arc<dyn crate::network::Resolver>,
 }
 
 impl Deps {
@@ -494,6 +544,7 @@ impl Deps {
             rts: std::env::current_exe().map_err(|e| format!("cannot locate the rts binary: {e}"))?,
             session_id: Some(session_id),
             fatal,
+            resolver: Arc::new(crate::network::SystemResolver),
         })
     }
 }
@@ -527,9 +578,14 @@ struct Live<'a> {
     log: &'a Logger,
     sb: &'a MvmSandbox,
     paths: &'a SessionPaths,
+    host: &'a dyn Host,
     machine_attempted: bool,
     machine_created: bool,
     child: Option<Child>,
+    /// The attach process's endpoint and supervisor, checked after removal.
+    network_pids: Vec<u32>,
+    /// mvm's audit directory, read at teardown into `network.jsonl`.
+    audit_dir: Option<PathBuf>,
 }
 
 impl Live<'_> {
@@ -568,6 +624,19 @@ impl Live<'_> {
         match self.sb.remove() {
             Ok(()) => self.log.log(&format!("teardown: removed {}", self.paths.machine)),
             Err(e) => self.log.log(&format!("teardown: MACHINE REMOVAL FAILED: {e}")),
+        }
+        // Both run after export and removal, so neither can stop them.
+        for &pid in &self.network_pids {
+            if let Some(name) = process_name(self.host, pid).filter(|n| NETWORK_PROCESSES.contains(&n.as_str())) {
+                self.log.log(&format!("teardown: NETWORK PROCESS REMAINED: pid {pid} ({name}); killed"));
+                let _ = self.host.run(&sv(&["kill", "-KILL", &pid.to_string()]), Duration::from_secs(5));
+            }
+        }
+        if let Some(dir) = &self.audit_dir {
+            match crate::network::extract_audit(dir, &self.paths.machine, &self.paths.network_audit) {
+                Ok(n) => self.log.log(&format!("teardown: copied {n} network audit entries to {}", self.paths.network_audit.display())),
+                Err(e) => self.log.log(&format!("teardown: NETWORK AUDIT FAILED: {e}")),
+            }
         }
     }
 }
@@ -611,7 +680,7 @@ pub fn run_session(cfg: &OperatorConfig, deps: Deps) -> i32 {
         }
     };
     sys::catch_termination_signals();
-    let mut live = Live { log: &log, sb: &sb, paths: &p, machine_attempted: false, machine_created: false, child: None };
+    let mut live = Live { log: &log, sb: &sb, paths: &p, host: deps.host.as_ref(), machine_attempted: false, machine_created: false, child: None, network_pids: vec![], audit_dir: None };
     let code = match session_body(cfg, &deps, &run, &operator_home, &supervisor, &mut live) {
         Ok(code) => code,
         Err(e) => {
@@ -635,6 +704,11 @@ fn interrupted(log: &Logger) -> Option<String> {
 
 fn stopped(deps: &Deps, log: &Logger) -> Option<String> {
     stop_reason(deps.fatal.as_deref()).inspect(|why| log.log(&format!("stopping: {why}")))
+}
+
+fn write_session_record(p: &SessionPaths, plan: &crate::network::Plan, probes: &[crate::network::Probe]) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(&json!({ "network": plan.record(probes) })).unwrap() + "\n";
+    write_private(&p.session_record, text.as_bytes()).map_err(|e| format!("writing {}: {e}", p.session_record.display()))
 }
 
 /// The options opencode passes to the sandbox plugin (plugin/index.ts).
@@ -677,24 +751,39 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         work_dir: Some(&p.work),
         provider: &cfg.provider,
     })?;
+    // Every launch, with or without an allowlist, before any machine command.
+    let root = mvm_root(&deps.env)?;
+    crate::network::check_mvm_host(&deps.env, &root)?;
+    let plan = crate::network::plan(&cfg.network, deps.resolver.as_ref())?;
+    write_session_record(p, &plan, &[])?;
     sweep_orphans(run, &mut |m| live.log.log(m))?;
     if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)) {
         return Err(why);
     }
 
     live.machine_attempted = true;
+    live.audit_dir = Some(root.join("audit"));
+    let hosts = plan.allow_hosts();
+    let egress = (!plan.is_empty()).then(|| crate::sandbox::Egress { allow_hosts: &hosts, attach_log: &p.attach_log });
     // A signal during create only sets a flag: create finishes, then teardown removes it.
     live.sb
-        .create(&CreateSpec { name: &p.machine, image: &cfg.image, memory_mib: cfg.limits.memory_mib, cpus: cfg.limits.cpus, egress: None })
+        .create(&CreateSpec { name: &p.machine, image: &cfg.image, memory_mib: cfg.limits.memory_mib, cpus: cfg.limits.cpus, egress })
         .map_err(|e| e.to_string())?;
     live.machine_created = true;
     live.log.log(&format!("created {}", p.machine));
+    if !plan.is_empty() {
+        let attach = live.sb.attach_pid().ok_or("network machine has no attached mvmctl machine run")?;
+        live.network_pids = network_children(live.host, attach)?;
+    }
+    let probes = crate::network::run_probes(live.sb, &plan)?;
+    write_session_record(p, &plan, &probes)?;
+    live.log.log(&plan.startup_line());
     initialize_guest_storage(live.sb)?;
     if let Some(inputs) = &cfg.inputs_dir {
         live.sb.copy_in(inputs, "/in").map_err(|e| e.to_string())?;
         live.log.log(&format!("copied {} to /in", inputs.display()));
     }
-    if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)) {
+    if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)).or_else(|| live.sb.network_lost()) {
         return Err(format!("{why} before opencode started"));
     }
 
@@ -733,7 +822,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
             transport_error = terminal.pump().err().map(|e| format!("terminal relay failed: {e}"));
         }
         if signalled.is_none() {
-            signalled = interrupted(live.log).or_else(|| stopped(deps, live.log));
+            signalled = interrupted(live.log).or_else(|| stopped(deps, live.log)).or_else(|| live.sb.network_lost());
         }
         transport_error.is_some() || signalled.is_some() || child.try_wait().ok().flatten().is_some()
     })
@@ -747,7 +836,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             return Ok(status.code().unwrap_or(1));
         }
-        if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)) {
+        if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)).or_else(|| live.sb.network_lost()) {
             return Err(why);
         }
         if Instant::now() >= next_sample {
@@ -890,16 +979,27 @@ mod tests {
     }
 
     type Script = Box<dyn Fn(&[String]) -> RunOutput + Send + Sync>;
+    type ExitWhen = Arc<dyn Fn() -> bool + Send + Sync>;
+    /// Host and mvmctl in one. Once `machine start` or `attach` has run,
+    /// `machine ps` answers from a running flag that they set and
+    /// `machine rm` clears; every other command goes to `reply`.
     struct Fake {
-        calls: Mutex<Vec<String>>,
+        calls: Arc<Mutex<Vec<String>>>,
         reply: Script,
+        running: std::sync::atomic::AtomicBool,
+        started: std::sync::atomic::AtomicBool,
+        /// When the attached `machine run` reports that it has exited.
+        exit_when: Mutex<ExitWhen>,
     }
     impl Fake {
         fn new(reply: impl Fn(&[String]) -> RunOutput + Send + Sync + 'static) -> Arc<Self> {
-            Arc::new(Self { calls: Mutex::new(vec![]), reply: Box::new(reply) })
+            Arc::new(Self { calls: Arc::new(Mutex::new(vec![])), reply: Box::new(reply), running: Default::default(), started: Default::default(), exit_when: Mutex::new(Arc::new(|| false)) })
         }
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+        fn exit_when(&self, f: impl Fn() -> bool + Send + Sync + 'static) {
+            *self.exit_when.lock().unwrap() = Arc::new(f);
         }
     }
     impl Host for Fake {
@@ -910,8 +1010,55 @@ mod tests {
     }
     impl Runner for Fake {
         fn run(&self, argv: &[String], _: Duration) -> io::Result<RunOutput> {
-            self.calls.lock().unwrap().push(argv.join(" "));
+            use std::sync::atomic::Ordering;
+            let line = argv.join(" ");
+            self.calls.lock().unwrap().push(line.clone());
+            if line.starts_with("machine start ") {
+                self.running.store(true, Ordering::SeqCst);
+                self.started.store(true, Ordering::SeqCst);
+            } else if line.starts_with("machine rm ") {
+                self.running.store(false, Ordering::SeqCst);
+            } else if line == "machine ps" && self.started.load(Ordering::SeqCst) {
+                let running = if self.running.load(Ordering::SeqCst) { "rts-0123456789ab running\n" } else { "" };
+                return Ok(out(0, &format!("NAME STATUS\n{running}"), ""));
+            }
             Ok((self.reply)(argv))
+        }
+        fn attach(&self, argv: &[String], _log: &Path) -> io::Result<Box<dyn crate::mvm::Attached>> {
+            self.calls.lock().unwrap().push(format!("attach {}", argv.join(" ")));
+            self.running.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.started.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(FakeAttached { calls: self.calls.clone(), exit_when: self.exit_when.lock().unwrap().clone() }))
+        }
+    }
+    /// A held `mvmctl machine run` with pid 4242.
+    struct FakeAttached {
+        calls: Arc<Mutex<Vec<String>>>,
+        exit_when: ExitWhen,
+    }
+    impl crate::mvm::Attached for FakeAttached {
+        fn pid(&self) -> u32 {
+            4242
+        }
+        fn exited(&mut self) -> Option<String> {
+            (self.exit_when)().then(|| "exit status: 1".into())
+        }
+        fn terminate(&mut self, _: Duration) {
+            self.calls.lock().unwrap().push("terminate".into());
+        }
+    }
+    /// For sessions with no allowlist: the resolver must never be asked.
+    struct NoResolve;
+    impl crate::network::Resolver for NoResolve {
+        fn resolve(&self, name: &str) -> io::Result<Vec<std::net::IpAddr>> {
+            panic!("resolver asked for {name} in a session with no allowlist")
+        }
+    }
+    /// Every name fails to resolve.
+    struct NoSuchHost;
+    impl crate::network::Resolver for NoSuchHost {
+        fn resolve(&self, _: &str) -> io::Result<Vec<std::net::IpAddr>> {
+            Err(io::Error::other("nodename nor servname provided"))
         }
     }
 
@@ -1182,7 +1329,7 @@ mod tests {
     fn external_sessions_refuse_an_unpatched_supervisor_before_any_vm_command() {
         let d = tempdir("unpatched");
         let f = Fake::new(|a| if a.last().map(String::as_str) == Some(SUPERVISOR_PROBE) { out(0, "stock", "") } else { healthy(a) });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None, resolver: Arc::new(NoResolve) };
         let external = ProviderConfig { base_url: "https://cloud-api.near.ai/v1".into(), ..provider() };
         assert_eq!(run_session(&session_cfg(&d, &d, external), deps), 1);
         assert_eq!(f.calls(), ["opencode --version", "/fake/home/.local/share/nearai-red-sandbox/mvm-hvf-supervisor --rts-vsock-drain-fix-version"]);
@@ -1320,8 +1467,8 @@ mod tests {
         });
         let worker = thread::spawn(move || {
             let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
-            let sb = MvmSandbox::new(&p.machine, Box::new(f)).unwrap();
-            let mut live = Live { log: &log, sb: &sb, paths: &p, machine_attempted: true, machine_created: true, child: None };
+            let sb = MvmSandbox::new(&p.machine, Box::new(f.clone())).unwrap();
+            let mut live = Live { log: &log, sb: &sb, paths: &p, host: f.as_ref(), machine_attempted: true, machine_created: true, child: None, network_pids: vec![], audit_dir: None };
             started_tx.send(()).unwrap();
             live.teardown("test");
         });
@@ -1346,7 +1493,7 @@ mod tests {
     fn a_session_refuses_before_any_vm_exists_when_opencode_is_the_wrong_version() {
         let d = tempdir("sess");
         let f = Fake::new(|a| if a.last().map(String::as_str) == Some("--version") { out(0, "1.0.0", "") } else { out(0, "", "") });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None, resolver: Arc::new(NoResolve) };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         assert!(!f.calls().iter().any(|c| c.starts_with("machine")), "{:?}", f.calls());
         fs::remove_dir_all(d).unwrap();
@@ -1356,7 +1503,7 @@ mod tests {
     fn a_session_uses_the_id_its_caller_chose() {
         let d = tempdir("sess-id");
         let f = Fake::new(|a| if a.last().map(String::as_str) == Some("--version") { out(0, "1.0.0", "") } else { out(0, "", "") });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into(), session_id: Some("0123456789ab".into()), fatal: None };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into(), session_id: Some("0123456789ab".into()), fatal: None, resolver: Arc::new(NoResolve) };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         let log = fs::read_to_string(d.join("0123456789ab/launcher.log"));
         let entries: Vec<_> = fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -1387,6 +1534,7 @@ mod tests {
         let d = tempdir("rss-fail-closed");
         let sessions = d.join("sessions");
         let f = Fake::new(|a| match a.get(1).map(String::as_str) {
+            Some("exec") if a.join(" ").contains("reachable-direct") => exec_out(a, "RTS_PROBE unreachable\n"),
             Some("exec") => out(0, "", &format!("\nRTS_EXIT_{} 0 0 0\n", a[8])),
             _ => healthy(a),
         });
@@ -1396,6 +1544,7 @@ mod tests {
             rts: "/x/rts".into(),
             session_id: None,
             fatal: None,
+            resolver: Arc::new(NoResolve),
         };
         let mut cfg = session_cfg(&sessions, &d, serve(MODELS_OK));
         cfg.opencode = "/nonexistent-opencode-rss-test".into();
@@ -1414,7 +1563,7 @@ mod tests {
             s if s.starts_with("machine create") => out(1, "", "image pull failed"),
             _ => healthy(a),
         });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None, resolver: Arc::new(NoResolve) };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         let calls = f.calls();
         assert!(calls.iter().any(|c| c.starts_with("machine rm rts-") && c.ends_with(" --force --yes")), "{calls:?}");
@@ -1423,5 +1572,271 @@ mod tests {
         let log = fs::read_to_string(session.join("launcher.log")).unwrap();
         assert!(log.contains("image pull failed") && log.contains("teardown: removed"), "{log}");
         fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn session_paths_place_the_network_files_in_the_session_dir() {
+        let p = session_paths("0123456789ab", Path::new("/s"), Path::new("/rt"));
+        assert_eq!(p.attach_log, PathBuf::from("/s/0123456789ab/mvm-attach.log"));
+        assert_eq!(p.session_record, PathBuf::from("/s/0123456789ab/session.json"));
+        assert_eq!(p.network_audit, PathBuf::from("/s/0123456789ab/network.jsonl"));
+    }
+
+    #[test]
+    fn network_children_keeps_the_endpoint_and_supervisor_and_needs_an_endpoint() {
+        let reply = |endpoint: &'static str| move |a: &[String]| match a.join(" ").as_str() {
+            "pgrep -P 4242" => out(0, "4243\n4244\n4245\n", ""),
+            "ps -o comm= -p 4243" => out(0, endpoint, ""),
+            "ps -o comm= -p 4244" => out(0, "mvm-hvf-supervisor\n", ""),
+            "ps -o comm= -p 4245" => out(0, "/bin/zsh\n", ""),
+            _ => out(1, "", ""),
+        };
+        let f = Fake::new(reply("/opt/mvm/bin/mvm-network-endpoint\n"));
+        assert_eq!(network_children(f.as_ref(), 4242).unwrap(), vec![4243, 4244]);
+        let f = Fake::new(reply("/bin/sleep\n"));
+        assert!(network_children(f.as_ref(), 4242).unwrap_err().contains("mvm-network-endpoint"));
+        let f = Fake::new(|_| out(1, "", ""));
+        assert!(network_children(f.as_ref(), 4242).is_err());
+    }
+
+    /// A `machine exec` reply: `stdout` and a valid trailer.
+    fn exec_out(a: &[String], stdout: &str) -> RunOutput {
+        out(0, stdout, &format!("\nRTS_EXIT_{} 0 {} 0\n", a[8], stdout.len()))
+    }
+
+    /// Replies for a session that runs up to opencode. An entry probe
+    /// prints `probe` as its last line and then runs `on_probe`. After
+    /// `machine rm`, the attach process's children are gone.
+    fn net_reply(probe: &'static str, on_probe: impl Fn() + Send + Sync + 'static) -> impl Fn(&[String]) -> RunOutput + Send + Sync + 'static {
+        let gone = std::sync::atomic::AtomicBool::new(false);
+        move |a| {
+            use std::sync::atomic::Ordering;
+            let line = a.join(" ");
+            match line.as_str() {
+                l if l.starts_with("machine rm ") => {
+                    gone.store(true, Ordering::SeqCst);
+                    out(0, "", "")
+                }
+                "pgrep -P 4242" => out(0, "4243\n4244\n", ""),
+                "ps -o comm= -p 4243" if !gone.load(Ordering::SeqCst) => out(0, "/opt/mvm/bin/mvm-network-endpoint\n", ""),
+                "ps -o comm= -p 4244" if !gone.load(Ordering::SeqCst) => out(0, "/opt/mvm/bin/mvm-hvf-supervisor\n", ""),
+                l if l.starts_with("ps -o comm= -p ") => out(1, "", ""),
+                "ps -o rss= -p 4244" => out(0, "1000\n", ""),
+                _ if a.get(1).map(String::as_str) == Some("exec") => {
+                    if line.contains("reachable-direct") {
+                        exec_out(a, "RTS_PROBE unreachable\n")
+                    } else if line.contains("RTS_PROBE connected") {
+                        let r = exec_out(a, &format!("{probe}\n"));
+                        on_probe();
+                        r
+                    } else if line.contains("echo NONE") {
+                        exec_out(a, "NONE\n")
+                    } else {
+                        exec_out(a, "")
+                    }
+                }
+                _ => healthy(a),
+            }
+        }
+    }
+
+    const OUR_FLOW: &str = r#"{"entry":{"event":"host.flow.allowed","labels":{"vm_name":"rts-0123456789ab","target":"198.51.100.7:8443"}},"sig":"s1"}"#;
+    const OTHER_FLOW: &str = r#"{"entry":{"event":"host.flow.allowed","labels":{"vm_name":"rts-ffffffffffff"}},"sig":"s2"}"#;
+
+    struct NetSession {
+        d: PathBuf,
+        mvm: PathBuf,
+        session: PathBuf,
+        cfg: OperatorConfig,
+    }
+
+    /// An MVM_HOME holding this VM's hvf.pid (4244) and an audit log, and a
+    /// config whose opencode does not exist, so the session stops after the
+    /// probes and the RSS check.
+    fn net_session(name: &str, network: &[&str]) -> NetSession {
+        let d = tempdir(name);
+        let mvm = d.join("mvm");
+        fs::create_dir_all(mvm.join("vms/rts-0123456789ab")).unwrap();
+        fs::write(mvm.join("vms/rts-0123456789ab/hvf.pid"), "4244\n").unwrap();
+        fs::create_dir_all(mvm.join("audit")).unwrap();
+        fs::write(mvm.join("audit/local.jsonl"), format!("{OTHER_FLOW}\n{OUR_FLOW}\n")).unwrap();
+        let mut cfg = session_cfg(&d.join("sessions"), &d, serve(MODELS_OK));
+        cfg.opencode = "/nonexistent-opencode".into();
+        cfg.network = network.iter().map(|s| s.to_string()).collect();
+        NetSession { session: d.join("sessions/0123456789ab"), d, mvm, cfg }
+    }
+
+    fn net_deps(f: &Arc<Fake>, mvm: &Path, resolver: Arc<dyn crate::network::Resolver>, extra: &[(&str, &str)]) -> Deps {
+        let mut env: Vec<(String, String)> = vec![("HOME".into(), "/fake/home".into()), ("MVM_HOME".into(), mvm.to_string_lossy().into_owned()), ("PATH".into(), "/usr/bin:/bin".into())];
+        env.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        Deps { host: f.clone(), runner: Some(f.clone()), env, rts: "/x/rts".into(), session_id: Some("0123456789ab".into()), fatal: None, resolver }
+    }
+
+    fn read_log(s: &NetSession) -> String {
+        fs::read_to_string(s.session.join("launcher.log")).unwrap_or_default()
+    }
+
+    fn position(calls: &[String], pred: impl Fn(&str) -> bool) -> Option<usize> {
+        calls.iter().position(|c| pred(c))
+    }
+
+    #[test]
+    fn a_session_with_a_proxy_variable_is_refused_before_any_machine_command() {
+        let s = net_session("net-proxy", &[]);
+        let f = Fake::new(net_reply("RTS_PROBE connected", || {}));
+        assert_eq!(run_session(&s.cfg, net_deps(&f, &s.mvm, Arc::new(NoResolve), &[("https_proxy", "http://p:3128")])), 1);
+        let (calls, log) = (f.calls(), read_log(&s));
+        fs::remove_dir_all(&s.d).unwrap();
+        assert!(!calls.iter().any(|c| c.starts_with("machine") || c.starts_with("attach")), "{calls:?}");
+        assert!(log.contains("https_proxy"), "{log}");
+    }
+
+    #[test]
+    fn an_unresolvable_entry_refuses_before_any_machine_command() {
+        let s = net_session("net-unresolvable", &["nowhere.example"]);
+        let f = Fake::new(net_reply("RTS_PROBE connected", || {}));
+        assert_eq!(run_session(&s.cfg, net_deps(&f, &s.mvm, Arc::new(NoSuchHost), &[])), 1);
+        let (calls, log) = (f.calls(), read_log(&s));
+        fs::remove_dir_all(&s.d).unwrap();
+        assert!(!calls.iter().any(|c| c.starts_with("machine") || c.starts_with("attach")), "{calls:?}");
+        assert!(log.contains("nowhere.example") && log.contains("does not resolve"), "{log}");
+    }
+
+    #[test]
+    fn a_no_network_session_runs_the_deny_all_probe_and_records_it() {
+        let s = net_session("net-none", &[]);
+        let f = Fake::new(net_reply("RTS_PROBE connected", || {}));
+        assert_eq!(run_session(&s.cfg, net_deps(&f, &s.mvm, Arc::new(NoResolve), &[])), 1);
+        let (calls, log) = (f.calls(), read_log(&s));
+        let record = fs::read_to_string(s.session.join("session.json"));
+        let audit_exists = s.session.join("network.jsonl").is_file();
+        fs::remove_dir_all(&s.d).unwrap();
+        let record: Value = serde_json::from_str(&record.unwrap()).unwrap();
+        assert_eq!(record, json!({"network": {"allow": [], "expanded": [], "resolved": {}, "probes": [{"target": "1.1.1.1:443", "result": "unreachable"}]}}));
+        assert!(log.contains("network: none"), "{log}");
+        assert!(calls.iter().any(|c| c == "machine start rts-0123456789ab"), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.contains("machine run") || c.contains("--allow-host")), "{calls:?}");
+        assert!(calls.iter().any(|c| c.contains("reachable-direct")), "deny-all probe did not run: {calls:?}");
+        assert!(audit_exists, "network.jsonl was not written");
+    }
+
+    #[test]
+    fn a_network_session_creates_with_allow_hosts_probes_and_logs_the_startup_line() {
+        let s = net_session("net-one", &["198.51.100.7:8443"]);
+        let f = Fake::new(net_reply("RTS_PROBE connected", || {}));
+        assert_eq!(run_session(&s.cfg, net_deps(&f, &s.mvm, Arc::new(NoResolve), &[])), 1);
+        let (calls, log) = (f.calls(), read_log(&s));
+        let record = fs::read_to_string(s.session.join("session.json"));
+        let audit = fs::read_to_string(s.session.join("network.jsonl"));
+        fs::remove_dir_all(&s.d).unwrap();
+        let create = calls.iter().find(|c| c.starts_with("machine create ")).expect("no create");
+        assert!(create.ends_with("--allow-host 198.51.100.7:8443"), "{create}");
+        assert!(calls.contains(&"attach machine run --name rts-0123456789ab --ttl 30d".to_string()), "{calls:?}");
+        assert!(!calls.iter().any(|c| c.starts_with("machine start")), "{calls:?}");
+        for c in &calls {
+            for flag in ["--net", "--peer", "--gpu", "--grants-file", "--policy"] {
+                assert!(!c.split(' ').any(|w| w == flag), "{c}");
+            }
+        }
+        let record: Value = serde_json::from_str(&record.unwrap()).unwrap();
+        assert_eq!(record["network"]["probes"], json!([{"target": "198.51.100.7:8443", "result": "connected"}]));
+        assert_eq!(record["network"]["allow"], json!(["198.51.100.7:8443"]));
+        assert!(log.contains("network: 1 host allowed (198.51.100.7:8443); TCP only; every connection is logged"), "{log}");
+        let rm = position(&calls, |c| c.starts_with("machine rm rts-0123456789ab")).expect("no rm");
+        let term = position(&calls, |c| c == "terminate").expect("attach not terminated");
+        assert!(rm < term, "{calls:?}");
+        assert!(!log.contains("NETWORK PROCESS REMAINED"), "{log}");
+        assert_eq!(audit.unwrap(), format!("{OUR_FLOW}\n"));
+        assert!(log.contains("teardown: copied 1 network audit entries to "), "{log}");
+    }
+
+    #[test]
+    fn a_lost_attach_before_opencode_ends_the_session_with_network_lost_and_still_exports_and_removes() {
+        let s = net_session("net-lost-early", &["198.51.100.7:8443"]);
+        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flip = lost.clone();
+        let f = Fake::new(net_reply("RTS_PROBE connected", move || flip.store(true, std::sync::atomic::Ordering::SeqCst)));
+        let seen = lost.clone();
+        f.exit_when(move || seen.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(run_session(&s.cfg, net_deps(&f, &s.mvm, Arc::new(NoResolve), &[])), 1);
+        let (calls, log) = (f.calls(), read_log(&s));
+        fs::remove_dir_all(&s.d).unwrap();
+        assert!(log.contains("network-lost") && log.contains("teardown: removed"), "{log}");
+        assert!(!log.contains("sampling host RSS") && !log.contains("starting "), "{log}");
+        let probe = position(&calls, |c| c.contains("RTS_PROBE connected")).expect("no probe");
+        let export = position(&calls, |c| c.contains("echo NONE")).expect("no export");
+        assert!(probe < export, "{calls:?}");
+        assert!(calls.iter().any(|c| c.starts_with("machine rm rts-0123456789ab")), "{calls:?}");
+    }
+
+    #[test]
+    fn a_lost_attach_during_the_handshake_ends_the_session_with_network_lost() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut s = net_session("net-lost-handshake", &["198.51.100.7:8443"]);
+        let started = s.d.join("started");
+        let script = s.d.join("opencode-stand-in");
+        fs::write(&script, format!("#!/bin/sh\n/usr/bin/touch '{}'; exec /bin/sleep 30\n", started.display())).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        s.cfg.opencode = script.to_string_lossy().into_owned();
+        let f = Fake::new(net_reply("RTS_PROBE connected", || {}));
+        let marker = started.clone();
+        f.exit_when(move || marker.exists());
+        let begun = Instant::now();
+        assert_eq!(run_session(&s.cfg, net_deps(&f, &s.mvm, Arc::new(NoResolve), &[])), 1);
+        let elapsed = begun.elapsed();
+        let (calls, log) = (f.calls(), read_log(&s));
+        let was_started = started.exists();
+        fs::remove_dir_all(&s.d).unwrap();
+        assert!(was_started, "the opencode stand-in never ran: {log}");
+        assert!(elapsed < Duration::from_millis(s.cfg.limits.handshake_ms / 2), "took {elapsed:?}");
+        assert!(log.contains("network-lost") && !log.contains("plugin ready"), "{log}");
+        assert!(log.contains("teardown: opencode stopped"), "{log}");
+        assert!(calls.iter().any(|c| c.starts_with("machine rm rts-0123456789ab")), "{calls:?}");
+    }
+
+    #[test]
+    fn a_failed_probe_refuses_and_tears_down() {
+        let s = net_session("net-probe-fail", &["198.51.100.7:8443"]);
+        let f = Fake::new(net_reply("RTS_PROBE refused HTTP/1.1 403 Forbidden", || {}));
+        assert_eq!(run_session(&s.cfg, net_deps(&f, &s.mvm, Arc::new(NoResolve), &[])), 1);
+        let (calls, log) = (f.calls(), read_log(&s));
+        let record = fs::read_to_string(s.session.join("session.json"));
+        fs::remove_dir_all(&s.d).unwrap();
+        assert!(log.contains("network probe 198.51.100.7:8443 failed"), "{log}");
+        assert!(!log.contains("network: 1 host allowed"), "{log}");
+        assert!(calls.iter().any(|c| c.starts_with("machine rm rts-0123456789ab")), "{calls:?}");
+        let record: Value = serde_json::from_str(&record.unwrap()).unwrap();
+        assert_eq!(record["network"]["probes"], json!([]));
+    }
+
+    #[test]
+    fn teardown_kills_a_lingering_endpoint_and_reports_audit_failure_without_blocking_removal() {
+        let d = tempdir("net-linger");
+        let p = session_paths("0123456789ab", &d.join("sessions"), &d.join("runtime"));
+        prepare_session_dirs(&p).unwrap();
+        let f = Fake::new(|a| match a.join(" ").as_str() {
+            "ps -o comm= -p 4243" => out(0, "/opt/mvm/bin/mvm-network-endpoint\n", ""),
+            "ps -o comm= -p 4245" => out(0, "/bin/zsh\n", ""),
+            _ => out(0, "", ""),
+        });
+        let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
+        let sb = MvmSandbox::new(&p.machine, Box::new(f.clone())).unwrap();
+        let mut live = Live {
+            log: &log, sb: &sb, paths: &p, host: f.as_ref(),
+            machine_attempted: true, machine_created: false, child: None,
+            network_pids: vec![4243, 4245], audit_dir: Some(d.join("no-such-audit")),
+        };
+        live.teardown("test");
+        let text = fs::read_to_string(&p.log_file).unwrap();
+        let calls = f.calls();
+        fs::remove_dir_all(&d).unwrap();
+        assert!(text.contains("teardown: NETWORK PROCESS REMAINED: pid 4243 (mvm-network-endpoint); killed"), "{text}");
+        assert!(!text.contains("pid 4245"), "{text}");
+        assert!(text.contains("teardown: NETWORK AUDIT FAILED: "), "{text}");
+        assert!(text.contains("teardown: removed rts-0123456789ab"), "{text}");
+        let rm = position(&calls, |c| c.starts_with("machine rm ")).expect("no rm");
+        let kill = position(&calls, |c| c == "kill -KILL 4243").expect("no kill");
+        assert!(rm < kill, "{calls:?}");
+        assert!(!calls.iter().any(|c| c == "kill -KILL 4245"), "{calls:?}");
     }
 }
