@@ -67,6 +67,8 @@ test("the tarball has exactly the spec's layout", () => {
     "share", "share/nearai-red-sandbox", "share/nearai-red-sandbox/opencode",
     "share/nearai-red-sandbox/opencode/session.example.json",
     "share/nearai-red-sandbox/plugin", "share/nearai-red-sandbox/plugin/audit.ts",
+    "share/nearai-red-sandbox/plugin/branding", "share/nearai-red-sandbox/plugin/branding/footer.ts",
+    "share/nearai-red-sandbox/plugin/branding/tui.tsx",
     "share/nearai-red-sandbox/plugin/index.ts", "share/nearai-red-sandbox/plugin/package.json",
   ])
   expect(readdirSync(out).sort()).toEqual(["SHA256SUMS", "install.sh", TARBALL("0.1.0")])
@@ -97,7 +99,9 @@ test("binaries are executable and build-info names the packaged supervisor", () 
   expect(info.match(/^signed_binary_sha256=.*$/gm)).toEqual([`signed_binary_sha256=${sha256(supervisor)}`])
   expect(info).toContain("patch_version=rts-vsock-drain-v1\n")
   expect(readFileSync(join(x, "bin/rts"), "utf8")).toBe(readFileSync(join(dir, "rts"), "utf8"))
-  expect(readFileSync(join(x, "share/nearai-red-sandbox/plugin/index.ts"))).toEqual(readFileSync(join(ROOT, "plugin/index.ts")))
+  for (const f of ["index.ts", "audit.ts", "package.json", "branding/tui.tsx", "branding/footer.ts"]) {
+    expect([f, readFileSync(join(x, "share/nearai-red-sandbox/plugin", f))]).toEqual([f, readFileSync(join(ROOT, "plugin", f))])
+  }
 })
 
 test("the tarball carries no extended attributes or AppleDouble metadata", () => {

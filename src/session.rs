@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use crate::config::{OperatorConfig, PLACEHOLDER_API_KEY, ProviderConfig};
+use crate::config::{OperatorConfig, PLACEHOLDER_API_KEY, ProviderConfig, model_display_name};
 use crate::copy::CopyLimits;
 use crate::mvm::{MvmSandbox, RunOutput, Runner, SpawnRunner, StateDir, list_machines, run_captured, tail};
 use crate::protocol::{new_nonce, random_hex};
@@ -22,6 +22,11 @@ use crate::sys;
 use crate::terminal::Terminal;
 
 pub const OPENCODE_VERSION: &str = "2.2.2";
+pub const PRODUCT_NAME: &str = "NEAR AI Red";
+pub const TERMINAL_TITLE: &str = "NEAR AI Red SandBox";
+/// The terminal UI plugin directory inside the plugin shim.
+pub const BRANDING_PLUGIN: &str = "branding";
+const EMBEDDED_PROVIDER_ID: &str = "nearai-red-embedded";
 
 const INIT_GUEST_STORAGE: &str = r#"set -eu
 tmp=$1; input=$2; output=$3
@@ -70,13 +75,13 @@ impl Host for RealHost {
 
 pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderConfig) -> Value {
     let models: serde_json::Map<String, Value> = p.models.iter().map(|m| {
-        let model = if p.id == "nearai-red-embedded" {
+        let model = if p.id == EMBEDDED_PROVIDER_ID {
             // Invalid route values must fail closed rather than silently use a
             // different backend or model. Embedded startup validates these IDs.
             let route = crate::inference::route_header(m).unwrap_or_else(|_| "invalid".into());
-            json!({ "name": m, "tool_call": true, "headers": { "x-ironwire-route": route } })
+            json!({ "name": model_display_name(m), "tool_call": true, "headers": { "x-ironwire-route": route } })
         } else {
-            json!({ "name": m, "tool_call": true })
+            json!({ "name": model_display_name(m), "tool_call": true })
         };
         (m.clone(), model)
     }).collect();
@@ -91,7 +96,9 @@ pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderCo
         "provider": {
             &p.id: {
                 "npm": "@ai-sdk/openai-compatible",
-                "name": p.id,
+                // Only the attested embedded provider is NEAR AI Red; an
+                // external provider keeps its own ID as its name.
+                "name": if p.id == EMBEDDED_PROVIDER_ID { PRODUCT_NAME } else { p.id.as_str() },
                 "options": { "baseURL": p.base_url, "apiKey": api_key },
                 "models": models,
             }
@@ -111,6 +118,35 @@ pub fn write_opencode_config(dir: &Path, plugin_dir: &Path, plugin_options: &Val
     fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     let file = dir.join("opencode.json");
     let text = serde_json::to_string_pretty(&opencode_config(plugin_dir, plugin_options, p)).unwrap() + "\n";
+    write_private(&file, text.as_bytes()).map_err(|e| format!("writing {}: {e}", file.display()))?;
+    Ok(file)
+}
+
+/// opencode's terminal UI reads its own config, `cli.json` beside
+/// opencode.json; the server's `plugin` list does not load TUI plugins.
+/// The branding plugin only draws the home footer: opencode never loads a
+/// TUI-only directory on the server, so tools, MCP and models are untouched.
+pub fn tui_config(plugin_dir: &Path, model_display: &str, attested: bool) -> Value {
+    json!({
+        // rts sets the window title; opencode would overwrite it on every route change.
+        "terminal": { "title": false },
+        "plugins": [{
+            "package": plugin_dir.join(BRANDING_PLUGIN).to_string_lossy(),
+            "options": { "model": model_display, "attested": attested },
+        }],
+    })
+}
+
+pub fn write_tui_config(dir: &Path, plugin_dir: &Path, model_display: &str, attested: bool) -> Result<PathBuf, String> {
+    // v2.2.2 marks a directory without a tui entry "unsupported" and says so
+    // only in /plugins, so refuse a broken install here instead.
+    let entry = plugin_dir.join(BRANDING_PLUGIN).join("tui.tsx");
+    if !entry.is_file() {
+        return Err(format!("plugin file missing: {}; reinstall rts", entry.display()));
+    }
+    fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let file = dir.join("cli.json");
+    let text = serde_json::to_string_pretty(&tui_config(plugin_dir, model_display, attested)).unwrap() + "\n";
     write_private(&file, text.as_bytes()).map_err(|e| format!("writing {}: {e}", file.display()))?;
     Ok(file)
 }
@@ -694,6 +730,9 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     let nonce = new_nonce();
     let plugin_options = plugin_options(p, cfg, &deps.rts, &nonce, operator_home);
     write_opencode_config(&p.config_dir, &cfg.plugin_dir, &plugin_options, &cfg.provider)?;
+    // run_connected reaches the session for embedded inference only after
+    // attestation verified; an external provider is recorded unattested.
+    write_tui_config(&p.config_dir, &cfg.plugin_dir, &model_display_name(&cfg.provider.models[0]), cfg.embedded_inference)?;
     // opencode loads opencode.json, AGENTS.md and .opencode/ from its cwd.
     if fs::read_dir(&p.work).map_err(|e| e.to_string())?.next().is_some() {
         return Err(format!("work directory is not empty: {}", p.work.display()));
@@ -711,6 +750,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         .envs(launch.env.iter().map(|(k, v)| (k, v)));
     let (child, mut terminal) = Terminal::spawn(&mut command)
         .map_err(|e| format!("starting {} failed: {e}", cfg.opencode))?;
+    terminal.set_title(TERMINAL_TITLE);
     let child = live.child.insert(child);
 
     let mut signalled = None;
@@ -908,6 +948,57 @@ mod tests {
         let direct = ProviderConfig { id: "nearai".into(), base_url: "https://cloud-api.near.ai/v1".into(), api_key_env: Some("NEARAI_API_KEY".into()), ..provider() };
         let c = opencode_config(Path::new("/p"), &json!({}), &direct);
         assert_eq!(c["provider"]["nearai"]["options"]["apiKey"], "{env:NEARAI_API_KEY}");
+    }
+
+    #[test]
+    fn the_embedded_provider_and_its_models_get_display_names_but_keep_their_ids() {
+        let embedded = ProviderConfig {
+            id: "nearai-red-embedded".into(),
+            models: vec!["deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated".into(), "z-ai/glm-5.3-flash".into()],
+            ..provider()
+        };
+        let c = opencode_config(Path::new("/p"), &json!({}), &embedded);
+        let p = &c["provider"]["nearai-red-embedded"];
+        assert_eq!(p["name"], "NEAR AI Red");
+        let deepseek = &p["models"]["deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated"];
+        assert_eq!(deepseek["name"], "DeepSeek V4.1 Flash Abliterated");
+        assert_eq!(deepseek["headers"]["x-ironwire-route"], "nearai:deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated");
+        assert_eq!(p["models"]["z-ai/glm-5.3-flash"]["name"], "glm-5.3-flash");
+        assert_eq!(c["model"], "nearai-red-embedded/deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated");
+        assert_eq!(c["enabled_providers"], json!(["nearai-red-embedded"]));
+        // An external provider is not NEAR AI Red; it keeps its own ID as its name.
+        let c = opencode_config(Path::new("/p"), &json!({}), &provider());
+        assert_eq!(c["provider"]["ironwire"]["name"], "ironwire");
+        assert_eq!(c["provider"]["ironwire"]["models"]["z-ai/glm-5.3-flash"]["name"], "glm-5.3-flash");
+    }
+
+    #[test]
+    fn the_tui_config_loads_only_the_branding_plugin_and_turns_off_opencode_titles() {
+        let c = tui_config(Path::new("/repo/plugin"), "DeepSeek V4.1 Flash Abliterated", true);
+        assert_eq!(c["terminal"], json!({ "title": false }));
+        assert_eq!(
+            c["plugins"],
+            json!([{ "package": "/repo/plugin/branding", "options": { "model": "DeepSeek V4.1 Flash Abliterated", "attested": true } }])
+        );
+        assert_eq!(tui_config(Path::new("/p"), "m", false)["plugins"][0]["options"]["attested"], false);
+    }
+
+    #[test]
+    fn writing_the_config_writes_a_private_cli_json_and_needs_the_branding_plugin() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir("sess-cli");
+        let plugin = d.join("plugin");
+        fs::create_dir_all(&plugin).unwrap();
+        let e = write_tui_config(&d.join("cfg"), &plugin, "m", true).unwrap_err();
+        assert!(e.contains("branding/tui.tsx"), "{e}");
+        fs::create_dir_all(plugin.join("branding")).unwrap();
+        fs::write(plugin.join("branding/tui.tsx"), "").unwrap();
+        let file = write_tui_config(&d.join("cfg"), &plugin, "m", true).unwrap();
+        assert_eq!(file, d.join("cfg/cli.json"));
+        assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        let v: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(v, tui_config(&plugin, "m", true));
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

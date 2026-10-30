@@ -254,9 +254,9 @@ The launcher writes this to `<runtime>/xdg/config/opencode/opencode.json`
   "provider": {
     "nearai-red-embedded": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "nearai-red-embedded",
+      "name": "NEAR AI Red",
       "options": { "baseURL": "http://127.0.0.1:<ephemeral-port>/openai/v1", "apiKey": "ironwire-holds-the-key" },
-      "models": { "z-ai/glm-5.3-flash": { "name": "z-ai/glm-5.3-flash", "tool_call": true, "headers": { "x-ironwire-route": "nearai:z-ai/glm-5.3-flash" } } }
+      "models": { "z-ai/glm-5.3-flash": { "name": "glm-5.3-flash", "tool_call": true, "headers": { "x-ironwire-route": "nearai:z-ai/glm-5.3-flash" } } }
     }
   },
   "model": "nearai-red-embedded/z-ai/glm-5.3-flash",
@@ -264,6 +264,19 @@ The launcher writes this to `<runtime>/xdg/config/opencode/opencode.json`
   "share": "disabled"
 }
 ```
+
+The `name` fields are display names only; everything else uses the IDs.
+Beside it rts writes `cli.json`, the terminal UI's own config:
+
+```json
+{
+  "terminal": { "title": false },
+  "plugins": [{ "package": "<plugin dir>/branding", "options": { "model": "glm-5.3-flash", "attested": true } }]
+}
+```
+
+It loads the home-footer plugin in `plugin/branding/` and stops opencode
+retitling the window, which rts titles `NEAR AI Red SandBox`.
 
 `bridge` is passed to `rts tool` unchanged. `stateDir` holds an exec lock,
 so one exec reaches the machine at a time across tool processes, and an

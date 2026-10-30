@@ -519,6 +519,34 @@ fixed scripts read operands from `"$1"`, `"$2"` and so on. `patch` is
 removed rather than sandboxed: implementing opencode's patch format is out of
 scope for v1, and `edit` and `write` cover the same ground.
 
+### Branding (`plugin/branding/`)
+
+Added 2026-10-29, with no fork of opencode. What the operator sees, and
+nothing the checks above depend on:
+
+- The generated opencode.json names the embedded provider `NEAR AI Red` and
+  gives each model a readable display name (`DeepSeek V4.1 Flash Abliterated`
+  for the default; otherwise the part of the ID after the last `/`). An
+  external provider keeps its ID as its name. Only `name` fields change: the
+  allowlist, the plugin's checks, the `x-ironwire-route` header and the
+  forwarder all use the model ID.
+- opencode v2.2.2's terminal UI reads its own config, `cli.json` beside
+  opencode.json, and loads TUI plugins only from its `plugins` list. rts
+  writes it with one entry, the TUI-only directory `plugin/branding/`
+  (`tui.tsx`, Solid JSX, which the published binary transpiles), with the
+  default model's display name and whether attestation verified as options.
+  The plugin appends one muted line to the home screen's `home.footer` slot:
+  `NEAR AI Red · SandBox · <model> · attested`, with `attested` only when the
+  session's attestation verified. The server never loads a directory without
+  a server entry, so tools, MCP and models are untouched.
+- `cli.json` sets `terminal.title: false`, so opencode stops retitling the
+  window on every route change, and rts writes the OSC 0 title
+  `NEAR AI Red SandBox` through the PTY relay before any opencode output.
+  On exit opencode's renderer clears the title.
+- The ignored PTY test `pinned_opencode_tui_starts_and_handshakes_over_the_gated_pty`
+  runs the pinned opencode and checks the footer and that the only title
+  set is rts's.
+
 ### Guest image
 
 A digest-pinned OCI image, pulled with `mvmctl image pull` before the first
@@ -652,7 +680,8 @@ src/forwarder.rs the attested forwarder; forwarder/pin.rs (rustls verifier),
                  forwarder/signature.rs (receipts, inference.jsonl)
 vendor/dcap-qvl-0.7.0/  the reviewed dcap-qvl source, used as a path dependency
 plugin/          opencode V2 plugin shim: tool transform, tool and model
-                 allowlist checks, audit hooks; each tool call spawns `rts tool`
+                 allowlist checks, audit hooks; each tool call spawns `rts tool`.
+                 plugin/branding/ is the TUI-only home footer plugin
 opencode/        pinned version, opencode config notes, attestation-policy.json
                  (pinned compose hashes, compiled into rts)
 tests/unit/      plugin shim tests (Rust unit tests live beside the code in src/)

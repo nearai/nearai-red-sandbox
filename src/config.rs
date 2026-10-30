@@ -229,6 +229,18 @@ pub const MODEL_ID_PLACEHOLDER: &str = "PLACEHOLDER-near-private-abliterated";
 /// 2026-10-29 (owned_by `nearai`).
 pub const DEFAULT_MODELS: &[&str] = &["deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated"];
 
+/// What the operator sees for a model in opencode. Display only: the
+/// allowlist, plugin checks, routing headers and forwarder use the ID.
+pub fn model_display_name(id: &str) -> String {
+    match id {
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated" => "DeepSeek V4.1 Flash Abliterated".into(),
+        _ => match id.rsplit_once('/') {
+            Some((_, last)) if !last.is_empty() => last.into(),
+            _ => id.into(),
+        },
+    }
+}
+
 pub fn require_real_models(models: &[String]) -> Result<(), String> {
     if models.iter().any(|m| m == MODEL_ID_PLACEHOLDER) {
         return Err(format!(
@@ -393,6 +405,16 @@ mod tests {
         assert_eq!(c.sessions_dir, PathBuf::from("/p/sessions"));
         assert_eq!(c.opencode, "/p/opencode");
         assert_eq!(c.mvmctl, PathBuf::from("/p/mvmctl"));
+    }
+
+    #[test]
+    fn model_display_names_are_readable_and_never_change_the_id() {
+        assert_eq!(model_display_name("deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated"), "DeepSeek V4.1 Flash Abliterated");
+        assert_eq!(model_display_name("z-ai/glm-5.3-flash"), "glm-5.3-flash");
+        assert_eq!(model_display_name("org/team/model-x"), "model-x");
+        assert_eq!(model_display_name("bare-model"), "bare-model");
+        // A trailing slash leaves nothing after it; show the whole ID.
+        assert_eq!(model_display_name("odd/"), "odd/");
     }
 
     #[test]
