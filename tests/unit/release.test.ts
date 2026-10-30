@@ -4,6 +4,7 @@ import { createHash } from "node:crypto"
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { gunzipSync } from "node:zlib"
 
 const ROOT = join(import.meta.dir, "..", "..")
 const SCRIPT = join(ROOT, "scripts", "package-release.sh")
@@ -97,6 +98,19 @@ test("binaries are executable and build-info names the packaged supervisor", () 
   expect(info).toContain("patch_version=rts-vsock-drain-v1\n")
   expect(readFileSync(join(x, "bin/rts"), "utf8")).toBe(readFileSync(join(dir, "rts"), "utf8"))
   expect(readFileSync(join(x, "share/nearai-red-sandbox/plugin/index.ts"))).toEqual(readFileSync(join(ROOT, "plugin/index.ts")))
+})
+
+test("the tarball carries no extended attributes or AppleDouble metadata", () => {
+  // A quarantine or provenance xattr on an input would otherwise ride along as
+  // a pax header and be restored onto the installed files.
+  for (const f of ["rts", "mvm-hvf-supervisor"]) sh("/usr/bin/xattr", ["-w", "com.example.rts-test", "1", join(dir, f)])
+  expect(sh("/usr/bin/xattr", [join(dir, "rts")])).toContain("com.example.rts-test")
+  const out = pkg("0.1.0")
+  const raw = gunzipSync(readFileSync(join(out, TARBALL("0.1.0")))).toString("latin1")
+  for (const needle of ["LIBARCHIVE.xattr", "SCHILY.xattr", "com.example.rts-test"]) {
+    expect([needle, raw.includes(needle)]).toEqual([needle, false])
+  }
+  expect(tarList(join(out, TARBALL("0.1.0"))).filter((n) => n.split("/").pop()!.startsWith("._"))).toEqual([])
 })
 
 test("SHA256SUMS verifies both files", () => {

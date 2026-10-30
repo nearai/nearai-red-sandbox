@@ -96,7 +96,7 @@ find "$tree" -type f -exec chmod 0644 {} +
 chmod 0755 "$tree/bin/rts" "$tree/libexec/nearai-red-sandbox/mvm-hvf-supervisor"
 
 tarball="rts-$version-$TARGET.tar.gz"
-COPYFILE_DISABLE=1 /usr/bin/tar --uid 0 --gid 0 --uname root --gname wheel \
+COPYFILE_DISABLE=1 /usr/bin/tar --no-xattrs --no-mac-metadata --uid 0 --gid 0 --uname root --gname wheel \
   -czf "$dist/$tarball" -C "$tree" LICENSE README.md bin libexec share
 sed "s/@RTS_VERSION@/$version/" "$install_sh" > "$dist/install.sh"
 chmod 0644 "$dist/$tarball" "$dist/install.sh"
