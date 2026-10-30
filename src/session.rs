@@ -107,6 +107,8 @@ pub fn opencode_config(plugin_dir: &Path, plugin_options: &Value, p: &ProviderCo
         // A provider policy (deny every other provider) behind the plugin's model transform.
         "enabled_providers": [p.id],
         "share": "disabled",
+        // opencode is pinned by rts setup; never check for or offer updates.
+        "autoupdate": false,
     })
 }
 
@@ -979,6 +981,17 @@ mod tests {
         let c = opencode_config(Path::new("/p"), &json!({}), &provider(), false);
         assert_eq!(c["provider"]["ironwire"]["name"], "ironwire");
         assert_eq!(c["provider"]["ironwire"]["models"]["z-ai/glm-5.3-flash"]["name"], "glm-5.3-flash");
+    }
+
+    #[test]
+    fn opencode_never_checks_for_or_offers_its_own_updates() {
+        // rts pins opencode; the "/update to install" notice would offer a
+        // version the launcher refuses. Measured in the stage 2 spike
+        // (2026-10-30): "autoupdate": false removes the notice and the check.
+        for embedded in [true, false] {
+            let c = opencode_config(Path::new("/p"), &json!({}), &provider(), embedded);
+            assert_eq!(c["autoupdate"], json!(false));
+        }
     }
 
     #[test]
