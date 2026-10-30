@@ -1,0 +1,4 @@
+running 236 tests
+test copy::tests::a_long_name_is_refused_too ... FAILED
+
+test result: FAILED. 235 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.44s

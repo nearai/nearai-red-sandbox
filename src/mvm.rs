@@ -73,18 +73,31 @@ fn read_capped(mut r: impl Read, cap: usize) -> Vec<u8> {
 }
 
 /// Runs mvmctl with stdin from /dev/null, argv only, and
-/// GIT_CONFIG_GLOBAL pointed at an empty file.
+/// GIT_CONFIG_GLOBAL pointed at an empty file. The child inherits the
+/// environment of rts plus `extra_env`, minus every name in `remove_env`.
 pub struct SpawnRunner {
     pub mvmctl: PathBuf,
     pub empty_git_config: PathBuf,
     pub extra_env: HashMap<String, String>,
+    pub remove_env: Vec<String>,
+}
+
+impl SpawnRunner {
+    /// The mvmctl command for `argv`, before stdio and spawning.
+    pub fn command(&self, argv: &[String]) -> Command {
+        let mut cmd = Command::new(&self.mvmctl);
+        cmd.args(argv).envs(&self.extra_env).env("GIT_CONFIG_GLOBAL", &self.empty_git_config);
+        // Last, so a removed name wins over both the parent and extra_env.
+        for name in &self.remove_env {
+            cmd.env_remove(name);
+        }
+        cmd
+    }
 }
 
 impl Runner for SpawnRunner {
     fn run(&self, argv: &[String], timeout: Duration) -> io::Result<RunOutput> {
-        let mut cmd = Command::new(&self.mvmctl);
-        cmd.args(argv).envs(&self.extra_env).env("GIT_CONFIG_GLOBAL", &self.empty_git_config);
-        run_captured(cmd, timeout)
+        run_captured(self.command(argv), timeout)
     }
 }
 
@@ -603,8 +616,24 @@ mod tests {
     }
 
     #[test]
+    fn spawn_runner_removes_named_variables_from_the_child() {
+        let mut extra_env = HashMap::new();
+        extra_env.insert("RTS_REMOVED_TEST_VAR".to_string(), "set".to_string());
+        let r = SpawnRunner {
+            mvmctl: "/bin/sh".into(),
+            empty_git_config: "/dev/null".into(),
+            extra_env,
+            remove_env: vec!["RTS_REMOVED_TEST_VAR".into()],
+        };
+        let cmd = r.command(&sv(&["-c", "true"]));
+        assert!(cmd.get_envs().any(|(k, v)| k == "RTS_REMOVED_TEST_VAR" && v.is_none()));
+        let o = r.run(&sv(&["-c", "echo ${RTS_REMOVED_TEST_VAR-unset}"]), Duration::from_secs(5)).unwrap();
+        assert_eq!(o.stdout, b"unset\n");
+    }
+
+    #[test]
     fn spawn_runner_captures_and_kills_on_timeout() {
-        let r = SpawnRunner { mvmctl: "/bin/sh".into(), empty_git_config: "/dev/null".into(), extra_env: HashMap::new() };
+        let r = SpawnRunner { mvmctl: "/bin/sh".into(), empty_git_config: "/dev/null".into(), extra_env: HashMap::new(), remove_env: Vec::new() };
         let o = r.run(&sv(&["-c", "echo $GIT_CONFIG_GLOBAL; echo e >&2; exit 4"]), Duration::from_secs(5)).unwrap();
         assert_eq!((o.code, o.stdout.as_slice(), o.stderr.as_slice(), o.killed), (Some(4), &b"/dev/null\n"[..], &b"e\n"[..], false));
         let t = Instant::now();

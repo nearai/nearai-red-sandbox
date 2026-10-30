@@ -1,0 +1,5 @@
+running 236 tests
+test copy::tests::a_long_name_is_refused ... FAILED
+test copy::tests::a_hardlink_is_refused ... FAILED
+
+test result: FAILED. 233 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.44s

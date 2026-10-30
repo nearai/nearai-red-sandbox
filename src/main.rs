@@ -2,6 +2,8 @@
 //!
 //!   rts launch [--config <path>] start one session (operator entry point)
 //!   rts login                    sign in through the system browser
+//!   rts setup [--check [--offline]]  install and check mvm, opencode and the guest image
+//!   rts --version                print the version
 //!   rts tool <name>              one sandboxed tool call, spawned by the plugin shim
 
 use std::io::Write;
@@ -9,11 +11,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use rts::{attest, auth, bridge, config, forwarder, inference, session};
+use rts::{attest, auth, bridge, config, forwarder, inference, session, setup};
 
 #[derive(Debug)]
 enum Action {
     Help,
+    Version,
+    Setup(setup::SetupOptions),
     Tool(String),
     Login(auth::LoginOptions),
     Launch {
@@ -26,6 +30,12 @@ enum Action {
 fn parse_args(args: &[&str]) -> Result<Action, String> {
     if matches!(args, ["--help" | "-h" | "help"]) {
         return Ok(Action::Help);
+    }
+    if matches!(args, ["--version" | "-V"]) {
+        return Ok(Action::Version);
+    }
+    if let ["setup", flags @ ..] = args {
+        return parse_setup(flags);
     }
     if let ["tool", name] = args {
         return Ok(Action::Tool((*name).into()));
@@ -123,6 +133,27 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
     })
 }
 
+fn parse_setup(flags: &[&str]) -> Result<Action, String> {
+    if flags.iter().any(|flag| matches!(*flag, "--help" | "-h")) {
+        return Ok(Action::Help);
+    }
+    let mut o = setup::SetupOptions::default();
+    for &flag in flags {
+        let seen = match flag {
+            "--check" => std::mem::replace(&mut o.check, true),
+            "--offline" => std::mem::replace(&mut o.offline, true),
+            _ => return Err(format!("Unknown option for setup: {flag}")),
+        };
+        if seen {
+            return Err(format!("Duplicate option: {flag}"));
+        }
+    }
+    if o.offline && !o.check {
+        return Err("--offline requires --check".into());
+    }
+    Ok(Action::Setup(o))
+}
+
 fn run_connected<G>(
     cfg: &mut config::OperatorConfig,
     preflight: impl FnOnce(&config::OperatorConfig) -> Result<(), String>,
@@ -140,28 +171,35 @@ fn run_connected<G>(
     Ok(run(cfg))
 }
 
-const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider]\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider.";
+const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider]\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.";
 
-fn local_preflight(cfg: &config::OperatorConfig, host: &dyn session::Host, env: &[(String, String)]) -> Result<(), String> {
+/// A private temp directory holding an empty Git config for mvmctl.
+fn private_git_config(prefix: &str) -> Result<(tempfile::TempDir, PathBuf), String> {
     use std::os::unix::fs::OpenOptionsExt;
     let temp = tempfile::Builder::new()
-        .prefix("rts-preflight-")
+        .prefix(prefix)
         .tempdir()
-        .map_err(|_| "Cannot create private preflight directory")?;
+        .map_err(|_| "Cannot create a private temp directory")?;
     let empty_git_config = temp.path().join("empty.gitconfig");
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&empty_git_config)
-        .map_err(|_| "Cannot create preflight Git configuration")?;
+        .map_err(|_| "Cannot create an empty Git configuration")?;
+    Ok((temp, empty_git_config))
+}
+
+fn local_preflight(cfg: &config::OperatorConfig, host: &dyn session::Host, env: &[(String, String)]) -> Result<(), String> {
+    let (temp, empty_git_config) = private_git_config("rts-preflight-")?;
     let work = temp.path().join("work");
     std::fs::create_dir(&work).map_err(|_| "Cannot create preflight work directory")?;
-    let supervisor = session::supervisor_path(env)?;
+    let supervisor = session::supervisor_path(env, rts::install::current_prefix().as_deref())?;
     let runner = rts::mvm::SpawnRunner {
         mvmctl: cfg.mvmctl.clone(),
         empty_git_config,
         extra_env: session::mvm_environment(env, &supervisor),
+        remove_env: Vec::new(),
     };
     // A pinned HTTPS placeholder skips the loopback-provider probe. Local
     // prerequisites must succeed before any native credential read or browser.
@@ -172,6 +210,7 @@ fn local_preflight(cfg: &config::OperatorConfig, host: &dyn session::Host, env: 
     session::preflight(&session::PreflightInput {
         host,
         run: &runner,
+        mvmctl: &cfg.mvmctl,
         opencode: &cfg.opencode,
         leak_seam_set: env.iter().any(|(key, _)| key == "RTS_TEST_LEAK"),
         supervisor_path: Some(&supervisor),
@@ -339,6 +378,48 @@ fn launch(
     )
 }
 
+fn setup_command(o: &setup::SetupOptions) -> Result<i32, String> {
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let home = env
+        .iter()
+        .find(|(k, _)| k == "HOME")
+        .map(|(_, v)| PathBuf::from(v))
+        .filter(|h| h.is_absolute())
+        .ok_or("rts setup needs HOME set to an absolute path")?;
+    let defaults = config::Defaults::from_env();
+    let explicit_mvmctl = env.iter().any(|(k, _)| k == "RTS_MVMCTL");
+    let supervisor = session::supervisor_path(&env, rts::install::current_prefix().as_deref())?;
+    let rts_exe = std::env::current_exe().map_err(|e| format!("Cannot locate the running rts: {e}"))?;
+    let (_temp, empty_git_config) = private_git_config("rts-setup-")?;
+    let fetch = setup::HttpsFetch::new()?;
+    let mvm_plain = setup::plain_mvm_runner(&defaults.mvmctl, &empty_git_config, &env);
+    let mvm = rts::mvm::SpawnRunner {
+        mvmctl: defaults.mvmctl.clone(),
+        empty_git_config,
+        extra_env: session::mvm_environment(&env, &supervisor),
+        remove_env: Vec::new(),
+    };
+    let lines = setup::run(
+        o,
+        &setup::SetupContext {
+            home: &home,
+            defaults: &defaults,
+            explicit_mvmctl,
+            supervisor: &supervisor,
+            rts: &rts_exe,
+            fetch: &fetch,
+            host: &session::RealHost,
+            mvm_plain: &mvm_plain,
+            mvm: &mvm,
+        },
+    )
+    .map_err(|e| e.lines().collect::<Vec<_>>().join("\n[rts] "))?;
+    for line in lines {
+        println!("{line}");
+    }
+    Ok(0)
+}
+
 fn code(c: i32) -> ExitCode {
     ExitCode::from(u8::try_from(c).unwrap_or(1))
 }
@@ -371,6 +452,11 @@ fn main() -> ExitCode {
             }
             return code(out.code);
         }
+        Action::Setup(options) => setup_command(&options),
+        Action::Version => {
+            println!("rts {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
         Action::Help => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -395,8 +481,10 @@ mod tests {
             "{}",
             Path::new("/cfg"),
             &config::Defaults {
-                repo: "/repo".into(),
                 mvmctl: "/bin/mvmctl".into(),
+                plugin_dir: "/repo/plugin".into(),
+                opencode: "opencode".into(),
+                sessions_dir: "/repo/sessions".into(),
             },
         )
         .unwrap()
@@ -606,7 +694,7 @@ mod tests {
         struct StockSupervisor;
         impl session::Host for StockSupervisor {
             fn run(&self, argv: &[String], _: std::time::Duration) -> std::io::Result<rts::mvm::RunOutput> {
-                let stdout = if argv.last().map(String::as_str) == Some("--version") { "2.1.4\n" } else { "stock supervisor\n" };
+                let stdout = if argv.last().map(String::as_str) == Some("--version") { "2.2.2\n" } else { "stock supervisor\n" };
                 Ok(rts::mvm::RunOutput { code: Some(0), stdout: stdout.as_bytes().to_vec(), ..Default::default() })
             }
         }
@@ -799,9 +887,34 @@ mod tests {
             ],
             vec!["other"],
             vec![],
+            vec!["setup", "--offline"],
+            vec!["setup", "--check", "--check"],
+            vec!["setup", "--config", "x"],
+            vec!["setup", "extra"],
+            vec!["--version", "x"],
         ] {
             assert!(parse_args(&args).is_err(), "accepted {args:?}");
         }
+    }
+
+    #[test]
+    fn setup_and_version_parse() {
+        use rts::setup::SetupOptions;
+        for (args, want) in [
+            (vec!["setup"], SetupOptions::default()),
+            (vec!["setup", "--check"], SetupOptions { check: true, offline: false }),
+            (vec!["setup", "--check", "--offline"], SetupOptions { check: true, offline: true }),
+            (vec!["setup", "--offline", "--check"], SetupOptions { check: true, offline: true }),
+        ] {
+            assert!(matches!(parse_args(&args), Ok(Action::Setup(o)) if o == want), "{args:?}");
+        }
+        for args in [vec!["--version"], vec!["-V"]] {
+            assert!(matches!(parse_args(&args), Ok(Action::Version)), "{args:?}");
+        }
+        assert!(matches!(parse_args(&["setup", "--help"]), Ok(Action::Help)));
+        let e = parse_args(&["setup", "--offline"]).unwrap_err();
+        assert!(e.contains("--offline requires --check"), "{e}");
+        assert!(USAGE.contains("rts setup [--check [--offline]]") && USAGE.contains("rts --version"));
     }
 
     #[test]
