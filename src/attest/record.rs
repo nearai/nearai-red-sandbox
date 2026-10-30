@@ -23,13 +23,18 @@ fn hex_set<'a>(set: impl IntoIterator<Item = &'a [u8; 32]>) -> Value {
     Value::Array(set.into_iter().map(|b| hex::encode(b).into()).collect())
 }
 
-fn verified_state(a: &Attested) -> (Value, Value) {
+/// Fingerprints, per-model keys and gateway keys, as hex.
+fn verified_state(a: &Attested) -> (Value, Value, Value) {
     let keys = a
         .keys
         .iter()
         .map(|(model, keys)| (model.clone(), hex_set(keys)))
         .collect::<serde_json::Map<_, _>>();
-    (hex_set(&a.fingerprints), Value::Object(keys))
+    (
+        hex_set(&a.fingerprints),
+        Value::Object(keys),
+        hex_set(&a.gateway_keys),
+    )
 }
 
 impl AttestationRecord {
@@ -81,24 +86,27 @@ impl AttestationRecord {
             .expect("attestation.json lives in the session directory")
     }
 
-    /// Status "verified", fingerprints and keys as hex, and the evidence.
+    /// Status "verified", fingerprints, model keys and gateway keys as hex,
+    /// and the evidence.
     pub fn verified(&self, a: &Attested) -> Result<(), String> {
-        let (fingerprints, keys) = verified_state(a);
+        let (fingerprints, keys, gateway_keys) = verified_state(a);
         self.update(|doc| {
             doc["status"] = "verified".into();
             doc["fingerprints"] = fingerprints;
             doc["keys"] = keys;
+            doc["gateway_keys"] = gateway_keys;
             doc["evidence"] = Value::Array(a.evidence.clone());
         })
     }
 
     /// Appends a re-attestation to "reattestations".
     pub fn reattested(&self, a: &Attested) -> Result<(), String> {
-        let (fingerprints, keys) = verified_state(a);
+        let (fingerprints, keys, gateway_keys) = verified_state(a);
         self.update(|doc| {
             let entry = json!({
                 "fingerprints": fingerprints,
                 "keys": keys,
+                "gateway_keys": gateway_keys,
                 "evidence": a.evidence,
             });
             match doc.get_mut("reattestations").and_then(Value::as_array_mut) {
@@ -200,6 +208,7 @@ mod tests {
         let mut a = Attested::default();
         a.fingerprints.insert([0xaa; 32]);
         a.keys.entry("m".into()).or_default().insert([0xbb; 32]);
+        a.gateway_keys.insert([0xcc; 32]);
         a.evidence.push(serde_json::json!({"model": "m"}));
         r.verified(&a).unwrap();
         let doc = read(&r);
@@ -212,11 +221,21 @@ mod tests {
             doc["keys"]["m"],
             serde_json::json!([hex::encode([0xbb; 32])])
         );
+        assert_eq!(
+            doc["gateway_keys"],
+            serde_json::json!([hex::encode([0xcc; 32])])
+        );
         assert_eq!(doc["evidence"][0]["model"], "m");
 
         r.reattested(&a).unwrap();
         r.reattested(&a).unwrap();
-        assert_eq!(read(&r)["reattestations"].as_array().unwrap().len(), 2);
+        let doc = read(&r);
+        let re = doc["reattestations"].as_array().unwrap();
+        assert_eq!(re.len(), 2);
+        assert_eq!(
+            re[1]["gateway_keys"],
+            serde_json::json!([hex::encode([0xcc; 32])])
+        );
 
         r.set_status("refused", "x");
         let doc = read(&r);

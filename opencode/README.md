@@ -123,7 +123,14 @@ The live `cloud-api.near.ai` leaf's SPKI sha256 was `73862c25...ba8ba5ad`,
 the gateway's attested fingerprint, and the forwarder's pinned client config
 completed a handshake with only the attested set; with a `[0; 32]` pin it
 refused the same leaf as unpinned. Completions and signature receipts need
-an API key and are not covered (spec check 6).
+an API key and are not covered by the replay (spec check 6).
+
+The gateway's ed25519 `signing_address` in the same report is
+`40599fb2...a711ad4acb`; the model entry's is `88fbc43b...1adcee78`. A real
+production session on 2026-10-29 got its first receipt signed with the
+gateway key, so the forwarder accepts attested gateway keys as receipt
+signers for any allowed model, and `inference.jsonl` records `signer`
+(`gateway` or `model`).
 
 ## Config shape accepted by v2.1.4
 
