@@ -1,7 +1,7 @@
 # Controlled network access from the sandbox: design
 
 Date: 2026-10-29
-Status: draft for review; blocker 1 worked around (see Attached start), upstream fix tracked in tinylabscom/mvm#4860
+Status: approved 2026-10-29; blocker 1 worked around (see Attached start), upstream fix tracked in tinylabscom/mvm#4860
 
 ## Purpose
 
