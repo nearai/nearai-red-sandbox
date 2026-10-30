@@ -107,8 +107,6 @@ then save this as `session.json` next to that directory:
 rts launch --config ./session.json
 ```
 
-For the documented macOS archive-transport prerequisites, including GNU tar
-and `PATH` setup, see the [launcher guide](opencode/README.md#how-a-session-runs).
 Paths in the session file are relative to that file. The inputs are copied to
 `/in` inside the guest; changes there do not modify your originals. For example,
 ask the agent:
@@ -137,8 +135,11 @@ location is `~/.local/share/nearai-red-sandbox/sessions/ID/`:
 | `launcher.log` | Launch progress and teardown diagnostics |
 
 Available records depend on how far the session gets and which features it
-uses. The agent's findings and exported files still need your review. See the [launcher guide](opencode/README.md) for
-model selection, resource limits, custom session paths, and source builds.
+uses. The agent's findings and exported files still need your review.
+[`opencode/session.example.json`](opencode/session.example.json) lists the
+session file's limits, including the VM's `cpus` and `memoryMiB`; the
+[launcher guide](opencode/README.md) covers model selection, custom session
+paths, and source builds.
 
 ## <img src="docs/assets/ramp.svg" alt="" height="16"> Network access
 
@@ -153,7 +154,7 @@ rts launch --config ./session.json --allow-host api.example-target.com
 rts launch --config ./session.json --allow-host packages
 
 # A service listening on a LAN address
-rts launch --allow-host 192.168.1.20:8080
+rts launch --config ./session.json --allow-host 192.168.1.20:8080
 
 # Discard any network entries in the session file
 rts launch --config ./session.json --no-network

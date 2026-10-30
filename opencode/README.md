@@ -19,9 +19,11 @@ sandboxed tool call spawns `rts tool <name>` (`src/bridge.rs`) with the
 request on stdin and returns its stdout. Exit 3 from `rts tool` means the
 machine is unavailable, and the call fails; nothing falls back to the host.
 
-On macOS, host-side tests and archive transport require GNU coreutils and
-GNU tar. BSD tar can add PAX metadata that the deliberately strict archive
-reader refuses. Install them and put their unprefixed commands first:
+On macOS, running the host-side unit tests requires GNU coreutils and GNU
+tar: some tests use the host's `tar` to stand in for the guest's, and BSD tar
+adds PAX metadata that the deliberately strict archive reader refuses. Using
+SandBox does not need them; copy-in writes plain ustar with the stock BSD tar.
+To run the tests, install them and put their unprefixed commands first:
 
 ```sh
 brew install coreutils gnu-tar

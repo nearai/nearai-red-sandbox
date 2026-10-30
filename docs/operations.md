@@ -28,9 +28,9 @@ for where an installed `rts` finds its files.
 An installed release checks for a newer one when `rts launch` starts, at
 most once every 24 hours (the result is cached in
 `~/.local/share/nearai-red-sandbox/update-check.json`). The check fetches
-the latest release's signed `latest.json`, gives up after 3 seconds, and
-adds no more than that timeout and never fails the launch. A newer release prints a notice and launch
-continues:
+the latest release's signed `latest.json` and gives up after 3 seconds, so
+it adds at most that to a launch and never fails it. A newer release prints a
+notice and launch continues:
 
 ```
 [rts] rts 0.2.0 is available (you have 0.1.0): run rts update
@@ -86,9 +86,6 @@ On an interactive terminal, `rts launch` first shows a short splash (about
 narrower than 60 columns, it prints the same steps as plain `[rts]` lines. The
 session's `launcher.log` is always plain text. opencode's own update check is
 turned off, because `rts setup` pins its version.
-
-`rts launch --config PATH` takes a session file; see the
-[launcher and inference setup](../opencode/README.md) for its options.
 
 ## Network access
 
