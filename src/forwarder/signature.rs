@@ -131,7 +131,8 @@ impl SseId {
 }
 
 /// ed25519 only; text is "<model>:<req>:<resp>" (model must equal ex.model)
-/// or "<req>:<resp>"; both hashes equal; key in `keys`; verify_strict.
+/// or "<req>:<resp>"; both hashes equal; key in `keys` (the model's attested
+/// keys and the attested gateway keys); verify_strict.
 /// Returns the key.
 pub fn check_receipt(
     r: &Receipt,
@@ -173,7 +174,7 @@ pub fn check_receipt(
     let key = receipt_key(r)?;
     if !keys.contains(&key) {
         return Err(format!(
-            "receipt signing key {} is not attested for model {:?}",
+            "receipt signing key {} is not attested for model {:?} or its gateway",
             hex::encode(key),
             ex.model
         ));
@@ -234,15 +235,13 @@ pub enum FetchError {
 impl std::fmt::Display for FetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FetchError::Rejected(Rejected::Unpinned(fp)) => write!(
+            FetchError::Rejected(r @ Rejected::Unpinned(_)) => {
+                write!(f, "signature fetch: {} is not attested", r.certificate())
+            }
+            FetchError::Rejected(r @ Rejected::Untrusted(_)) => write!(
                 f,
-                "signature fetch: upstream certificate {} is not attested",
-                hex::encode(fp)
-            ),
-            FetchError::Rejected(Rejected::Untrusted(fp)) => write!(
-                f,
-                "signature fetch: upstream certificate {} does not chain to a trusted root",
-                hex::encode(fp)
+                "signature fetch: {} does not chain to a trusted root",
+                r.certificate()
             ),
             FetchError::Failed(reason) => f.write_str(reason),
         }
@@ -359,6 +358,9 @@ pub struct InferenceLine {
     pub request_sha256: String,
     pub response_sha256: String,
     pub signing_key: Option<String>,
+    /// Which attested role's key signed: "gateway" or "model". None unless
+    /// verified.
+    pub signer: Option<&'static str>,
     pub signature_ms: Option<u64>,
     pub result: String,
 }
@@ -744,6 +746,7 @@ mod tests {
             request_sha256: "aa".into(),
             response_sha256: "bb".into(),
             signing_key: None,
+            signer: None,
             signature_ms: Some(3),
             result: result.into(),
         };
@@ -759,6 +762,7 @@ mod tests {
         assert_eq!(lines[0]["result"], "verified");
         assert_eq!(lines[0]["streamed"], true);
         assert_eq!(lines[0]["signing_key"], serde_json::Value::Null);
+        assert_eq!(lines[0]["signer"], serde_json::Value::Null);
         assert_eq!(lines[1]["result"], "not-signed (HTTP 429)");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);

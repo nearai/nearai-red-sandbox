@@ -82,12 +82,16 @@ pub fn load_policy(json: &str) -> Result<Policy, String> {
     Ok(Policy { compose_hashes })
 }
 
-/// The verified state of a session: gateway TLS fingerprints and, per model,
-/// the attested ed25519 signing keys.
+/// The verified state of a session: gateway TLS fingerprints, per model the
+/// attested ed25519 signing keys, and the attested gateways' ed25519 keys.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Attested {
     pub fingerprints: BTreeSet<[u8; 32]>,
     pub keys: BTreeMap<String, BTreeSet<[u8; 32]>>,
+    /// The ed25519 `signing_address` of every gateway entry that passed
+    /// every check (TDX quote, TCB policy, report_data binding, compose).
+    /// NEAR AI production signs receipts with it, for any model.
+    pub gateway_keys: BTreeSet<[u8; 32]>,
     /// Per model: nonce, raw report, per-entry TCB status, compose hash, GPU kid.
     pub evidence: Vec<Value>,
 }
@@ -95,6 +99,7 @@ pub struct Attested {
 impl Attested {
     pub fn merge(&mut self, other: Attested) {
         self.fingerprints.extend(other.fingerprints);
+        self.gateway_keys.extend(other.gateway_keys);
         for (model, keys) in other.keys {
             self.keys.entry(model).or_default().extend(keys);
         }
@@ -111,7 +116,9 @@ pub struct Attestor {
     pub quotes: Arc<dyn QuoteVerifier>,
     pub gpus: Arc<dyn GpuVerifier>,
     pub base_url: String,
-    pub key: HostSecret,
+    /// Sent as the bearer on the report fetch when present. NEAR AI
+    /// production serves the report without one (2026-10-29).
+    pub key: Option<HostSecret>,
     pub models: Vec<String>,
     pub options: AttestOptions,
     pub policy: Policy,
@@ -131,7 +138,7 @@ impl Attestor {
     /// `BlockingHttp` must not run on a Tokio runtime thread: call `attest`
     /// from a plain thread.
     pub fn real(
-        key: HostSecret,
+        key: Option<HostSecret>,
         models: &[String],
         options: AttestOptions,
     ) -> Result<Attestor, String> {
@@ -175,7 +182,7 @@ impl Attestor {
         let url = report::report_url(&self.base_url, model, &nonce);
         let resp = self
             .http
-            .get(&url, Some(&self.key))
+            .get(&url, self.key.as_ref())
             .map_err(|e| format!("attestation report request failed: {e}"))?;
         if resp.status != 200 {
             return Err(format!("attestation report returned HTTP {}", resp.status));
@@ -206,7 +213,21 @@ impl Attestor {
         let mut record = self
             .check_quote(gateway, &nonce)
             .map_err(|e| format!("gateway: {e}"))?;
+        // Only after every gateway check passed. NEAR AI production signs
+        // receipts with an ed25519 gateway key; any other algorithm pins
+        // TLS only and attests no receipt key.
+        let gateway_key = if gateway.signing_algo == "ed25519" {
+            Some(
+                report::hex32(&gateway.signing_address)
+                    .map_err(|e| format!("gateway: ed25519 signing_address: {e}"))?,
+            )
+        } else {
+            None
+        };
         record.insert("role".into(), "gateway".into());
+        if let Some(key) = gateway_key {
+            record.insert("signing_key".into(), hex::encode(key).into());
+        }
         entry_records.push(Value::Object(record));
 
         let keys = out.keys.entry(model.to_string()).or_default();
@@ -249,6 +270,8 @@ impl Attestor {
             record.insert("gpu_overall".into(), verdict.overall.into());
             entry_records.push(Value::Object(record));
         }
+        // Every model entry passed too: the report is accepted whole.
+        out.gateway_keys.extend(gateway_key);
         out.evidence.push(json!({
             "model": model,
             "nonce": nonce_hex,
@@ -310,6 +333,7 @@ mod tests {
     const KEY: [u8; 32] = [0x11; 32];
     const FP: [u8; 32] = [0x22; 32];
     const GW_ADDR: [u8; 20] = [0x33; 20];
+    const GW_KEY: [u8; 32] = [0x55; 32];
     const PAYLOAD: &str = "{\"nonce\":\"n\"}";
 
     struct FakeQuotes(HashMap<Vec<u8>, Result<TdxClaims, String>>);
@@ -367,9 +391,11 @@ mod tests {
         status: u16,
         body: Option<Vec<u8>>,
         quote_err: Option<String>,
+        gw_quote_err: Option<String>,
         gpu: Result<GpuVerdict, String>,
         options: AttestOptions,
         policy: Policy,
+        keyless: bool,
     }
 
     impl Case {
@@ -397,6 +423,7 @@ mod tests {
                 status: 200,
                 body: None,
                 quote_err: None,
+                gw_quote_err: None,
                 gpu: Ok(GpuVerdict {
                     kid: "kid-1".into(),
                     overall: true,
@@ -405,6 +432,7 @@ mod tests {
                 policy: Policy {
                     compose_hashes: BTreeSet::from([sha(&[COMPOSE.as_bytes()])]),
                 },
+                keyless: false,
             }
         }
     }
@@ -441,7 +469,12 @@ mod tests {
                     body,
                 },
             );
-            quotes.insert(format!("gw-{model}").into_bytes(), Ok(case.gw.clone()));
+            quotes.insert(
+                format!("gw-{model}").into_bytes(),
+                case.gw_quote_err
+                    .clone()
+                    .map_or_else(|| Ok(case.gw.clone()), Err),
+            );
             quotes.insert(
                 format!("m0-{model}").into_bytes(),
                 case.quote_err
@@ -459,7 +492,7 @@ mod tests {
             quotes: Arc::new(FakeQuotes(quotes)),
             gpus: gpu.clone(),
             base_url: BASE.into(),
-            key: DUMMY_KEY.to_string().into(),
+            key: (!first.keyless).then(|| DUMMY_KEY.to_string().into()),
             models: models.iter().map(|m| m.to_string()).collect(),
             options: first.options,
             policy: first.policy.clone(),
@@ -507,6 +540,17 @@ mod tests {
         run_cases(&["m"], vec![for_model(case, "m")])
     }
 
+    /// Production serves the report without an API key, so attestation can
+    /// run keyless; it still verifies, and no bearer is sent.
+    #[test]
+    fn a_keyless_attestor_fetches_the_report_without_a_bearer() {
+        let mut case = Case::good([1; 32]);
+        case.keyless = true;
+        let run = run_one(case);
+        assert_eq!(run.result.unwrap().fingerprints, BTreeSet::from([FP]));
+        assert_eq!(run.http.bearers(), vec![false]);
+    }
+
     #[test]
     fn a_good_report_yields_the_fingerprint_and_model_keys() {
         let run = run_one(Case::good([1; 32]));
@@ -521,6 +565,8 @@ mod tests {
             vec![format!("GET {}", report_url(BASE, "m", &[1; 32]))]
         );
         assert_eq!(run.http.bearers(), vec![true]);
+        // An ecdsa gateway pins TLS only; it attests no receipt key.
+        assert!(a.gateway_keys.is_empty(), "{:?}", a.gateway_keys);
         assert_eq!(
             *run.gpu.seen.lock().unwrap(),
             vec![(PAYLOAD.to_string(), hex::encode([1u8; 32]))]
@@ -700,6 +746,83 @@ mod tests {
         }
     }
 
+    /// A good report whose gateway signs with ed25519, as production does.
+    fn ed25519_gateway(nonce: [u8; 32]) -> Case {
+        let mut case = Case::good(nonce);
+        let gw = case.report["gateway_attestation"].as_object_mut().unwrap();
+        gw.insert("signing_address".into(), hex::encode(GW_KEY).into());
+        gw.insert("signing_algo".into(), "ed25519".into());
+        case.gw = claims(sha(&[&GW_KEY, &FP]), nonce, COMPOSE);
+        case
+    }
+
+    #[test]
+    fn an_ed25519_gateway_that_passes_every_check_yields_its_key() {
+        let a = run_one(ed25519_gateway([1; 32])).result.unwrap();
+        assert_eq!(a.gateway_keys, BTreeSet::from([GW_KEY]));
+        // The gateway key is not a model key.
+        assert_eq!(
+            a.keys,
+            BTreeMap::from([("m".to_string(), BTreeSet::from([KEY]))])
+        );
+        let gw = &a.evidence[0]["entries"][0];
+        assert_eq!(gw["role"], "gateway");
+        assert_eq!(gw["signing_key"], hex::encode(GW_KEY));
+    }
+
+    /// The gateway key is accepted only from an entry that passed every
+    /// check: any failed check refuses the whole report, so no key escapes.
+    #[test]
+    fn a_gateway_key_from_a_report_that_failed_a_check_is_not_accepted() {
+        type Mutate = Box<dyn Fn(&mut Case)>;
+        let cases: Vec<(&str, Mutate)> = vec![
+            ("does not bind", Box::new(|c| c.gw.report_data[0] ^= 1)),
+            ("nonce", Box::new(|c| c.gw.report_data[63] ^= 1)),
+            (
+                "TDX quote",
+                Box::new(|c| c.gw_quote_err = Some("bad signature".into())),
+            ),
+            ("Revoked", Box::new(|c| c.gw.tcb_status = "Revoked".into())),
+            (
+                "--allow-tcb-out-of-date",
+                Box::new(|c| c.gw.tcb_status = "OutOfDate".into()),
+            ),
+            (
+                "attestation-policy.json",
+                Box::new(|c| {
+                    c.gw.mr_config_id = mr_config(OTHER_COMPOSE);
+                    c.report["gateway_attestation"]
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("info".into(), info(OTHER_COMPOSE));
+                }),
+            ),
+            (
+                "signing_address",
+                Box::new(|c| {
+                    // A 31-byte key the quote binds is still refused.
+                    c.gw = claims(sha(&[&[0x55; 31], &FP]), [1; 32], COMPOSE);
+                    c.report["gateway_attestation"]
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("signing_address".into(), "55".repeat(31).into());
+                }),
+            ),
+            // A later model entry failing refuses the gateway key too.
+            (
+                "GPU",
+                Box::new(|c| c.gpu = Err("NRAS verdict: false".into())),
+            ),
+        ];
+        for (phrase, mutate) in cases {
+            let mut case = ed25519_gateway([1; 32]);
+            mutate(&mut case);
+            let err = run_one(case).result.unwrap_err();
+            assert!(err.contains(phrase), "expected {phrase:?} in {err:?}");
+            assert!(err.contains("model m"), "{err}");
+        }
+    }
+
     /// `model_name` is checked when present; NEAR AI may omit it, so its
     /// absence is not refused until check 6 confirms the field.
     #[test]
@@ -733,6 +856,157 @@ mod tests {
         );
     }
 
+    /// The production compose hashes measured on 2026-10-29: the gateway
+    /// (dstack-0.5.12) and the abliterated DeepSeek model entry
+    /// (dstack-nvidia-0.5.11), each sha256(info.tcb_info.app_compose).
+    #[test]
+    fn the_committed_policy_pins_the_production_composes() {
+        let policy = load_policy(POLICY_JSON).unwrap();
+        for h in [
+            "f571e5dafe8f96baf116a271b4be9cba228b447dd6ebe502bbda81ede7bcc7ce",
+            "ae66f844658a7aee331dcb9fb59bd40323d71d192d37719e022cc4af8389265b",
+        ] {
+            assert!(
+                policy.compose_hashes.contains(&report::hex32(h).unwrap()),
+                "{h} is not pinned"
+            );
+        }
+        assert_eq!(policy.compose_hashes.len(), 2);
+    }
+
+    /// The production evidence recorded by tests/live_attest.rs on
+    /// 2026-10-29 (report, PCS collateral, root CRL, NRAS answer and the
+    /// JWKS key it names), replayed through the real quote and GPU
+    /// verifiers at the recorded time.
+    fn production_replay(
+        now: u64,
+        policy: Policy,
+        key: Option<HostSecret>,
+    ) -> Result<Attested, String> {
+        use base64::Engine;
+        let run: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/near-prod/live-run-2026-10-29.json"
+        ))
+        .unwrap();
+        let http = FakeHttp::new();
+        for e in run["exchanges"].as_array().unwrap() {
+            let headers = e["headers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| {
+                    (
+                        h[0].as_str().unwrap().to_string(),
+                        h[1].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            http.route(
+                e["method"].as_str().unwrap(),
+                e["url"].as_str().unwrap(),
+                HttpResponse {
+                    status: e["status"].as_u64().unwrap() as u16,
+                    headers,
+                    body: base64::engine::general_purpose::STANDARD
+                        .decode(e["body_b64"].as_str().unwrap())
+                        .unwrap(),
+                },
+            );
+        }
+        let nonce = report::hex32(run["nonces"][0].as_str().unwrap()).unwrap();
+        let http: Arc<dyn Http> = http;
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(now));
+        Attestor {
+            quotes: Arc::new(PcsQuoteVerifier { http: http.clone() }),
+            gpus: Arc::new(NrasGpuVerifier {
+                http: http.clone(),
+                clock: clock.clone(),
+            }),
+            http,
+            clock,
+            base_url: run["base_url"].as_str().unwrap().into(),
+            key,
+            models: vec![crate::config::DEFAULT_MODELS[0].to_string()],
+            options: AttestOptions::default(),
+            policy,
+            nonce: Arc::new(move || nonce),
+        }
+        .attest()
+    }
+
+    const PRODUCTION_RECORDED_AT: u64 = 1_793_309_354;
+
+    #[test]
+    fn the_recorded_production_evidence_attests_under_the_default_options() {
+        let a = production_replay(
+            PRODUCTION_RECORDED_AT,
+            load_policy(POLICY_JSON).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            a.fingerprints,
+            BTreeSet::from([
+                report::hex32("73862c254372091cc6895b900111503860694f8916ebf0c63b18d245ba8ba5ad")
+                    .unwrap(),
+                report::hex32("4066aed3031802c9de0197e0e849a18133e445f2bb085b036c2a18ab47796408")
+                    .unwrap(),
+            ])
+        );
+        // The live leaf's SPKI hash is the gateway's attested fingerprint.
+        use rustls::pki_types::pem::PemObject;
+        let leaf = rustls::pki_types::CertificateDer::from_pem_slice(include_bytes!(
+            "../tests/fixtures/near-prod/cloud-api-leaf.pem"
+        ))
+        .unwrap();
+        assert!(
+            a.fingerprints
+                .contains(&crate::forwarder::pin::spki_sha256(&leaf).unwrap())
+        );
+        assert_eq!(
+            a.keys[crate::config::DEFAULT_MODELS[0]],
+            BTreeSet::from([report::hex32(
+                "88fbc43bdd80a7cc51c3f47ac7ec88b37efe2471b4e20a651281fbd81adcee78"
+            )
+            .unwrap()])
+        );
+        // Production signs receipts with the gateway's ed25519 key
+        // (session d493b14cec32, 2026-10-29), so it is attested too.
+        assert_eq!(
+            a.gateway_keys,
+            BTreeSet::from([report::hex32(
+                "40599fb284f43953bb356b09080fd803c960fc10285ad90eca462ca711ad4acb"
+            )
+            .unwrap()])
+        );
+        let entries = a.evidence[0]["entries"].as_array().unwrap();
+        assert!(entries.iter().all(|e| e["tcb_status"] == "UpToDate"));
+    }
+
+    #[test]
+    fn the_recorded_production_evidence_is_refused_without_its_pinned_composes() {
+        let e = production_replay(
+            PRODUCTION_RECORDED_AT,
+            Policy {
+                compose_hashes: BTreeSet::new(),
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(e.contains("not pinned"), "{e}");
+    }
+
+    #[test]
+    fn the_recorded_production_evidence_is_refused_once_the_nras_token_expires() {
+        let e = production_replay(
+            PRODUCTION_RECORDED_AT + 7 * 24 * 3600,
+            load_policy(POLICY_JSON).unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert!(e.contains("GPU attestation"), "{e}");
+    }
+
     #[test]
     fn the_committed_policy_parses_and_bad_entries_are_refused() {
         load_policy(POLICY_JSON).unwrap();
@@ -761,16 +1035,19 @@ mod tests {
     }
 
     #[test]
-    fn merge_unions_fingerprints_keys_and_evidence() {
+    fn merge_unions_fingerprints_keys_gateway_keys_and_evidence() {
         let mut a = Attested::default();
         a.fingerprints.insert(FP);
+        a.gateway_keys.insert(GW_KEY);
         a.keys.entry("m".into()).or_default().insert(KEY);
         a.evidence.push(serde_json::json!(1));
         let mut b = Attested::default();
         b.fingerprints.insert([5; 32]);
         b.keys.entry("m".into()).or_default().insert([6; 32]);
+        b.gateway_keys.insert([7; 32]);
         b.evidence.push(serde_json::json!(2));
         a.merge(b);
+        assert_eq!(a.gateway_keys, BTreeSet::from([GW_KEY, [7; 32]]));
         assert_eq!(a.fingerprints.len(), 2);
         assert_eq!(a.keys["m"], BTreeSet::from([KEY, [6; 32]]));
         assert_eq!(a.evidence.len(), 2);

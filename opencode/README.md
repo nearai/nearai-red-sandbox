@@ -55,7 +55,10 @@ To use a separately managed IronWire daemon, explicitly set
 `provider.id` and `provider.baseURL` in the operator configuration. The old
 `http://127.0.0.1:8463/openai/v1` connection remains available in that external
 mode and bypasses browser sign-in. A provider with only `models` selects
-embedded inference; omitting the provider entirely selects the default model.
+embedded inference; omitting the provider entirely selects the default model,
+NEAR AI's `deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated` (listed by
+production `/v1/models` on 2026-10-29). A config that still names the retired
+placeholder `PLACEHOLDER-near-private-abliterated` is refused at launch.
 
 A provider reached directly (for example `https://cloud-api.near.ai/v1`)
 still works: set `provider.id`, `provider.baseURL` (https) and
@@ -87,6 +90,47 @@ Confirmed on 2026-10-28 from NEAR AI's own docs repo, `nearai/docs` at commit
 That page was checked by NEAR AI against opencode 1.18.31 and uses the v1
 config shape. docs.near.ai itself was not reachable from the build
 environment, so the GitHub source of the page was read instead.
+
+## Live attestation test against NEAR AI production
+
+`tests/live_attest.rs` is opt-in (every test `#[ignore]`) and reaches NEAR
+AI, Intel PCS and NVIDIA NRAS:
+
+```sh
+RUSTFLAGS="-D warnings" CARGO_INCREMENTAL=0 \
+  cargo test --test live_attest -- --ignored --nocapture --test-threads=1
+```
+
+It defaults to production (`https://cloud-api.near.ai/v1`) and the default
+models; `RTS_LIVE_NEAR_BASE_URL` and `RTS_LIVE_NEAR_MODELS` override them.
+NEAR AI serves the attestation report without an API key, so none is needed;
+`RTS_LIVE_NEAR_API_KEY`, when set, is sent as the bearer. `RTS_LIVE_SAVE_DIR`
+saves every exchange (report, PCS, CRL, NRAS) as `live-run.json`, the source
+of `tests/fixtures/near-prod/live-run-2026-10-29.json`, which an offline
+unit test replays through the real verifiers at the recorded time.
+
+Recorded on 2026-10-29 for `deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated`,
+with the default options (TCB `UpToDate` required, pinned compose):
+
+| Check | Gateway | Model entry |
+|---|---|---|
+| TDX TCB status | `UpToDate`, no advisories | `UpToDate`, no advisories |
+| Compose hash | `f571e5da...7bcc7ce` (`dstack-0.5.12`) | `ae66f844...8389265b` (`dstack-nvidia-0.5.11`) |
+| `tls_cert_fingerprint` (SPKI sha256) | `73862c25...ba8ba5ad` | `4066aed3...47796408` |
+| NRAS | | overall `true`, kid `nv-eat-kid-prod-20261029142518307-...` |
+
+The live `cloud-api.near.ai` leaf's SPKI sha256 was `73862c25...ba8ba5ad`,
+the gateway's attested fingerprint, and the forwarder's pinned client config
+completed a handshake with only the attested set; with a `[0; 32]` pin it
+refused the same leaf as unpinned. Completions and signature receipts need
+an API key and are not covered by the replay (spec check 6).
+
+The gateway's ed25519 `signing_address` in the same report is
+`40599fb2...a711ad4acb`; the model entry's is `88fbc43b...1adcee78`. A real
+production session on 2026-10-29 got its first receipt signed with the
+gateway key, so the forwarder accepts attested gateway keys as receipt
+signers for any allowed model, and `inference.jsonl` records `signer`
+(`gateway` or `model`).
 
 ## Config shape accepted by v2.1.4
 

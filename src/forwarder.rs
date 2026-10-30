@@ -145,6 +145,9 @@ struct State {
     /// The seed's attested signing keys per model, merged with every
     /// re-attestation.
     keys: RwLock<BTreeMap<String, BTreeSet<[u8; 32]>>>,
+    /// The attested gateways' ed25519 keys, valid receipt signers for any
+    /// allowed model; merged with every re-attestation like `keys`.
+    gateway_keys: RwLock<BTreeSet<[u8; 32]>>,
     signatures: SignaturePolicy,
     inference_log: PathBuf,
     /// Responses relayed or being checked that have no line yet. Whoever
@@ -207,6 +210,7 @@ impl Forwarder {
             max_request_bytes: cfg.max_request_bytes,
             upstream: upstream.to_string(),
             keys: RwLock::new(cfg.seed.keys),
+            gateway_keys: RwLock::new(cfg.seed.gateway_keys),
             signatures: cfg.signatures,
             inference_log: cfg.inference_log,
             pending: Mutex::new(BTreeMap::new()),
@@ -325,6 +329,7 @@ async fn drain(state: &State) {
             request_sha256: hex::encode(open.request_sha256),
             response_sha256: open.response_sha256.map(hex::encode).unwrap_or_default(),
             signing_key: None,
+            signer: None,
             signature_ms: None,
             result: format!("failed: {reason}"),
         };
@@ -507,14 +512,11 @@ async fn handle(state: &Arc<State>, req: Request<Incoming>) -> Out {
                     "rts forwarder: upstream request failed",
                 );
             }
-            Some(Rejected::Untrusted(fp)) => {
+            Some(r @ Rejected::Untrusted(_)) => {
                 return fatal_reply(
                     state,
                     "pin-failed",
-                    format!(
-                        "pin: upstream certificate {} does not chain to a trusted root",
-                        hex::encode(fp)
-                    ),
+                    format!("pin: {} does not chain to a trusted root", r.certificate()),
                 );
             }
             Some(Rejected::Unpinned(fp)) => {
@@ -532,16 +534,10 @@ async fn handle(state: &Arc<State>, req: Request<Incoming>) -> Out {
                     Ok(resp) => resp,
                     Err(_) => {
                         if let Some(r) = state.pins.take_rejected() {
-                            let fp = match r {
-                                Rejected::Unpinned(fp) | Rejected::Untrusted(fp) => fp,
-                            };
                             return fatal_reply(
                                 state,
                                 "pin-failed",
-                                format!(
-                                    "pin: upstream certificate {} refused after re-attestation",
-                                    hex::encode(fp)
-                                ),
+                                format!("pin: {} refused after re-attestation", r.certificate()),
                             );
                         }
                         return local(
@@ -584,7 +580,7 @@ async fn learn(state: &State, fp: [u8; 32]) -> Result<(), Unlearned> {
         return Ok(());
     }
     Err(Unlearned::Failed(format!(
-        "pin: upstream certificate {} is not attested after {REATTEST_ATTEMPTS} re-attestations",
+        "pin: upstream certificate with public key sha256 {} is not attested after {REATTEST_ATTEMPTS} re-attestations",
         hex::encode(fp)
     )))
 }
@@ -614,6 +610,12 @@ async fn reattest_once(state: &State, what: &str) -> Result<(), Unlearned> {
     for (model, more) in attested.keys {
         keys.entry(model).or_default().extend(more);
     }
+    drop(keys);
+    state
+        .gateway_keys
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(attested.gateway_keys);
     Ok(())
 }
 
@@ -789,16 +791,22 @@ async fn check(
             },
         },
     };
-    let (result, signing_key, signature_ms) = match &outcome {
-        Checked::Verified(key, took) => (
+    let (result, signing_key, signer, signature_ms) = match &outcome {
+        Checked::Verified(key, signer, took) => (
             "verified".to_string(),
             Some(hex::encode(key)),
+            Some(signer.as_str()),
             Some(u64::try_from(took.as_millis()).unwrap_or(u64::MAX)),
         ),
-        Checked::NotSigned => (format!("not-signed (HTTP {})", status.as_u16()), None, None),
-        Checked::Stopped => ("failed: session stopped".to_string(), None, None),
+        Checked::NotSigned => (
+            format!("not-signed (HTTP {})", status.as_u16()),
+            None,
+            None,
+            None,
+        ),
+        Checked::Stopped => ("failed: session stopped".to_string(), None, None, None),
         Checked::Failed(reason) | Checked::PinFailed(reason) => {
-            (format!("failed: {reason}"), None, None)
+            (format!("failed: {reason}"), None, None, None)
         }
     };
     let line = InferenceLine {
@@ -809,6 +817,7 @@ async fn check(
         request_sha256: hex::encode(ex.request_sha256),
         response_sha256: hex::encode(ex.response_sha256),
         signing_key,
+        signer,
         signature_ms,
         result,
     };
@@ -832,7 +841,7 @@ async fn check(
 }
 
 enum Checked {
-    Verified([u8; 32], Duration),
+    Verified([u8; 32], Signer, Duration),
     NotSigned,
     Stopped,
     Failed(String),
@@ -840,22 +849,71 @@ enum Checked {
     PinFailed(String),
 }
 
-fn attested_keys(state: &State, model: &str) -> BTreeSet<[u8; 32]> {
-    state
-        .keys
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(model)
-        .cloned()
-        .unwrap_or_default()
+/// Which attested role's key signed a receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Signer {
+    Model,
+    Gateway,
+}
+
+impl Signer {
+    fn as_str(self) -> &'static str {
+        match self {
+            Signer::Model => "model",
+            Signer::Gateway => "gateway",
+        }
+    }
+}
+
+/// One snapshot of the keys that may sign a receipt for `model`: its own
+/// attested keys and the attested gateway keys.
+struct Signers {
+    model: BTreeSet<[u8; 32]>,
+    gateway: BTreeSet<[u8; 32]>,
+}
+
+impl Signers {
+    fn all(&self) -> BTreeSet<[u8; 32]> {
+        self.model.union(&self.gateway).copied().collect()
+    }
+
+    fn contains(&self, key: &[u8; 32]) -> bool {
+        self.model.contains(key) || self.gateway.contains(key)
+    }
+
+    /// A key attested both ways is logged as the model's.
+    fn role(&self, key: &[u8; 32]) -> Signer {
+        if self.model.contains(key) {
+            Signer::Model
+        } else {
+            Signer::Gateway
+        }
+    }
+}
+
+fn attested_keys(state: &State, model: &str) -> Signers {
+    Signers {
+        model: state
+            .keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(model)
+            .cloned()
+            .unwrap_or_default(),
+        gateway: state
+            .gateway_keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+    }
 }
 
 /// Fetches and checks the receipt. A certificate the fetch sees refused is
 /// handled as one a completion sees: an unpinned one is learned (`learn`,
 /// at most once per fetch) and the fetch retried within what is left of the
 /// window; an untrusted one, or one still refused, is `pin-failed`. A key
-/// not attested for the model gets one re-attestation, then the check runs
-/// again.
+/// attested neither for the model nor for the gateway gets one
+/// re-attestation, then the check runs again.
 async fn verify(state: &State, ex: &Exchange, auth: &HeaderValue) -> Checked {
     let start = Instant::now();
     let deadline = start + state.signatures.window;
@@ -884,16 +942,16 @@ async fn verify(state: &State, ex: &Exchange, auth: &HeaderValue) -> Checked {
             // The fetch that answered: signature_ms stays the fetch time.
             Ok(fetched) => break fetched,
             Err(FetchError::Failed(e)) => return Checked::Failed(format!("signature: {e}")),
-            Err(FetchError::Rejected(Rejected::Untrusted(fp))) => {
+            Err(FetchError::Rejected(r @ Rejected::Untrusted(_))) => {
                 return Checked::PinFailed(format!(
-                    "pin: upstream certificate {} does not chain to a trusted root",
-                    hex::encode(fp)
+                    "pin: {} does not chain to a trusted root",
+                    r.certificate()
                 ));
             }
-            Err(FetchError::Rejected(Rejected::Unpinned(fp))) if learned => {
+            Err(FetchError::Rejected(r @ Rejected::Unpinned(_))) if learned => {
                 return Checked::PinFailed(format!(
-                    "pin: upstream certificate {} refused after re-attestation",
-                    hex::encode(fp)
+                    "pin: {} refused after re-attestation",
+                    r.certificate()
                 ));
             }
             Err(FetchError::Rejected(Rejected::Unpinned(fp))) => {
@@ -919,8 +977,10 @@ async fn verify(state: &State, ex: &Exchange, auth: &HeaderValue) -> Checked {
             }
         }
     }
-    match signature::check_receipt(&receipt, ex, &attested_keys(state, &ex.model)) {
-        Ok(key) => Checked::Verified(key, took),
+    // One snapshot for both the check and the role it logs.
+    let signers = attested_keys(state, &ex.model);
+    match signature::check_receipt(&receipt, ex, &signers.all()) {
+        Ok(key) => Checked::Verified(key, signers.role(&key), took),
         Err(e) => Checked::Failed(format!("signature: {e}")),
     }
 }
@@ -989,16 +1049,40 @@ mod tests {
         hex::encode(Sha256::digest(b))
     }
 
+    /// The key NEAR AI production signs receipts with: the gateway's.
+    fn gateway_key() -> SigningKey {
+        SigningKey::from_bytes(&[10; 32])
+    }
+
+    fn gateway_vk() -> [u8; 32] {
+        gateway_key().verifying_key().to_bytes()
+    }
+
     /// A receipt as NEAR AI returns it, signed with the test key.
     fn receipt_for(text: &str) -> Vec<u8> {
+        receipt_signed(&test_key(), text)
+    }
+
+    fn receipt_signed(key: &SigningKey, text: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "text": text,
-            "signature": hex::encode(test_key().sign(text.as_bytes()).to_bytes()),
-            "signing_address": hex::encode(test_vk()),
+            "signature": hex::encode(key.sign(text.as_bytes()).to_bytes()),
+            "signing_address": hex::encode(key.verifying_key().to_bytes()),
             "signing_algo": "ed25519",
             "signature_kind": "provider_tee",
         }))
         .unwrap()
+    }
+
+    /// As `good_receipt`, signed with the gateway key.
+    fn gateway_receipt(req: &[u8], resp: &[u8]) -> (u16, Vec<u8>) {
+        (
+            200,
+            receipt_signed(
+                &gateway_key(),
+                &format!("m:{}:{}", sha_hex(req), sha_hex(resp)),
+            ),
+        )
     }
 
     /// Signs sha256(request body received) and sha256(response body sent).
@@ -1074,7 +1158,7 @@ mod tests {
     }
 
     fn fp(name: &str) -> [u8; 32] {
-        pin::sha256_der(cert(name).as_ref())
+        pin::spki_sha256(&cert(name)).expect("parses")
     }
 
     fn fps(names: &[&str]) -> BTreeSet<[u8; 32]> {
@@ -1356,6 +1440,25 @@ mod tests {
         })
     }
 
+    /// As `reattest`, also attesting `gateway_keys`.
+    fn reattest_gateway(
+        answer: &[&str],
+        gateway_keys: &[[u8; 32]],
+        calls: &Arc<AtomicUsize>,
+    ) -> Reattest {
+        let answer = fps(answer);
+        let gateway_keys: BTreeSet<[u8; 32]> = gateway_keys.iter().copied().collect();
+        let calls = calls.clone();
+        Arc::new(move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Attested {
+                fingerprints: answer.clone(),
+                gateway_keys: gateway_keys.clone(),
+                ..Attested::default()
+            })
+        })
+    }
+
     struct Rig {
         /// None once `stop_forwarder` has run.
         forwarder: Option<Forwarder>,
@@ -1413,12 +1516,26 @@ mod tests {
         max: usize,
         signatures: SignaturePolicy,
     ) -> Rig {
+        rig_seeded(up, seed, keys, &[], reattest, max, signatures)
+    }
+
+    /// As `rig_with`, also seeding the attested gateway keys.
+    fn rig_seeded(
+        up: &Upstream,
+        seed: &[&str],
+        keys: &[[u8; 32]],
+        gateway_keys: &[[u8; 32]],
+        reattest: Reattest,
+        max: usize,
+        signatures: SignaturePolicy,
+    ) -> Rig {
         let dir = crate::testutil::tempdir("forwarder");
         let record =
             AttestationRecord::create(&dir, "0123456789ab", &AttestOptions::default()).unwrap();
         let seed = Attested {
             fingerprints: fps(seed),
             keys: [("m".to_string(), keys.iter().copied().collect())].into(),
+            gateway_keys: gateway_keys.iter().copied().collect(),
             ..Attested::default()
         };
         record.verified(&seed).unwrap();
@@ -2286,6 +2403,146 @@ mod tests {
                 .unwrap()
                 .starts_with("failed:")
         );
+    }
+
+    /// NEAR AI production signs receipts with the attested gateway's key
+    /// (session d493b14cec32, 2026-10-29): accepted for any allowed model.
+    #[test]
+    fn a_receipt_signed_by_the_attested_gateway_key_verifies() {
+        let up = upstream_with(|_| "a", false, ok_reply, gateway_receipt);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig_seeded(
+            &up,
+            &["a"],
+            &[test_vk()],
+            &[gateway_vk()],
+            reattest(&["a"], &calls),
+            1 << 20,
+            quick(),
+        );
+        assert_eq!(rig.post(BODY), (200, REPLY.to_vec()));
+        let lines = rig.wait_lines(1);
+        assert_eq!(lines[0]["result"], "verified", "{}", lines[0]);
+        assert_eq!(lines[0]["signer"], "gateway");
+        assert_eq!(lines[0]["signing_key"], hex::encode(gateway_vk()));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a known key never re-attests"
+        );
+        assert_eq!(rig.fatal.reason(), None);
+        assert_eq!(
+            rig.doc()["gateway_keys"],
+            serde_json::json!([hex::encode(gateway_vk())])
+        );
+        no_key_in(&rig);
+    }
+
+    #[test]
+    fn a_receipt_signed_by_a_model_key_verifies_and_logs_signer_model() {
+        let up = upstream(|_| "a", false, ok_reply);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig_seeded(
+            &up,
+            &["a"],
+            &[test_vk()],
+            &[gateway_vk()],
+            reattest(&["a"], &calls),
+            1 << 20,
+            quick(),
+        );
+        assert_eq!(rig.post(BODY).0, 200);
+        let lines = rig.wait_lines(1);
+        assert_eq!(lines[0]["result"], "verified", "{}", lines[0]);
+        assert_eq!(lines[0]["signer"], "model");
+        assert_eq!(lines[0]["signing_key"], hex::encode(test_vk()));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A key that is neither the model's nor the gateway's gets exactly one
+    /// re-attestation; one that does not attest it ends the session.
+    #[test]
+    fn a_key_neither_model_nor_gateway_fails_after_one_reattestation() {
+        let up = upstream_with(|_| "a", false, ok_reply, gateway_receipt);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig_seeded(
+            &up,
+            &["a"],
+            &[test_vk()],
+            &[[0x77; 32]],
+            reattest_gateway(&["a"], &[[0x78; 32]], &calls),
+            1 << 20,
+            quick(),
+        );
+        assert_eq!(rig.post(BODY).0, 200);
+        wait_within(Duration::from_secs(3), "fatal", || {
+            rig.fatal.reason().is_some()
+        });
+        let reason = rig.fatal.reason().unwrap();
+        assert!(reason.contains("not attested"), "{reason}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        wait_for("signature-failed", || {
+            rig.doc()["status"] == "signature-failed"
+        });
+        let lines = rig.wait_lines(1);
+        assert!(lines[0]["result"].as_str().unwrap().starts_with("failed:"));
+        assert_eq!(lines[0]["signer"], serde_json::Value::Null);
+        assert_eq!(lines[0]["signing_key"], serde_json::Value::Null);
+        no_key_in(&rig);
+    }
+
+    /// A re-attestation that fails a check (here, the gateway's) yields no
+    /// gateway key: the receipt it signed is refused.
+    #[test]
+    fn a_gateway_key_from_a_failed_reattestation_is_not_accepted() {
+        let up = upstream_with(|_| "a", false, ok_reply, gateway_receipt);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let failing: Reattest = {
+            let calls = calls.clone();
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err("model m: gateway: TDX quote: bad signature".into())
+            })
+        };
+        let rig = rig_seeded(&up, &["a"], &[test_vk()], &[], failing, 1 << 20, quick());
+        assert_eq!(rig.post(BODY).0, 200);
+        wait_for("signature-failed", || {
+            rig.doc()["status"] == "signature-failed"
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let lines = rig.wait_lines(1);
+        assert!(lines[0]["result"].as_str().unwrap().starts_with("failed:"));
+        assert_eq!(lines[0]["signer"], serde_json::Value::Null);
+    }
+
+    /// Re-attestation carries gateway keys into the forwarder and the record.
+    #[test]
+    fn a_gateway_key_learned_by_reattestation_is_kept() {
+        let up = upstream_with(|_| "a", false, ok_reply, gateway_receipt);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig_seeded(
+            &up,
+            &["a"],
+            &[test_vk()],
+            &[],
+            reattest_gateway(&["a"], &[gateway_vk()], &calls),
+            1 << 20,
+            quick(),
+        );
+        assert_eq!(rig.post(BODY).0, 200);
+        let lines = rig.wait_lines(1);
+        assert_eq!(lines[0]["result"], "verified", "{}", lines[0]);
+        assert_eq!(lines[0]["signer"], "gateway");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let doc = rig.doc();
+        assert_eq!(
+            doc["reattestations"][0]["gateway_keys"],
+            serde_json::json!([hex::encode(gateway_vk())])
+        );
+        assert_eq!(rig.post(BODY).0, 200);
+        assert_eq!(rig.wait_lines(2)[1]["signer"], "gateway");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the merged key is kept");
+        assert_eq!(rig.fatal.reason(), None);
     }
 
     #[test]
