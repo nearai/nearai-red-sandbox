@@ -1,6 +1,7 @@
-import { afterEach, beforeEach, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { spawnSync } from "node:child_process"
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { createHash } from "node:crypto"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -124,4 +125,117 @@ test("render-formula refuses a template with a placeholder left", () => {
   expect(r.status).toBe(1)
   expect(r.stderr).toContain("@")
   expect(existsSync(f)).toBe(false)
+})
+
+// check-existing-release.sh: a re-run after `gh release create` succeeded must
+// skip creation only when the published assets are exactly this run's files.
+describe("check-existing-release", () => {
+  const SCRIPT = "scripts/release/check-existing-release.sh"
+  const V = "0.1.0"
+  const TARBALL = `rts-${V}-aarch64-apple-darwin.tar.gz`
+  let dist: string
+  let fakebin: string
+  let release: string
+  let ghLog: string
+  const hex = (b: string | Buffer) => createHash("sha256").update(b).digest("hex")
+
+  beforeEach(() => {
+    dist = join(dir, "dist")
+    fakebin = join(dir, "bin")
+    release = join(dir, "release.json")
+    ghLog = join(dir, "gh.log")
+    mkdirSync(dist)
+    mkdirSync(fakebin)
+    writeFileSync(join(dist, TARBALL), "tarball bytes")
+    writeFileSync(join(dist, "install.sh"), "#!/bin/bash\n")
+    writeFileSync(join(dist, "SHA256SUMS"), `${hex("tarball bytes")}  ${TARBALL}\n${hex("#!/bin/bash\n")}  install.sh\n`)
+    // gh api honours --jq like `jq -r`; the stub runs the script's own filter over a canned release.
+    writeFileSync(join(fakebin, "gh"), `#!/bin/bash
+echo "$*" >> '${ghLog}'
+[ "$1" = api ] || exit 2
+filter=
+while [ $# -gt 0 ]; do [ "$1" = --jq ] && filter=$2; shift; done
+[ -f '${release}' ] || { echo "HTTP 404: Not Found" >&2; exit 1; }
+exec /usr/bin/jq -r "$filter" '${release}'
+`)
+    chmodSync(join(fakebin, "gh"), 0o755)
+  })
+
+  function published(assets: { name: string; digest: string | null }[]) {
+    writeFileSync(release, JSON.stringify({ tag_name: `v${V}`, draft: false, assets }))
+  }
+  function exact() {
+    return [
+      { name: TARBALL, digest: `sha256:${hex("tarball bytes")}` },
+      { name: "install.sh", digest: `sha256:${hex("#!/bin/bash\n")}` },
+      { name: "SHA256SUMS", digest: `sha256:${hex(readFileSync(join(dist, "SHA256SUMS")))}` },
+    ]
+  }
+  function check() {
+    return spawnSync("bash", [join(ROOT, SCRIPT), "--repo", "nearai/nearai-red-sandbox", "--tag", `v${V}`, "--dir", dist], {
+      encoding: "utf8", cwd: ROOT, env: { PATH: `${fakebin}:/usr/bin:/bin`, HOME: dir },
+    })
+  }
+
+  test("an exact match passes and reads the release by tag", () => {
+    published(exact())
+    const r = check()
+    expect(r.stderr).toBe("")
+    expect(r.status).toBe(0)
+    expect(r.stdout).toContain("already holds exactly this run's assets")
+    expect(readFileSync(ghLog, "utf8")).toContain("api repos/nearai/nearai-red-sandbox/releases/tags/v0.1.0 ")
+  })
+
+  const cases: [string, () => { name: string; digest: string | null }[]][] = [
+    ["a different tarball digest", () => exact().map((a) => (a.name === TARBALL ? { ...a, digest: `sha256:${"0".repeat(64)}` } : a))],
+    ["a different SHA256SUMS", () => exact().map((a) => (a.name === "SHA256SUMS" ? { ...a, digest: `sha256:${"1".repeat(64)}` } : a))],
+    ["a missing asset", () => exact().filter((a) => a.name !== "install.sh")],
+    ["an extra asset", () => [...exact(), { name: "extra.txt", digest: `sha256:${"2".repeat(64)}` }]],
+    ["an asset without a digest", () => exact().map((a) => (a.name === "install.sh" ? { ...a, digest: null } : a))],
+    ["no assets", () => []],
+  ]
+  for (const [label, assets] of cases) {
+    test(`${label} is refused`, () => {
+      published(assets())
+      const r = check()
+      expect(r.status).toBe(1)
+      expect(r.stderr).toContain("v0.1.0")
+      expect(r.stderr).toContain("does not hold exactly this run's assets")
+    })
+  }
+
+  test("a release the API cannot read is refused", () => {
+    const r = check()
+    expect(r.status).toBe(1)
+    expect(r.stderr).toContain("v0.1.0")
+  })
+
+  test("a dist whose files do not match its SHA256SUMS is refused", () => {
+    published(exact())
+    writeFileSync(join(dist, "install.sh"), "changed\n")
+    const r = check()
+    expect(r.status).toBe(1)
+  })
+})
+
+test("the publish job guards gh release create with check-existing-release", () => {
+  const wf = readFileSync(join(ROOT, ".github", "workflows", "release.yml"), "utf8")
+  const step = wf.split("- name: Publish release")[1].split("- name:")[0]
+  const view = step.indexOf('gh release view "v$V"')
+  const guard = step.indexOf("scripts/release/check-existing-release.sh")
+  const create = step.indexOf('gh release create "v$V"')
+  expect(view).toBeGreaterThan(-1)
+  expect(guard).toBeGreaterThan(view)
+  expect(create).toBeGreaterThan(guard)
+})
+
+test("HOMEBREW_TAP_TOKEN is documented as a repository secret, not an environment secret", () => {
+  const wf = readFileSync(join(ROOT, ".github", "workflows", "release.yml"), "utf8")
+  const config = wf.split("release-config:")[1].split("\n  build:")[0]
+  expect(config).not.toContain("environment:")
+  expect(config).toContain("missing repository secret HOMEBREW_TAP_TOKEN")
+  const publish = wf.split("\n  publish:")[1]
+  expect(publish).not.toContain("environment:")
+  const spec = readFileSync(join(ROOT, "docs", "specs", "2026-10-29-release-and-installers-design.md"), "utf8")
+  expect(spec).toContain("`HOMEBREW_TAP_TOKEN` must be a repository or organization secret")
 })

@@ -14,6 +14,13 @@
 # secret names, environment: release on the signing job, contents: write only
 # on the publish job, a release-config preflight, notarization accepted only
 # on a JSON status of Accepted, and a tap pull request the workflow merges.
+#
+# Secrets: the MACOS_* signing and notary secrets are read only by the build
+# job, which runs in the `release` environment, so they may live there (or at
+# repository or organization level). HOMEBREW_TAP_TOKEN is read by
+# release-config and publish, which run without an environment, so it must be
+# a repository or organization secret: an environment secret is invisible to
+# them.
 name: release
 
 on:
@@ -51,6 +58,8 @@ jobs:
           exit 1
 
       # Fail a tag push here rather than after the release is already public.
+      # No environment on this job: HOMEBREW_TAP_TOKEN must be a repository or
+      # organization secret, as publish reads it the same way.
       - name: Confirm tag-release credentials are configured
         if: github.event_name == 'push'
         env:
@@ -58,7 +67,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$HOMEBREW_TAP_TOKEN" ]; then
-            echo "refusing to release: missing secret HOMEBREW_TAP_TOKEN (contents and pull-request write on nearai/homebrew-tap)" >&2
+            echo "refusing to release: missing repository secret HOMEBREW_TAP_TOKEN (contents and pull-request write on nearai/homebrew-tap); set it as a repository or organization secret, not in the release environment, which this job and publish do not use" >&2
             exit 1
           fi
 
@@ -140,7 +149,7 @@ jobs:
           for name in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD MACOS_SIGNING_IDENTITY \
             MACOS_NOTARY_ASC_KEY_P8_BASE64 MACOS_NOTARY_ASC_KEY_ID MACOS_NOTARY_ASC_ISSUER_ID; do
             if [ -z "${!name}" ]; then
-              echo "refusing: secret $name is not set in the release environment" >&2
+              echo "refusing: secret $name is not set (set it in the release environment, or as a repository or organization secret)" >&2
               exit 1
             fi
           done
@@ -295,12 +304,22 @@ jobs:
             [ -f "$f" ] || { echo "refusing: $f is missing from the build artifact" >&2; exit 1; }
           done
 
+      # A re-run of this job after the release was created but the tap step
+      # failed finds the release already there. It skips creation only when the
+      # published assets are exactly this run's files (GitHub's per-asset
+      # sha256 digests against this run's SHA256SUMS); otherwise it fails. See
+      # "Recovering a partly published release" in the release design spec.
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
           V: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
+          if gh release view "v$V" --repo nearai/nearai-red-sandbox >/dev/null 2>&1; then
+            bash scripts/release/check-existing-release.sh --repo nearai/nearai-red-sandbox \
+              --tag "v$V" --dir "$RUNNER_TEMP/dist"
+            exit 0
+          fi
           gh release create "v$V" "$RUNNER_TEMP"/dist/* \
             --repo nearai/nearai-red-sandbox \
             --verify-tag \
@@ -323,6 +342,7 @@ jobs:
 
       # HOMEBREW_TAP_TOKEN: fine-grained, contents and pull-request write on
       # nearai/homebrew-tap only. github.token cannot reach another repository.
+      # A repository or organization secret: this job has no environment.
       - name: Bump and merge the formula
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
