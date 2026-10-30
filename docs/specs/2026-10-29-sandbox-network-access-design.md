@@ -1,7 +1,7 @@
 # Controlled network access from the sandbox: design
 
 Date: 2026-10-29
-Status: draft for review; BLOCKED on mvm v0.22.0 (see Blockers measured 2026-10-29)
+Status: draft for review; blocker 1 worked around (see Attached start), upstream fix tracked in tinylabscom/mvm#4860
 
 ## Purpose
 
@@ -65,8 +65,7 @@ Full record: `docs/research/2026-10-29-mvm-egress-spike-hvf.md`.
    makes it exit about 0.5 s after `machine start` returns; the guest then
    logs "guest egress is down". Reproduced on two machines. No upstream issue
    or newer release (v0.22.0 is the latest stable) covered it; filed upstream as tinylabscom/mvm#4860 on 2026-10-29 (reproduced with the stock supervisor). `rts` uses
-   persistent machines (`create`, `start`, `exec`, `rm`), so this design cannot
-   work until it is fixed or worked around.
+   persistent machines (`create`, `start`, `exec`, `rm`), so `machine start` cannot be used for network sessions; see Attached start.
 2. **mvm's TLS interception does not close CDN fronting**, so it is not part
    of this design:
    - Routes with `intercept = true` close fronting only when the guest
@@ -91,6 +90,45 @@ Full record: `docs/research/2026-10-29-mvm-egress-spike-hvf.md`.
 Consequences for this design: risk 2 (IP-level filtering, CDN co-tenancy)
 stays an accepted, documented limitation in v1. Closing it needs an
 rts-owned SNI-checking path, which is out of scope until blocker 1 is solved.
+
+## Attached start (workaround for blocker 1, measured 2026-10-29)
+
+Full record: `docs/research/2026-10-29-mvm-attached-run-spike.md`.
+
+For a session with a non-empty allowlist, `rts` keeps `machine create` as it
+is and replaces `machine start` with a background
+`mvmctl machine run --name rts-<id> --ttl <session limit>` (no `--image`, no
+argv, no `-d`). That process boots the persistent machine and stays attached;
+as the network endpoint's parent it keeps egress alive. Measured: allowlisted
+`pypi.org` answered 200 at 45 s, 3 min and 31 min, a non-listed host was
+refused each time, and `machine exec`, base64 argv file writes and reads,
+and the always-exit-0 wrapper behave as with `machine start`. Sessions with
+no allowlist keep `machine start`.
+
+Requirements this places on `rts`:
+
+- **Supervise the attach process.** If it exits for any reason, the endpoint
+  exits with it and egress fails closed while `exec` keeps working, so the
+  failure would be silent. `rts` treats the attach process's exit as fatal:
+  the session ends with `network-lost` (export `/out`, remove the VM).
+  Re-attaching does not restore egress.
+- **Teardown order.** `machine rm --force --yes`, then SIGTERM to the attach
+  process (`rm` does not stop it), then confirm no endpoint or supervisor
+  process for the machine remains.
+- **Its output.** The attach process echoes every exec's argv, including the
+  base64 chunks of files written into the guest. Its stdout and stderr go to
+  `sessions/<id>/mvm-attach.log` (0600), never to the operator's terminal.
+- **One start at a time.** Two attach starts launched back to back raced on a
+  `plan.json.tmp` rename; `rts` runs one session at a time, and the start is
+  retried once if it fails before boot.
+- **TTL.** `--ttl` is set to the session's wall-clock limit (at most mvm's 30
+  days); expiry behaviour was not measured and is treated as `network-lost`.
+- **Not used:** a fully foreground `machine run --image … -- <argv>` died
+  about 60 s after boot in three of three tries ("control frame read
+  failed"), cause not found.
+
+When #4860 is fixed upstream, `machine start` replaces the attached start and
+this section is removed.
 
 ## Risks accepted with this design
 
