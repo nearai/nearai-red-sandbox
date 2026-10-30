@@ -435,11 +435,13 @@ with a forwarder between IronWire and NEAR AI, instead of patching IronWire.
   It takes the chat ID from `id` in the JSON body, or from the first SSE
   `data:` event. After the response ends, off the response path, it fetches
   `GET /v1/signature/{id}?model=<id>&signing_algo=ed25519` over the pinned
-  client, retrying 404 with backoff inside a 10 s window (to be measured in
-  check 6). It then requires: `signing_algo` is `ed25519`; `text` is
+  client, retrying 404 with backoff inside a 10 s window (production receipts
+  arrived 89 to 106 ms after the response ended, measured in check 6). It then
+  requires: `signing_algo` is `ed25519`; `text` is
   `<model>:<request sha256>:<response sha256>` (or the two-part form without
   a model) with the model equal to the request's and both hashes equal to its
-  own; `signing_address` is a key attested this session either for that
+  own (in the two-part form the model is still bound, through the request
+  hash, because the request body names it); `signing_address` is a key attested this session either for that
   model or for the gateway (any allowed model); and `ed25519-dalek`'s
   `verify_strict` accepts `signature` over `text`. A key attested neither way
   triggers exactly one re-attestation, merged into both sets, and the check
@@ -728,9 +730,22 @@ Each is a short probe. None is assumed.
      (`40599fb2...`), not the model entry's (`88fbc43b...`). The forwarder
      now accepts the gateway key for any allowed model (see Per-response
      signatures).
-   - Still open, needing an API key: the signature receipt latency (the 10 s
-     window), the receipt `text` format against the exact relayed bytes, and
-     `signature_kind`.
+   - Measured 2026-10-29 on production, in a full session after the gateway
+     key was accepted (`sessions/d158ee49af81`, 10 streamed completions with
+     tool calls): every receipt verified with `verify_strict` against the
+     attested gateway key (`signer: gateway` in `inference.jsonl`); the
+     receipt `text` hashes matched the exact request and response bytes the
+     forwarder relayed (with `Accept-Encoding: identity`), and its model name
+     matched the request's; each receipt was available 89 to 106 ms after its
+     response ended (median 95 ms), so the 10 s window has ample margin and is
+     kept. The earlier failed session (`sessions/d493b14cec32`) had already
+     shown the `text` shape, model name and both hashes matching; only its
+     signer was rejected.
+   - Still open: which `signature_kind` production receipts carry (the field
+     is parsed but not recorded), whether every gateway instance shares the
+     signing key, and a captured production receipt as an offline test
+     fixture, so `check_receipt` is exercised against a real signature in the
+     default suite.
 7. Done 2026-10-28, for attestation and the forwarder:
    - `cloud-api.near.ai` presented leaf sha256 (of the whole DER)
      `5664580137f5b2abc8b2cc9ef53dc2bd7cd79b6ffc9f840dbbfca708a2c51022` on
