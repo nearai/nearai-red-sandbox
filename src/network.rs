@@ -1,10 +1,12 @@
-//! Sandbox network allowlist entries: parsing, preset expansion and validation.
+//! Sandbox network allowlist entries: parsing, preset expansion, validation,
+//! host-side resolution and the resolved [`Plan`].
 //!
-//! This module is pure: nothing here resolves a name or touches the network.
-//! Every check fails closed and names the entry as the operator wrote it.
+//! Only [`plan`] looks a name up, and only through a [`Resolver`]. Every
+//! check fails closed and names the entry as the operator wrote it.
 
-use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
 /// The `packages` preset: package registries, all on port 443.
 pub const PRESET_PACKAGES: &[&str] = &[
@@ -263,12 +265,359 @@ fn valid_host_name(h: &str) -> Result<String, String> {
     Ok(name)
 }
 
+/// Looks a host name up on the host, before launch.
+pub trait Resolver: Send + Sync {
+    fn resolve(&self, name: &str) -> io::Result<Vec<IpAddr>>;
+}
+
+/// The host's own resolver, through `ToSocketAddrs`.
+pub struct SystemResolver;
+
+impl Resolver for SystemResolver {
+    fn resolve(&self, name: &str) -> io::Result<Vec<IpAddr>> {
+        let mut out: Vec<IpAddr> = Vec::new();
+        for addr in (name, DEFAULT_PORT).to_socket_addrs()? {
+            if !out.contains(&addr.ip()) {
+                out.push(addr.ip());
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// One `--allow-host` value for `mvmctl machine create`. Only a [`Plan`]
+/// makes one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowHost(String);
+
+impl AllowHost {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The result of one guest-side probe of an entry (Task 7 produces these).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    pub target: String,
+    pub result: String,
+}
+
+/// An allowlist that has been parsed, expanded, validated and resolved on
+/// the host. An empty plan means no network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    written: Vec<String>,
+    entries: Vec<Entry>,
+    resolved: BTreeMap<String, Vec<IpAddr>>,
+}
+
+/// Expand and validate `written`, then resolve every host name once through
+/// `resolver`. A name that does not resolve, or resolves only to refused
+/// ranges, refuses the whole list.
+pub fn plan(written: &[String], resolver: &dyn Resolver) -> Result<Plan, String> {
+    let entries = expand(written)?;
+    // Which entry as written first produced each name, for error messages.
+    let mut source: HashMap<String, &str> = HashMap::new();
+    for w in written {
+        for e in expand(std::slice::from_ref(w))? {
+            if let Host::Name(n) = e.host {
+                source.entry(n).or_insert(w.as_str());
+            }
+        }
+    }
+    let mut resolved = BTreeMap::new();
+    for e in &entries {
+        let Host::Name(name) = &e.host else { continue };
+        if resolved.contains_key(name) {
+            continue;
+        }
+        let as_written = source.get(name).copied().unwrap_or(name.as_str());
+        let ips = match resolver.resolve(name) {
+            Ok(ips) if !ips.is_empty() => ips,
+            Ok(_) => {
+                return Err(format!(
+                    "network entry {as_written:?}: {name} does not resolve on this host (no addresses)"
+                ));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "network entry {as_written:?}: {name} does not resolve on this host ({err})"
+                ));
+            }
+        };
+        if let Some(range) = ips
+            .iter()
+            .map(|ip| refused_range(*ip))
+            .collect::<Option<Vec<_>>>()
+            .and_then(|ranges| ranges.first().copied())
+        {
+            return Err(format!(
+                "network entry {as_written:?}: {name} resolves only to refused addresses ({range} addresses are always refused)"
+            ));
+        }
+        resolved.insert(name.clone(), ips);
+    }
+    Ok(Plan {
+        written: written.to_vec(),
+        entries,
+        resolved,
+    })
+}
+
+impl Plan {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// One value per entry, as mvm v0.22.0 parses them: it splits at the
+    /// last `:` and keeps the host verbatim, so IPv6 goes unbracketed.
+    pub fn allow_hosts(&self) -> Vec<AllowHost> {
+        self.entries
+            .iter()
+            .map(|e| match &e.host {
+                Host::Name(n) => AllowHost(format!("{n}:{}", e.port)),
+                Host::Ip(ip) => AllowHost(format!("{ip}:{}", e.port)),
+            })
+            .collect()
+    }
+
+    pub fn startup_line(&self) -> String {
+        if self.is_empty() {
+            return "network: none".into();
+        }
+        let n = self.entries.len();
+        let s = if n == 1 { "" } else { "s" };
+        format!(
+            "network: {n} host{s} allowed ({}); TCP only; every connection is logged",
+            self.written.join(", ")
+        )
+    }
+
+    pub fn record(&self, probes: &[Probe]) -> serde_json::Value {
+        let resolved: serde_json::Map<String, serde_json::Value> = self
+            .resolved
+            .iter()
+            .map(|(name, ips)| {
+                let ips = ips.iter().map(|ip| ip.to_string().into()).collect();
+                (name.clone(), serde_json::Value::Array(ips))
+            })
+            .collect();
+        serde_json::json!({
+            "allow": self.written,
+            "expanded": self.entries.iter().map(Entry::display).collect::<Vec<_>>(),
+            "resolved": resolved,
+            "probes": probes
+                .iter()
+                .map(|p| serde_json::json!({"target": p.target, "result": p.result}))
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
+    use std::io;
+
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// Answers from a fixed table; a name not in the table is `NotFound`.
+    /// Errors are stored by kind so the table can hand out fresh copies.
+    struct FakeResolver(HashMap<&'static str, Result<Vec<IpAddr>, io::ErrorKind>>);
+
+    impl Resolver for FakeResolver {
+        fn resolve(&self, name: &str) -> io::Result<Vec<IpAddr>> {
+            match self.0.get(name) {
+                Some(Ok(ips)) => Ok(ips.clone()),
+                Some(Err(kind)) => Err(io::Error::new(*kind, format!("fake: {kind:?}"))),
+                None => Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "fake: not in table",
+                )),
+            }
+        }
+    }
+
+    fn fake(answers: &[(&'static str, Result<Vec<IpAddr>, io::ErrorKind>)]) -> FakeResolver {
+        FakeResolver(answers.iter().cloned().collect())
+    }
+
+    /// Give each `packages` host a public address.
+    fn with_packages(mut r: FakeResolver) -> FakeResolver {
+        for (i, h) in PRESET_PACKAGES.iter().enumerate() {
+            r.0.insert(
+                h,
+                Ok(vec![format!("198.51.100.{}", 100 + i).parse().unwrap()]),
+            );
+        }
+        r
+    }
+
+    #[test]
+    fn a_name_that_does_not_resolve_refuses_the_session() {
+        let e = plan(
+            &s(&["nowhere.example"]),
+            &fake(&[("nowhere.example", Err(io::ErrorKind::NotFound))]),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("\"nowhere.example\"") && e.contains("does not resolve"),
+            "{e}"
+        );
+        let e = plan(
+            &s(&["empty.example"]),
+            &fake(&[("empty.example", Ok(vec![]))]),
+        )
+        .unwrap_err();
+        assert!(e.contains("does not resolve"), "{e}");
+    }
+
+    #[test]
+    fn a_preset_host_that_does_not_resolve_names_the_preset() {
+        let mut r = with_packages(fake(&[]));
+        r.0.insert("pypi.org", Err(io::ErrorKind::TimedOut));
+        let e = plan(&s(&["packages"]), &r).unwrap_err();
+        assert!(
+            e.contains("\"packages\"") && e.contains("pypi.org does not resolve"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_name_resolving_only_to_refused_ranges_is_refused() {
+        for (name, ip, why) in [
+            ("localhost", "127.0.0.1", "loopback"),
+            ("meta.example", "169.254.169.254", "metadata"),
+            ("cgnat.example", "100.64.3.4", "100.64.0.0/10"),
+            ("mapped.example", "::ffff:127.0.0.1", "loopback"),
+        ] {
+            let e = plan(&s(&[name]), &fake(&[(name, Ok(vec![ip.parse().unwrap()]))])).unwrap_err();
+            assert!(
+                e.contains(&format!("{name:?}")) && e.contains(why),
+                "{name}: {e}"
+            );
+        }
+        let mixed = plan(
+            &s(&["mixed.example"]),
+            &fake(&[(
+                "mixed.example",
+                Ok(vec![
+                    "127.0.0.1".parse().unwrap(),
+                    "198.51.100.9".parse().unwrap(),
+                ]),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(mixed.entries().len(), 1);
+    }
+
+    #[test]
+    fn invalid_entries_are_refused_before_any_lookup() {
+        struct Panics;
+        impl Resolver for Panics {
+            fn resolve(&self, name: &str) -> io::Result<Vec<IpAddr>> {
+                panic!("resolved {name} although the list is invalid")
+            }
+        }
+        let e = plan(&s(&["a.example", "127.0.0.1:8463"]), &Panics).unwrap_err();
+        assert!(e.contains("loopback"), "{e}");
+    }
+
+    #[test]
+    fn each_name_is_resolved_once() {
+        use std::sync::Mutex;
+        struct Counting(Mutex<Vec<String>>);
+        impl Resolver for Counting {
+            fn resolve(&self, name: &str) -> io::Result<Vec<IpAddr>> {
+                self.0.lock().unwrap().push(name.to_string());
+                Ok(vec!["198.51.100.1".parse().unwrap()])
+            }
+        }
+        let r = Counting(Mutex::new(vec![]));
+        let p = plan(
+            &s(&["a.example", "a.example:8443", "198.51.100.7:8443"]),
+            &r,
+        )
+        .unwrap();
+        assert_eq!(p.entries().len(), 3);
+        assert_eq!(*r.0.lock().unwrap(), ["a.example"]);
+    }
+
+    #[test]
+    fn allow_hosts_render_for_mvm_and_ipv6_is_unbracketed() {
+        let p = plan(
+            &s(&["a.example", "198.51.100.7:8443", "[2001:db8::7]:443"]),
+            &fake(&[("a.example", Ok(vec!["198.51.100.1".parse().unwrap()]))]),
+        )
+        .unwrap();
+        let v: Vec<String> = p
+            .allow_hosts()
+            .iter()
+            .map(|a| a.as_str().to_string())
+            .collect();
+        assert_eq!(v, ["a.example:443", "198.51.100.7:8443", "2001:db8::7:443"]);
+    }
+
+    #[test]
+    fn an_empty_plan_allows_nothing() {
+        let p = plan(&[], &fake(&[])).unwrap();
+        assert!(p.is_empty());
+        assert!(p.entries().is_empty());
+        assert!(p.allow_hosts().is_empty());
+    }
+
+    #[test]
+    fn the_startup_line_for_none_one_and_many() {
+        let r = fake(&[(
+            "api.example-target.com",
+            Ok(vec!["198.51.100.2".parse().unwrap()]),
+        )]);
+        assert_eq!(plan(&[], &r).unwrap().startup_line(), "network: none");
+        assert_eq!(
+            plan(&s(&["198.51.100.7:8443"]), &r).unwrap().startup_line(),
+            "network: 1 host allowed (198.51.100.7:8443); TCP only; every connection is logged"
+        );
+        // `packages` names resolve through the fake too: give each of the seven an address.
+        let many = plan(
+            &s(&[
+                "packages",
+                "api.example-target.com",
+                "198.51.100.7:8443",
+                "192.168.1.20:8080",
+            ]),
+            &with_packages(r),
+        )
+        .unwrap();
+        assert_eq!(
+            many.startup_line(),
+            "network: 10 hosts allowed (packages, api.example-target.com, 198.51.100.7:8443, 192.168.1.20:8080); TCP only; every connection is logged"
+        );
+    }
+
+    #[test]
+    fn the_record_carries_written_expanded_resolved_and_probes() {
+        let p = plan(
+            &s(&["a.example"]),
+            &fake(&[("a.example", Ok(vec!["198.51.100.1".parse().unwrap()]))]),
+        )
+        .unwrap();
+        let r = p.record(&[Probe {
+            target: "a.example:443".into(),
+            result: "connected".into(),
+        }]);
+        assert_eq!(
+            r,
+            serde_json::json!({"allow": ["a.example"], "expanded": ["a.example:443"], "resolved": {"a.example": ["198.51.100.1"]}, "probes": [{"target": "a.example:443", "result": "connected"}]})
+        );
     }
 
     #[test]
