@@ -27,7 +27,7 @@
   - the deny-all probe target is `1.1.1.1:443`;
   - each entry is probed once with a 10-second timeout;
   - the guest proxy is `127.0.0.1:1080`. The proxy environment set for tool execs is `HTTPS_PROXY=http://127.0.0.1:1080`, `HTTP_PROXY=http://127.0.0.1:1080`, `ALL_PROXY=socks5h://127.0.0.1:1080` and `NO_PROXY=localhost,127.0.0.1,::1`, plus the same four in lower case (mvm's `guest_netd.rs:102-123`, per the research notes);
-  - the attach command is `machine run --name <name> --ttl 30d`: no `--image`, no argv, no `-d`. `30d` is mvm's `MAX_TTL`, which is inclusive (`ttl.rs:16,72` at v0.22.0, which accepts the suffixes s/m/h/d);
+  - the attach command is `machine run --name <name> --ttl <limits.sessionHours>h` (Task 9a; the plan first fixed it at `30d`): no `--image`, no argv, no `-d`. `30d` is mvm's `MAX_TTL`, which is inclusive (`ttl.rs:16,72` at v0.22.0, which accepts the suffixes s/m/h/d);
   - the audit source is `<mvm root>/audit/local.jsonl` plus `local.seg-*.jsonl`. Kept events are those with prefix `host.flow.`, `dns.`, `icmp.` or `host.route.` and an exact `entry.labels.vm_name`;
   - the startup lines (logged through `Logger::log`, `src/session.rs:472-478`, so on the terminal they carry its usual `[rts <id>] ` prefix) are `network: N hosts allowed (<entries as written>); TCP only; every connection is logged` (`1 host` when N is 1) and `network: none`.
 - The mvm root is `MVM_HOME`, or else `HOME/.mvm`, with an empty value treated as unset, exactly as in `supervisor_pid_file` (`src/session.rs:382-387`). Task 3 extracts that logic as `session::mvm_root`.
@@ -569,6 +569,42 @@ Decisions:
 - [ ] **Step 5: Commit.** `git add src/session.rs && git commit -m "Validate, probe, supervise and audit sandbox network per session"`
 
 ---
+
+### Task 9a: Session time limit and the attach TTL (added 2026-10-29, approved by Zaki)
+
+Supersedes the fixed `ATTACH_TTL = "30d"` in Task 5 and the Global Constraints: the attach `--ttl` follows a real session limit.
+
+**Files:**
+- Modify: `src/config.rs` (`Limits` `:46`, `RawLimits`, `parse_config` `:292-317`), `src/mvm.rs` (the attach argv from Task 5), `src/session.rs` (the run loop in `session_body`), `opencode/session.example.json`, `opencode/README.md`
+- Test: `src/config.rs`, `src/mvm.rs`, `src/session.rs` unit tests
+
+**Interfaces:**
+- Produces: `Limits.session_hours: u32` from config `limits.sessionHours`, default `24`, refused unless `1..=720` (720 h is mvm's 30-day `MAX_TTL`); `pub fn attach_ttl(hours: u32) -> String` returning `"<hours>h"`; the session loop ends the session with stop reason `session-limit` when the wall-clock time since boot reaches the limit (export `/out`, remove the VM), for every session, with or without network.
+
+- [ ] **Step 1: Failing tests.** `limits.sessionHours` absent gives 24; `0`, `721` and a non-integer are refused with `config: limits.sessionHours must be an integer from 1 to 720`; `attach_ttl(24) == "24h"`; the attach argv for a 24 h config is `machine run --name <name> --ttl 24h`; a session whose limit has passed (injected clock) stops with `session-limit` and runs teardown in the usual order; a session within its limit is not stopped.
+- [ ] **Step 2: Run, expect FAIL** (`RUSTFLAGS="-D warnings" CARGO_INCREMENTAL=0 cargo test --lib`).
+- [ ] **Step 3: Implement**; replace `ATTACH_TTL` and every test that asserted `--ttl 30d`.
+- [ ] **Step 4: Run, expect PASS**, and the full gate.
+- [ ] **Step 5: Commit** "Limit session wall-clock time and derive the attach TTL from it".
+
+### Task 9b: Post-boot check of the IPs mvm pinned (added 2026-10-29, approved by Zaki)
+
+`rts` resolves and validates every name before boot (Task 2), but mvm resolves the names again when its endpoint starts and pins those answers. A different answer at that moment (DNS changed, or a hostile resolver) could pin a LAN or otherwise refused address. After boot and before the probes, `rts` compares what mvm pinned with what `rts` validated.
+
+**Files:**
+- Modify: `src/network.rs` (a pure comparison), `src/session.rs` (call it after boot, before Task 7's probes), `tests/contain/network.rs` (Task 10 measures the real event shape)
+- Test: `src/network.rs` unit tests
+
+**Interfaces:**
+- Consumes: Task 2's resolved plan (name -> validated IPs), Task 8's audit reader (entries for `vm_name == rts-<id>`).
+- Produces: `pub fn check_pinned(plan: &Plan, pinned: &BTreeMap<String, BTreeSet<IpAddr>>) -> Result<(), String>`; the session reads this VM's `dns.resolved` (or equivalent pinning) entries from mvm's audit log, waiting up to 10 s for an entry per name, and ends the session with stop reason `network-mismatch` (export `/out`, remove the VM) when a name has no pinning entry, when any pinned IP is in a refused range (Task 1's ranges), or when any pinned IP is not among the addresses `rts` resolved and validated for that name. `session.json` records the pinned IPs next to `rts`'s.
+
+- [ ] **Step 1: Failing tests** for `check_pinned`: identical sets pass; a pinned IP missing from `rts`'s set fails naming the host and IP; a pinned `192.168.1.10` for a name `rts` resolved to a public IP fails; a name with no pinning entry fails; IP-literal entries (no DNS) pass trivially; a subset of `rts`'s IPs passes (mvm may pin fewer).
+- [ ] **Step 2: Run, expect FAIL.** **Step 3: Implement** the pure check and the session call. The audit field names (`entry.labels.target`, `entry.labels.resolved_ips`, or the `dns.resolved` shape) are taken from the research notes and confirmed against a real run in Task 10; if the real shape differs, Task 10 fixes the parser and records the measurement.
+- [ ] **Step 4: Run, expect PASS**, and the full gate.
+- [ ] **Step 5: Commit** "Refuse a session when mvm pinned IPs rts did not validate".
+
+Task 10 additionally checks, on real mvm: a session with one allowed host records matching pinned IPs in `session.json`; and the session limit by running a session with `sessionHours` overridden to a test-only minimum through an injected clock, not by waiting.
 
 ### Task 10: Containment against real mvm
 
