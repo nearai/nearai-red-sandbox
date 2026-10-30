@@ -90,7 +90,7 @@ main() {
   # ~/.local/share/nearai-red-sandbox unless it is mode 700. Directories that
   # already exist keep their modes.
   if ! (umask 077 && mkdir -p -- "$prefix/share/nearai-red-sandbox"); then
-    die "could not create the install prefix $prefix; create it or set RTS_INSTALL_PREFIX"
+    die "could not create $prefix/share/nearai-red-sandbox under the install prefix; fix that path or set RTS_INSTALL_PREFIX"
   fi
   # Same filesystem as the prefix, so the moves below are renames.
   stage_dir=$(mktemp -d "$prefix/.rts-install.XXXXXX")
