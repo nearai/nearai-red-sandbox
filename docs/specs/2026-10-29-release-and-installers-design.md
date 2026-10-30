@@ -272,7 +272,7 @@ sha256, written by the release workflow; the tap commit is the trust anchor.
 
 ## Open items
 
-- Create `nearai/homebrew-tap` and the `HOMEBREW_TAP_TOKEN`.
+- Create `nearai/homebrew-tap` and the `HOMEBREW_TAP_TOKEN` repository (or organization) secret.
 - Add the Apple signing and notary secrets; confirm the exact Developer ID
   Application identity name and team ID.
 - Make the repository public before the first tag; the installers cannot

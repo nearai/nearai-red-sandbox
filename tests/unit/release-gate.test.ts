@@ -61,7 +61,7 @@ test("GNU tools go first on PATH only for the test gate, never for later steps",
 
 test("release scripts call BSD stat and tar by absolute path", () => {
   const files = ["install.sh", "scripts/build-patched-mvm-supervisor.sh", "scripts/package-release.sh",
-    "scripts/release/check-tests.sh", "scripts/release/render-formula.sh"]
+    "scripts/release/check-tests.sh", "scripts/release/render-formula.sh", "scripts/release/check-existing-release.sh"]
   for (const file of files) {
     const text = readFileSync(join(ROOT, file), "utf8")
     for (const [i, line] of text.split("\n").entries()) {
