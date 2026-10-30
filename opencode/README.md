@@ -279,6 +279,31 @@ the ready file.
   descriptions in its transform, but that hook may overwrite the `shell` one.
   This affects only what the model is told, not where commands run.
 
+## Network access
+
+The session file's `network.allow` lists what the guest may reach; absent or
+empty, the guest has no network and the launch probes that `1.1.1.1:443` is
+unreachable. `rts launch --allow-host ENTRY` (repeatable) adds entries, and
+`--no-network` drops them all (it is refused together with `--allow-host`).
+
+```json
+"network": { "allow": ["packages", "api.example-target.com", "198.51.100.7:8443", "[2001:db8::7]:443"] }
+```
+
+Each entry is the preset `packages`, a host name (`name`, `name:port`) or an
+IP address with a port (`ip:port`, IPv6 as `[addr]:port`); the port defaults
+to 443. The entries are validated and resolved on the host before
+`machine create`, passed as one `--allow-host` each, probed from the guest
+after boot, and recorded in `sessions/<id>/session.json`; the VM's allowed and
+denied connections are copied to `sessions/<id>/network.jsonl` at teardown.
+A session with entries replaces `machine start` with an attached
+`mvmctl machine run` (tinylabscom/mvm#4860) whose output goes only to
+`sessions/<id>/mvm-attach.log` (0600); if it exits, the session stops with
+`network-lost`, and if mvm pinned an address `rts` did not validate, with
+`network-mismatch`. See the [README](../README.md#network-access) for the
+examples and caveats, and the
+[design](../docs/specs/2026-10-29-sandbox-network-access-design.md).
+
 ## Session time limit
 
 `limits.sessionHours` (default `24`, an integer from 1 to 720) caps a
