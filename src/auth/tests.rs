@@ -221,14 +221,17 @@ fn callback_timeout_and_cancellation_release_the_listener() {
             .unwrap_err(),
         "NEAR AI sign-in timed out"
     );
-    assert!(start.elapsed() < Duration::from_millis(500));
+    // Generous bounds: a loaded CI runner (the 2026-10-30 release dry run)
+    // can miss tight ones. The test proves release, not speed.
+    let elapsed = start.elapsed();
+    assert!(elapsed < Duration::from_secs(2), "timeout took {elapsed:?}");
     // Parallel tests can be between fork and exec with a transient inherited
     // descriptor. CLOEXEC closes that copy at exec; require bounded release
     // instead of assuming the scheduler has already completed every spawn.
     let endpoint = format!("127.0.0.1:{}", address.port().unwrap())
         .parse()
         .unwrap();
-    let released = Instant::now() + Duration::from_secs(1);
+    let released = Instant::now() + Duration::from_secs(5);
     loop {
         match TcpStream::connect_timeout(&endpoint, Duration::from_millis(10)) {
             Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => break,

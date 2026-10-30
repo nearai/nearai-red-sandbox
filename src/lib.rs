@@ -19,6 +19,7 @@ pub mod sys;
 pub mod tools;
 pub mod terminal;
 pub mod untar;
+pub mod update;
 
 #[cfg(test)]
 mod testutil;

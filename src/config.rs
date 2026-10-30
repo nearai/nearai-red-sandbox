@@ -87,6 +87,8 @@ pub struct OperatorConfig {
     /// Guest egress allowlist entries as written (`network.allow`, then any
     /// `--allow-host` flags). Empty means no network.
     pub network: Vec<String>,
+    /// `"updateCheck"`: the launch update check (default on).
+    pub update_check: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -136,6 +138,7 @@ struct Raw {
     plugin_dir: Option<String>,
     #[serde(default)]
     network: RawNetwork,
+    update_check: Option<bool>,
 }
 
 fn is_env_name(s: &str) -> bool {
@@ -357,6 +360,7 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
         mvmctl: path(raw.mvmctl, "mvmctl")?.unwrap_or_else(|| d.mvmctl.clone()),
         plugin_dir: path(raw.plugin_dir, "pluginDir")?.unwrap_or_else(|| d.plugin_dir.clone()),
         network,
+        update_check: raw.update_check.unwrap_or(true),
     })
 }
 
@@ -378,6 +382,14 @@ mod tests {
             opencode: "opencode".into(),
             sessions_dir: "/repo/sessions".into(),
         }
+    }
+
+    #[test]
+    fn update_check_defaults_on_and_can_be_turned_off() {
+        assert!(parse("{}").unwrap().update_check);
+        assert!(!parse(r#"{ "updateCheck": false }"#).unwrap().update_check);
+        let e = parse(r#"{ "updateCheck": "no" }"#).unwrap_err();
+        assert!(e.starts_with("config:"), "{e}");
     }
 
     #[test]

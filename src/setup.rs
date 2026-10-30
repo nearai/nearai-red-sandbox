@@ -63,10 +63,16 @@ impl HttpsFetch {
     /// No redirects followed (`download` checks each hop), https only,
     /// 30 s to connect, 600 s per request including the body.
     pub fn new() -> Result<Self, String> {
+        Self::with_timeouts(Duration::from_secs(30), Duration::from_secs(600))
+    }
+
+    /// As `new`, with `connect` to connect and `total` per request
+    /// including the body.
+    pub fn with_timeouts(connect: Duration, total: Duration) -> Result<Self, String> {
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(600))
+            .connect_timeout(connect)
+            .timeout(total)
             .https_only(true)
             .build()
             .map_err(|e| format!("building the HTTPS client: {e}"))?;

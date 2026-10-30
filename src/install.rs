@@ -56,6 +56,11 @@ pub fn home_sessions(home: &Path) -> PathBuf {
     home.join(HOME_SHARE).join("sessions")
 }
 
+/// The launch update check's cache (`ironwire_update::CheckedAt`).
+pub fn update_cache(home: &Path) -> PathBuf {
+    home.join(HOME_SHARE).join("update-check.json")
+}
+
 pub struct Lookup<'a> {
     /// `env!("CARGO_MANIFEST_DIR")`: the checkout a source build came from.
     pub source: &'a Path,
@@ -169,5 +174,6 @@ mod tests {
         assert_eq!(mvm_dir(h), PathBuf::from("/h/.local/mvm/v0.22.0"));
         assert_eq!(opencode_dir(h), PathBuf::from("/h/.local/share/nearai-red-sandbox/opencode/2.2.2"));
         assert_eq!(home_sessions(h), PathBuf::from("/h/.local/share/nearai-red-sandbox/sessions"));
+        assert_eq!(update_cache(h), PathBuf::from("/h/.local/share/nearai-red-sandbox/update-check.json"));
     }
 }
