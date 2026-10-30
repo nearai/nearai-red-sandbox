@@ -74,11 +74,22 @@ pub trait Exec {
     fn exec(&self, argv: &[String], opts: &ExecOptions) -> Result<ExecResult>;
 }
 
+/// Guest egress for one machine: the resolved `--allow-host` values, the
+/// 0600 file that takes the attached `machine run` output, and the session
+/// limit that sets its `--ttl`.
+pub struct Egress<'a> {
+    pub allow_hosts: &'a [crate::network::AllowHost],
+    pub attach_log: &'a Path,
+    pub session_hours: u32,
+}
+
 pub struct CreateSpec<'a> {
     pub name: &'a str,
     pub image: &'a str,
     pub memory_mib: u32,
     pub cpus: u32,
+    /// `None` is no network: `machine start`, and no `--allow-host`.
+    pub egress: Option<Egress<'a>>,
 }
 
 pub trait Sandbox: Exec {

@@ -24,7 +24,7 @@ tool effects land.
 | Models | By default, only NEAR AI's abliterated DeepSeek, by exact ID: `deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated` (listed by production `/v1/models` on 2026-10-29). A config that still names the retired pre-launch placeholder `PLACEHOLDER-near-private-abliterated` is refused. `provider.models` is the allowlist. It is enforced three times: by `rts` config, by the plugin's model filter (exact IDs passed as a plugin option), and by the forwarder. |
 | Inference attestation | Before every session, in `rts`, after credentials and before IronWire starts: fetch NEAR AI's attestation report with a fresh nonce and verify it fail-closed (TDX quote with `dcap-qvl =0.7.0`, report data binding, compose measurement, NVIDIA GPU verdict). Any failure refuses the session. |
 | Inference path | IronWire's NEAR AI endpoint is an attested forwarder inside `rts` (`http://127.0.0.1:<port>/v1`), not `cloud-api.near.ai`. The forwarder pins upstream TLS to the attested certificate fingerprints, refuses models outside the allowlist, and verifies every response's ed25519 signature. A failed signature ends the session. Chosen over patching IronWire. |
-| VM egress | None. mvm default-deny, no `--allow-host`. |
+| VM egress | Per-session allowlist over mvm --allow-host, default none; see 2026-10-29-sandbox-network-access-design.md. |
 | Files in | An operator inputs directory, packed into a tar on the host and pushed in after boot as base64 argv chunks, extracted to `/in`. A copy, not a live mount. |
 | Files out | Only the guest's `/out`, copied to `sessions/<id>/out` before teardown. |
 | Lifecycle | One VM per opencode session, always destroyed when the session ends, including on crash or signal. |
@@ -35,7 +35,7 @@ tool effects land.
 ## Architecture
 
 ```
-host (macOS)                                   mvm microVM (dev profile, no network)
+host (macOS)                                   mvm microVM (dev profile, no network by default)
 -------------------------------------          -------------------------------------
 launcher
   1. mvmctl machine create/start rts-<s> ---> boots image; inputs pushed to /in
@@ -667,7 +667,6 @@ docs/specs/      design documents
 
 ## Out of scope for v1
 
-- VM egress allowlists.
 - Persistent or reused VMs.
 - The mvm SDK.
 - Concurrent sessions.

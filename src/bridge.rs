@@ -4,7 +4,7 @@
 //! ```json
 //! { "options": { "machine": "rts-…", "mvmctl": "…", "emptyGitConfig": "…",
 //!                "stateDir": "…", "timeoutMs": 120000, "maxOutputBytes": 65536,
-//!                "cwd": "/", "mvmHome": "…" },
+//!                "cwd": "/", "mvmHome": "…", "proxy": true },
 //!   "input": { …the tool's own arguments… } }
 //! ```
 //!
@@ -44,6 +44,9 @@ pub struct BridgeOptions {
     pub cwd: Option<String>,
     #[serde(default)]
     pub mvm_home: Option<String>,
+    /// Network session: `shell` runs under the guest proxy environment.
+    #[serde(default)]
+    pub proxy: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +99,7 @@ pub fn call(tool: &str, sb: &dyn Exec, o: &BridgeOptions, input: &Value, leak_sh
         max_output_bytes: o.max_output_bytes,
         cwd: o.cwd.clone().unwrap_or_else(|| "/".into()),
         leak_shell,
+        proxy: o.proxy,
     };
     match (Tools { sb, limits }).call(tool, input) {
         Ok(text) => Outcome::ok(text),
@@ -137,6 +141,7 @@ pub fn run(tool: &str) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::sv;
     use crate::testutil::{Recorder, ok};
     use serde_json::json;
 
@@ -158,6 +163,26 @@ mod tests {
         let r = parse(request(json!({ "cwd": "/in", "mvmHome": "/home/op" }))).unwrap();
         assert_eq!(r.options.cwd.as_deref(), Some("/in"));
         assert_eq!(r.input["command"], "true");
+    }
+
+    #[test]
+    fn proxy_defaults_to_false_and_parses_when_set() {
+        assert!(!parse(request(json!({}))).unwrap().options.proxy);
+        assert!(parse(request(json!({ "proxy": true }))).unwrap().options.proxy);
+        assert!(!parse(request(json!({ "proxy": false }))).unwrap().options.proxy);
+        assert!(parse(request(json!({ "proxy": "yes" }))).is_err());
+    }
+
+    #[test]
+    fn a_proxied_request_runs_shell_under_the_proxy_env() {
+        let rec = Recorder::new(|_, _| ok(b""));
+        let r = parse(request(json!({ "proxy": true }))).unwrap();
+        let out = call("shell", &rec, &r.options, &json!({ "command": "id" }), false);
+        assert_eq!(out.code, EXIT_OK);
+        let a = &rec.argvs()[0];
+        assert_eq!(a[0], "env");
+        assert_eq!(a[1..9].to_vec(), crate::network::proxy_env());
+        assert_eq!(a[9..].to_vec(), sv(&["sh", "-c", "id"]));
     }
 
     #[test]

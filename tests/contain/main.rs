@@ -12,4 +12,5 @@ mod exec;
 mod files;
 mod harness;
 mod leak;
+mod network;
 mod session;

@@ -21,6 +21,9 @@ pub struct ToolLimits {
     /// TEST ONLY: run `shell` on the host so the leak check can prove the
     /// containment suite notices. Never set in a real session.
     pub leak_shell: bool,
+    /// Network session: run `shell` under the guest proxy environment
+    /// (`network::proxy_env`), which `machine exec` does not inherit.
+    pub proxy: bool,
 }
 
 const READ_LINE_CAP: usize = 2000;
@@ -128,7 +131,9 @@ impl Tools<'_> {
             Some(w) => resolve(&self.limits.cwd, w),
             None => self.limits.cwd.clone(),
         };
-        let r = self.sb.exec(&sv(&["sh", "-c", command]), &ExecOptions { timeout_ms, workdir: Some(workdir), ..self.opts() })?;
+        let mut argv = if self.limits.proxy { std::iter::once("env".to_string()).chain(crate::network::proxy_env()).collect() } else { vec![] };
+        argv.extend(sv(&["sh", "-c", command]));
+        let r = self.sb.exec(&argv, &ExecOptions { timeout_ms, workdir: Some(workdir), ..self.opts() })?;
         let mut parts = vec![text(&r.stdout).trim_end().to_string(), text(&r.stderr).trim_end().to_string()];
         if r.stdout_bytes > r.stdout.len() as u64 {
             parts.push(format!("[output truncated: {} bytes total]", r.stdout_bytes));
@@ -308,7 +313,7 @@ mod tests {
     use serde_json::json;
 
     fn lim() -> ToolLimits {
-        ToolLimits { timeout_ms: 120_000, max_output_bytes: 65536, cwd: "/".into(), leak_shell: false }
+        ToolLimits { timeout_ms: 120_000, max_output_bytes: 65536, cwd: "/".into(), leak_shell: false, proxy: false }
     }
     fn file_reply(data: &[u8], size: Option<u64>) -> ExecResult {
         let mut out = format!("F {}\n", size.unwrap_or(data.len() as u64)).into_bytes();
@@ -331,6 +336,32 @@ mod tests {
         let out = run(&rec, lim(), "shell", json!({"command": "make && false"})).unwrap();
         assert_eq!(rec.argvs()[0], sv(&["sh", "-c", "make && false"]));
         assert!(out.contains("partial") && out.ends_with("exit status: 3"));
+    }
+
+    #[test]
+    fn shell_in_a_network_session_runs_under_the_proxy_env() {
+        let rec = Recorder::new(|_, _| ok(b""));
+        run(&rec, ToolLimits { proxy: true, ..lim() }, "shell", json!({"command": "pip download six"})).unwrap();
+        assert_eq!(
+            rec.argvs()[0],
+            sv(&[
+                "env",
+                "HTTPS_PROXY=http://127.0.0.1:1080",
+                "HTTP_PROXY=http://127.0.0.1:1080",
+                "ALL_PROXY=socks5h://127.0.0.1:1080",
+                "NO_PROXY=localhost,127.0.0.1,::1",
+                "https_proxy=http://127.0.0.1:1080",
+                "http_proxy=http://127.0.0.1:1080",
+                "all_proxy=socks5h://127.0.0.1:1080",
+                "no_proxy=localhost,127.0.0.1,::1",
+                "sh",
+                "-c",
+                "pip download six",
+            ])
+        );
+        let rec = Recorder::new(|_, _| ok(b""));
+        run(&rec, ToolLimits { proxy: false, ..lim() }, "shell", json!({"command": "pip download six"})).unwrap();
+        assert_eq!(rec.argvs()[0], sv(&["sh", "-c", "pip download six"]));
     }
 
     #[test]

@@ -10,8 +10,9 @@ The microVM sandbox for **NEAR AI Red** (`near-ai-red`), supporting agentic
 security research and red teaming.
 
 This project is designed to run OpenCode tool calls inside an ephemeral microVM
-per session, with guest networking disabled, inputs copied into the guest, and
-results exported through `/out`. Inference runs on the host so provider
+per session, with no guest network unless the operator allowlists hosts for
+that session, inputs copied into the guest, and results exported through
+`/out`. Inference runs on the host so provider
 credentials stay outside the guest.
 
 <p align="center"><img src="docs/assets/dunes.svg" width="672" alt=""></p>
@@ -111,6 +112,109 @@ $ rts login     # optional: sign in to NEAR AI Cloud ahead of time
 `rts launch --config PATH` takes a session file; see the
 [launcher and inference setup](opencode/README.md) for its options.
 
+## <img src="docs/assets/ramp.svg" alt="" height="16"> Network access
+
+By default the guest has no network, and every launch proves it: after boot
+the guest must fail to reach `1.1.1.1:443`, or the session is refused. A
+session gets egress only to an allowlist its operator declares before launch,
+fixed for the session's life:
+
+```json
+"network": {
+  "allow": ["packages", "api.example-target.com", "198.51.100.7:8443", "192.168.1.20:8080"]
+}
+```
+
+in the session file, plus any `--allow-host ENTRY` flags (repeatable, merged
+with the config). `--no-network` drops every entry from the config, and is
+refused together with `--allow-host`. An entry is the preset `packages`, a
+host name (`name` or `name:port`), or an IP address with a port (`ip:port`,
+IPv6 as `[addr]:port`). The port defaults to 443. There are no wildcards and
+no UDP; ports 0 and 22, loopback, link-local, cloud metadata, unspecified,
+multicast and `100.64.0.0/10` addresses, and more than 64 entries are refused before any VM
+exists. `rts` resolves each name on the host and refuses one that does not
+resolve or resolves only to a refused range.
+
+```console
+$ rts launch --allow-host packages               # pip, npm, apk and cargo registries
+$ rts launch --allow-host api.example-target.com # one target, port 443
+$ rts launch --allow-host 192.168.1.20:8080      # a service on this machine's LAN address
+```
+
+- **`packages`** is `dl-cdn.alpinelinux.org`, `pypi.org`,
+  `files.pythonhosted.org`, `registry.npmjs.org`, `index.crates.io`,
+  `static.crates.io` and `crates.io`, all on 443. The guest image has no
+  curl, python or node and tool calls run without root, so install into a
+  user root, for example
+  `apk add --usermode --root /tmp/r --initdb --no-scripts --keys-dir /etc/apk/keys --repositories-file /etc/apk/repositories python3 py3-pip`.
+- **One target** is named host by host; each entry is one host and one port.
+- **A service on your own machine** must listen on a LAN address, and the
+  entry names that address and port. `127.0.0.1` cannot work: mvm always
+  refuses the host's loopback (and `rts` refuses `localhost`, `127.0.0.1` and
+  `[::1]` entries outright). That is also what keeps the guest away from
+  IronWire and the attested forwarder, which listen on `127.0.0.1` and hold
+  the inference key.
+
+The startup line says what the session got:
+`network: 10 hosts allowed (packages, api.example-target.com, 198.51.100.7:8443, 192.168.1.20:8080); TCP only; every connection is logged`,
+or `network: none`.
+
+How it works: the guest has no network interface. mvm gives it an HTTP and
+SOCKS proxy on `127.0.0.1:1080`, and a per-VM host process,
+`mvm-network-endpoint`, admits a connection only when its destination IP and
+port match an entry. Only proxy-aware programs get out; `shell` tool calls
+run with `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY` (both cases)
+set to that proxy. After boot each entry is probed once from the guest, and
+a failure ends the session naming the entry. Because mvm routes allowed
+traffic through any proxy set in its own environment, a shell with
+`HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` (either case) set refuses every
+launch, with or without an allowlist; so does an mvm host config that
+mentions `egress`.
+
+Before you allow a host, know what it admits:
+
+- **Anything allowed can receive anything.** The model can send whatever it
+  has, including the contents of `/in`, to any allowed destination.
+  Write-capable services (code hosts, paste sites, LLM APIs) are the obvious
+  channels, which is why `packages` leaves out GitHub.
+- **The check is by IP, not by name.** mvm pins each name's addresses at boot
+  and checks only destination IP and port, with no SNI or `Host` check.
+  Allowing a host behind a shared CDN admits every other site on the same
+  addresses. Measured 2026-10-29, the Alpine, PyPI and crates hosts resolve
+  to Fastly (`151.101.*`) and the npm registry to Cloudflare (`104.16.*`), so
+  `packages` admits a large share of those CDNs' sites on port 443: it is a
+  convenience preset, not a narrow one.
+- **An unsandboxed host process.** A session with any entry starts
+  `mvm-network-endpoint`, which parses traffic from the hostile guest and on
+  macOS runs as you with no sandbox. Sessions without an allowlist never
+  start it.
+- **TCP only, with no byte or rate caps.**
+
+Where the audit lands, under `sessions/ID/`:
+
+- `session.json`: the entries as written, the expanded list, each name's
+  resolved IPs, the IPs mvm pinned, and the probe results.
+- `network.jsonl`: every allowed and denied connection for this VM, copied at
+  teardown from mvm's chain-signed audit log as written (still signed).
+- `mvm-attach.log` (mode 0600): the output of the `mvmctl machine run` that
+  keeps egress up. It echoes every exec's argv, including file contents, so
+  it is never shown on the terminal or in `launcher.log`.
+
+A session ends, exporting `/out` and removing the VM, with stop reason:
+
+- `network-lost` when the attached `mvmctl machine run` exits, at any point.
+  Egress would otherwise fail silently, and re-attaching does not restore it.
+- `network-mismatch` when, after boot, the addresses mvm pinned for a name
+  include one `rts` did not resolve and validate, or one in a refused range,
+  or mvm recorded none. mvm records its pins only once a connection has
+  succeeded, so the check follows the probes.
+- `session-limit` when `limits.sessionHours` (default 24, 1 to 720) has
+  passed since boot, with or without network. The attached `machine run`
+  gets the same limit as its `--ttl`.
+
+The [network access design](docs/specs/2026-10-29-sandbox-network-access-design.md)
+has the measurements behind each of these.
+
 ## <img src="docs/assets/ramp.svg" alt="" height="16"> Architecture
 
 ```mermaid
@@ -128,10 +232,10 @@ flowchart TB
         tool["rts tool<br/>shell, read, write, edit, glob, grep"]
         ironwire["embedded IronWire<br/>holds the NEAR AI key"]
         fwd["attested forwarder<br/>pinned TLS, model allowlist,<br/>ed25519 receipt checks"]
-        sessions[("sessions/ID/<br/>out, tools.jsonl,<br/>attestation.json, inference.jsonl")]
+        sessions[("sessions/ID/<br/>out, tools.jsonl, attestation.json,<br/>inference.jsonl, session.json, network.jsonl")]
     end
 
-    subgraph vm["mvm microVM rts-ID - no network, destroyed at session end"]
+    subgraph vm["mvm microVM rts-ID - no network unless allowlisted, destroyed at session end"]
         guest["guest<br/>/in copied in, /out exported"]
     end
 
@@ -157,18 +261,25 @@ How a session runs:
    fresh nonce, the pinned compose measurement, and the NVIDIA GPU verdict.
    Any failure refuses the session before a VM exists.
 2. **Boot.** A fresh microVM with no network interface boots from a
-   digest-pinned image, and the operator's inputs are copied into `/in`.
+   digest-pinned image, and the operator's inputs are copied into `/in`. With
+   an allowlist, its only way out is mvm's proxy, limited to the listed hosts
+   and ports (see [Network access](#network-access)). Every launch probes
+   this: each allowed entry must connect, and a session with no allowlist
+   must fail to reach `1.1.1.1:443`.
 3. **Run.** opencode runs on the host. The sandbox plugin replaces its file
    and shell tools so every tool call executes in the guest; every other tool,
    MCP server, and non-allowlisted model is removed. Completions go through
    IronWire and the attested forwarder, which pins TLS to the attested
    certificate and checks NEAR AI's signature on every response. A failed
    check ends the session.
-4. **Tear down.** On exit, signal, or a fatal check, `/out` is exported through
+4. **Tear down.** On exit, signal, a fatal check, or the session time limit
+   (`limits.sessionHours`, default 24), `/out` is exported through
    a hostile-archive extractor and the VM is removed. Audit records stay in
    `sessions/ID/`.
 
-The guest is treated as hostile: it never sees credentials, has no network,
+The guest is treated as hostile: it never sees credentials, has no network
+beyond the hosts its operator allowlisted for the session (none by default),
+can never reach the host's loopback, where IronWire and the forwarder listen,
 and can only return files through `/out`.
 
 ## <img src="docs/assets/ramp.svg" alt="" height="16"> Project status
@@ -180,6 +291,8 @@ repository; see the launcher guide for access and setup.
 
 - [Design](docs/specs/2026-10-27-sandboxed-opencode-design.md)
 - [Implementation plan](docs/plans/2026-10-27-sandboxed-opencode.md)
+- [Network access design](docs/specs/2026-10-29-sandbox-network-access-design.md)
+  and [plan](docs/plans/2026-10-29-sandbox-network-access.md)
 - [Attested inference plan](docs/plans/2026-10-28-attested-inference.md)
 - [Launcher and inference setup](opencode/README.md)
 - [NEAR AI Cloud sign-in](docs/authentication.md)
