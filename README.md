@@ -47,6 +47,60 @@ re-checks everything and downloads and changes nothing; `rts setup --check
 without mvmctl or the network. See the [launcher guide](opencode/README.md#installed-layout)
 for where an installed `rts` finds its files.
 
+### Updates
+
+An installed release checks for a newer one when `rts launch` starts, at
+most once every 24 hours (the result is cached in
+`~/.local/share/nearai-red-sandbox/update-check.json`). The check fetches
+the latest release's signed `latest.json`, gives up after 3 seconds, and
+never blocks or fails the launch. A newer release prints a notice and launch
+continues:
+
+```
+[rts] rts 0.2.0 is available (you have 0.1.0): run rts update
+```
+
+When the running version is below the release's oldest supported version,
+the notice says it may not work. A failed check (no network, a timeout, a bad
+signature) prints nothing and is recorded in the session's `launcher.log`.
+`RTS_NO_UPDATE_CHECK=1`, or `"updateCheck": false` in the session config,
+turns the check off; neither affects `rts update`.
+
+```console
+$ rts update            # install the newest signed release over this curl install
+$ rts update --check    # only report whether a newer release exists
+$ rts update --force    # reinstall the signed latest release even when it is not newer
+```
+
+`rts update` accepts only a `latest.json` signed with the update key below.
+It downloads that release's `install.sh`, refuses it unless its sha256 matches
+the manifest, and runs it with this install's prefix; the installer checks
+the tarball against the signed digest and `SHA256SUMS` (and the attestation
+when `gh` is installed), swaps the files in, and runs `rts setup`. Then
+`rts update` checks that the new `rts` carries a Developer ID signature from
+team `KXSWJN7WY8` and reports the signed version. `--force` skips none of
+these checks. Homebrew installs update with `brew upgrade rts`: the notice
+says so and `rts update` refuses. Source builds have no launch check, and
+`rts update` refuses there.
+
+The update public key (Ed25519, hex) is set as `KEY` below. To check a
+release's `latest.json` against its `latest.json.sig` by hand, use OpenSSL 3
+(`$(brew --prefix openssl@3)/bin/openssl`; macOS's `/usr/bin/openssl` is
+LibreSSL, whose `pkeyutl` has no `-rawin`, checked 2026-10-30):
+
+```sh
+KEY=9b4a81b8bd017898c36871c6bd1cb890faf95b6e378e72eb99b9c15841f02ac9
+printf '302a300506032b6570032100%s' "$KEY" | xxd -r -p > pub.der
+openssl pkey -pubin -inform DER -in pub.der -out pub.pem
+base64 --decode < latest.json.sig > sig.bin
+openssl pkeyutl -verify -pubin -inkey pub.pem -rawin -in latest.json -sigfile sig.bin
+```
+
+The last command prints `Signature Verified Successfully`. `SHA256SUMS`
+lives in the same release as the files it covers, so whoever can rewrite
+release assets can rewrite it too; without the signing key they cannot
+produce a `latest.json` that verifies.
+
 ## <img src="docs/assets/ramp.svg" alt="" height="16"> Quick start
 
 ```console

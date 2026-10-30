@@ -85,6 +85,23 @@ paths the tarball owns. For a full removal delete the prefix's files above,
 `~/.local/mvm/v0.22.0` and `~/.local/share/nearai-red-sandbox` (this deletes
 the default sessions directory too).
 
+## Update check
+
+`rts launch` on a curl or Homebrew install checks for a newer signed release
+after the config is loaded and before credentials are read or any VM exists
+(see [Updates](../README.md#updates)). It runs at most once per 24 hours
+(cache: `~/.local/share/nearai-red-sandbox/update-check.json`), waits at most
+3 seconds, and never fails the launch; a failure is appended to the
+session's `launcher.log` as `<unix secs> update check: <reason>`. Source
+builds and builds without a compiled-in update key never check.
+
+| Setting | Effect |
+|---|---|
+| config `"updateCheck": false` | no launch check: no cache read, no request (default `true`; a non-boolean is refused) |
+| `RTS_NO_UPDATE_CHECK` set and non-empty | the same, whatever the config says |
+
+Neither setting affects `rts update`, which an operator runs explicitly.
+
 ## Inference through embedded IronWire
 
 By default opencode talks to [IronWire](https://github.com/nearai/ironwire)'s

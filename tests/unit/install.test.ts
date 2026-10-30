@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
 import { spawnSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import { appendFileSync, chmodSync, statSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
@@ -254,6 +255,49 @@ test("an unrendered template without RTS_VERSION is refused", () => {
 
 test("the template with RTS_VERSION set installs that version", () => {
   const r = install("0.1.0", TEMPLATE)
+  expect(r.status).toBe(0)
+  expect(lines(log)).toEqual(["0.1.0 setup"])
+})
+
+function installWithTarballSha(version: string, sha: string) {
+  const rel = release(version)
+  const e = env(version, rel)
+  e.RTS_TARBALL_SHA256 = sha
+  return spawnSync("/bin/bash", [join(rel, "install.sh")], { encoding: "utf8", env: e })
+}
+
+const sha256 = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex")
+
+test("a tarball that matches SHA256SUMS but not RTS_TARBALL_SHA256 is refused", () => {
+  const r = installWithTarballSha("0.1.0", "0".repeat(64))
+  expect(r.status).toBe(1)
+  expect(r.stderr).toContain("RTS_TARBALL_SHA256")
+  expect(r.stderr).toContain(TARBALL("0.1.0"))
+  expect(existsSync(join(prefix, "bin/rts"))).toBe(false)
+  expect(existsSync(log)).toBe(false)
+  expect(readdirSync(tmp)).toEqual([])
+})
+
+test("a malformed RTS_TARBALL_SHA256 is refused before downloading", () => {
+  for (const bad of ["ABC", "A".repeat(64), "0".repeat(63), "0".repeat(65), "g".repeat(64)]) {
+    const r = installWithTarballSha("0.1.0", bad)
+    expect([bad, r.status]).toEqual([bad, 1])
+    expect(r.stderr).toContain("RTS_TARBALL_SHA256 must be 64 lowercase hex characters")
+    expect(existsSync(curlLog)).toBe(false)
+    expect(existsSync(prefix)).toBe(false)
+  }
+})
+
+test("a matching RTS_TARBALL_SHA256 installs", () => {
+  const rel = release("0.1.0")
+  const r = installWithTarballSha("0.1.0", sha256(join(rel, TARBALL("0.1.0"))))
+  expect(r.stderr + r.stdout).not.toContain("refusing")
+  expect(r.status).toBe(0)
+  expect(lines(log)).toEqual(["0.1.0 setup"])
+})
+
+test("an empty RTS_TARBALL_SHA256 keeps today's behaviour", () => {
+  const r = installWithTarballSha("0.1.0", "")
   expect(r.status).toBe(0)
   expect(lines(log)).toEqual(["0.1.0 setup"])
 })
