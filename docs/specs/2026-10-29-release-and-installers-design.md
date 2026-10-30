@@ -178,8 +178,19 @@ last line, so a truncated download runs nothing. No `sudo`.
 4. If `gh` is available, `gh attestation verify <tarball> --repo
    nearai/nearai-red-sandbox`; a failure stops the install. Without `gh`,
    print one line saying provenance was not checked.
-5. Unpack into a staging directory, then move `bin`, `libexec` and `share`
-   into the prefix, replacing earlier files.
+5. Create `<prefix>/share/nearai-red-sandbox` and any missing parents with
+   mode 0700 (directories that already exist keep their modes;
+   `scripts/build-patched-mvm-supervisor.sh` refuses
+   `~/.local/share/nearai-red-sandbox` unless it is mode 700). Unpack into a
+   staging directory under the prefix, then replace exactly the paths the
+   tarball owns: `bin/rts`, `libexec/nearai-red-sandbox`,
+   `share/nearai-red-sandbox/plugin` and
+   `share/nearai-red-sandbox/opencode/session.example.json`. Each earlier copy
+   of those paths is moved aside first and put back if a later move fails.
+   Nothing else under the prefix is touched: other files in `bin`, opencode
+   under `share/nearai-red-sandbox/opencode/<version>`, sessions and a
+   source-built supervisor in `share/nearai-red-sandbox` survive an upgrade.
+   `LICENSE` and `README.md` stay in the tarball.
 6. Run `<prefix>/bin/rts setup`.
 7. If `<prefix>/bin` is not on `PATH`, print the line to add to the shell
    profile. The script never edits profiles.
