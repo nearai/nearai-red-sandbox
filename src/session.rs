@@ -680,7 +680,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     live.machine_attempted = true;
     // A signal during create only sets a flag: create finishes, then teardown removes it.
     live.sb
-        .create(&CreateSpec { name: &p.machine, image: &cfg.image, memory_mib: cfg.limits.memory_mib, cpus: cfg.limits.cpus })
+        .create(&CreateSpec { name: &p.machine, image: &cfg.image, memory_mib: cfg.limits.memory_mib, cpus: cfg.limits.cpus, egress: None })
         .map_err(|e| e.to_string())?;
     live.machine_created = true;
     live.log.log(&format!("created {}", p.machine));

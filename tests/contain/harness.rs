@@ -114,7 +114,7 @@ impl std::ops::Deref for Machine {
 pub fn fresh_machine(h: &Harness) -> Machine {
     let name = format!("rts-{}", random_hex(6));
     let m = Machine(MvmSandbox::new(&name, Box::new(h.run.clone())).unwrap());
-    m.create(&CreateSpec { name: &name, image: &h.image, memory_mib: 512, cpus: 1 }).expect("machine create");
+    m.create(&CreateSpec { name: &name, image: &h.image, memory_mib: 512, cpus: 1, egress: None }).expect("machine create");
     initialize_guest_storage(&m.0).expect("guest input/output storage");
     m
 }

@@ -460,6 +460,20 @@ pub fn check_mvm_host(env: &[(String, String)], mvm_root: &std::path::Path) -> R
     Ok(())
 }
 
+/// `--allow-host` values for tests in other modules. IP literals need no
+/// lookup; a name resolves to a fixed public test address.
+#[cfg(test)]
+pub(crate) fn test_allow_hosts(entries: &[&str]) -> Vec<AllowHost> {
+    struct Fixed;
+    impl Resolver for Fixed {
+        fn resolve(&self, _: &str) -> io::Result<Vec<IpAddr>> {
+            Ok(vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1))])
+        }
+    }
+    let written: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
+    plan(&written, &Fixed).expect("test entries are valid").allow_hosts()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
