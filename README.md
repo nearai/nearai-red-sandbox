@@ -153,7 +153,7 @@ A session ends, exporting `/out` and removing the VM, with stop reason:
 - `network-mismatch` when, after boot, the addresses mvm pinned for a name
   include one `rts` did not resolve and validate, or one in a refused range,
   or mvm recorded none. mvm records its pins only once a connection has
-  succeeded, so the check follows the first probe.
+  succeeded, so the check follows the probes.
 - `session-limit` when `limits.sessionHours` (default 24, 1 to 720) has
   passed since boot, with or without network. The attached `machine run`
   gets the same limit as its `--ttl`.

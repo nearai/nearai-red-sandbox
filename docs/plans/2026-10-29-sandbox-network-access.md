@@ -589,10 +589,10 @@ Supersedes the fixed `ATTACH_TTL = "30d"` in Task 5 and the Global Constraints: 
 
 ### Task 9b: Post-boot check of the IPs mvm pinned (added 2026-10-29, approved by Zaki)
 
-`rts` resolves and validates every name before boot (Task 2), but mvm resolves the names again when its endpoint starts and pins those answers. A different answer at that moment (DNS changed, or a hostile resolver) could pin a LAN or otherwise refused address. After boot and before the probes, `rts` compares what mvm pinned with what `rts` validated.
+`rts` resolves and validates every name before boot (Task 2), but mvm resolves the names again when its endpoint starts and pins those answers. A different answer at that moment (DNS changed, or a hostile resolver) could pin a LAN or otherwise refused address. After the probes and before anything else runs in the guest, `rts` compares what mvm pinned with what `rts` validated. (The plan first said "before the probes"; Task 10 measured that mvm v0.22.0 writes its pins only in `host.flow.allowed`, and only on a successful flow, so the check has to follow the probes.)
 
 **Files:**
-- Modify: `src/network.rs` (a pure comparison), `src/session.rs` (call it after boot, before Task 7's probes), `tests/contain/network.rs` (Task 10 measures the real event shape)
+- Modify: `src/network.rs` (a pure comparison), `src/session.rs` (call it after Task 7's probes, before anything else runs in the guest), `tests/contain/network.rs` (Task 10 measures the real event shape)
 - Test: `src/network.rs` unit tests
 
 **Interfaces:**

@@ -1,7 +1,7 @@
 # Controlled network access from the sandbox: design
 
 Date: 2026-10-29
-Status: approved 2026-10-29; blocker 1 worked around (see Attached start), upstream fix tracked in tinylabscom/mvm#4860
+Status: approved 2026-10-29; blocker 1 worked around (see Attached start), upstream fix tracked in tinylabscom/mvm#4860. Amended 2026-10-30 with the session limit and the pinned-IP check (plan Tasks 9a and 9b, approved by Zaki 2026-10-29) and the order of that check measured in Task 10.
 
 ## Purpose
 
@@ -21,7 +21,9 @@ controls, keeps "no network" as the default, and documents how to use it.
 | Granularity | Exact host names or IP addresses, each with a TCP port (443 when omitted). No wildcards, no UDP, no mid-session changes (mvm supports none of these). |
 | Presets | One built-in preset in v1, `packages`. Other needs are named host by host. |
 | Approach | A thin layer over mvm's allowlist (chosen 2026-10-29 over an rts-owned SNI-checking proxy reached through `--peer`, and over mvm's `--net` preset). |
-| Audit | The allowlist and its resolved IPs in `sessions/<id>/session.json`; every allowed and denied flow for this VM copied from mvm's signed audit log into `sessions/<id>/network.jsonl`. |
+| Session limit | `limits.sessionHours`, an integer from 1 to 720 (720 h is mvm's inclusive 30-day `MAX_TTL`), default 24. Every session, with or without network, stops with `session-limit` once that many hours have passed since boot (export `/out`, remove the VM). A network session's attached `machine run` gets the same limit as `--ttl <hours>h`. |
+| Pinned-IP check | mvm resolves each name again when its endpoint starts and pins those answers. After the probes, `rts` compares what mvm pinned with what it resolved and validated, and stops with `network-mismatch` on any difference it does not allow (Launch sequence step 6). |
+| Audit | The allowlist, its resolved IPs and the IPs mvm pinned in `sessions/<id>/session.json`; every allowed and denied flow for this VM copied from mvm's signed audit log into `sessions/<id>/network.jsonl`. |
 
 ## How mvm v0.22.0 enforces egress (read from source, 2026-10-29)
 
@@ -97,7 +99,7 @@ Full record: `docs/research/2026-10-29-mvm-attached-run-spike.md`.
 
 For a session with a non-empty allowlist, `rts` keeps `machine create` as it
 is and replaces `machine start` with a background
-`mvmctl machine run --name rts-<id> --ttl <session limit>` (no `--image`, no
+`mvmctl machine run --name rts-<id> --ttl <limits.sessionHours>h` (no `--image`, no
 argv, no `-d`). That process boots the persistent machine and stays attached;
 as the network endpoint's parent it keeps egress alive. Measured: allowlisted
 `pypi.org` answered 200 at 45 s, 3 min and 31 min, a non-listed host was
@@ -121,8 +123,10 @@ Requirements this places on `rts`:
 - **One start at a time.** Two attach starts launched back to back raced on a
   `plan.json.tmp` rename; `rts` runs one session at a time, and the start is
   retried once if it fails before boot.
-- **TTL.** `--ttl` is set to the session's wall-clock limit (at most mvm's 30
-  days); expiry behaviour was not measured and is treated as `network-lost`.
+- **TTL.** `--ttl` is `limits.sessionHours` as `<hours>h` (1 to 720 hours, so
+  at most mvm's 30 days). The `session-limit` clock starts just before
+  `machine create`, so `rts` stops the session no later than mvm's TTL would.
+  Expiry of the TTL itself was not measured and is treated as `network-lost`.
 - **Not used:** a fully foreground `machine run --image … -- <argv>` died
   about 60 s after boot in three of three tries ("control frame read
   failed"), cause not found.
@@ -194,10 +198,31 @@ network: 10 hosts allowed (packages, api.example-target.com, 198.51.100.7:8443, 
 network: none
 ```
 
+Session limit, in the same config:
+
+```json
+"limits": { "sessionHours": 24 }
+```
+
+An integer from 1 to 720, default 24; anything else refuses the config with
+`config: limits.sessionHours must be an integer from 1 to 720`.
+
+Stop reasons this design adds. Each one exports `/out` and removes the VM:
+
+- `network-lost`: the attached `mvmctl machine run` exited, at any point
+  (Attached start).
+- `network-mismatch`: the addresses mvm pinned for a name include one `rts`
+  did not resolve and validate, or one in a refused range, or mvm recorded
+  none for it (Launch sequence step 6).
+- `session-limit`: `limits.sessionHours` have passed since boot, with or
+  without network.
+
 ## Launch sequence
 
-All of this runs before `machine create`; any failure refuses the session with
-a message naming the entry and the reason, and nothing falls back to wider
+Steps 1 to 3 run before `machine create`, step 4 is the create, and steps 5
+and 6 run after boot, before anything else runs in the guest (storage set-up,
+the copy into `/in`, opencode). Any failure refuses or ends the session with a
+message naming the entry and the reason, and nothing falls back to wider
 access.
 
 1. **Parse and validate.** Expand presets; parse hosts, IPs and ports; refuse
@@ -224,11 +249,30 @@ access.
    timeout. Any failure ends the session, naming the entry. With no allowlist,
    probe that `1.1.1.1:443` is unreachable (the address the original no-egress measurement used), so a no-network
    session proves deny-all on every launch.
+6. **Check mvm's pins.** mvm resolves each name again when its endpoint
+   starts and pins those answers, so a changed or hostile DNS answer at that
+   moment could pin an address `rts` never validated. After the probes, `rts`
+   reads this VM's entries from mvm's audit log, waiting up to 10 s for a pin
+   for every host name in the allowlist (IP-literal entries pin to themselves
+   and are not checked). It reads `labels.resolved_ips` from
+   `host.flow.allowed` (keyed by the host half of `labels.target`) and from
+   `dns.resolved` (keyed by `labels.qname`). Measured on mvm v0.22.0 in Task
+   10: the pins appear only in `host.flow.allowed`, and only once a flow has
+   succeeded; the guest does no DNS of its own through the proxy, so no
+   `dns.resolved` entry appears. That is why the check follows the probes
+   rather than preceding them, and why one probe connection to whatever mvm
+   pinned precedes a refusal. The session ends with `network-mismatch` when
+   the audit log never appears, when a name has no pin, when a pinned IP is
+   in a refused range (step 1's ranges), or when a pinned IP is not among the
+   IPs `rts` resolved for that name. mvm pinning a subset of `rts`'s IPs
+   passes. The pins are written to `session.json` before the check, so a
+   refused session records them too.
 
 ## Audit
 
 - `sessions/<id>/session.json` gains `network`: the entries as written, the
-  expanded list, each name's resolved IPs, and the probe results.
+  expanded list, each name's resolved IPs, the IPs mvm pinned for each name
+  (step 6, written before the check), and the probe results.
 - At teardown, `rts` reads `~/.mvm/audit/local.jsonl` (and any rotated
   `local.seg-*.jsonl` written during the session) and copies the entries whose
   `entry.labels.vm_name` is `rts-<id>` and whose event is `host.flow.*`,
@@ -259,7 +303,26 @@ access.
   - refusal on a default egress grant and on a proxy variable in the `mvmctl`
     environment;
   - audit filtering by `vm_name` and event, across a rotated segment;
-  - the startup line for none, one and many entries.
+  - the startup line for none, one and many entries;
+  - `limits.sessionHours`: absent gives 24, 1 and 720 are accepted, 0, 721
+    and a non-integer are refused; the attach argv is
+    `machine run --name <name> --ttl <hours>h`, and create refuses a limit
+    outside 1 to 720 and runs nothing;
+  - the session limit is reached at exactly its hours since boot; a session
+    past its limit (injected clock), with or without network and during the
+    plugin handshake, stops with `session-limit` and tears down in the usual
+    order (rm before SIGTERM to the attach); a session within it is not
+    stopped;
+  - the pinned-IP check: identical sets pass, a subset passes, IP-literal
+    entries pass; a pinned IP `rts` did not validate, a pinned LAN IP for a
+    public name, a pin in a refused range even when `rts` resolved it, and a
+    name with no pin each fail with `network-mismatch`;
+  - reading pins from `dns.resolved` and `host.flow.allowed` for this VM only,
+    across a rotated segment, and failing on an unparseable address;
+  - at session level: matching pins are recorded in `session.json` and the
+    session proceeds; a pinned LAN IP, and a name mvm never pinned (after the
+    wait), end the session with `network-mismatch` and still export `/out`
+    and remove the VM.
 - Containment (real mvm on this host):
   - no allowlist: the guest reaches nothing, and the deny-all probe passes;
   - one allowed host: that host and port connect; another host, another port
@@ -271,7 +334,17 @@ access.
     preset drops `dl-cdn.alpinelinux.org` and the spec records the
     measurement;
   - leak check: with an allowlist, the guest cannot reach the IronWire or
-    forwarder loopback ports.
+    forwarder loopback ports;
+  - one allowed host: the IPs mvm pinned, read from the real audit log, pass
+    the pinned-IP check;
+  - losing the attach is detected, and teardown leaves no endpoint or
+    supervisor process;
+  - through the launcher, with opencode: killing the attach mid-session ends
+    the session with `network-lost`, `/out` is exported, the machine is
+    removed and the attach output stays out of the terminal; and a session
+    whose limit is set to 1 hour with an injected clock ends with
+    `session-limit` (attach `--ttl 1h`), records matching pinned IPs in
+    `session.json` and leaves no machine or network process.
 
 ## Out of scope for v1
 
