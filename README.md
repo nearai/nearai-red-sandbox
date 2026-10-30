@@ -1,8 +1,10 @@
 <p align="center">
-  <img src="docs/assets/sandbox-splash.gif" width="672" alt="NEAR AI Red SandBox: an ASCII sandstorm reveals the cube and wordmark">
+  <img src="docs/assets/sandbox-splash.gif" width="672" alt="SandBox splash: a sandstorm of ASCII grains clears to reveal the NEAR AI Red cube, wordmark and the Cybersecurity Program tagline">
 </p>
 
 # NEAR AI Red · SandBox
+
+Cybersecurity Program
 
 **AI security research in a disposable microVM, with credentials kept on your Mac.**
 
@@ -17,7 +19,7 @@ isolation with attested NEAR AI Cloud inference. You choose the inputs and
 network destinations; SandBox manages the VM lifecycle and keeps session
 records for review.
 
-## Why SandBox
+## <img src="docs/assets/ramp.svg" alt="" height="16"> Why SandBox
 
 - **Give the agent room to work within a defined boundary.** Shell commands
   and file operations execute in the microVM. Inputs are copied in rather
@@ -41,7 +43,7 @@ is under development and currently supports **macOS on Apple silicon**.
 
 <p align="center"><img src="docs/assets/dunes.svg" width="672" alt=""></p>
 
-## Install
+## <img src="docs/assets/ramp.svg" alt="" height="16"> Install
 
 Choose either installation method.
 
@@ -73,7 +75,7 @@ rejects an anonymous registry pull, use the
 [authenticated pull instructions](opencode/README.md#recorded-live-validation-status),
 which require Artifact Registry Reader access.
 
-## Quick start
+## <img src="docs/assets/ramp.svg" alt="" height="16"> Quick start
 
 ```sh
 rts launch
@@ -138,7 +140,7 @@ Available records depend on how far the session gets and which features it
 uses. The agent's findings and exported files still need your review. See the [launcher guide](opencode/README.md) for
 model selection, resource limits, custom session paths, and source builds.
 
-## Network access
+## <img src="docs/assets/ramp.svg" alt="" height="16"> Network access
 
 Guest network access is off by default. To reach a target or fetch packages,
 allow destinations explicitly at launch:
@@ -179,29 +181,44 @@ attachment, or an unexpected resolved address ends the session. For the full
 entry syntax, package-install example, restrictions, audit files, and stop
 reasons, see the [network operator reference](docs/operations.md#network-access).
 
-## Architecture
+## <img src="docs/assets/ramp.svg" alt="" height="16"> Architecture
 
 SandBox separates the agent's tools from its inference connection:
 
 ```mermaid
 flowchart TB
-    cloud["NEAR AI Cloud<br/>attested gateway and model TEEs"]
-    subgraph host["Your Mac"]
-        launcher["rts launch<br/>verification and session lifecycle"]
-        ui["OpenCode + sandbox plugin<br/>terminal UI and tool routing"]
-        proxy["IronWire + attested forwarder<br/>holds the inference key"]
-        records["Session directory<br/>exported files and audit records"]
+    subgraph ext["External services"]
+        near["NEAR AI Cloud<br/>gateway and model TEEs"]
+        pcs["Intel PCS<br/>TDX collateral"]
+        nras["NVIDIA NRAS<br/>GPU verdicts"]
     end
-    subgraph vm["Disposable Linux microVM"]
-        tools["File and shell tools<br/>/in: copied inputs<br/>/out: files to keep"]
+
+    subgraph host["Host (macOS) - holds credentials, never runs tool calls"]
+        launch["rts launch<br/>preflight, attestation, VM lifecycle"]
+        opencode["opencode v2.2.2<br/>standalone, isolated config"]
+        plugin["sandbox plugin<br/>7-tool and exact-ID model allowlists"]
+        tool["rts tool<br/>shell, read, write, edit, glob, grep"]
+        ironwire["embedded IronWire<br/>holds the NEAR AI key"]
+        fwd["attested forwarder<br/>pinned TLS, model allowlist,<br/>ed25519 receipt checks"]
+        sessions[("sessions/ID/<br/>out, tools.jsonl, attestation.json,<br/>inference.jsonl, session.json, network.jsonl")]
     end
-    launcher -->|"verify attestation"| cloud
-    launcher -->|"create and tear down"| tools
-    ui -->|"tool calls via rts"| tools
-    ui -->|"inference requests"| proxy
-    proxy -->|"pinned TLS and signed receipts"| cloud
-    tools -.->|"export /out at teardown"| records
-    launcher -->|"session records"| records
+
+    subgraph vm["mvm microVM rts-ID - no network unless allowlisted, destroyed at session end"]
+        guest["guest<br/>/in copied in, /out exported"]
+    end
+
+    launch -->|"1 attest every allowed model"| near
+    launch -->|"verify TDX quotes"| pcs
+    launch -->|"verify GPU evidence"| nras
+    launch -->|"2 create VM, copy inputs to /in"| guest
+    launch -->|"3 start session"| opencode
+    opencode --> plugin
+    plugin -->|"each tool call"| tool
+    tool -->|"mvmctl machine exec"| guest
+    opencode -->|"completions"| ironwire
+    ironwire --> fwd
+    fwd ==>|"TLS pinned to the attested certificate"| near
+    guest -.->|"4 /out exported at teardown"| sessions
 ```
 
 1. **Verify.** Check local prerequisites, authenticate, and verify the default
@@ -234,7 +251,7 @@ path. External providers require an explicit opt-out of required attestation;
 see [provider configuration](opencode/README.md#inference-through-embedded-ironwire).
 The OpenCode footer distinguishes `attested` and `unattested` sessions.
 
-## Updates
+## <img src="docs/assets/ramp.svg" alt="" height="16"> Updates
 
 ```sh
 rts update --check    # Check for a newer release
@@ -251,7 +268,7 @@ Updates use a signed release manifest and verify downloaded artifacts. See
 [update verification](docs/operations.md#updates) for the signing key, manual
 verification commands, `--force`, and installation behavior.
 
-## Project status
+## <img src="docs/assets/ramp.svg" alt="" height="16"> Project status
 
 SandBox is under development. Its documented containment results apply to the
 tested Apple-silicon Mac and pinned versions; they do not establish isolation
@@ -265,7 +282,7 @@ for the tested scope and the patched supervisor requirement.
 - [Network design and measurements](docs/specs/2026-10-29-sandbox-network-access-design.md)
 - [Attested inference plan](docs/plans/2026-10-28-attested-inference.md)
 
-## NEAR AI Cloud access
+## <img src="docs/assets/ramp.svg" alt="" height="16"> NEAR AI Cloud access
 
 Default sessions use browser sign-in and an embedded
 [IronWire](https://github.com/nearai/ironwire) proxy. The dedicated inference key
