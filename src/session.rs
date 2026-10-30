@@ -418,10 +418,16 @@ pub fn wait_for_ready(file: &Path, nonce: &str, deadline: Duration, poll: Durati
 
 /// mvm v0.22.0 writes this PID file; inspect has no PID and the supervisor
 /// receives its VM identity over stdin, so its argv cannot identify the VM.
-fn supervisor_pid_file(name: &str, env: &[(String, String)]) -> Result<PathBuf, String> {
+/// mvm's state root: `MVM_HOME`, or else `HOME/.mvm`. An empty value counts
+/// as unset.
+pub fn mvm_root(env: &[(String, String)]) -> Result<PathBuf, String> {
     let get = |key: &str| env.iter().find(|(k, v)| k == key && !v.is_empty()).map(|(_, v)| PathBuf::from(v));
-    let root = get("MVM_HOME").or_else(|| get("HOME").map(|h| h.join(".mvm")))
-        .ok_or_else(|| "cannot monitor HVF supervisor: neither HOME nor MVM_HOME is set".to_string())?;
+    get("MVM_HOME").or_else(|| get("HOME").map(|h| h.join(".mvm")))
+        .ok_or_else(|| "neither HOME nor MVM_HOME is set".to_string())
+}
+
+fn supervisor_pid_file(name: &str, env: &[(String, String)]) -> Result<PathBuf, String> {
+    let root = mvm_root(env).map_err(|e| format!("cannot monitor HVF supervisor: {e}"))?;
     Ok(root.join("vms").join(name).join("hvf.pid"))
 }
 
@@ -754,6 +760,15 @@ mod tests {
     use crate::testutil::tempdir;
     use std::net::TcpListener;
     use std::sync::Mutex;
+
+    #[test]
+    fn mvm_root_prefers_mvm_home_and_ignores_empty_values() {
+        let env = |v: &[(&str, &str)]| v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+        assert_eq!(mvm_root(&env(&[("MVM_HOME", ""), ("HOME", "/h")])).unwrap(), PathBuf::from("/h/.mvm"));
+        assert_eq!(mvm_root(&env(&[("MVM_HOME", "/m"), ("HOME", "/h")])).unwrap(), PathBuf::from("/m"));
+        assert!(mvm_root(&env(&[])).is_err());
+        assert!(mvm_root(&env(&[("MVM_HOME", ""), ("HOME", "")])).is_err());
+    }
 
     #[test]
     fn plugin_options_carry_the_exact_model_allowlist() {

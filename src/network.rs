@@ -419,6 +419,47 @@ impl Plan {
     }
 }
 
+/// The proxy variables mvm v0.22.0 reads from its own environment
+/// (`network_endpoint_spawn.rs:871-875`). Allowed guest traffic would leave
+/// through any of them.
+pub const PROXY_VARS: [&str; 6] = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
+
+/// Refuse an mvm host whose settings could grant guest egress outside
+/// `rts`'s control: any proxy variable mvm reads (even if empty) in the
+/// environment `rts` passes to `mvmctl`, or a host config at
+/// `<mvm root>/config/config.toml` that mentions `egress` on a non-comment
+/// line or that exists but cannot be read. A missing config passes, since
+/// mvm then writes its defaults, which grant no egress in v0.22.0. Runs on
+/// every launch, with or without an allowlist.
+pub fn check_mvm_host(env: &[(String, String)], mvm_root: &std::path::Path) -> Result<(), String> {
+    if let Some((var, _)) = env.iter().find(|(k, _)| PROXY_VARS.contains(&k.as_str())) {
+        return Err(format!(
+            "{var} is set in the environment rts passes to mvmctl; mvm would route allowed guest traffic through it. Unset it and launch again"
+        ));
+    }
+    let cfg = mvm_root.join("config").join("config.toml");
+    match std::fs::symlink_metadata(&cfg) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("cannot check mvm host config {}: {e}", cfg.display())),
+        Ok(_) => {}
+    }
+    let text = std::fs::read_to_string(&cfg)
+        .map_err(|e| format!("cannot read mvm host config {}: {e}", cfg.display()))?;
+    // A line scan, not a TOML parse: anything outside a whole-line comment
+    // that mentions egress refuses, including a trailing comment.
+    if let Some(line) = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.starts_with('#') && l.to_ascii_lowercase().contains("egress"))
+    {
+        return Err(format!(
+            "mvm host config {} mentions egress ({line:?}); it could grant guest egress outside rts's control. Remove that setting and launch again",
+            cfg.display()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,5 +761,31 @@ mod tests {
             .chain(["one-more.example".into()])
             .collect();
         assert!(expand(&over).unwrap_err().contains("64"));
+    }
+
+    #[test]
+    fn any_proxy_variable_mvm_reads_refuses_every_launch() {
+        let root = crate::testutil::tempdir("mvmroot");
+        for var in PROXY_VARS {
+            let e = check_mvm_host(&[(var.into(), String::new())], &root).unwrap_err();
+            assert!(e.contains(var), "{e}");
+        }
+        assert!(check_mvm_host(&[("NO_PROXY".into(), "x".into()), ("HOME".into(), "/h".into())], &root).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_host_config_mentioning_egress_or_unreadable_refuses() {
+        let root = crate::testutil::tempdir("mvmroot");
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        let cfg = root.join("config/config.toml");
+        std::fs::write(&cfg, "dev_vm_cpus = 8\ndefault_cpus = 2\ntrusted_plan_signers = []\n# egress in a comment is fine\n[tenant]\nname = \"\"\n").unwrap();
+        assert!(check_mvm_host(&[], &root).is_ok());
+        std::fs::write(&cfg, "[default_grants.egress]\nallow = []\n").unwrap();
+        assert!(check_mvm_host(&[], &root).unwrap_err().contains("config.toml"));
+        std::fs::remove_file(&cfg).unwrap();
+        std::fs::create_dir(&cfg).unwrap(); // exists, unreadable as a file
+        assert!(check_mvm_host(&[], &root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
