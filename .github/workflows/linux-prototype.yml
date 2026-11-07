@@ -1,0 +1,21 @@
+name: linux-prototype
+
+on:
+  push:
+    paths:
+      - "linux/**"
+      - ".github/workflows/linux-prototype.yml"
+  pull_request:
+    paths:
+      - "linux/**"
+      - ".github/workflows/linux-prototype.yml"
+
+jobs:
+  tool-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Run Linux prototype tests
+        run: python3 -m pytest linux/test_rts_linux.py -q
