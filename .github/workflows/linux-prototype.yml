@@ -17,5 +17,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install bubblewrap
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Install pytest
+        run: python3 -m pip install --user pytest
       - name: Run Linux prototype tests
         run: python3 -m pytest linux/test_rts_linux.py -q
