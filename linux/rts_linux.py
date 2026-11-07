@@ -345,11 +345,15 @@ def launch(args: argparse.Namespace) -> int:
         + " Use only the provided shell/read/write/edit/glob/grep tools."
     )
     env = dict(os.environ)
-    for key in ("AI_AGENT", "OPENCODE", "OPENCODE_TERMINAL", "OPENCODE_SESSION_ID", "OPENCODE_CONFIG", "OPENCODE_CONFIG_CONTENT"):
+    for key in (
+        "AI_AGENT", "OPENCODE", "OPENCODE_TERMINAL", "OPENCODE_SESSION_ID",
+        "NEARAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+    ):
         env.pop(key, None)
     env["HOME"] = str(root / "home")
     env["XDG_CONFIG_HOME"] = str(root / "home" / ".config")
     env["XDG_DATA_HOME"] = str(root / "home" / ".local" / "share")
+    env["OPENCODE_CONFIG"] = str(global_dir / "opencode.json")
     Path(env["HOME"]).mkdir(parents=True, exist_ok=True)
     session = {
         "id": sid,
