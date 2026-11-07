@@ -1,0 +1,14 @@
+{
+  "inputsDir": "./inputs",
+  "provider": {
+    "baseURL": "http://127.0.0.1:8001/v1",
+    "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated",
+    "apiKeyEnv": "NEARAI_API_KEY"
+  },
+  "limits": {
+    "sessionHours": 1
+  },
+  "network": {
+    "allow": []
+  }
+}
