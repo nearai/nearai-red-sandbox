@@ -56,34 +56,38 @@ fn saved_key_launch_fails_closed_on_storage_error_without_opening_browser() {
 }
 
 #[test]
-fn valid_callback_requires_independent_local_nonce_and_access_token() {
-    assert!(
-        decode_deposit(
-            "state=expected&token=browser-session&refresh_token=broad",
-            "expected"
-        )
-        .is_ok()
-    );
-    for body in [
-        "state=wrong&token=session",
-        "token=session",
-        "state=expected&token=",
-        "state=expected&state=expected&token=session",
-        "state=expected&token=a&token=b",
-        "state=expected&token=session&refresh_token=a&refresh_token=b",
+fn callback_requires_code_and_matching_state_without_legacy_tokens() {
+    assert!(decode_callback("state=expected&code=one-time-code", "expected").is_ok());
+    for query in [
+        "state=wrong&code=code",
+        "code=code",
+        "state=expected&code=",
+        "state=expected&state=expected&code=code",
+        "state=expected&code=a&code=b",
+        "state=expected&token=legacy",
+        "state=expected&code=a&refresh_token=legacy",
+        "state=expected&code=a&error=denied",
+        "state=expected&code=a&extra=b",
+        "state=expected&code=a#token=legacy",
+        "state=expected&code=a&error=denied&error=denied",
     ] {
         assert!(
-            decode_deposit(body, "expected").is_err(),
-            "accepted malformed deposit"
+            decode_callback(query, "expected").is_err(),
+            "accepted malformed callback"
         );
     }
     assert!(
-        decode_deposit(
-            &format!("state=expected&token={}", "a".repeat(8192)),
+        decode_callback(
+            &format!("state=expected&code={}", "a".repeat(8192)),
             "expected"
         )
         .is_err()
     );
+    assert_eq!(
+        decode_callback("state=expected&error=access_denied", "expected").unwrap_err(),
+        "NEAR AI sign-in failed"
+    );
+    assert!(decode_callback("error=access_denied", "expected").is_err());
 }
 
 #[test]
@@ -100,34 +104,6 @@ fn account_selection_refuses_ambiguity_and_unknown_explicit_ids() {
     );
     assert!(choose(&ids, Some("unknown"), "organization").is_err());
     assert!(choose(&[], None, "workspace").is_err());
-}
-
-#[test]
-fn callback_deposits_reject_foreign_origin_and_host() {
-    assert!(valid_submission(
-        Some("http://127.0.0.1:9123"),
-        "127.0.0.1:9123",
-        "127.0.0.1:9123",
-        Some("same-origin")
-    ));
-    assert!(!valid_submission(
-        Some("https://attacker.invalid"),
-        "127.0.0.1:9123",
-        "127.0.0.1:9123",
-        Some("cross-site")
-    ));
-    assert!(!valid_submission(
-        None,
-        "127.0.0.1:9123",
-        "127.0.0.1:9123",
-        None
-    ));
-    assert!(!valid_submission(
-        Some("http://127.0.0.1:9123"),
-        "attacker.invalid",
-        "127.0.0.1:9123",
-        Some("same-origin")
-    ));
 }
 
 #[test]
@@ -215,9 +191,12 @@ fn callback_timeout_and_cancellation_release_the_listener() {
     let start = Instant::now();
     assert_eq!(
         callback
-            .receive(start + Duration::from_millis(50), &|| false, |_| panic!(
-                "no callback expected"
-            ))
+            .receive(
+                start + Duration::from_millis(50),
+                &|| false,
+                "expected",
+                |_| panic!("no callback expected")
+            )
             .unwrap_err(),
         "NEAR AI sign-in timed out"
     );
@@ -243,13 +222,14 @@ fn callback_timeout_and_cancellation_release_the_listener() {
     }
     let mut response = String::new();
     existing.read_to_string(&mut response).unwrap();
-    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
     let callback = browser::Callback::bind().unwrap();
     assert_eq!(
         callback
             .receive(
                 Instant::now() + Duration::from_secs(5),
                 &|| true,
+                "expected",
                 |_| panic!("cancelled")
             )
             .unwrap_err(),
@@ -265,85 +245,55 @@ fn client() -> reqwest::blocking::Client {
         .unwrap()
 }
 
-fn page_nonce(page: &str) -> String {
-    page.split("body.set(\"state\", \"")
-        .nth(1)
-        .unwrap()
-        .split('"')
-        .next()
-        .unwrap()
-        .to_string()
-}
-
 #[test]
 fn real_loopback_callback_ignores_spoofs_and_acknowledges_only_after_storage() {
     let callback = browser::Callback::bind().unwrap();
     let url = callback.url();
-    let origin = url::Url::parse(&url)
-        .unwrap()
-        .origin()
-        .ascii_serialization();
     let receiver = std::thread::spawn(move || {
         callback.receive(
             Instant::now() + Duration::from_secs(4),
             &|| false,
-            |session| {
-                assert_eq!(session.expose_secret(), "browser-session-only");
-                // The real failure path must reach the browser as failure, not success.
+            "app-state",
+            |code| {
+                assert_eq!(code.expose_secret(), "one-time-code");
                 UnavailableStore.save(&credential())?;
                 Ok(credential())
             },
         )
     });
     let client = client();
-    assert_eq!(
-        client.get(format!("{url}-wrong")).send().unwrap().status(),
-        404
-    );
-    let page = client.get(&url).send().unwrap();
-    assert_eq!(page.headers()["cache-control"], "no-store");
-    let nonce = page_nonce(&page.text().unwrap());
-    let deposit = format!("{url}/deposit");
-    for (origin_header, body, expected) in [
+    for (path, host, expected) in [
+        (format!("{url}-wrong?state=app-state&code=code"), None, 404),
+        (format!("{url}?state=wrong&code=code"), None, 400),
+        (format!("{url}?state=app-state&code=a&code=b"), None, 400),
+        (format!("{url}?state=app-state&token=legacy"), None, 400),
         (
-            "https://attacker.invalid",
-            format!("state={nonce}&token=browser-session-only"),
-            403,
-        ),
-        (
-            origin.as_str(),
-            "state=wrong&token=browser-session-only".into(),
-            400,
-        ),
-        (
-            origin.as_str(),
-            format!("state={nonce}&token=a&token=b"),
-            400,
-        ),
-        (
-            origin.as_str(),
-            format!("state={nonce}&token={}", "a".repeat(8192)),
+            format!("{url}?state=app-state&code=code"),
+            Some("attacker.invalid"),
             400,
         ),
     ] {
-        assert_eq!(
-            client
-                .post(&deposit)
-                .header("origin", origin_header)
-                .body(body)
-                .send()
-                .unwrap()
-                .status(),
-            expected
-        );
+        let mut request = client.get(path);
+        if let Some(host) = host {
+            request = request.header("host", host);
+        }
+        assert_eq!(request.send().unwrap().status(), expected);
     }
+    assert_eq!(
+        client
+            .post(&url)
+            .body("state=app-state&token=legacy")
+            .send()
+            .unwrap()
+            .status(),
+        400
+    );
     let response = client
-        .post(&deposit)
-        .header("origin", &origin)
-        .body(format!("state={nonce}&token=browser-session-only"))
+        .get(format!("{url}?state=app-state&code=one-time-code"))
         .send()
         .unwrap();
     assert_eq!(response.status(), 500);
+    assert_eq!(response.headers()["cache-control"], "no-store");
     assert_eq!(
         receiver.join().unwrap().unwrap_err(),
         "NEAR AI credential storage unavailable"
@@ -359,9 +309,12 @@ fn stalled_callback_connections_cannot_extend_total_deadline() {
     let start = Instant::now();
     assert_eq!(
         callback
-            .receive(start + Duration::from_millis(60), &|| false, |_| panic!(
-                "no tokens"
-            ))
+            .receive(
+                start + Duration::from_millis(60),
+                &|| false,
+                "expected",
+                |_| panic!("no tokens")
+            )
             .unwrap_err(),
         "NEAR AI sign-in timed out"
     );
@@ -379,6 +332,7 @@ fn signal_consumed_during_a_partial_request_still_interrupts_the_ceremony() {
     let result = callback.receive(
         Instant::now() + Duration::from_millis(100),
         &|| checks.fetch_add(1, Ordering::SeqCst) == 4,
+        "expected",
         |_| panic!("no complete request"),
     );
     assert_eq!(result.unwrap_err(), "NEAR AI sign-in interrupted");
@@ -388,6 +342,7 @@ struct ApiRequest {
     method: String,
     path: String,
     authorization: String,
+    user_agent: String,
     body: serde_json::Value,
 }
 
@@ -408,10 +363,14 @@ fn read_api_request(stream: &mut TcpStream) -> ApiRequest {
     let headers = std::str::from_utf8(&bytes[..end]).unwrap().to_string();
     let mut length = 0;
     let mut authorization = String::new();
+    let mut user_agent = String::new();
     for line in headers.lines().skip(1) {
         if let Some((key, value)) = line.split_once(':') {
             if key.eq_ignore_ascii_case("content-length") {
                 length = value.trim().parse().unwrap();
+            }
+            if key.eq_ignore_ascii_case("user-agent") {
+                user_agent = value.trim().into();
             }
             if key.eq_ignore_ascii_case("authorization") {
                 authorization = value.trim().into();
@@ -429,6 +388,7 @@ fn read_api_request(stream: &mut TcpStream) -> ApiRequest {
         method: first.next().unwrap().into(),
         path: first.next().unwrap().into(),
         authorization,
+        user_agent,
         body: if length == 0 {
             serde_json::Value::Null
         } else {
@@ -562,20 +522,27 @@ fn cloud_errors_are_redacted_and_redirects_are_not_followed() {
 #[test]
 fn authorization_uses_exact_cloud_origin_and_escaped_bare_callback() {
     let api = cloud::CloudApi::live(Instant::now() + Duration::from_secs(1)).unwrap();
-    let callback = "http://127.0.0.1:43210/rts/random/callback";
+    let callback = "http://127.0.0.1:43210/rts/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/callback";
+    let proof = pkce::Pkce::generate().unwrap();
     for (provider, path) in [
         (Provider::Github, "/v1/auth/github"),
         (Provider::Google, "/v1/auth/google"),
     ] {
-        let url = url::Url::parse(&api.authorize_url(provider, callback).unwrap()).unwrap();
+        let url = url::Url::parse(&api.authorize_url(provider, callback, &proof).unwrap()).unwrap();
         assert_eq!(
             url.origin().ascii_serialization(),
-            "https://cloud-api.near.ai"
+            "https://cloud-platform.near.ai"
         );
         assert_eq!(url.path(), path);
         assert_eq!(
             url.query_pairs().collect::<Vec<_>>(),
-            [("frontend_callback".into(), callback.into())]
+            [
+                ("frontend_callback".into(), callback.into()),
+                ("client_id".into(), "red-sandbox".into()),
+                ("code_challenge".into(), proof.challenge().into()),
+                ("code_challenge_method".into(), "S256".into()),
+                ("state".into(), proof.state.clone().into()),
+            ]
         );
     }
     for callback in [
@@ -583,7 +550,110 @@ fn authorization_uses_exact_cloud_origin_and_escaped_bare_callback() {
         "https://127.0.0.1:9123/callback",
         "http://attacker.invalid:9123/callback",
         "http://127.0.0.1:9123/callback#frag",
+        "http://127.0.0.1:9123/rts/short/callback",
+        "http://127.0.0.1:9123/rts/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/callback/",
+        "http://127.0.0.1:9123/rts/%300123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/callback",
     ] {
-        assert!(api.authorize_url(Provider::Github, callback).is_err());
+        assert!(
+            api.authorize_url(Provider::Github, callback, &proof)
+                .is_err()
+        );
     }
+}
+
+#[test]
+fn native_redemption_sends_only_the_bound_proof_and_receives_session_over_http() {
+    let (origin, requests) = mock_api(vec![(
+        "200 OK",
+        r#"{"access_token":"session-only","refresh_token":"discard-refresh","refresh_token_expiration":"later","user":{}}"#,
+    )]);
+    let api = cloud::CloudApi::for_test(&origin, Instant::now() + Duration::from_secs(4));
+    let proof = pkce::Pkce::generate().unwrap();
+    let redirect = "http://127.0.0.1:1234/rts/test/callback";
+    let session = api
+        .redeem(&"one-time-code".to_string().into(), &proof, redirect)
+        .unwrap();
+    assert_eq!(session.expose_secret(), "session-only");
+    let requests = requests.join().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].path, "/v1/auth/native/token");
+    assert!(requests[0].authorization.is_empty());
+    assert_eq!(requests[0].user_agent, "nearai-red-sandbox/0.1");
+    assert_eq!(
+        requests[0].body,
+        serde_json::json!({"grant_type":"authorization_code", "client_id":"red-sandbox", "code":"one-time-code", "code_verifier":proof.verifier(), "redirect_uri":redirect})
+    );
+}
+
+#[test]
+fn redemption_errors_and_legacy_responses_never_fall_back_or_leak() {
+    for (status, body) in [
+        (
+            "400 Bad Request",
+            r#"{"error":"invalid_grant","detail":"secret"}"#,
+        ),
+        ("404 Not Found", "secret"),
+        ("302 Found", "secret"),
+        (
+            "200 OK",
+            r#"{"token":"legacy-token","refresh_token":"secret"}"#,
+        ),
+        ("200 OK", r#"{"access_token":"","refresh_token":"secret"}"#),
+    ] {
+        let (origin, requests) = mock_api(vec![(status, body)]);
+        let api = cloud::CloudApi::for_test(&origin, Instant::now() + Duration::from_secs(4));
+        let proof = pkce::Pkce::generate().unwrap();
+        let error = api
+            .redeem(
+                &"code-secret".to_string().into(),
+                &proof,
+                "http://127.0.0.1:1234/rts/test/callback",
+            )
+            .unwrap_err();
+        for secret in ["code-secret", "legacy-token", "secret", proof.verifier()] {
+            assert!(!error.contains(secret));
+        }
+        assert_eq!(requests.join().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn a_successful_callback_completes_only_once_and_legacy_fragment_cannot_complete() {
+    let callback = browser::Callback::bind().unwrap();
+    let url = callback.url();
+    let receiver = std::thread::spawn(move || {
+        callback.receive(
+            Instant::now() + Duration::from_secs(4),
+            &|| false,
+            "expected",
+            |code| {
+                assert_eq!(code.expose_secret(), "only-code");
+                Ok(credential())
+            },
+        )
+    });
+    let client = client();
+    // A browser never transmits fragments: an old server's bearer-token
+    // redirect reaches only the bare callback and is refused there.
+    assert_eq!(
+        client
+            .get(format!("{url}#token=legacy&refresh_token=legacy"))
+            .send()
+            .unwrap()
+            .status(),
+        400
+    );
+    let response = client
+        .get(format!("{url}?code=only-code&state=expected"))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(receiver.join().unwrap().unwrap().key_id, "key-one");
+    assert!(
+        client
+            .get(format!("{url}?code=only-code&state=expected"))
+            .send()
+            .is_err()
+    );
 }

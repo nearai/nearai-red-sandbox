@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 mod browser;
 mod cloud;
+mod pkce;
 mod storage;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -56,14 +57,18 @@ fn login_with(
     crate::sys::catch_termination_signals();
     let deadline = Instant::now() + Duration::from_secs(300);
     let api = cloud::CloudApi::live(deadline)?;
+    let proof = pkce::Pkce::generate()?;
     let callback = browser::Callback::bind()?;
-    let url = api.authorize_url(options.provider, &callback.url())?;
+    let redirect_uri = callback.url();
+    let url = api.authorize_url(options.provider, &redirect_uri, &proof)?;
     crate::brand::progress::message("Opening your browser to sign in to NEAR AI Cloud…");
     browser::open(&url)?;
     callback.receive(
         deadline,
         &|| crate::sys::take_signal().is_some(),
-        |session| {
+        &proof.state,
+        |code| {
+            let session = api.redeem(&code, &proof, &redirect_uri)?;
             let credential = api.mint(&session, options)?;
             store.save(&credential)?;
             Ok(credential)
@@ -143,7 +148,7 @@ fn choose(items: &[String], selected: Option<&str>, kind: &str) -> Result<String
 }
 
 #[cfg(test)]
-use browser::{decode_deposit, valid_submission};
+use browser::decode_callback;
 
 #[cfg(test)]
 mod tests;
