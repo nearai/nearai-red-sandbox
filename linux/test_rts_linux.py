@@ -135,3 +135,25 @@ def test_launch_keeps_the_api_key_off_disk(tmp_path: Path):
     for f in (tmp_path / "s").rglob("*"):
         if f.is_file():
             assert "sk-SECRET" not in f.read_text(errors="replace"), f
+
+
+def test_launch_drops_host_opencode_config_overrides(tmp_path: Path):
+    dump = tmp_path / "env.json"
+    stub = tmp_path / "opencode"
+    stub.write_text(
+        "#!/usr/bin/env python3\nimport json, os\n"
+        f"open({str(dump)!r}, 'w').write(json.dumps(dict(os.environ)))\n"
+    )
+    stub.chmod(0o755)
+    r = subprocess.run(
+        [sys.executable, str(CLI), "launch", "--prompt", "hi",
+         "--sessions-dir", str(tmp_path / "s"), "--opencode", str(stub)],
+        text=True,
+        capture_output=True,
+        env={**os.environ, "OPENCODE_CONFIG_CONTENT": '{"mcp":{}}', "OPENCODE_CONFIG_DIR": "/tmp/evil"},
+    )
+    assert r.returncode == 0, r.stderr
+    env = json.loads(dump.read_text())
+    assert "OPENCODE_CONFIG_CONTENT" not in env
+    assert "OPENCODE_CONFIG_DIR" not in env
+    assert env["OPENCODE_CONFIG"].endswith("opencode.json")

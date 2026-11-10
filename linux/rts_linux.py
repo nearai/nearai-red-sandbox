@@ -378,6 +378,8 @@ def launch(args: argparse.Namespace) -> int:
     env = dict(os.environ)
     for key in (
         "AI_AGENT", "OPENCODE", "OPENCODE_TERMINAL", "OPENCODE_SESSION_ID",
+        # Host config overrides would be merged into the generated session config.
+        "OPENCODE_CONFIG_CONTENT", "OPENCODE_CONFIG_DIR",
         "NEARAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
     ):
         env.pop(key, None)
