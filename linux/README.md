@@ -22,8 +22,8 @@ production microVM backend lands.
 | mvm / SandBox | rts-linux prototype |
 |---|---|
 | Apple-silicon HVF microVM | Linux user-namespace bubblewrap jail |
-| mvm image + supervisor | host root read-only + private `/tmp` |
-| host-side proxy with host:port allowlist | **no guest network by default**; `--network` shares the host network (no allowlist proxy yet) |
+| mvm image + supervisor | system dirs (`/usr`, `/etc`, `/lib*`, `/bin`, `/sbin`, `/opt`) read-only, private `/tmp`, empty environment; home dirs and the session's own files are not visible |
+| host-side proxy with host:port allowlist | **no guest network by default**; `--network` shares the host network (no allowlist proxy yet). A non-empty `network.allow` is refused rather than widened to the whole network |
 | attestation and IronWire receipts | not implemented |
 | canaries, RSS ceiling, session TTL | session record only; TTL is a `subprocess` timeout |
 | interactive OpenCode TUI | headless `opencode run --standalone --format json` |
@@ -56,6 +56,9 @@ untrusted production targets.
 }
 ```
 
+The API key is read from the `apiKeyEnv` variable and handed to OpenCode through the environment
+(`{env:RTS_LINUX_API_KEY}`); it is not written into the session directory.
+
 ```bash
 chmod +x linux/rts_linux.py
 linux/rts_linux.py launch --config session.json \
@@ -79,8 +82,10 @@ printf '%s' '{"options":{"root":"/tmp/rts-session"},"input":{"command":"uname -s
 python3 -m pytest linux/test_rts_linux.py -q
 ```
 
-The tests exercise copy-in/out, path-escape refusal, the six tools, and no-network behavior. They
-skip when `bwrap` is unavailable.
+The tests exercise copy-in/out, path-escape and symlink refusal, the six tools, no-network
+behavior, host-filesystem and environment isolation of the shell, the allowlist refusal, and that
+the API key is never written to the session directory. The shell tests skip when `bwrap` is
+unavailable.
 
 ## Next steps toward a production Linux backend
 

@@ -30,6 +30,12 @@ from pathlib import Path
 TOOLS = ("shell", "read", "write", "edit", "glob", "grep")
 MAX_OUTPUT = 65_536
 PROMPT_MAX = 65_536
+# Host directories the jailed shell may see, read-only. Everything else on the host
+# (home directories, /root, /run, /var, other sessions, this session's own config and
+# API key) stays invisible. Missing entries are skipped (`--ro-bind-try`), and on
+# merged-/usr systems /bin, /lib etc. are symlinks that bwrap recreates.
+SYSTEM_DIRS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc", "/opt")
+API_KEY_ENV = "RTS_LINUX_API_KEY"
 
 
 def die(message: str, code: int = 1) -> None:
@@ -80,9 +86,10 @@ def tool_shell(root: Path, options: dict, payload: dict) -> str:
     if payload.get("background"):
         raise ValueError("background mode is not supported")
     timeout = max(1, int(payload.get("timeout_ms") or options.get("timeoutMs") or 120_000)) / 1000
-    argv = [
-        "bwrap",
-        "--die-with-parent",
+    argv = ["bwrap", "--die-with-parent", "--new-session", "--clearenv"]
+    for d in SYSTEM_DIRS:
+        argv += ["--ro-bind-try", d, d]
+    argv += [
         "--unshare-pid",
         "--unshare-ipc",
         "--unshare-uts",
@@ -90,9 +97,6 @@ def tool_shell(root: Path, options: dict, payload: dict) -> str:
         "--unshare-user",
         "--cap-drop",
         "ALL",
-        "--ro-bind",
-        "/",
-        "/",
         "--dev",
         "/dev",
         "--proc",
@@ -116,8 +120,14 @@ def tool_shell(root: Path, options: dict, payload: dict) -> str:
         "--setenv",
         "PATH",
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "--setenv",
+        "LANG",
+        "C.UTF-8",
     ]
-    if not options.get("network"):
+    if options.get("network"):
+        # systemd-resolved hosts point /etc/resolv.conf here.
+        argv += ["--ro-bind-try", "/run/systemd/resolve", "/run/systemd/resolve"]
+    else:
         argv.append("--unshare-net")
     argv += ["--", "/bin/sh", "-c", command]
     try:
@@ -173,12 +183,28 @@ def tool_edit(root: Path, options: dict, payload: dict) -> str:
     return f"edited {path.relative_to(root)}"
 
 
+def _walk_files(root: Path, base: Path):
+    """Regular files under base that really live inside the session root.
+
+    glob and grep run on the host, outside the jail, so a symlink planted by the
+    shell tool (e.g. /tmp/work/k -> /home/user/.ssh/id_rsa) must not be followed.
+    """
+    root_resolved = root.resolve()
+    for path in base.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        resolved = path.resolve()
+        if root_resolved not in resolved.parents:
+            continue
+        yield path
+
+
 def tool_glob(root: Path, options: dict, payload: dict) -> str:
     pattern = payload.get("pattern") or "*"
     base = _guest(root, payload.get("path") or "/work")
     matches = []
-    for path in base.rglob("*"):
-        if path.is_file() and fnmatch.fnmatch(str(path.relative_to(base)), pattern):
+    for path in _walk_files(root, base):
+        if fnmatch.fnmatch(str(path.relative_to(base)), pattern):
             matches.append(str(path.relative_to(root)))
             if len(matches) >= 500:
                 break
@@ -195,9 +221,7 @@ def tool_grep(root: Path, options: dict, payload: dict) -> str:
     base = _guest(root, payload.get("path") or "/work")
     regex = re.compile(re.escape(pattern) if literal else pattern, 0 if case_sensitive else re.I)
     out = []
-    for path in base.rglob("*"):
-        if not path.is_file():
-            continue
+    for path in _walk_files(root, base):
         if include and not fnmatch.fnmatch(path.name, include):
             continue
         try:
@@ -283,8 +307,13 @@ def launch(args: argparse.Namespace) -> int:
     model = provider.get("model") or os.environ.get("RTS_LINUX_MODEL") or "deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated"
     api_key_env = provider.get("apiKeyEnv") or "NEARAI_API_KEY"
     api_key = provider.get("apiKey") or os.environ.get(api_key_env) or ""
-    limit = (cfg.get("limits") or {}).get("sessionHours", 1)
-    network = bool(args.network or (cfg.get("network") or {}).get("allow"))
+    limit = float((cfg.get("limits") or {}).get("sessionHours", 1))
+    allow = (cfg.get("network") or {}).get("allow") or []
+    if allow and not args.network:
+        # There is no allowlist proxy yet; never widen a host:port allowlist to the
+        # whole host network without the operator asking for it explicitly.
+        die("network.allow is not supported by the prototype; pass --network to share the host network", 2)
+    network = bool(args.network)
     sessions_dir = Path(args.sessions_dir or os.environ.get("RTS_LINUX_SESSIONS") or (Path.cwd() / "sessions")).resolve()
     sessions_dir.mkdir(parents=True, exist_ok=True)
     sid = "rts-" + secrets.token_hex(6)
@@ -324,7 +353,9 @@ def launch(args: argparse.Namespace) -> int:
             "rth": {
                 "npm": "@ai-sdk/openai-compatible",
                 "name": "RTH Linux Sandbox",
-                "options": {"baseURL": base_url, "apiKey": api_key},
+                # The key stays in the environment; OpenCode substitutes it at load time,
+                # so it is never written into the session directory.
+                "options": {"baseURL": base_url, "apiKey": "{env:%s}" % API_KEY_ENV},
                 "models": {model: {"name": "RTH model", "tool_call": True}},
             }
         },
@@ -340,7 +371,7 @@ def launch(args: argparse.Namespace) -> int:
     (root / "opencode.json").write_text(json.dumps(opencode, indent=2))
     (root / "AGENTS.md").write_text(
         "You are running inside a Linux bwrap sandbox. Inputs are in /tmp/in, writable work is "
-        "/tmp/work, and /out/tmp is exported when the session ends. Network is "
+        "/tmp/work, and /tmp/out is exported when the session ends. Network is "
         + ("enabled (host namespace; prototype has no allowlist proxy)." if network else "disabled.")
         + " Use only the provided shell/read/write/edit/glob/grep tools."
     )
@@ -350,6 +381,7 @@ def launch(args: argparse.Namespace) -> int:
         "NEARAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
     ):
         env.pop(key, None)
+    env[API_KEY_ENV] = api_key
     env["HOME"] = str(root / "home")
     env["XDG_CONFIG_HOME"] = str(root / "home" / ".config")
     env["XDG_DATA_HOME"] = str(root / "home" / ".local" / "share")
@@ -371,7 +403,7 @@ def launch(args: argparse.Namespace) -> int:
             [args.opencode, "run", "--standalone", "--format", "json", "--title", "NEAR AI Red Linux Sandbox", prompt],
             cwd=root / "work",
             env=env,
-            timeout=max(60, int(limit) * 3600),
+            timeout=max(60, int(limit * 3600)),
         )
         print(f"[rts-linux] opencode exit {proc.returncode}", flush=True)
     except subprocess.TimeoutExpired:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -55,9 +56,82 @@ def test_path_escape_is_refused(root: Path):
     assert "escapes" in r.stderr or "not found" in r.stderr
 
 
-@pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap not installed")
+needs_bwrap = pytest.mark.skipif(shutil.which("bwrap") is None, reason="bubblewrap not installed")
+
+PY_CONNECT = (
+    "python3 -c \"import socket; socket.create_connection(('1.1.1.1', 80), timeout=2); print('NET' + '_OK')\""
+)
+
+
+@needs_bwrap
 def test_network_is_disabled_by_default(root: Path):
-    r = run_tool(root, "shell", {"command": "curl -sS --max-time 2 http://1.1.1.1 >/dev/null"})
-    # curl may not exist in a minimal host; the exit status is still non-zero when offline.
-    assert r.returncode == 0
-    assert "exit 0" not in r.stdout or "curl" in r.stdout.lower()
+    r = run_tool(root, "shell", {"command": PY_CONNECT})
+    assert r.returncode == 0, r.stderr
+    assert "NET_OK" not in r.stdout
+    assert "[exit " in r.stdout
+
+
+@needs_bwrap
+def test_shell_cannot_see_host_files_outside_the_session(root: Path, tmp_path_factory):
+    # A secret next to the session (like the session's own opencode.json) and the
+    # caller's home directory must both be invisible inside the jail.
+    secret = root / "secret.json"
+    secret.write_text("sk-SECRET")
+    home = Path.home()
+    r = run_tool(root, "shell", {"command": f"cat {secret}; ls -A {home}; echo done"})
+    assert r.returncode == 0, r.stderr
+    assert "sk-SECRET" not in r.stdout
+    assert "done" in r.stdout
+    assert "No such file" in r.stdout
+
+
+@needs_bwrap
+def test_shell_environment_is_cleared(root: Path):
+    request = {"options": {"root": str(root)}, "input": {"command": "echo token=$RTS_LINUX_API_KEY"}}
+    r = subprocess.run(
+        [sys.executable, str(CLI), "tool", "shell"],
+        input=json.dumps(request),
+        text=True,
+        capture_output=True,
+        env={**os.environ, "RTS_LINUX_API_KEY": "sk-SECRET"},
+    )
+    assert r.returncode == 0, r.stderr
+    assert "sk-SECRET" not in r.stdout
+
+
+def test_glob_and_grep_do_not_follow_symlinks_out(root: Path, tmp_path_factory):
+    outside = tmp_path_factory.mktemp("outside") / "secret.txt"
+    outside.write_text("sk-SECRET\n")
+    (root / "work" / "link.txt").symlink_to(outside)
+    assert "sk-SECRET" not in run_tool(root, "grep", {"pattern": "SECRET", "path": "/work"}).stdout
+    assert "link.txt" not in run_tool(root, "glob", {"pattern": "*.txt", "path": "/work"}).stdout
+    assert run_tool(root, "read", {"path": "/work/link.txt"}).returncode != 0
+
+
+def test_launch_refuses_an_allowlist_without_a_proxy(tmp_path: Path):
+    cfg = tmp_path / "session.json"
+    cfg.write_text(json.dumps({"network": {"allow": ["example.com:443"]}}))
+    r = subprocess.run(
+        [sys.executable, str(CLI), "launch", "--config", str(cfg), "--prompt", "hi",
+         "--sessions-dir", str(tmp_path / "s"), "--opencode", "/bin/false"],
+        text=True,
+        capture_output=True,
+    )
+    assert r.returncode == 2
+    assert "network.allow" in r.stderr
+
+
+def test_launch_keeps_the_api_key_off_disk(tmp_path: Path):
+    cfg = tmp_path / "session.json"
+    cfg.write_text(json.dumps({"provider": {"apiKeyEnv": "TEST_KEY"}}))
+    r = subprocess.run(
+        [sys.executable, str(CLI), "launch", "--config", str(cfg), "--prompt", "hi",
+         "--sessions-dir", str(tmp_path / "s"), "--opencode", "/bin/true"],
+        text=True,
+        capture_output=True,
+        env={**os.environ, "TEST_KEY": "sk-SECRET"},
+    )
+    assert r.returncode == 0, r.stderr
+    for f in (tmp_path / "s").rglob("*"):
+        if f.is_file():
+            assert "sk-SECRET" not in f.read_text(errors="replace"), f
