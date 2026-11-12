@@ -12,7 +12,6 @@ pub(super) struct Callback {
     listener: TcpListener,
     host: String,
     path: String,
-    nonce: String,
 }
 
 impl Callback {
@@ -30,7 +29,6 @@ impl Callback {
             listener,
             host,
             path: format!("/rts/{}/callback", crate::protocol::random_hex(32)),
-            nonce: crate::protocol::random_hex(32),
         })
     }
 
@@ -42,6 +40,7 @@ impl Callback {
         self,
         deadline: Instant,
         cancelled: &dyn Fn() -> bool,
+        state: &str,
         finish: impl FnOnce(HostSecret) -> Result<InferenceCredential, String>,
     ) -> Result<InferenceCredential, String> {
         loop {
@@ -77,37 +76,23 @@ impl Callback {
                 );
                 continue;
             }
-            if request.method == "GET" && request.path == self.path {
+            let Some((path, query)) = request.path.split_once('?') else {
                 respond(
                     &mut stream,
-                    "200 OK",
-                    "text/html; charset=utf-8",
-                    &self.page(),
-                );
-                continue;
-            }
-            if request.method != "POST" || request.path != format!("{}/deposit", self.path) {
-                respond(&mut stream, "404 Not Found", "text/plain", "Not found.");
-                continue;
-            }
-            if !valid_submission(
-                request.origin.as_deref(),
-                &request.host,
-                &self.host,
-                request.fetch_site.as_deref(),
-            ) {
-                respond(
-                    &mut stream,
-                    "403 Forbidden",
+                    "400 Bad Request",
                     "text/plain",
                     "Callback refused.",
                 );
                 continue;
+            };
+            if request.method != "GET" || path != self.path || !request.body.is_empty() {
+                respond(&mut stream, "404 Not Found", "text/plain", "Not found.");
+                continue;
             }
-            match decode_deposit(&request.body, &self.nonce) {
-                Ok(token) => {
+            match decode_callback(query, state) {
+                Ok(code) => {
                     check_deadline(deadline, cancelled)?;
-                    let result = finish(token);
+                    let result = finish(code);
                     if result.is_ok() {
                         respond(
                             &mut stream,
@@ -125,6 +110,15 @@ impl Callback {
                     }
                     return result;
                 }
+                Err(error) if error == "NEAR AI sign-in failed" => {
+                    respond(
+                        &mut stream,
+                        "400 Bad Request",
+                        "text/plain",
+                        "Sign-in failed. Return to your terminal.",
+                    );
+                    return Err(error);
+                }
                 Err(_) => respond(
                     &mut stream,
                     "400 Bad Request",
@@ -133,25 +127,6 @@ impl Callback {
                 ),
             }
         }
-    }
-
-    fn page(&self) -> String {
-        // Both interpolated strings are generated hexadecimal capabilities.
-        // The refresh token stays in browser memory and is discarded there.
-        format!(
-            r#"<!doctype html><meta charset="utf-8"><title>NEAR AI Red Sandbox</title>
-<p id="status">Finishing sign-in…</p><script>
-const fragment = new URLSearchParams(location.hash.slice(1));
-history.replaceState(null, "", location.pathname);
-const body = new URLSearchParams(); body.set("state", "{}");
-if (fragment.getAll("token").length === 1) body.set("token", fragment.get("token"));
-fragment.delete("token"); fragment.delete("refresh_token");
-fetch("{}/deposit", {{method:"POST", credentials:"omit", headers:{{"Content-Type":"application/x-www-form-urlencoded"}}, body:body.toString()}})
-.then(r => {{document.getElementById("status").textContent = r.ok ? "Signed in. Return to your terminal." : "Sign-in failed. Return to your terminal.";}})
-.catch(() => {{document.getElementById("status").textContent = "Sign-in failed. Return to your terminal.";}});
-</script>"#,
-            self.nonce, self.path
-        )
     }
 }
 
@@ -187,51 +162,44 @@ pub(super) fn check_deadline(
     Ok(())
 }
 
-pub(super) fn valid_submission(
-    origin: Option<&str>,
-    host: &str,
-    expected: &str,
-    fetch_site: Option<&str>,
-) -> bool {
-    host == expected
-        && origin == Some(format!("http://{expected}").as_str())
-        && fetch_site.is_none_or(|site| site == "same-origin")
-}
-
-pub(super) fn decode_deposit(body: &str, state: &str) -> Result<HostSecret, String> {
-    if body.len() > MAX_BYTES {
+/// A code is accepted only with the initiating app's independent state.
+/// Token-bearing legacy responses and ambiguous parameters never enter redemption.
+pub(super) fn decode_callback(query: &str, state: &str) -> Result<HostSecret, String> {
+    if query.len() > MAX_BYTES || query.contains('#') {
         return Err(REFUSED.into());
     }
     let mut seen_state = None;
-    let mut token = None;
-    let mut refresh_seen = false;
-    for (key, value) in url::form_urlencoded::parse(body.as_bytes()) {
+    let mut code = None;
+    let mut error = None;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         let value = Zeroizing::new(value.into_owned());
         match key.as_ref() {
             "state" if seen_state.is_none() => seen_state = Some(value),
-            "token" if token.is_none() => token = Some(value),
-            "refresh_token" if !refresh_seen => {
-                refresh_seen = true;
-            }
+            "code" if code.is_none() => code = Some(value),
+            "error" if error.is_none() => error = Some(value),
             _ => return Err(REFUSED.into()),
         }
     }
     if seen_state.as_deref().map(String::as_str) != Some(state) {
         return Err(REFUSED.into());
     }
-    let mut token = token.ok_or(REFUSED)?;
-    if !valid_key(&token) {
+    if error.is_some() && code.is_none() {
+        return Err("NEAR AI sign-in failed".into());
+    }
+    if error.is_some() {
         return Err(REFUSED.into());
     }
-    Ok(std::mem::take(&mut *token).into())
+    let mut code = code.ok_or(REFUSED)?;
+    if !valid_key(&code) {
+        return Err(REFUSED.into());
+    }
+    Ok(std::mem::take(&mut *code).into())
 }
 
 struct Request {
     method: String,
-    path: String,
+    path: Zeroizing<String>,
     host: String,
-    origin: Option<String>,
-    fetch_site: Option<String>,
     body: Zeroizing<String>,
 }
 
@@ -290,14 +258,10 @@ fn read_request(
         return Err(REFUSED.into());
     }
     let mut host = None;
-    let mut origin = None;
-    let mut fetch_site = None;
     for line in lines.filter(|line| !line.is_empty()) {
         let (name, value) = line.split_once(':').ok_or(REFUSED)?;
         let slot = match name.to_ascii_lowercase().as_str() {
             "host" => &mut host,
-            "origin" => &mut origin,
-            "sec-fetch-site" => &mut fetch_site,
             _ => continue,
         };
         if slot.is_some() {
@@ -312,10 +276,8 @@ fn read_request(
     );
     Ok(Request {
         method: first[0].into(),
-        path: first[1].into(),
+        path: Zeroizing::new(first[1].into()),
         host: host.ok_or(REFUSED)?,
-        origin,
-        fetch_site,
         body,
     })
 }

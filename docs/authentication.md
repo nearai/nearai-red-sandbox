@@ -12,6 +12,15 @@ rts login
 rts login --provider google
 ```
 
+Native browser sign-in uses cloud-platform's authorization-code flow with S256
+PKCE and the registered public client ID `red-sandbox`. Each attempt keeps an
+independent random verifier and state in host memory. The browser receives only
+a short-lived authorization code; the app verifies callback state and exchanges
+the code over HTTPS at `https://cloud-platform.near.ai/v1/auth/native/token`
+before creating its inference key. Token-bearing browser fragments are refused;
+there is no legacy sign-in fallback. The public client ID selects callback policy
+and does not attest that a binary is authentic.
+
 Browser sign-in has a five-minute deadline and can be interrupted with Ctrl-C.
 The browser reports success after the dedicated inference key is minted and
 saved. Sign-in does not fund the account; inference uses your NEAR AI Cloud
@@ -31,9 +40,9 @@ workspace that differs from the saved connection requires explicit sign-in.
 
 Only the dedicated inference key and its account metadata are stored under
 `nearai-red-sandbox.inference` in macOS Keychain or Linux Secret Service. Broad
-browser access tokens are discarded after key creation; refresh tokens remain
-in the browser and are discarded. Storage failures stop setup; there is no
-plaintext credential file fallback. Help and tool dispatch do not read credentials.
+access and refresh tokens never pass through the browser callback. The app
+discards the refresh token after exchange and the access token after key creation.
+Storage failures stop setup; there is no plaintext credential file fallback. Help and tool dispatch do not read credentials.
 
 Each launch creates a private embedded IronWire proxy, with only the selected
 NEAR AI backend, on an ephemeral loopback port. The proxy holds the inference

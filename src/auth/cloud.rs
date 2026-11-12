@@ -5,7 +5,7 @@ use std::io::Read;
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
 
-const ORIGIN: &str = "https://cloud-api.near.ai";
+const ORIGIN: &str = "https://cloud-platform.near.ai";
 const MAX_RESPONSE: u64 = 256 * 1024;
 
 pub(super) struct CloudApi {
@@ -43,6 +43,19 @@ impl Drop for Minted {
     }
 }
 
+#[derive(Deserialize)]
+struct Redeemed {
+    access_token: String,
+    refresh_token: String,
+}
+
+impl Drop for Redeemed {
+    fn drop(&mut self) {
+        self.access_token.zeroize();
+        self.refresh_token.zeroize();
+    }
+}
+
 impl CloudApi {
     pub(super) fn live(deadline: Instant) -> Result<Self, String> {
         Self::build(ORIGIN, deadline)
@@ -74,6 +87,7 @@ impl CloudApi {
         &self,
         provider: Provider,
         callback: &str,
+        proof: &super::pkce::Pkce,
     ) -> Result<String, String> {
         let parsed = url::Url::parse(callback).map_err(|_| "Invalid NEAR AI callback")?;
         if parsed.scheme() != "http"
@@ -83,6 +97,7 @@ impl CloudApi {
             || parsed.fragment().is_some()
             || !parsed.username().is_empty()
             || parsed.password().is_some()
+            || !native_callback_path(parsed.path())
         {
             return Err("Invalid NEAR AI callback".into());
         }
@@ -95,8 +110,45 @@ impl CloudApi {
             .join(&format!("/v1/auth/{provider}"))
             .map_err(|_| "Invalid NEAR AI authorization URL")?;
         url.query_pairs_mut()
-            .append_pair("frontend_callback", callback);
+            .append_pair("frontend_callback", callback)
+            .append_pair("client_id", "red-sandbox")
+            .append_pair("code_challenge", &proof.challenge())
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("state", &proof.state);
         Ok(url.into())
+    }
+
+    pub(super) fn redeem(
+        &self,
+        code: &HostSecret,
+        proof: &super::pkce::Pkce,
+        redirect_uri: &str,
+    ) -> Result<HostSecret, String> {
+        super::browser::check_deadline(self.deadline, &|| crate::sys::take_signal().is_some())?;
+        let url = self
+            .origin
+            .join("/v1/auth/native/token")
+            .map_err(|_| "Invalid NEAR AI Cloud path")?;
+        let request = self
+            .http
+            .post(url)
+            .timeout(
+                self.deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(30)),
+            )
+            .json(&serde_json::json!({
+                "grant_type": "authorization_code",
+                "client_id": "red-sandbox",
+                "code": code.expose_secret(),
+                "code_verifier": proof.verifier(),
+                "redirect_uri": redirect_uri,
+            }));
+        let mut session: Redeemed = self.send(request)?;
+        if !valid_key(&session.access_token) || !valid_key(&session.refresh_token) {
+            return Err("NEAR AI Cloud returned an invalid session".into());
+        }
+        Ok(std::mem::take(&mut session.access_token).into())
     }
 
     pub(super) fn mint(
@@ -204,6 +256,13 @@ impl CloudApi {
         if let Some(body) = body {
             request = request.json(body);
         }
+        self.send(request)
+    }
+
+    fn send<T: serde::de::DeserializeOwned>(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+    ) -> Result<T, String> {
         let response = request
             .send()
             .map_err(|_| "NEAR AI Cloud request failed; retry sign-in")?;
@@ -226,4 +285,17 @@ impl CloudApi {
         serde_json::from_slice(&bytes)
             .map_err(|_| "NEAR AI Cloud returned an unexpected response".into())
     }
+}
+
+fn native_callback_path(path: &str) -> bool {
+    let Some(token) = path
+        .strip_prefix("/rts/")
+        .and_then(|rest| rest.strip_suffix("/callback"))
+    else {
+        return false;
+    };
+    token.len() == 64
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
