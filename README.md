@@ -94,6 +94,8 @@ Cloud inference and attestation checks.
 
 ### Start with sponsored credits
 
+Received an API key? Follow the [API key getting-started guide](docs/getting-started-with-an-api-key.md) from installation through your first saved result.
+
 If you received an individual trial key, save it in a private host file with
 mode `0600`, then run:
 
