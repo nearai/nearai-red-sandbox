@@ -25,7 +25,7 @@ pub const MAX_RECEIPT_BYTES: usize = 16 << 10;
 /// line or event before the first JSON event.
 pub const MAX_ID_SCAN_BYTES: usize = 16 << 20;
 
-/// As ironwire_upstream::receipt::RawReceipt (ironwire bf8b90b).
+/// As ironwire_upstream::receipt::RawReceipt (pinned IronWire revision).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Receipt {
     pub text: String,
