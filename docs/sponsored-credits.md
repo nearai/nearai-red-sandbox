@@ -20,6 +20,8 @@ Keep an operator record of the recipient reference, key ID, key prefix, allowanc
 
 ## Recipient setup
 
+Send recipients the [API key getting-started guide](getting-started-with-an-api-key.md) for installation, private key import, a first session, and saving results.
+
 Save the supplied key in a private, regular host file with mode `0600`, then import it:
 
 ```sh
