@@ -29,18 +29,33 @@ The provider option chooses the browser sign-in service when sign-in is needed.
 Use `rts login` to replace an existing connection. A requested organization or
 workspace that differs from the saved connection requires explicit sign-in.
 
-Only the dedicated inference key and its account metadata are stored under
+The active sponsored key, or a dedicated personal inference key with its account
+metadata, is stored under
 `nearai-red-sandbox.inference` in macOS Keychain or Linux Secret Service. Broad
 browser access tokens are discarded after key creation; refresh tokens remain
 in the browser and are discarded. Storage failures stop setup; there is no
 plaintext credential file fallback. Help and tool dispatch do not read credentials.
 
 Each launch creates a private embedded IronWire proxy, with only the selected
-NEAR AI backend, on an ephemeral loopback port. The proxy holds the inference
-key in host memory. OpenCode receives a placeholder API key. The guest, tool
+NEAR AI backend, on an ephemeral loopback port. The launcher-owned pinned forwarder holds the active inference key in host
+memory; the embedded proxy receives a placeholder. OpenCode receives a placeholder API key. The guest, tool
 requests, configuration, command arguments, audit logs, and exported files do
 not receive the Cloud key. The proxy remains alive through session teardown
 and stops afterward.
+
+## Sponsored allowance
+
+Use `rts trial --key-file PATH` to import a recipient's private key file into the
+native credential store. This replaces the active connection. `rts launch` then
+uses the allowance without browser sign-in. The key has no local expiration;
+Cloud controls its spending limit and revocation.
+
+An explicit exhausted/invalid-key response opens personal Cloud login. Inference
+waits during login; the VM and OpenCode remain running. Successful login replaces
+the saved sponsored key and retries the rejected request once. A personal account
+needs its own credits. Ordinary network, rate-limit, and server errors do not
+open login, and personal-account failures do not repeat it. If login fails or is
+cancelled, use `rts login` and launch again. See [the operator guide](sponsored-credits.md).
 
 ## Configuration
 

@@ -587,3 +587,120 @@ fn authorization_uses_exact_cloud_origin_and_escaped_bare_callback() {
         assert!(api.authorize_url(Provider::Github, callback).is_err());
     }
 }
+
+#[test]
+fn sponsored_storage_is_versioned_redacted_and_replaced_by_personal_login() {
+    let store = MemoryStore::default();
+    let key: HostSecret = "sk-sponsored-test".to_string().into();
+    *store.0.borrow_mut() = Some(storage::encode_sponsored(&key).unwrap().to_string());
+    let loaded = storage::decode_launch(store.0.borrow().as_ref().unwrap().as_bytes()).unwrap();
+    assert!(loaded.sponsored);
+    assert_eq!(loaded.key.expose_secret(), "sk-sponsored-test");
+    assert!(!format!("{loaded:?}").contains("sk-sponsored-test"));
+    store.save(&credential()).unwrap();
+    let loaded = storage::decode_launch(store.0.borrow().as_ref().unwrap().as_bytes()).unwrap();
+    assert!(!loaded.sponsored);
+    assert_eq!(loaded.key.expose_secret(), "sk-test-inference-only");
+    for document in [
+        r#"{"version":2,"kind":"sponsored","key":"bad key"}"#,
+        r#"{"version":2,"kind":"sponsored","key":"secret","expires":1}"#,
+        r#"{"version":3,"kind":"sponsored","key":"secret"}"#,
+    ] {
+        assert!(storage::decode_launch(document.as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn sponsored_key_file_bounds_newlines_permissions_and_symlinks() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let directory = std::env::temp_dir().join(format!(
+        "rts-sponsored-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("key");
+    for value in ["secret", "secret\n", "secret\r\n"] {
+        std::fs::write(&path, value).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            sponsored::read_key(&path).unwrap().expose_secret(),
+            "secret"
+        );
+    }
+    for value in [
+        " secret".to_string(),
+        "secret ".into(),
+        "secret\n\n".into(),
+        "x".repeat(4097),
+        "".into(),
+    ] {
+        std::fs::write(&path, value).unwrap();
+        assert!(sponsored::read_key(&path).is_err());
+    }
+    std::fs::write(&path, format!("{}\r\n", "x".repeat(4096))).unwrap();
+    assert_eq!(
+        sponsored::read_key(&path).unwrap().expose_secret().len(),
+        4096
+    );
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(sponsored::read_key(&path).is_err());
+    let link = directory.join("link");
+    symlink(&path, &link).unwrap();
+    assert!(sponsored::read_key(&link).is_err());
+    assert!(sponsored::read_key(&directory).is_err());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn cancellation_after_mint_preserves_saved_sponsored_key() {
+    use std::cell::Cell;
+    let store = MemoryStore::default();
+    *store.0.borrow_mut() = Some(
+        storage::encode_sponsored(&"sponsored-original".to_string().into())
+            .unwrap()
+            .to_string(),
+    );
+    let original = store.0.borrow().clone();
+    let cancelled = Cell::new(false);
+    let result = mint_and_save(&store, &|| cancelled.get(), || {
+        cancelled.set(true);
+        Ok(credential())
+    });
+    assert_eq!(result.unwrap_err(), "NEAR AI sign-in interrupted");
+    assert_eq!(*store.0.borrow(), original);
+    let result = mint_and_save(&store, &|| true, || panic!("cancelled login minted a key"));
+    assert_eq!(result.unwrap_err(), "NEAR AI sign-in interrupted");
+    assert_eq!(*store.0.borrow(), original);
+}
+
+#[test]
+fn sponsored_storage_readback_requires_exact_key_and_source() {
+    let key: HostSecret = "expected-sponsored".to_string().into();
+    let document = storage::encode_sponsored(&key).unwrap();
+    assert!(storage::verify_sponsored(&key, document.as_bytes()).is_ok());
+    let other = storage::encode_sponsored(&"different-sponsored".to_string().into()).unwrap();
+    assert!(storage::verify_sponsored(&key, other.as_bytes()).is_err());
+    assert!(
+        storage::verify_sponsored(&key, storage::encode(&credential()).unwrap().as_bytes())
+            .is_err()
+    );
+    assert!(storage::verify_sponsored(&key, b"invalid document").is_err());
+}
+
+#[test]
+fn cloud_session_cancellation_uses_supplied_callback_before_network() {
+    let api = cloud::CloudApi::for_test_with_cancel(
+        "http://127.0.0.1:1",
+        Instant::now() + Duration::from_secs(1),
+        &|| true,
+    );
+    assert_eq!(
+        api.mint(&"session".to_string().into(), &LoginOptions::default())
+            .unwrap_err(),
+        "NEAR AI sign-in interrupted"
+    );
+}

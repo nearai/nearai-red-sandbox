@@ -8,10 +8,11 @@ use zeroize::{Zeroize, Zeroizing};
 const ORIGIN: &str = "https://cloud-api.near.ai";
 const MAX_RESPONSE: u64 = 256 * 1024;
 
-pub(super) struct CloudApi {
+pub(super) struct CloudApi<'a> {
     origin: url::Url,
     http: reqwest::blocking::Client,
     deadline: Instant,
+    cancelled: &'a dyn Fn() -> bool,
 }
 
 #[derive(Deserialize)]
@@ -43,12 +44,24 @@ impl Drop for Minted {
     }
 }
 
-impl CloudApi {
+impl<'a> CloudApi<'a> {
+    #[cfg(test)]
     pub(super) fn live(deadline: Instant) -> Result<Self, String> {
-        Self::build(ORIGIN, deadline)
+        Self::build(ORIGIN, deadline, &|| false)
     }
 
-    fn build(origin: &str, deadline: Instant) -> Result<Self, String> {
+    pub(super) fn live_with_cancel(
+        deadline: Instant,
+        cancelled: &'a dyn Fn() -> bool,
+    ) -> Result<Self, String> {
+        Self::build(ORIGIN, deadline, cancelled)
+    }
+
+    fn build(
+        origin: &str,
+        deadline: Instant,
+        cancelled: &'a dyn Fn() -> bool,
+    ) -> Result<Self, String> {
         Ok(Self {
             origin: url::Url::parse(origin).map_err(|_| "Invalid NEAR AI service origin")?,
             http: reqwest::blocking::Client::builder()
@@ -59,6 +72,7 @@ impl CloudApi {
                 .build()
                 .map_err(|_| "Cannot create NEAR AI Cloud client")?,
             deadline,
+            cancelled,
         })
     }
 
@@ -67,7 +81,19 @@ impl CloudApi {
         let parsed = url::Url::parse(origin).unwrap();
         assert_eq!(parsed.scheme(), "http");
         assert_eq!(parsed.host_str(), Some("127.0.0.1"));
-        Self::build(origin, deadline).unwrap()
+        Self::for_test_with_cancel(origin, deadline, &|| false)
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test_with_cancel(
+        origin: &str,
+        deadline: Instant,
+        cancelled: &'a dyn Fn() -> bool,
+    ) -> Self {
+        let parsed = url::Url::parse(origin).unwrap();
+        assert_eq!(parsed.scheme(), "http");
+        assert_eq!(parsed.host_str(), Some("127.0.0.1"));
+        Self::build(origin, deadline, cancelled).unwrap()
     }
 
     pub(super) fn authorize_url(
@@ -184,7 +210,7 @@ impl CloudApi {
         session: &HostSecret,
         body: Option<&serde_json::Value>,
     ) -> Result<T, String> {
-        super::browser::check_deadline(self.deadline, &|| crate::sys::take_signal().is_some())?;
+        super::browser::check_deadline(self.deadline, self.cancelled)?;
         let url = self
             .origin
             .join(path)
