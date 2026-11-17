@@ -50,7 +50,7 @@ const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const DRAIN_POLL: Duration = Duration::from_millis(20);
 const REATTEST_ATTEMPTS: usize = 3;
 /// Per read on the upstream connection, resetting after each read: the
-/// default `upstream_timeout_secs` IronWire bf8b90b applies to its own reads
+/// pinned IronWire default for `upstream_timeout_secs` on its own reads
 /// (`ironwire_core/src/config.rs`), so the forwarder never gives up on a
 /// response IronWire still waits for, and a stalled upstream is not read
 /// forever after IronWire has gone. Before the response head this is a 502;
