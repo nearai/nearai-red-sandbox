@@ -96,6 +96,8 @@ pub type Reattest = Arc<dyn Fn() -> Result<Attested, String> + Send + Sync>;
 
 /// Holds `reattest`, which captures the API key, so it has no `Debug`.
 pub struct ForwarderConfig {
+    /// Host-owned credential source; None preserves external/test forwarding.
+    pub credentials: Option<Arc<crate::sponsored::Credentials>>,
     /// "https://cloud-api.near.ai/v1"; tests use https://127.0.0.1:<port>/v1
     pub upstream: String,
     pub models: Vec<String>,
@@ -114,6 +116,7 @@ pub struct ForwarderConfig {
 
 /// Owns the loopback listener and its runtime thread, as `EmbeddedInference`.
 pub struct Forwarder {
+    credentials: Option<Arc<crate::sponsored::Credentials>>,
     port: u16,
     /// The signature window: how long `drop` lets pending checks finish.
     drain: Duration,
@@ -131,6 +134,7 @@ impl std::fmt::Debug for Forwarder {
 }
 
 struct State {
+    credentials: Option<Arc<crate::sponsored::Credentials>>,
     completions: String,
     models: BTreeSet<String>,
     client: reqwest::Client,
@@ -198,7 +202,9 @@ impl Forwarder {
             .read_timeout(UPSTREAM_READ_TIMEOUT)
             .build()
             .map_err(|e| format!("forwarder: upstream client: {e}"))?;
+        let credentials = cfg.credentials.clone();
         let state = Arc::new(State {
+            credentials: cfg.credentials,
             completions: format!("{upstream}/chat/completions"),
             models: cfg.models.into_iter().collect(),
             client,
@@ -241,6 +247,7 @@ impl Forwarder {
             Err(_) => return Err("forwarder: startup did not complete".into()),
         }
         Ok(Forwarder {
+            credentials,
             port,
             drain,
             shutdown: Some(shutdown),
@@ -257,6 +264,9 @@ impl Forwarder {
 
 impl Drop for Forwarder {
     fn drop(&mut self) {
+        if let Some(credentials) = &self.credentials {
+            credentials.cancel();
+        }
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -483,15 +493,111 @@ async fn handle(state: &Arc<State>, req: Request<Incoming>) -> Out {
             "rts forwarder: model is not in the allowlist",
         );
     }
-    // The exact bytes received, never a re-serialization; hashed as sent.
-    let sent = Sent {
-        model,
-        request_sha256: Sha256::digest(&body).into(),
-        authorization: headers.get(AUTHORIZATION).cloned().map(|mut v| {
-            v.set_sensitive(true);
-            v
-        }),
+    let mut credential = match &state.credentials {
+        Some(credentials) => match credentials.current().await {
+            Ok(snapshot) => Some(snapshot),
+            Err(_) => {
+                return local(
+                    StatusCode::UNAUTHORIZED,
+                    "NEAR AI Cloud sign-in did not complete; run rts login and launch again.",
+                );
+            }
+        },
+        None => None,
     };
+    for attempt in 0..2 {
+        if let Some(snapshot) = &credential {
+            use secrecy::ExposeSecret;
+            let mut auth =
+                match HeaderValue::from_str(&format!("Bearer {}", snapshot.key.expose_secret())) {
+                    Ok(auth) => auth,
+                    Err(_) => {
+                        return local(
+                            StatusCode::UNAUTHORIZED,
+                            "Invalid NEAR AI credential; run rts login",
+                        );
+                    }
+                };
+            auth.set_sensitive(true);
+            headers.insert(AUTHORIZATION, auth);
+        }
+        // Snapshot authorization for this response's receipt, independently
+        // of a concurrent credential switch.
+        let sent = Sent {
+            model: model.clone(),
+            request_sha256: Sha256::digest(&body).into(),
+            authorization: headers.get(AUTHORIZATION).cloned().map(|mut v| {
+                v.set_sensitive(true);
+                v
+            }),
+        };
+        let mut resp = match send_once(state, &headers, &body).await {
+            Ok(resp) => resp,
+            Err(reply) => return reply,
+        };
+        let mut prefix = Vec::new();
+        if attempt == 0
+            && credential.as_ref().is_some_and(|c| c.sponsored)
+            && matches!(resp.status().as_u16(), 401 | 402)
+            && !is_encoded(resp.headers())
+        {
+            // Read only a small error envelope. Unknown/oversized bodies
+            // are relayed unchanged, including the bytes already consumed.
+            let mut complete = false;
+            while prefix.len() <= 16 * 1024 {
+                let chunk = tokio::select! {
+                    biased;
+                    () = fatal_raised(&state.fatal) => return stopped_reply(),
+                    chunk = resp.chunk() => chunk,
+                };
+                match chunk {
+                    Ok(Some(bytes)) => prefix.extend_from_slice(&bytes),
+                    Ok(None) => {
+                        complete = true;
+                        break;
+                    }
+                    Err(_) => {
+                        return local(
+                            StatusCode::BAD_GATEWAY,
+                            "rts forwarder: upstream error body failed",
+                        );
+                    }
+                }
+            }
+            if complete
+                && let Some(message) = crate::sponsored::rejection(resp.status().as_u16(), &prefix)
+            {
+                let keys = state.credentials.as_ref().expect("credential source");
+                crate::brand::progress::message(message);
+                let result = tokio::select! {
+                    biased;
+                    () = fatal_raised(&state.fatal) => return stopped_reply(),
+                    result = keys.recover(credential.as_ref().expect("credential snapshot").generation) => result,
+                };
+                credential = match result {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(_) => {
+                        return local(
+                            StatusCode::UNAUTHORIZED,
+                            "NEAR AI Cloud sign-in did not complete; run rts login and launch again.",
+                        );
+                    }
+                };
+                continue;
+            }
+        }
+        return relay(state.clone(), resp, sent, Bytes::from(prefix));
+    }
+    unreachable!("at most one credential retry")
+}
+
+/// Every attempt, including a credential retry, uses the same pin/re-attest
+/// policy and forwards the exact original request bytes.
+async fn send_once(
+    state: &Arc<State>,
+    headers: &reqwest::header::HeaderMap,
+    body: &Bytes,
+) -> Result<reqwest::Response, Out> {
     let send = || {
         state
             .client
@@ -501,55 +607,55 @@ async fn handle(state: &Arc<State>, req: Request<Incoming>) -> Out {
             .send()
     };
     if state.fatal.reason().is_some() {
-        return stopped_reply();
+        return Err(stopped_reply());
     }
     let resp = match send().await {
         Ok(resp) => resp,
         Err(_) => match state.pins.take_rejected() {
             None => {
-                return local(
+                return Err(local(
                     StatusCode::BAD_GATEWAY,
                     "rts forwarder: upstream request failed",
-                );
+                ));
             }
             Some(r @ Rejected::Untrusted(_)) => {
-                return fatal_reply(
+                return Err(fatal_reply(
                     state,
                     "pin-failed",
                     format!("pin: {} does not chain to a trusted root", r.certificate()),
-                );
+                ));
             }
             Some(Rejected::Unpinned(fp)) => {
                 match learn(state, fp).await {
                     Ok(()) => {}
-                    Err(Unlearned::Stopped) => return stopped_reply(),
+                    Err(Unlearned::Stopped) => return Err(stopped_reply()),
                     Err(Unlearned::Failed(reason)) => {
-                        return fatal_reply(state, "pin-failed", reason);
+                        return Err(fatal_reply(state, "pin-failed", reason));
                     }
                 }
                 if state.fatal.reason().is_some() {
-                    return stopped_reply();
+                    return Err(stopped_reply());
                 }
                 match send().await {
                     Ok(resp) => resp,
                     Err(_) => {
                         if let Some(r) = state.pins.take_rejected() {
-                            return fatal_reply(
+                            return Err(fatal_reply(
                                 state,
                                 "pin-failed",
                                 format!("pin: {} refused after re-attestation", r.certificate()),
-                            );
+                            ));
                         }
-                        return local(
+                        return Err(local(
                             StatusCode::BAD_GATEWAY,
                             "rts forwarder: upstream request failed",
-                        );
+                        ));
                     }
                 }
             }
         },
     };
-    relay(state.clone(), resp, sent)
+    Ok(resp)
 }
 
 enum Unlearned {
@@ -668,7 +774,7 @@ fn is_event_stream(content_type: Option<&HeaderValue>) -> bool {
 /// Status, Content-Type and the body as it arrives. A task reads upstream to
 /// the end, hashing every chunk it relays, even after the client has gone;
 /// then checks the receipt. A fatal raised elsewhere cuts the relay.
-fn relay(state: Arc<State>, mut upstream: reqwest::Response, sent: Sent) -> Out {
+fn relay(state: Arc<State>, mut upstream: reqwest::Response, sent: Sent, prefix: Bytes) -> Out {
     let status = upstream.status();
     let content_type = upstream.headers().get(CONTENT_TYPE).cloned();
     let streamed = is_event_stream(content_type.as_ref());
@@ -688,6 +794,7 @@ fn relay(state: Arc<State>, mut upstream: reqwest::Response, sent: Sent) -> Out 
     );
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     tokio::spawn(async move {
+        let mut prefix = (!prefix.is_empty()).then_some(prefix);
         let mut hasher = Sha256::new();
         let mut sse = SseId::default();
         // A non-streamed 2xx body, kept to find its chat ID.
@@ -702,7 +809,9 @@ fn relay(state: Arc<State>, mut upstream: reqwest::Response, sent: Sent) -> Out 
                 let next = tokio::select! {
                     biased;
                     () = fatal_raised(&state.fatal) => break Relayed::Stopped,
-                    next = upstream.chunk() => next,
+                    next = async {
+                        if let Some(bytes) = prefix.take() { Ok(Some(bytes)) } else { upstream.chunk().await }
+                    } => next,
                 };
                 let chunk = match next {
                     Ok(Some(chunk)) => chunk,
@@ -1529,6 +1638,29 @@ mod tests {
         max: usize,
         signatures: SignaturePolicy,
     ) -> Rig {
+        rig_credentials(
+            up,
+            seed,
+            keys,
+            gateway_keys,
+            reattest,
+            max,
+            signatures,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rig_credentials(
+        up: &Upstream,
+        seed: &[&str],
+        keys: &[[u8; 32]],
+        gateway_keys: &[[u8; 32]],
+        reattest: Reattest,
+        max: usize,
+        signatures: SignaturePolicy,
+        credentials: Option<Arc<crate::sponsored::Credentials>>,
+    ) -> Rig {
         let dir = crate::testutil::tempdir("forwarder");
         let record =
             AttestationRecord::create(&dir, "0123456789ab", &AttestOptions::default()).unwrap();
@@ -1541,6 +1673,7 @@ mod tests {
         record.verified(&seed).unwrap();
         let fatal = Fatal::new();
         let forwarder = Forwarder::start(ForwarderConfig {
+            credentials,
             upstream: up.url(),
             models: vec!["m".into()],
             roots: roots(),
@@ -1558,6 +1691,238 @@ mod tests {
             fatal,
             record,
             dir,
+        }
+    }
+
+    #[test]
+    fn sponsored_refusals_switch_credentials_and_retry_exact_bytes_with_verified_receipts() {
+        for (status, kind, streamed) in [
+            (401, "invalid_api_key", false),
+            (402, "api_key_limit_exceeded", false),
+            (402, "no_credits", true),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let c = calls.clone();
+            let credentials = crate::sponsored::Credentials::new(
+                "trial-test-key".to_string().into(),
+                true,
+                Arc::new(move |_| {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok("personal-test-key".to_string().into())
+                }),
+            );
+            let up = upstream(
+                |_| "a",
+                false,
+                move |req| {
+                    if req.head.contains("Bearer trial-test-key") {
+                        Answer::Whole(
+                            status,
+                            serde_json::to_vec(&serde_json::json!({"error":{"type":kind}}))
+                                .unwrap(),
+                        )
+                    } else {
+                        assert!(req.head.contains("Bearer personal-test-key"));
+                        if streamed {
+                            sse_answer(vec![Duration::ZERO; 3], &Arc::new(Mutex::new(None)))
+                        } else {
+                            Answer::Whole(200, REPLY.to_vec())
+                        }
+                    }
+                },
+            );
+            let rig = rig_credentials(
+                &up,
+                &["a"],
+                &[test_vk()],
+                &[],
+                reattest(&["a"], &Arc::new(AtomicUsize::new(0))),
+                4096,
+                quick(),
+                Some(credentials),
+            );
+            let body = if streamed { STREAM_BODY } else { BODY };
+            let (code, bytes) = rig.post(body);
+            assert_eq!(code, 200);
+            assert_eq!(
+                bytes,
+                if streamed {
+                    SSE.concat()
+                } else {
+                    REPLY.to_vec()
+                }
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let requests = up.requests();
+            assert_eq!(requests.len(), 2);
+            assert!(requests.iter().all(|r| r.body == body));
+            assert_eq!(rig.wait_lines(1)[0]["result"], "verified");
+            assert!(
+                up.signature_requests()
+                    .iter()
+                    .all(|r| r.head.contains("Bearer personal-test-key"))
+            );
+            assert!(rig.fatal.reason().is_none());
+            let artifacts = std::fs::read_to_string(rig.log_path()).unwrap();
+            assert!(
+                !artifacts.contains("trial-test-key") && !artifacts.contains("personal-test-key")
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_reattestation_can_finish_while_sponsored_login_is_pending() {
+        let (login_started, started) = std::sync::mpsc::channel();
+        let (release_login, login_gate) = std::sync::mpsc::channel();
+        let login_gate = Arc::new(Mutex::new(login_gate));
+        let credentials = crate::sponsored::Credentials::new(
+            "trial-test-key".to_string().into(),
+            true,
+            Arc::new(move |_| {
+                login_started.send(()).unwrap();
+                login_gate
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                Ok("personal-test-key".to_string().into())
+            }),
+        );
+        let (sign_started, signing) = std::sync::mpsc::channel();
+        let (release_sign, sign_gate) = std::sync::mpsc::channel();
+        let sign_gate = Arc::new(Mutex::new(sign_gate));
+        let up = upstream_with(
+            |_| "a",
+            false,
+            |_| Answer::Whole(200, REPLY.to_vec()),
+            move |req, resp| {
+                sign_started.send(()).unwrap();
+                sign_gate
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                good_receipt(req, resp)
+            },
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let keys = credentials.clone();
+        let reattest: Reattest = Arc::new(move || {
+            // This is the production reattestation closure's credential read.
+            assert!(keys.snapshot()?.sponsored);
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(Attested {
+                fingerprints: fps(&["a"]),
+                keys: [("m".to_string(), [test_vk()].into())].into(),
+                ..Attested::default()
+            })
+        });
+        let rig = rig_credentials(
+            &up,
+            &["a"],
+            &[],
+            &[],
+            reattest,
+            4096,
+            quick(),
+            Some(credentials.clone()),
+        );
+        assert_eq!(rig.post(BODY).0, 200);
+        signing.recv_timeout(Duration::from_secs(5)).unwrap();
+        let owner = credentials.clone();
+        let login = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(owner.recover(0))
+                .is_ok()
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        release_sign.send(()).unwrap();
+        assert_eq!(rig.wait_lines(1)[0]["result"], "verified");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(rig.fatal.reason().is_none());
+        release_login.send(()).unwrap();
+        assert!(login.join().unwrap());
+        assert!(!credentials.snapshot().unwrap().sponsored);
+    }
+
+    #[test]
+    fn exhausted_personal_account_after_handoff_does_not_repeat_login() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let keys = crate::sponsored::Credentials::new(
+            "trial-test-key".to_string().into(),
+            true,
+            Arc::new(move |_| {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok("personal-test-key".to_string().into())
+            }),
+        );
+        let refusal = br#"{"error":{"type":"no_credits"}}"#;
+        let up = upstream(
+            |_| "a",
+            false,
+            move |_| Answer::Whole(402, refusal.to_vec()),
+        );
+        let rig = rig_credentials(
+            &up,
+            &["a"],
+            &[test_vk()],
+            &[],
+            reattest(&["a"], &Arc::new(AtomicUsize::new(0))),
+            4096,
+            quick(),
+            Some(keys),
+        );
+        assert_eq!(rig.post(BODY), (402, refusal.to_vec()));
+        assert_eq!(up.requests().len(), 2);
+        assert_eq!(rig.post(BODY), (402, refusal.to_vec()));
+        assert_eq!(up.requests().len(), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(rig.fatal.reason().is_none());
+    }
+
+    #[test]
+    fn sponsored_transient_unknown_and_personal_errors_do_not_open_login_or_retry() {
+        for (status, body, sponsored) in [
+            (
+                401,
+                br#"{"error":{"type":"internal_server_error"}}"#.as_slice(),
+                true,
+            ),
+            (402, b"not json", true),
+            (429, br#"{"error":{"type":"no_credits"}}"#, true),
+            (503, b"unavailable", true),
+            (402, br#"{"error":{"type":"no_credits"}}"#, false),
+        ] {
+            let credentials = crate::sponsored::Credentials::new(
+                "test-key".to_string().into(),
+                sponsored,
+                Arc::new(|_| panic!("must not log in")),
+            );
+            let up = upstream(
+                |_| "a",
+                false,
+                move |_| Answer::Whole(status, body.to_vec()),
+            );
+            let rig = rig_credentials(
+                &up,
+                &["a"],
+                &[test_vk()],
+                &[],
+                reattest(&["a"], &Arc::new(AtomicUsize::new(0))),
+                4096,
+                quick(),
+                Some(credentials),
+            );
+            assert_eq!(rig.post(BODY), (status, body.to_vec()));
+            assert_eq!(up.requests().len(), 1);
+            assert_eq!(
+                rig.wait_lines(1)[0]["result"],
+                format!("not-signed (HTTP {status})")
+            );
+            assert!(rig.fatal.reason().is_none());
         }
     }
 
@@ -1935,6 +2300,7 @@ mod tests {
             AttestationRecord::create(&dir, "0123456789ab", &AttestOptions::default()).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let cfg = |upstream: &str, seed: &[&str]| ForwarderConfig {
+            credentials: None,
             upstream: upstream.into(),
             models: vec!["m".into()],
             roots: roots(),

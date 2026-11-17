@@ -25,3 +25,5 @@ pub mod update;
 
 #[cfg(test)]
 mod testutil;
+
+pub mod sponsored;

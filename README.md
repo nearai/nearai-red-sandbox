@@ -69,8 +69,8 @@ supervisor. Source builds require the [supervisor setup](docs/mvm-supervisor.md)
 See the [operator reference](docs/operations.md#dependency-setup-and-verification)
 for download verification and installation paths.
 
-**Before your first session:** you need NEAR AI Cloud access with an available
-organization balance. Setup also needs to download the guest image. If mvm
+**Before your first session:** you need a sponsored trial key or NEAR AI Cloud
+access with an available organization balance. Setup also needs to download the guest image. If mvm
 rejects an anonymous registry pull, use the
 [authenticated pull instructions](opencode/README.md#recorded-live-validation-status),
 which require Artifact Registry Reader access.
@@ -91,6 +91,22 @@ SandBox verifies the inference path, boots a fresh microVM, and opens OpenCode.
 The agent's tools work in the guest even though the terminal UI runs on your
 Mac. Guest network access remains off; the host still needs connectivity for
 Cloud inference and attestation checks.
+
+### Start with sponsored credits
+
+If you received an individual trial key, save it in a private host file with
+mode `0600`, then run:
+
+```sh
+rts trial --key-file ./trial.key
+rts launch
+```
+
+The key is stored in the native credential store. You can use its allowance
+without signing in. Once Cloud reports that the key is exhausted or revoked,
+SandBox opens NEAR AI Cloud login and continues the session using your account's
+available credits. See [sponsored credits](docs/sponsored-credits.md) for setup
+and issuance instructions.
 
 ### Bring code in and save findings
 

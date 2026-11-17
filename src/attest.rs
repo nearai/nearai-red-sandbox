@@ -7,6 +7,9 @@ pub mod http;
 pub mod nras;
 pub mod record;
 pub mod report;
+
+/// An explicit Cloud refusal, safe for the sponsored launch login path.
+const CREDENTIAL_REFUSED: &str = "attestation report refused the API credential";
 pub mod tdx;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -109,6 +112,22 @@ impl Attested {
 
 pub type Nonce = Arc<dyn Fn() -> [u8; 32] + Send + Sync>;
 
+/// A launch can recover only an explicit Cloud credential rejection.
+#[derive(Debug)]
+pub enum AttestationFailure {
+    CredentialRefused { model: String },
+    Other(String),
+}
+
+impl AttestationFailure {
+    pub fn message(self) -> String {
+        match self {
+            Self::CredentialRefused { model } => format!("model {model}: {CREDENTIAL_REFUSED}"),
+            Self::Other(message) => message,
+        }
+    }
+}
+
 /// Holds the API key, so it has no `Debug`.
 pub struct Attestor {
     pub http: Arc<dyn Http>,
@@ -116,8 +135,8 @@ pub struct Attestor {
     pub quotes: Arc<dyn QuoteVerifier>,
     pub gpus: Arc<dyn GpuVerifier>,
     pub base_url: String,
-    /// Sent as the bearer on the report fetch when present. NEAR AI
-    /// production serves the report without one (2026-10-29).
+    /// Sent as the bearer on the report fetch when present. Cloud requires
+    /// a valid API key for authenticated attestation-report routes.
     pub key: Option<HostSecret>,
     pub models: Vec<String>,
     pub options: AttestOptions,
@@ -163,15 +182,28 @@ impl Attestor {
 
     /// Attests every allowed model, each with its own request and nonce.
     pub fn attest(&self) -> Result<Attested, String> {
+        self.attest_for_launch()
+            .map_err(AttestationFailure::message)
+    }
+
+    pub fn attest_for_launch(&self) -> Result<Attested, AttestationFailure> {
         if self.models.is_empty() {
-            return Err("attestation: no models to attest".into());
+            return Err(AttestationFailure::Other(
+                "attestation: no models to attest".into(),
+            ));
         }
         let mut all = Attested::default();
         for model in &self.models {
-            all.merge(
-                self.attest_model(model)
-                    .map_err(|e| format!("model {model}: {e}"))?,
-            );
+            let attested = self.attest_model(model).map_err(|error| {
+                if error == CREDENTIAL_REFUSED {
+                    AttestationFailure::CredentialRefused {
+                        model: model.clone(),
+                    }
+                } else {
+                    AttestationFailure::Other(format!("model {model}: {error}"))
+                }
+            })?;
+            all.merge(attested);
         }
         Ok(all)
     }
@@ -185,6 +217,9 @@ impl Attestor {
             .get(&url, self.key.as_ref())
             .map_err(|e| format!("attestation report request failed: {e}"))?;
         if resp.status != 200 {
+            if crate::sponsored::rejection(resp.status, &resp.body).is_some() {
+                return Err(CREDENTIAL_REFUSED.into());
+            }
             return Err(format!("attestation report returned HTTP {}", resp.status));
         }
         let raw = std::str::from_utf8(&resp.body)
@@ -542,6 +577,37 @@ mod tests {
 
     /// Production serves the report without an API key, so attestation can
     /// run keyless; it still verifies, and no bearer is sent.
+    #[test]
+    fn only_recognized_credential_refusals_are_reported_for_prelaunch_handoff() {
+        for (status, kind, recognized) in [
+            (401, "invalid_api_key", true),
+            (402, "api_key_limit_exceeded", true),
+            (402, "no_credits", true),
+            (401, "unknown", false),
+            (402, "unknown", false),
+            (503, "no_credits", false),
+        ] {
+            let mut case = Case::good([1; 32]);
+            case.status = status;
+            case.report = serde_json::json!({"error":{"type":kind}});
+            let error = run_one(case).result.unwrap_err();
+            assert_eq!(
+                error.ends_with(CREDENTIAL_REFUSED),
+                recognized,
+                "{status} {kind}: {error}"
+            );
+        }
+        let mut case = Case::good([1; 32]);
+        case.status = 401;
+        case.report = serde_json::json!({"unexpected": "response"});
+        assert!(
+            !run_one(case)
+                .result
+                .unwrap_err()
+                .ends_with(CREDENTIAL_REFUSED)
+        );
+    }
+
     #[test]
     fn a_keyless_attestor_fetches_the_report_without_a_bearer() {
         let mut case = Case::good([1; 32]);

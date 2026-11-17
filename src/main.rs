@@ -82,6 +82,7 @@ enum Action {
     Update(rts::update::apply::UpdateOptions),
     Tool(String),
     Login(auth::LoginOptions),
+    Trial(PathBuf),
     Launch {
         file: Option<PathBuf>,
         login: auth::LoginOptions,
@@ -99,6 +100,12 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
     }
     if matches!(args, ["--version" | "-V"]) {
         return Ok(Action::Version);
+    }
+    if let ["trial", "--key-file", path] = args {
+        if path.is_empty() || path.starts_with('-') {
+            return Err("trial --key-file needs a path".into());
+        }
+        return Ok(Action::Trial(PathBuf::from(path)));
     }
     if let ["setup", flags @ ..] = args {
         return parse_setup(flags);
@@ -314,7 +321,7 @@ fn run_connected<G>(
     Ok(run(cfg))
 }
 
-const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network] [--no-splash]\n                  [--cpus N] [--memory SIZE] [--prompt TEXT | --prompt-file PATH]\n       rts launch --prompt \"Review /in and save findings to /out/report.md\"\n       rts launch --prompt-file ./handoff.md       # submit a UTF-8 task file\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts launch --cpus 4 --memory 8G             # a bigger VM (default 2 vCPUs, 2048 MiB)\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nThe guest has no network unless the session file's network.allow or --allow-host names entries\n(HOST, HOST:PORT, IP:PORT or [IPv6]:PORT, port 443 by default, or the preset packages);\n--no-network drops them all. TCP only, and every connection is logged. A session stops with\nsession-limit after limits.sessionHours (default 24), network-lost when the attached\nmvmctl machine run that keeps egress up exits, and network-mismatch when mvm pinned an address\nrts did not validate; /out is exported and the VM removed in every case.\n--cpus and --memory (MiB, or with an M or G suffix) override limits.cpus and limits.memoryMiB,\nup to this host's CPU count and RAM; the host RSS watchdog follows memory unless the session\nfile sets limits.hostRssCeilingMiB.\n--prompt or --prompt-file submits one initial task after the sandbox plugin is verified,\nthen leaves OpenCode interactive. Prompt files are relative to the invoking directory,\nmust be UTF-8 and at most 64 KiB; empty/whitespace-only or NUL-containing text is refused.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
+const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network] [--no-splash]\n                  [--cpus N] [--memory SIZE] [--prompt TEXT | --prompt-file PATH]\n       rts launch --prompt \"Review /in and save findings to /out/report.md\"\n       rts launch --prompt-file ./handoff.md       # submit a UTF-8 task file\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts launch --cpus 4 --memory 8G             # a bigger VM (default 2 vCPUs, 2048 MiB)\n       rts trial --key-file PATH   # import your individual sponsored allowance\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nThe guest has no network unless the session file's network.allow or --allow-host names entries\n(HOST, HOST:PORT, IP:PORT or [IPv6]:PORT, port 443 by default, or the preset packages);\n--no-network drops them all. TCP only, and every connection is logged. A session stops with\nsession-limit after limits.sessionHours (default 24), network-lost when the attached\nmvmctl machine run that keeps egress up exits, and network-mismatch when mvm pinned an address\nrts did not validate; /out is exported and the VM removed in every case.\n--cpus and --memory (MiB, or with an M or G suffix) override limits.cpus and limits.memoryMiB,\nup to this host's CPU count and RAM; the host RSS watchdog follows memory unless the session\nfile sets limits.hostRssCeilingMiB.\n--prompt or --prompt-file submits one initial task after the sandbox plugin is verified,\nthen leaves OpenCode interactive. Prompt files are relative to the invoking directory,\nmust be UTF-8 and at most 64 KiB; empty/whitespace-only or NUL-containing text is refused.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
 
 /// A private temp directory holding an empty Git config for mvmctl.
 fn private_git_config(prefix: &str) -> Result<(tempfile::TempDir, PathBuf), String> {
@@ -511,8 +518,12 @@ fn launch(
         |cfg| {
             // Sign-in may print its own lines (the browser notice): no animation.
             let step = progress.step("sign-in", Live::Still);
-            let credential = auth::load_or_login(login)?;
-            step.ok("NEAR AI Cloud");
+            let mut credential = auth::load_for_launch(login)?;
+            step.ok(if credential.sponsored {
+                "sponsored allowance"
+            } else {
+                "NEAR AI Cloud"
+            });
             let record = attest::record::AttestationRecord::create(
                 &cfg.sessions_dir,
                 &session_id,
@@ -522,16 +533,38 @@ fn launch(
                 record.set_status("refused", &e);
                 format!("attestation failed: {e} (see {})", record.path().display())
             };
-            let attestor = Arc::new(
-                attest::Attestor::real(
-                    Some(credential.key.clone()),
-                    &cfg.provider.models,
-                    attest_options,
-                )
-                .map_err(refused)?,
-            );
             let step = progress.step("attestation", Live::Decode(cfg.provider.models.join(", ")));
-            let attested = attestor.attest().map_err(refused)?;
+            let attest_key = |key| -> Result<attest::Attested, attest::AttestationFailure> {
+                attest::Attestor::real(Some(key), &cfg.provider.models, attest_options.clone())
+                    .map_err(attest::AttestationFailure::Other)?.attest_for_launch()
+            };
+            let attested = match attest_key(credential.key.clone()) {
+                Ok(attested) => attested,
+                Err(attest::AttestationFailure::CredentialRefused { .. }) if credential.sponsored => {
+                    brand::progress::message(
+                        "Your sponsored API key is no longer available. Sign in to NEAR AI Cloud to continue.",
+                    );
+                    credential = auth::LaunchCredential {
+                        key: auth::login(login)?.key,
+                        sponsored: false,
+                    };
+                    attest_key(credential.key.clone()).map_err(|error| refused(error.message()))?
+                }
+                Err(error) => return Err(refused(error.message())),
+            };
+            let credentials = {
+                let options = login.clone();
+                rts::sponsored::Credentials::new(
+                    credential.key,
+                    credential.sponsored,
+                    Arc::new(move |cancelled| {
+                        auth::login_during_session(&options, &|| {
+                            cancelled.load(std::sync::atomic::Ordering::SeqCst)
+                        })
+                        .map(|credential| credential.key)
+                    }),
+                )
+            };
             step.ok(&format!(
                 "{} · TLS keys pinned: {}",
                 plural(cfg.provider.models.len(), "model", "verified"),
@@ -543,14 +576,36 @@ fn launch(
                 attested,
                 |seed| {
                     forwarder::Forwarder::start(forwarder::ForwarderConfig {
+                        credentials: Some(credentials.clone()),
                         upstream: inference::NEAR_BASE_URL.into(),
                         models: cfg.provider.models.clone(),
                         roots: forwarder::pin::native_roots()?,
                         seed,
                         // BlockingHttp: the forwarder runs this on Tokio's blocking pool.
                         reattest: {
-                            let attestor = attestor.clone();
-                            Arc::new(move || attestor.attest())
+                            let credentials = credentials.clone();
+                            let models = cfg.provider.models.clone();
+                            let options = attest_options.clone();
+                            Arc::new(move || {
+                                let snapshot = credentials.snapshot()?;
+                                let attest = |key| {
+                                    attest::Attestor::real(Some(key), &models, options.clone())
+                                        .map_err(attest::AttestationFailure::Other)?
+                                        .attest_for_launch()
+                                };
+                                match attest(snapshot.key) {
+                                    Ok(attested) => Ok(attested),
+                                    Err(attest::AttestationFailure::CredentialRefused { .. }) if snapshot.sponsored => {
+                                        brand::progress::message("Your sponsored API key is no longer available. Sign in to NEAR AI Cloud to continue.");
+                                        // Reattest runs on the forwarder's blocking pool;
+                                        // share any login already pending on its runtime.
+                                        let next = tokio::runtime::Handle::current()
+                                            .block_on(credentials.recover(snapshot.generation))?;
+                                        attest(next.key).map_err(attest::AttestationFailure::message)
+                                    }
+                                    Err(error) => Err(error.message()),
+                                }
+                            })
                         },
                         fatal: fatal.clone(),
                         record: record.clone(),
@@ -561,13 +616,16 @@ fn launch(
                 },
                 |forwarder| {
                     inference::start_with_endpoint(
-                        credential.key,
+                        config::PLACEHOLDER_API_KEY.to_string().into(),
                         &cfg.provider.models,
                         &forwarder.base_url(),
                     )
                 },
             )?;
-            step.ok(&format!("IronWire {} · pinned forwarder", inference.provider().base_url));
+            step.ok(&format!(
+                "IronWire {} · pinned forwarder",
+                inference.provider().base_url
+            ));
             Ok((
                 inference.provider(),
                 Connected {
@@ -657,6 +715,10 @@ fn main() -> ExitCode {
                 Err(error) => Err(error),
             }
         },
+        Action::Trial(path) => auth::import_sponsored(&path).map(|_| {
+            println!("Sponsored API key saved. Run rts launch to start; NEAR AI Cloud sign-in will be offered when its allowance runs out or the key is revoked.");
+            0
+        }),
         Action::Login(options) => auth::login(&options).map(|_| {
             println!("Signed in to NEAR AI Cloud.");
             0
@@ -986,6 +1048,22 @@ mod tests {
             |_| panic!("must not start session"),
         );
         assert!(result.unwrap_err().contains("rts-vsock-drain-v1"));
+    }
+
+    #[test]
+    fn trial_import_requires_a_key_file_and_never_accepts_a_key_on_argv() {
+        assert!(
+            matches!(parse_args(&["trial", "--key-file", "/private/key"]).unwrap(), Action::Trial(path) if path == PathBuf::from("/private/key"))
+        );
+        for args in [
+            vec!["trial"],
+            vec!["trial", "--key-file"],
+            vec!["trial", "secret"],
+            vec!["trial", "--key", "secret"],
+            vec!["trial", "--key-file", "a", "extra"],
+        ] {
+            assert!(parse_args(&args).is_err());
+        }
     }
 
     #[test]
