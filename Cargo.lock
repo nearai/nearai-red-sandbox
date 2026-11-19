@@ -2782,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "rts"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "apple-native-keyring-store",
  "base64 0.23.1",
