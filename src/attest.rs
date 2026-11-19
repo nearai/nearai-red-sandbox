@@ -108,6 +108,55 @@ impl Attested {
         }
         self.evidence.extend(other.evidence);
     }
+
+    /// Entries accepted by key continuity rather than a pin: an unreviewed
+    /// build trusted because NEAR AI released the session's key to it. The
+    /// operator is told; `compose_acceptance` records it in attestation.json.
+    pub fn key_continuity(&self) -> Vec<String> {
+        let mut out = vec![];
+        for ev in &self.evidence {
+            let model = ev["model"].as_str().unwrap_or("?");
+            for e in ev["entries"].as_array().into_iter().flatten() {
+                if e["compose_acceptance"] != "key-continuity" {
+                    continue;
+                }
+                let which = match e["index"].as_u64() {
+                    Some(i) if e["role"] == "model" => format!("model_attestations[{i}]"),
+                    _ => "gateway_attestation".to_string(),
+                };
+                let hash = e["compose_hash"].as_str().unwrap_or("?");
+                out.push(format!("{model} {which} compose {hash}"));
+            }
+        }
+        out
+    }
+}
+
+/// The signing keys a session attested at launch, under the full policy.
+/// Re-attestation under `Pinned` accepts an unpinned compose for an entry
+/// whose quote binds one of these keys: NEAR AI instances of a model share
+/// one signing key across builds, so a mid-session redeploy keeps its key
+/// while its compose hash changes (issue #25). Empty at launch, so a new
+/// session is always strictly pinned.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Continuity {
+    pub model_keys: BTreeMap<String, BTreeSet<[u8; 32]>>,
+    pub gateway_keys: BTreeSet<[u8; 32]>,
+}
+
+impl Continuity {
+    pub fn from_attested(a: &Attested) -> Self {
+        Self {
+            model_keys: a.keys.clone(),
+            gateway_keys: a.gateway_keys.clone(),
+        }
+    }
+
+    fn vouches_for_model(&self, model: &str, key: &[u8; 32]) -> bool {
+        self.model_keys
+            .get(model)
+            .is_some_and(|keys| keys.contains(key))
+    }
 }
 
 pub type Nonce = Arc<dyn Fn() -> [u8; 32] + Send + Sync>;
@@ -141,6 +190,8 @@ pub struct Attestor {
     pub models: Vec<String>,
     pub options: AttestOptions,
     pub policy: Policy,
+    /// Keys already attested this session; empty for a launch.
+    pub continuity: Continuity,
     pub nonce: Nonce,
 }
 
@@ -176,8 +227,15 @@ impl Attestor {
             models: models.to_vec(),
             options,
             policy: load_policy(POLICY_JSON)?,
+            continuity: Continuity::default(),
             nonce: Arc::new(urandom_nonce),
         })
+    }
+
+    /// For re-attestation: see [`Continuity`].
+    pub fn with_continuity(mut self, continuity: Continuity) -> Self {
+        self.continuity = continuity;
+        self
     }
 
     /// Attests every allowed model, each with its own request and nonce.
@@ -245,8 +303,13 @@ impl Attestor {
             report::hex32(gateway_fp).map_err(|e| format!("gateway tls_cert_fingerprint: {e}"))?,
         );
         let mut entry_records = vec![];
+        // Only an ed25519 gateway attests a key that can vouch for it; the
+        // quote binds signing_address (check_report_data) before compose.
+        let gateway_continued = gateway.signing_algo == "ed25519"
+            && report::hex32(&gateway.signing_address)
+                .is_ok_and(|k| self.continuity.gateway_keys.contains(&k));
         let mut record = self
-            .check_quote(gateway, &nonce)
+            .check_quote(gateway, &nonce, gateway_continued)
             .map_err(|e| format!("gateway: {e}"))?;
         // Only after every gateway check passed. NEAR AI production signs
         // receipts with an ed25519 gateway key; any other algorithm pins
@@ -278,7 +341,8 @@ impl Attestor {
                 )));
             }
             let key = report::ed25519_key(entry).map_err(at)?;
-            let mut record = self.check_quote(entry, &nonce).map_err(at)?;
+            let continued = self.continuity.vouches_for_model(model, &key);
+            let mut record = self.check_quote(entry, &nonce, continued).map_err(at)?;
             let payload = entry
                 .nvidia_payload
                 .as_deref()
@@ -317,11 +381,14 @@ impl Attestor {
     }
 
     /// The checks every entry carries: TDX quote, TCB policy, report_data,
-    /// and compose. Returns the entry's evidence record.
+    /// and compose. `continued`: the entry's signing key is in
+    /// [`Continuity`]; it counts only once report_data has bound that key.
+    /// Returns the entry's evidence record.
     fn check_quote(
         &self,
         e: &Evidence,
         nonce: &[u8; 32],
+        continued: bool,
     ) -> Result<serde_json::Map<String, Value>, String> {
         let quote = hex::decode(&e.intel_quote)
             .map_err(|_| "TDX quote (intel_quote) is not hex".to_string())?;
@@ -332,11 +399,12 @@ impl Attestor {
         let acceptance = tcb_policy(&claims.tcb_status, self.options.allow_tcb_out_of_date)?;
         report::check_report_data(&claims.report_data, e, nonce)?;
         let compose = report::app_compose(e.info.as_ref())?;
-        let hash = report::check_compose(
+        let (hash, compose_acceptance) = report::check_compose(
             &claims.mr_config_id,
             &compose,
             &self.policy,
             self.options.compose_policy,
+            continued,
         )?;
         let mut m = serde_json::Map::new();
         m.insert("tcb_status".into(), claims.tcb_status.into());
@@ -346,6 +414,10 @@ impl Attestor {
             serde_json::to_value(acceptance).unwrap_or(Value::Null),
         );
         m.insert("compose_hash".into(), hex::encode(hash).into());
+        m.insert(
+            "compose_acceptance".into(),
+            compose_acceptance.as_str().into(),
+        );
         Ok(m)
     }
 }
@@ -431,6 +503,7 @@ mod tests {
         options: AttestOptions,
         policy: Policy,
         keyless: bool,
+        continuity: Continuity,
     }
 
     impl Case {
@@ -468,6 +541,7 @@ mod tests {
                     compose_hashes: BTreeSet::from([sha(&[COMPOSE.as_bytes()])]),
                 },
                 keyless: false,
+                continuity: Continuity::default(),
             }
         }
     }
@@ -531,6 +605,7 @@ mod tests {
             models: models.iter().map(|m| m.to_string()).collect(),
             options: first.options,
             policy: first.policy.clone(),
+            continuity: first.continuity.clone(),
             nonce: counter_nonce(),
         };
         Run {
@@ -922,6 +997,199 @@ mod tests {
         );
     }
 
+    /// A redeploy: the entry's compose is not pinned (`OTHER_COMPOSE`).
+    fn redeployed_model(mut case: Case) -> Case {
+        case.m0.mr_config_id = mr_config(OTHER_COMPOSE);
+        case.report["model_attestations"][0]
+            .as_object_mut()
+            .unwrap()
+            .insert("info".into(), info(OTHER_COMPOSE));
+        case
+    }
+
+    fn redeployed_gateway(mut case: Case) -> Case {
+        case.gw.mr_config_id = mr_config(OTHER_COMPOSE);
+        case.report["gateway_attestation"]
+            .as_object_mut()
+            .unwrap()
+            .insert("info".into(), info(OTHER_COMPOSE));
+        case
+    }
+
+    fn continuity(model: &str, keys: &[[u8; 32]], gateway: &[[u8; 32]]) -> Continuity {
+        Continuity {
+            model_keys: BTreeMap::from([(model.to_string(), keys.iter().copied().collect())]),
+            gateway_keys: gateway.iter().copied().collect(),
+        }
+    }
+
+    /// Issue #25: NEAR redeploys a model to a new build mid-session. The new
+    /// compose is not pinned, but the instance holds the signing key the
+    /// session already attested from a pinned build, so re-attestation keeps
+    /// the session alive and records why it accepted the compose.
+    #[test]
+    fn a_redeployed_model_holding_an_attested_key_is_accepted_by_key_continuity() {
+        let mut case = redeployed_model(Case::good([1; 32]));
+        case.continuity = continuity("m", &[KEY], &[]);
+        let a = run_one(case).result.unwrap();
+        assert_eq!(
+            a.keys,
+            BTreeMap::from([("m".to_string(), BTreeSet::from([KEY]))])
+        );
+        assert_eq!(a.fingerprints, BTreeSet::from([FP]));
+        let entries = &a.evidence[0]["entries"];
+        assert_eq!(entries[0]["compose_acceptance"], "pinned");
+        assert_eq!(entries[1]["compose_acceptance"], "key-continuity");
+        assert_eq!(
+            entries[1]["compose_hash"],
+            hex::encode(sha(&[OTHER_COMPOSE.as_bytes()]))
+        );
+    }
+
+    #[test]
+    fn without_continuity_a_redeployed_model_is_still_refused_under_pinned() {
+        let err = run_one(redeployed_model(Case::good([1; 32])))
+            .result
+            .unwrap_err();
+        assert!(err.contains("not pinned"), "{err}");
+    }
+
+    /// Continuity vouches only for a key already attested for this model.
+    #[test]
+    fn continuity_does_not_vouch_for_a_new_key_or_another_models_key() {
+        for c in [
+            continuity("m", &[[0x44; 32]], &[]),
+            continuity("other", &[KEY], &[]),
+            // A gateway key is not a model key.
+            continuity("x", &[], &[KEY]),
+        ] {
+            let mut case = redeployed_model(Case::good([1; 32]));
+            case.continuity = c;
+            let err = run_one(case).result.unwrap_err();
+            assert!(err.contains("not pinned"), "{err}");
+        }
+    }
+
+    /// Continuity replaces only the pin: every other check still applies.
+    #[test]
+    fn continuity_does_not_skip_any_other_check() {
+        type Mutate = Box<dyn Fn(&mut Case)>;
+        let cases: Vec<(&str, Mutate)> = vec![
+            ("does not bind", Box::new(|c| c.m0.report_data[0] ^= 1)),
+            ("nonce", Box::new(|c| c.m0.report_data[63] ^= 1)),
+            ("TDX quote", Box::new(|c| c.quote_err = Some("bad".into()))),
+            ("Revoked", Box::new(|c| c.m0.tcb_status = "Revoked".into())),
+            (
+                "GPU",
+                Box::new(|c| c.gpu = Err("NRAS verdict: false".into())),
+            ),
+            (
+                "does not match sha256(app_compose)",
+                Box::new(|c| c.m0.mr_config_id = mr_config(COMPOSE)),
+            ),
+        ];
+        for (phrase, mutate) in cases {
+            let mut case = redeployed_model(Case::good([1; 32]));
+            case.continuity = continuity("m", &[KEY], &[]);
+            mutate(&mut case);
+            let err = run_one(case).result.unwrap_err();
+            assert!(err.contains(phrase), "expected {phrase:?} in {err:?}");
+        }
+    }
+
+    #[test]
+    fn a_redeployed_ed25519_gateway_holding_an_attested_key_is_accepted() {
+        let mut case = redeployed_gateway(ed25519_gateway([1; 32]));
+        case.continuity = continuity("m", &[], &[GW_KEY]);
+        let a = run_one(case).result.unwrap();
+        assert_eq!(a.gateway_keys, BTreeSet::from([GW_KEY]));
+        assert_eq!(
+            a.evidence[0]["entries"][0]["compose_acceptance"],
+            "key-continuity"
+        );
+
+        // A model key does not vouch for the gateway.
+        let mut case = redeployed_gateway(ed25519_gateway([1; 32]));
+        case.continuity = continuity("m", &[KEY, GW_KEY], &[]);
+        let err = run_one(case).result.unwrap_err();
+        assert!(
+            err.contains("gateway") && err.contains("not pinned"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn continuity_does_not_skip_any_gateway_check() {
+        type Mutate = Box<dyn Fn(&mut Case)>;
+        let cases: Vec<(&str, Mutate)> = vec![
+            ("does not bind", Box::new(|c| c.gw.report_data[0] ^= 1)),
+            ("nonce", Box::new(|c| c.gw.report_data[63] ^= 1)),
+            ("TDX quote", Box::new(|c| c.gw_quote_err = Some("bad".into()))),
+            ("Revoked", Box::new(|c| c.gw.tcb_status = "Revoked".into())),
+            (
+                "does not match sha256(app_compose)",
+                Box::new(|c| c.gw.mr_config_id = mr_config(COMPOSE)),
+            ),
+        ];
+        for (phrase, mutate) in cases {
+            let mut case = redeployed_gateway(ed25519_gateway([1; 32]));
+            case.continuity = continuity("m", &[], &[GW_KEY]);
+            mutate(&mut case);
+            let err = run_one(case).result.unwrap_err();
+            assert!(err.contains(phrase), "expected {phrase:?} in {err:?}");
+        }
+    }
+
+    #[test]
+    fn key_continuity_acceptances_are_listed_for_the_operator() {
+        let mut case = redeployed_model(Case::good([1; 32]));
+        case.continuity = continuity("m", &[KEY], &[]);
+        let a = run_one(case).result.unwrap();
+        assert_eq!(
+            a.key_continuity(),
+            vec![format!(
+                "m model_attestations[0] compose {}",
+                hex::encode(sha(&[OTHER_COMPOSE.as_bytes()]))
+            )]
+        );
+        assert!(run_one(Case::good([1; 32])).result.unwrap().key_continuity().is_empty());
+    }
+
+    /// An ecdsa gateway attests no ed25519 key, so nothing can vouch for it.
+    #[test]
+    fn a_redeployed_ecdsa_gateway_is_refused_even_with_continuity() {
+        let mut case = redeployed_gateway(Case::good([1; 32]));
+        case.continuity = continuity("m", &[KEY], &[GW_KEY]);
+        let err = run_one(case).result.unwrap_err();
+        assert!(
+            err.contains("gateway") && err.contains("not pinned"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn mr_config_only_records_its_acceptance() {
+        let mut case = redeployed_model(Case::good([1; 32]));
+        case.options.compose_policy = ComposePolicy::MrConfigOnly;
+        let a = run_one(case).result.unwrap();
+        assert_eq!(
+            a.evidence[0]["entries"][1]["compose_acceptance"],
+            "mr-config-only"
+        );
+    }
+
+    #[test]
+    fn continuity_is_seeded_from_the_sessions_attested_keys() {
+        let mut a = Attested::default();
+        a.keys.insert("m".into(), BTreeSet::from([KEY]));
+        a.gateway_keys.insert(GW_KEY);
+        a.fingerprints.insert(FP);
+        assert_eq!(
+            Continuity::from_attested(&a),
+            continuity("m", &[KEY], &[GW_KEY])
+        );
+    }
+
     /// The production compose hashes measured on 2026-10-29: the gateway
     /// (dstack-0.5.12) and the abliterated DeepSeek model entry
     /// (dstack-nvidia-0.5.11), each sha256(info.tcb_info.app_compose).
@@ -995,6 +1263,7 @@ mod tests {
             models: vec![crate::config::DEFAULT_MODELS[0].to_string()],
             options: AttestOptions::default(),
             policy,
+            continuity: Continuity::default(),
             nonce: Arc::new(move || nonce),
         }
         .attest()

@@ -381,6 +381,23 @@ so a failed check can stop a session after OpenCode has received response bytes.
 Receipts may be signed by the attested gateway or model; they are not independent
 proof that a particular model generated the answer.
 
+#### Compose pins and NEAR redeploys
+
+A launch accepts only compose hashes pinned in
+[`opencode/attestation-policy.json`](opencode/attestation-policy.json).
+NEAR AI may redeploy a model or the gateway to a new TEE build mid-session,
+which changes its compose hash. When the forwarder re-attests, it accepts an
+unpinned compose only if that entry passes every other check and its quote
+binds a signing key the session already attested at launch: instances of a
+model share one signing key across builds. rts prints a warning naming each
+such entry, and `attestation.json` records each
+entry's `compose_acceptance` as `pinned`, `key-continuity`, or `mr-config-only`.
+A new launch against the new build is still refused until it is pinned. To pin
+it, run one session with `--compose-policy mr-config-only` (or use a session
+that continued by key), then run
+`scripts/refresh-attestation-policy.py <session>/attestation.json`, review
+each printed `app_compose`, then rerun it with `--write` and rebuild.
+
 The attested inference behavior above describes the default embedded NEAR AI
 path. External providers require an explicit opt-out of required attestation;
 see [provider configuration](opencode/README.md#inference-through-embedded-ironwire).
