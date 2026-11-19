@@ -561,7 +561,7 @@ mod tests {
         crate::brand::theme::install(&plugin_dir, &paths.config_dir).unwrap();
         write_opencode_config(&paths.config_dir, &plugin_dir, &json!({
             "machine": paths.machine, "nonce": nonce, "readyFile": paths.ready_file,
-            "auditFile": paths.audit_file, "provider": "ironwire", "models": provider.models, "rts": "/nonexistent-rts-no-tools-called",
+            "auditFile": paths.audit_file, "provider": "ironwire", "models": provider.models, "toolCommand": ["/nonexistent-rts-no-tools-called", "tool"],
             "bridge": { "machine": paths.machine }, "debugFile": paths.runtime.join("debug.json"),
         }), &provider, false).unwrap();
         let launch = opencode_launch(

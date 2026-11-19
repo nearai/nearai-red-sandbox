@@ -160,6 +160,36 @@ struct State {
     /// lock also keeps lines from interleaving.
     pending: Mutex<BTreeMap<u64, Open>>,
     next_check: std::sync::atomic::AtomicU64,
+    /// Chat completion IDs relayed during this session, bounded to `MAX_SEEN_IDS`.
+    /// Only these IDs may be fetched via `GET /v1/signature/{id}`.
+    seen_ids: Mutex<SeenIds>,
+}
+
+const MAX_SEEN_IDS: usize = 4096;
+
+#[derive(Default)]
+struct SeenIds {
+    order: std::collections::VecDeque<String>,
+    set: BTreeSet<String>,
+}
+
+impl SeenIds {
+    fn insert(&mut self, id: &str) {
+        if !signature::usable_id(id) || self.set.contains(id) {
+            return;
+        }
+        if self.order.len() >= MAX_SEEN_IDS
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.set.remove(&oldest);
+        }
+        self.set.insert(id.to_string());
+        self.order.push_back(id.to_string());
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.set.contains(id)
+    }
 }
 
 /// What is known of a response before its check settles.
@@ -221,6 +251,7 @@ impl Forwarder {
             inference_log: cfg.inference_log,
             pending: Mutex::new(BTreeMap::new()),
             next_check: std::sync::atomic::AtomicU64::new(0),
+            seen_ids: Mutex::new(SeenIds::default()),
         });
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
             .map_err(|e| format!("forwarder: cannot bind 127.0.0.1: {e}"))?;
@@ -447,6 +478,15 @@ async fn handle(state: &Arc<State>, req: Request<Incoming>) -> Out {
     if state.fatal.reason().is_some() {
         return stopped_reply();
     }
+    if req.method() == Method::GET
+        && let Some(chat_id) = req
+            .uri()
+            .path()
+            .strip_prefix("/v1/signature/")
+            .map(str::to_string)
+    {
+        return handle_signature(state, req, &chat_id).await;
+    }
     if req.method() != Method::POST || req.uri().path() != "/v1/chat/completions" {
         eprintln!("{}", not_forwarded_line(req.method(), req.uri().path()));
         return local(StatusCode::NOT_FOUND, "rts forwarder: not forwarded");
@@ -533,7 +573,7 @@ async fn handle(state: &Arc<State>, req: Request<Incoming>) -> Out {
         };
         let mut resp = match send_once(state, &headers, &body).await {
             Ok(resp) => resp,
-            Err(reply) => return reply,
+            Err(reply) => return *reply,
         };
         let mut prefix = Vec::new();
         if attempt == 0
@@ -591,65 +631,149 @@ async fn handle(state: &Arc<State>, req: Request<Incoming>) -> Out {
     unreachable!("at most one credential retry")
 }
 
+/// Relay `GET /v1/signature/{id}` (with query string) only for chat IDs
+/// observed in completions relayed during this session.
+async fn handle_signature(state: &Arc<State>, req: Request<Incoming>, chat_id: &str) -> Out {
+    if !signature::usable_id(chat_id) || !lock(&state.seen_ids).contains(chat_id) {
+        eprintln!("{}", not_forwarded_line(req.method(), req.uri().path()));
+        return local(StatusCode::NOT_FOUND, "rts forwarder: not forwarded");
+    }
+    let mut url = format!("{}/signature/{chat_id}", state.upstream);
+    if let Some(query) = req.uri().query() {
+        url.push('?');
+        url.push_str(query);
+    }
+    let mut headers = reqwest::header::HeaderMap::new();
+    for name in [AUTHORIZATION, ACCEPT] {
+        for value in req.headers().get_all(&name) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    if let Some(credentials) = &state.credentials {
+        let snapshot = match credentials.current().await {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                return local(
+                    StatusCode::UNAUTHORIZED,
+                    "NEAR AI Cloud sign-in did not complete; run rts login and launch again.",
+                );
+            }
+        };
+        use secrecy::ExposeSecret;
+        let mut auth = match HeaderValue::from_str(&format!(
+            "Bearer {}",
+            snapshot.key.expose_secret()
+        )) {
+            Ok(auth) => auth,
+            Err(_) => {
+                return local(
+                    StatusCode::UNAUTHORIZED,
+                    "Invalid NEAR AI credential; run rts login",
+                );
+            }
+        };
+        auth.set_sensitive(true);
+        headers.insert(AUTHORIZATION, auth);
+    }
+    let resp = match send_pinned(state, || state.client.get(&url).headers(headers.clone()).send())
+        .await
+    {
+        Ok(resp) => resp,
+        Err(reply) => return *reply,
+    };
+    let status = resp.status();
+    let content_type = resp.headers().get(CONTENT_TYPE).cloned();
+    let body = match resp.bytes().await {
+        Ok(body) => body,
+        Err(_) => {
+            return local(
+                StatusCode::BAD_GATEWAY,
+                "rts forwarder: upstream signature body failed",
+            );
+        }
+    };
+    let mut out = Response::new(
+        Full::new(body)
+            .map_err(|never| match never {})
+            .boxed(),
+    );
+    *out.status_mut() = status;
+    if let Some(ct) = content_type {
+        out.headers_mut().insert(CONTENT_TYPE, ct);
+    }
+    out
+}
+
 /// Every attempt, including a credential retry, uses the same pin/re-attest
 /// policy and forwards the exact original request bytes.
 async fn send_once(
     state: &Arc<State>,
     headers: &reqwest::header::HeaderMap,
     body: &Bytes,
-) -> Result<reqwest::Response, Out> {
-    let send = || {
+) -> Result<reqwest::Response, Box<Out>> {
+    send_pinned(state, || {
         state
             .client
             .post(&state.completions)
             .headers(headers.clone())
             .body(body.clone())
             .send()
-    };
+    })
+    .await
+}
+
+async fn send_pinned<Fut>(
+    state: &Arc<State>,
+    send: impl Fn() -> Fut,
+) -> Result<reqwest::Response, Box<Out>>
+where
+    Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+{
     if state.fatal.reason().is_some() {
-        return Err(stopped_reply());
+        return Err(Box::new(stopped_reply()));
     }
     let resp = match send().await {
         Ok(resp) => resp,
         Err(_) => match state.pins.take_rejected() {
             None => {
-                return Err(local(
+                return Err(Box::new(local(
                     StatusCode::BAD_GATEWAY,
                     "rts forwarder: upstream request failed",
-                ));
+                )));
             }
             Some(r @ Rejected::Untrusted(_)) => {
-                return Err(fatal_reply(
+                return Err(Box::new(fatal_reply(
                     state,
                     "pin-failed",
                     format!("pin: {} does not chain to a trusted root", r.certificate()),
-                ));
+                )));
             }
             Some(Rejected::Unpinned(fp)) => {
                 match learn(state, fp).await {
                     Ok(()) => {}
-                    Err(Unlearned::Stopped) => return Err(stopped_reply()),
+                    Err(Unlearned::Stopped) => return Err(Box::new(stopped_reply())),
                     Err(Unlearned::Failed(reason)) => {
-                        return Err(fatal_reply(state, "pin-failed", reason));
+                        return Err(Box::new(fatal_reply(state, "pin-failed", reason)));
                     }
                 }
                 if state.fatal.reason().is_some() {
-                    return Err(stopped_reply());
+                    return Err(Box::new(stopped_reply()));
                 }
                 match send().await {
                     Ok(resp) => resp,
                     Err(_) => {
                         if let Some(r) = state.pins.take_rejected() {
-                            return Err(fatal_reply(
+                            return Err(Box::new(fatal_reply(
                                 state,
                                 "pin-failed",
                                 format!("pin: {} refused after re-attestation", r.certificate()),
-                            ));
+                            )));
                         }
-                        return Err(local(
+                        return Err(Box::new(local(
                             StatusCode::BAD_GATEWAY,
                             "rts forwarder: upstream request failed",
-                        ));
+                        )));
                     }
                 }
             }
@@ -828,6 +952,9 @@ fn relay(state: Arc<State>, mut upstream: reqwest::Response, sent: Sent, prefix:
                     kept.extend_from_slice(&chunk);
                 } else if streamed {
                     sse.push(&chunk);
+                    if let Some(id) = sse.id() {
+                        lock(&state.seen_ids).insert(id);
+                    }
                 }
                 hasher.update(&chunk);
                 if let Some(tx) = &client
@@ -839,6 +966,14 @@ fn relay(state: Arc<State>, mut upstream: reqwest::Response, sent: Sent, prefix:
                 }
             }
         };
+        let chat_id = if streamed {
+            sse.id().map(str::to_string)
+        } else {
+            signature::chat_id_from_json(&kept)
+        };
+        if let Some(chat_id) = chat_id.as_deref() {
+            lock(&state.seen_ids).insert(chat_id);
+        }
         if let Some(tx) = client {
             if !matches!(relayed, Relayed::Complete) {
                 let _ = tx.send(Err("upstream response stopped".into())).await;
@@ -846,11 +981,6 @@ fn relay(state: Arc<State>, mut upstream: reqwest::Response, sent: Sent, prefix:
             // Dropping the sender ends the client's body before the check.
             drop(tx);
         }
-        let chat_id = if streamed {
-            sse.id().map(str::to_string)
-        } else {
-            signature::chat_id_from_json(&kept)
-        };
         let ex = Exchange {
             model: sent.model,
             chat_id: chat_id
@@ -2261,6 +2391,7 @@ mod tests {
             DUMMY_KEY.to_string().into(),
             &["m".into()],
             &rig.fw().base_url(),
+            crate::inference::IronWireSetup::default(),
         )
         .unwrap();
         let client = reqwest::blocking::Client::builder()
@@ -3115,5 +3246,85 @@ mod tests {
         });
         assert_eq!(rig.doc()["reason"], "cannot write inference.jsonl");
         assert_eq!(rig.post(BODY).0, 502);
+    }
+
+    #[test]
+    fn a_signature_fetch_for_a_relayed_completion_is_relayed_with_the_real_key() {
+        let reply = |_req: &Seen| {
+            Answer::Whole(
+                200,
+                br#"{"id":"chatcmpl-abc","choices":[]}"#.to_vec(),
+            )
+        };
+        let up = upstream(|_| "a", false, reply);
+        let keys = crate::sponsored::Credentials::new(
+            "real-nearai-secret".to_string().into(),
+            false,
+            Arc::new(|_| Err("no login".into())),
+        );
+        let rig = rig_credentials(
+            &up,
+            &["a"],
+            &[test_vk()],
+            &[],
+            reattest(&["a"], &Arc::new(AtomicUsize::new(0))),
+            1 << 20,
+            quick(),
+            Some(keys),
+        );
+        let (status, _) = rig.post(BODY);
+        assert_eq!(status, 200);
+        // Wait for the forwarder's own receipt check so signature_requests() is deterministic.
+        assert_eq!(rig.wait_lines(1)[0]["result"], "verified");
+
+        let (sig_status, sig_body) =
+            send(rig.fw(), "GET", "/v1/signature/chatcmpl-abc?model=m", b"");
+        assert_eq!(sig_status, 200);
+        let doc: serde_json::Value = serde_json::from_slice(&sig_body).unwrap();
+        assert!(doc.get("signature").is_some(), "{doc}");
+
+        let sig_reqs = up.signature_requests();
+        let relayed = sig_reqs
+            .iter()
+            .find(|r| r.head.contains("GET /v1/signature/chatcmpl-abc?model=m "))
+            .expect("signature fetch with query string must reach upstream");
+        assert!(
+            relayed.head.contains("authorization: Bearer real-nearai-secret"),
+            "{}",
+            relayed.head
+        );
+    }
+
+    #[test]
+    fn a_signature_fetch_for_an_unseen_id_is_refused() {
+        let up = upstream(|_| "a", false, ok_reply);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        let (status, _) = send(rig.fw(), "GET", "/v1/signature/chatcmpl-zzz", b"");
+        assert_eq!(status, 404);
+        assert!(up.signature_requests().is_empty());
+        assert!(up.handshakes().is_empty());
+    }
+
+    #[test]
+    fn other_paths_stay_refused() {
+        let up = upstream(|_| "a", false, ok_reply);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rig = rig(&up, &["a"], reattest(&["a"], &calls), 1 << 20);
+        assert_eq!(send(rig.fw(), "GET", "/v1/models", b"").0, 404);
+        assert_eq!(send(rig.fw(), "POST", "/v1/embeddings", BODY).0, 404);
+        assert!(up.handshakes().is_empty());
+    }
+
+    #[test]
+    fn seen_ids_drops_oldest_past_capacity() {
+        let mut seen = SeenIds::default();
+        for i in 0..(MAX_SEEN_IDS + 2) {
+            seen.insert(&format!("chatcmpl-{i}"));
+        }
+        assert!(!seen.contains("chatcmpl-0"));
+        assert!(!seen.contains("chatcmpl-1"));
+        assert!(seen.contains("chatcmpl-2"));
+        assert!(seen.contains(&format!("chatcmpl-{}", MAX_SEEN_IDS + 1)));
     }
 }

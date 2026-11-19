@@ -324,6 +324,20 @@ impl Defaults {
             rts_mvmctl: rts_mvmctl.as_deref(),
         })
     }
+
+    /// Paths inside an embedder-owned prefix, independent of `HOME` and
+    /// `current_exe`.
+    pub fn for_prefix(prefix: &Path, sessions_dir: &Path) -> Self {
+        Self {
+            mvmctl: crate::install::mvm_dir(prefix).join("mvmctl"),
+            plugin_dir: crate::install::prefix_plugin(prefix),
+            opencode: crate::install::opencode_dir(prefix)
+                .join("opencode")
+                .to_string_lossy()
+                .into_owned(),
+            sessions_dir: sessions_dir.to_path_buf(),
+        }
+    }
 }
 
 /// The route ID that stood in for the default model before NEAR AI's
