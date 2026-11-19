@@ -123,6 +123,16 @@ def test_a_malformed_report_is_a_clean_error(tmp_path):
     assert "Traceback" not in r.stderr
 
 
+def test_accepts_object_valued_tcb_info_like_rts(tmp_path):
+    ev = evidence("q", PINNED, "pinned", NEW_MODEL, "mr-config-only")
+    r = json.loads(ev["report"])
+    r["model_attestations"][0]["info"]["tcb_info"] = {"app_compose": COMPOSES["model"]}
+    ev["report"] = json.dumps(r)
+    a, p = write(tmp_path, {"status": "verified", "evidence": [ev]}, policy_with(PINNED))
+    found = refresh.candidates(json.loads(a.read_text()), json.loads(p.read_text()), "2026-11-19")
+    assert [c["sha256"] for c in found] == [NEW_MODEL]
+
+
 def test_rejects_a_malformed_hash(tmp_path):
     doc = {"status": "verified", "evidence": [evidence("q", PINNED, "pinned", "zz", "mr-config-only")]}
     a, p = write(tmp_path, doc, policy_with(PINNED))

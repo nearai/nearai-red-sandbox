@@ -72,7 +72,13 @@ def candidates(doc, policy, today):
                     continue
                 try:
                     where, info = _entry(ev.get("model"), ev.get("report"), entry)
-                    compose = json.loads(info["tcb_info"])["app_compose"]
+                    # As rts (report.rs app_compose): a JSON string or an object.
+                    tcb = info["tcb_info"]
+                    if isinstance(tcb, str):
+                        tcb = json.loads(tcb)
+                    compose = tcb["app_compose"]
+                    if not isinstance(compose, str):
+                        raise ValueError("app_compose is not a string")
                 except (TypeError, ValueError, KeyError, IndexError, AttributeError) as e:
                     raise ValueError(f"cannot read the recorded report for compose {h}: {e!r}")
                 # Trust the recorded compose, not the recorded hash field.
