@@ -356,7 +356,7 @@ fn a_session_past_its_hour_ends_with_session_limit_and_leaves_nothing() {
 
     let mut deps = rts::session::Deps::real(id.clone(), None).unwrap();
     // The test binary is not rts; the plugin shim spawns this for tool calls.
-    deps.rts = env!("CARGO_BIN_EXE_rts").into();
+    deps.tool_command = vec![env!("CARGO_BIN_EXE_rts").into(), "tool".into()];
     // Real time (so the 10 s pin wait still ends) plus an hour once jumped.
     let jumped = Arc::new(AtomicBool::new(false));
     let j = jumped.clone();

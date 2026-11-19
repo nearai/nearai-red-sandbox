@@ -158,6 +158,7 @@ location is `~/.local/share/nearai-red-sandbox/sessions/ID/`:
 | File | What it contains |
 | --- | --- |
 | `out/` | Files exported from the guest's `/out` directory |
+| `opencode/` | Preserved OpenCode session data store |
 | `tools.jsonl` | Tool-call audit records |
 | `attestation.json` | Evidence and verification results for the inference path |
 | `inference.jsonl` | Inference and response-receipt records |

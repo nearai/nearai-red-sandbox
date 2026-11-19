@@ -302,6 +302,178 @@ const INSPECT_TIMEOUT: Duration = Duration::from_secs(60);
 const PULL_TIMEOUT: Duration = Duration::from_secs(1800);
 const CODESIGN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A pinned, signed `rts` release archive supplied by an embedder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseArchive {
+    pub url: String,
+    pub sha256: [u8; 32],
+}
+
+const RELEASE_MAX_BYTES: u64 = 128 << 20;
+const RELEASE_OWNED: [&str; 2] = ["libexec/nearai-red-sandbox", "share/nearai-red-sandbox/plugin"];
+
+fn swap_into_prefix(prefix: &Path, stage: &Path, rel: &str) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dst = prefix.join(rel);
+    if let Some(parent) = dst.parent() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+    }
+    if exists(&dst) {
+        let backup = stage.join("old").join(rel);
+        if let Some(parent) = backup.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        }
+        fs::rename(&dst, &backup).map_err(|e| format!("moving {} aside: {e}", dst.display()))?;
+    }
+    let src = stage.join("unpacked").join(rel);
+    fs::rename(&src, &dst).map_err(|e| format!("moving {} into {}: {e}", src.display(), dst.display()))
+}
+
+fn install_release_components(
+    prefix: &Path,
+    release: &ReleaseArchive,
+    f: &dyn Fetch,
+    host: &dyn Host,
+) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    let label = "rts release";
+    if prefix.exists() {
+        remove_stale_temp_dirs(prefix).map_err(|e| format!("{label}: {e}"))?;
+    } else {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(prefix)
+            .map_err(|e| format!("{label}: creating {}: {e}", prefix.display()))?;
+    }
+    let tmp = tempfile::Builder::new()
+        .prefix(TEMP_PREFIX)
+        .tempdir_in(prefix)
+        .map_err(|e| format!("{label}: creating a temp directory in {}: {e}", prefix.display()))?;
+    let download_path = tmp.path().join("release.tar.gz");
+    let unpacked = tmp.path().join("unpacked");
+    let expected = hex(&release.sha256);
+
+    let got = {
+        let mut file = fs::File::create(&download_path)
+            .map_err(|e| format!("{label}: creating {}: {e}", download_path.display()))?;
+        let d = download(f, &release.url, RELEASE_MAX_BYTES, &mut file)
+            .map_err(|e| format!("{label}: {e}; nothing was installed"))?;
+        file.sync_all()
+            .map_err(|e| format!("{label}: writing {}: {e}", download_path.display()))?;
+        d
+    };
+    if !got.sha256.eq_ignore_ascii_case(&expected) {
+        let _ = fs::remove_file(&download_path);
+        return Err(format!(
+            "{label}: sha256 mismatch for {}: expected {expected}, got {}; nothing was installed",
+            release.url, got.sha256
+        ));
+    }
+
+    fs::create_dir(&unpacked)
+        .map_err(|e| format!("{label}: creating {}: {e}", unpacked.display()))?;
+    let argv: Vec<String> = vec![
+        "/usr/bin/tar".into(),
+        "-xzf".into(),
+        download_path.to_string_lossy().into_owned(),
+        "-C".into(),
+        unpacked.to_string_lossy().into_owned(),
+        "--".into(),
+        RELEASE_OWNED[0].into(),
+        RELEASE_OWNED[1].into(),
+    ];
+    let out = host
+        .run(&argv, UNPACK_TIMEOUT)
+        .map_err(|e| format!("{label}: running /usr/bin/tar: {e}; nothing was installed"))?;
+    if out.killed || out.code != Some(0) {
+        let how = if out.killed {
+            "was killed".to_string()
+        } else {
+            format!("exited with {:?}", out.code)
+        };
+        return Err(format!(
+            "{label}: /usr/bin/tar {how} unpacking {}: {}; nothing was installed",
+            release.url,
+            tail(&out.stderr)
+        ));
+    }
+
+    let sup = unpacked.join("libexec/nearai-red-sandbox/mvm-hvf-supervisor");
+    if !fs::symlink_metadata(&sup).map(|m| m.is_file()).unwrap_or(false) {
+        return Err(format!(
+            "{label}: {} does not contain a regular file libexec/nearai-red-sandbox/mvm-hvf-supervisor; nothing was installed",
+            release.url
+        ));
+    }
+    let plugin = unpacked.join("share/nearai-red-sandbox/plugin");
+    if !fs::symlink_metadata(&plugin).map(|m| m.is_dir()).unwrap_or(false) {
+        return Err(format!(
+            "{label}: {} does not contain share/nearai-red-sandbox/plugin; nothing was installed",
+            release.url
+        ));
+    }
+
+    let mut swapped: Vec<&str> = Vec::new();
+    for &rel in &RELEASE_OWNED {
+        if let Err(e) = swap_into_prefix(prefix, tmp.path(), rel) {
+            for &prev in swapped.iter().rev() {
+                let dst = prefix.join(prev);
+                let backup = tmp.path().join("old").join(prev);
+                let _ = fs::remove_dir_all(&dst);
+                if exists(&backup) {
+                    let _ = fs::rename(&backup, &dst);
+                }
+            }
+            return Err(format!("{label}: {e}; the earlier install was restored"));
+        }
+        swapped.push(rel);
+    }
+    Ok(())
+}
+
+/// Download and verify `release`, extract the signed supervisor and plugin
+/// into `prefix`, then install or check mvm, OpenCode and the guest image
+/// under `prefix`.
+pub fn run_in_prefix(
+    o: &SetupOptions,
+    c: &SetupContext,
+    prefix: &Path,
+    release: &ReleaseArchive,
+) -> Result<Vec<String>, String> {
+    run_in_prefix_with(o, c, prefix, release, (&mvm(), &opencode()))
+}
+
+pub(crate) fn run_in_prefix_with(
+    o: &SetupOptions,
+    c: &SetupContext,
+    prefix: &Path,
+    release: &ReleaseArchive,
+    components: (&Component, &Component),
+) -> Result<Vec<String>, String> {
+    if !o.check {
+        install_release_components(prefix, release, c.fetch, c.host)?;
+    }
+    let prefix_defaults = Defaults::for_prefix(prefix, &c.defaults.sessions_dir);
+    let prefix_sup = crate::install::prefix_supervisor(prefix);
+    let prefix_ctx = SetupContext {
+        home: prefix,
+        defaults: &prefix_defaults,
+        explicit_mvmctl: c.explicit_mvmctl,
+        supervisor: &prefix_sup,
+        rts: c.rts,
+        fetch: c.fetch,
+        host: c.host,
+        mvm_plain: c.mvm_plain,
+        mvm: c.mvm,
+    };
+    run_with(o, &prefix_ctx, components)
+}
+
 /// Ok: one summary line per component ("<name> <version> <path>"). Err:
 /// every failure, one per line.
 pub fn run(o: &SetupOptions, c: &SetupContext) -> Result<Vec<String>, String> {
@@ -1249,5 +1421,119 @@ mod tests {
         let e = r.run(offline, &s).unwrap_err();
         assert!(e.contains(r.rts.to_str().unwrap()) && e.contains(&sup) && e.contains("invalid signature"), "{e}");
         assert!(s.mvm.calls().is_empty() && s.plain.calls().is_empty());
+    }
+
+    fn release_tarball(work: &Path, supervisor_bytes: &[u8], plugin_marker: &str) -> (Vec<u8>, [u8; 32]) {
+        let root = work.join("release-stage");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("libexec/nearai-red-sandbox")).unwrap();
+        fs::create_dir_all(root.join("share/nearai-red-sandbox/plugin")).unwrap();
+        fs::write(root.join("libexec/nearai-red-sandbox/mvm-hvf-supervisor"), supervisor_bytes).unwrap();
+        fs::write(root.join("libexec/nearai-red-sandbox/mvm-hvf-supervisor.build-info"), "build=1\n").unwrap();
+        fs::write(root.join("share/nearai-red-sandbox/plugin/index.ts"), plugin_marker).unwrap();
+        let archive = work.join("rts-release.tar.gz");
+        let st = std::process::Command::new("/usr/bin/tar")
+            .args(["-czf", archive.to_str().unwrap(), "-C", root.to_str().unwrap(), "libexec/nearai-red-sandbox", "share/nearai-red-sandbox/plugin"])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let bytes = fs::read(&archive).unwrap();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        (bytes, digest)
+    }
+
+    #[test]
+    fn run_in_prefix_installs_release_components_under_the_prefix() {
+        let r = SetupRig::new();
+        let prefix = r._dir.path().join("embedded-prefix");
+        let (bytes, sha256) = release_tarball(r._dir.path(), b"signed-supervisor-v2", "plugin-v2");
+        let url = "https://github.com/nearai/nearai-red-sandbox/releases/download/v0.1.5/rts.tar.gz";
+        r.fetch.inner.body(url, bytes);
+        let release = ReleaseArchive { url: url.into(), sha256 };
+        let s = r.seams(host_ok, plain_ok, mvm_ok);
+        let ctx = SetupContext {
+            home: &r.home,
+            defaults: &r.defaults,
+            explicit_mvmctl: false,
+            supervisor: &r.supervisor,
+            rts: &r.rts,
+            fetch: &r.fetch,
+            host: &s.host,
+            mvm_plain: &s.plain,
+            mvm: &s.mvm,
+        };
+        let lines = run_in_prefix_with(&SetupOptions::default(), &ctx, &prefix, &release, (&r.components.0, &r.components.1)).unwrap();
+        assert_eq!(fs::read(crate::install::prefix_supervisor(&prefix)).unwrap(), b"signed-supervisor-v2");
+        assert_eq!(fs::read_to_string(crate::install::prefix_plugin(&prefix).join("index.ts")).unwrap(), "plugin-v2");
+        assert!(lines.iter().any(|l| l.contains(&crate::install::prefix_supervisor(&prefix).display().to_string())), "{lines:?}");
+    }
+
+    #[test]
+    fn a_digest_mismatch_leaves_the_old_component_in_place() {
+        let r = SetupRig::new();
+        let prefix = r._dir.path().join("embedded-prefix");
+        let old_sup = crate::install::prefix_supervisor(&prefix);
+        fs::create_dir_all(old_sup.parent().unwrap()).unwrap();
+        fs::write(&old_sup, b"previous-supervisor-bytes").unwrap();
+        let old_plugin = crate::install::prefix_plugin(&prefix).join("index.ts");
+        fs::create_dir_all(old_plugin.parent().unwrap()).unwrap();
+        fs::write(&old_plugin, "previous-plugin").unwrap();
+
+        let (bytes, mut sha256) = release_tarball(r._dir.path(), b"tampered", "tampered");
+        sha256[0] ^= 0xff;
+        let url = "https://github.com/nearai/nearai-red-sandbox/releases/download/v0.1.5/rts.tar.gz";
+        r.fetch.inner.body(url, bytes);
+        let release = ReleaseArchive { url: url.into(), sha256 };
+        let s = r.seams(host_ok, plain_ok, mvm_ok);
+        let ctx = SetupContext {
+            home: &r.home,
+            defaults: &r.defaults,
+            explicit_mvmctl: false,
+            supervisor: &r.supervisor,
+            rts: &r.rts,
+            fetch: &r.fetch,
+            host: &s.host,
+            mvm_plain: &s.plain,
+            mvm: &s.mvm,
+        };
+        let err = run_in_prefix_with(&SetupOptions::default(), &ctx, &prefix, &release, (&r.components.0, &r.components.1)).unwrap_err();
+        assert!(err.contains("sha256 mismatch"), "{err}");
+        assert_eq!(fs::read(&old_sup).unwrap(), b"previous-supervisor-bytes");
+        assert_eq!(fs::read_to_string(&old_plugin).unwrap(), "previous-plugin");
+    }
+
+    #[test]
+    fn check_mode_in_a_prefix_downloads_nothing() {
+        let r = SetupRig::new();
+        let prefix = r._dir.path().join("embedded-prefix");
+        let release = ReleaseArchive {
+            url: "https://github.com/nearai/nearai-red-sandbox/releases/download/v0.1.5/rts.tar.gz".into(),
+            sha256: [0u8; 32],
+        };
+        let s = r.seams(host_ok, plain_ok, mvm_ok);
+        let ctx = SetupContext {
+            home: &r.home,
+            defaults: &r.defaults,
+            explicit_mvmctl: false,
+            supervisor: &r.supervisor,
+            rts: &r.rts,
+            fetch: &r.fetch,
+            host: &s.host,
+            mvm_plain: &s.plain,
+            mvm: &s.mvm,
+        };
+        let _ = run_in_prefix_with(&SetupOptions { check: true, offline: false }, &ctx, &prefix, &release, (&r.components.0, &r.components.1));
+        assert!(r.fetches().is_empty(), "check mode fetched {:?}", r.fetches());
+    }
+
+    #[test]
+    fn defaults_for_prefix_point_inside_it() {
+        let prefix = Path::new("/opt/tc/red-team/runtime");
+        let sessions = Path::new("/opt/tc/red-team/sessions");
+        let d = Defaults::for_prefix(prefix, sessions);
+        assert!(d.mvmctl.starts_with(prefix), "{}", d.mvmctl.display());
+        assert_eq!(d.plugin_dir, crate::install::prefix_plugin(prefix));
+        assert!(Path::new(&d.opencode).starts_with(prefix), "{}", d.opencode);
+        assert_eq!(d.sessions_dir, sessions);
     }
 }

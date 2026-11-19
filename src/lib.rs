@@ -11,6 +11,7 @@ pub mod copy;
 pub mod files;
 pub mod glob;
 pub mod install;
+pub mod launch;
 pub mod mvm;
 pub mod network;
 pub mod protocol;

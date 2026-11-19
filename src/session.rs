@@ -272,6 +272,8 @@ pub struct SessionPaths {
     pub session_record: PathBuf,
     /// This VM's entries from mvm's signed audit log, copied at teardown.
     pub network_audit: PathBuf,
+    /// OpenCode's preserved data store (`session_dir/opencode`).
+    pub opencode_data: PathBuf,
 }
 
 pub fn session_paths(id: &str, sessions_dir: &Path, runtime: &Path) -> SessionPaths {
@@ -297,6 +299,7 @@ pub fn session_paths(id: &str, sessions_dir: &Path, runtime: &Path) -> SessionPa
         attach_log: session_dir.join("mvm-attach.log"),
         session_record: session_dir.join("session.json"),
         network_audit: session_dir.join("network.jsonl"),
+        opencode_data: session_dir.join("opencode"),
         session_dir,
     }
 }
@@ -682,8 +685,8 @@ pub struct Deps {
     /// None: mvmctl from the config, with the operator's HOME.
     pub runner: Option<Arc<dyn Runner>>,
     pub env: Vec<(String, String)>,
-    /// The `rts` binary the plugin shim spawns for each tool call.
-    pub rts: PathBuf,
+    /// Command prefix the plugin shim spawns as `tool_command ++ [<tool>]`.
+    pub tool_command: Vec<String>,
     /// Chosen by the caller when it writes into sessions/<id>/ before the
     /// session starts (attestation.json); None picks a fresh one.
     pub session_id: Option<String>,
@@ -701,7 +704,13 @@ impl Deps {
             host: Arc::new(RealHost),
             runner: None,
             env: std::env::vars().collect(),
-            rts: std::env::current_exe().map_err(|e| format!("cannot locate the rts binary: {e}"))?,
+            tool_command: vec![
+                std::env::current_exe()
+                    .map_err(|e| format!("cannot locate the rts binary: {e}"))?
+                    .to_string_lossy()
+                    .into_owned(),
+                "tool".into(),
+            ],
             session_id: Some(session_id),
             fatal,
             resolver: Arc::new(crate::network::SystemResolver),
@@ -788,6 +797,58 @@ fn finish_canaries(registry: &crate::canary::Registry, paths: &SessionPaths, exp
     failed
 }
 
+fn copy_tree_preserving_mode(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let meta = fs::symlink_metadata(src)?;
+    if meta.is_dir() {
+        let mode = meta.permissions().mode() & 0o777;
+        fs::DirBuilder::new().recursive(true).mode(mode).create(dst)?;
+        fs::set_permissions(dst, fs::Permissions::from_mode(mode))?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            copy_tree_preserving_mode(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else if meta.is_file() {
+        let mode = meta.permissions().mode() & 0o777;
+        fs::copy(src, dst)?;
+        fs::set_permissions(dst, fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+fn keep_opencode_data(paths: &SessionPaths, log: &Logger) {
+    let src = paths.xdg_data.join("opencode");
+    let dst = &paths.opencode_data;
+    match fs::symlink_metadata(&src) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            log.log("opencode data: unexpected non-directory; not kept");
+            return;
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            log.log("opencode data: none to keep");
+            return;
+        }
+        Err(e) => {
+            log.log(&format!("opencode data: cannot inspect store: {e}"));
+            return;
+        }
+    }
+    if fs::rename(&src, dst).is_ok() {
+        log.log("opencode data: kept");
+        return;
+    }
+    match copy_tree_preserving_mode(&src, dst) {
+        Ok(()) => {
+            let _ = fs::remove_dir_all(&src);
+            log.log("opencode data: kept");
+        }
+        Err(e) => {
+            log.log(&format!("opencode data: FAILED to keep store: {e}"));
+        }
+    }
+}
+
 impl Live<'_> {
     fn teardown(&mut self, why: &str) {
         crate::brand::progress::teardown();
@@ -804,6 +865,7 @@ impl Live<'_> {
             let _ = c.wait();
             self.log.log("teardown: opencode stopped");
         }
+        keep_opencode_data(self.paths, self.log);
         if !self.machine_attempted {
             return;
         }
@@ -869,7 +931,16 @@ pub fn run_session_with_prompt(cfg: &OperatorConfig, deps: Deps, initial_prompt:
     }
     log.log(&format!("session {id}: results in {}, runtime in {}", p.session_dir.display(), p.runtime.display()));
 
-    let supervisor = match supervisor_path(&deps.env, crate::install::install_prefix(&deps.rts).as_deref()) {
+    if deps.tool_command.is_empty() || deps.tool_command[0].is_empty() {
+        log.log("tool command must not be empty");
+        return 1;
+    }
+    let install_prefix = deps
+        .tool_command
+        .first()
+        .map(Path::new)
+        .and_then(crate::install::install_prefix);
+    let supervisor = match supervisor_path(&deps.env, install_prefix.as_deref()) {
         Ok(path) => path,
         Err(error) => {
             log.log(&error);
@@ -964,7 +1035,7 @@ fn wait_for_pins(plan: &crate::network::Plan, audit_dir: &Path, machine: &str, c
 }
 
 /// The options opencode passes to the sandbox plugin (plugin/index.ts).
-pub fn plugin_options(p: &SessionPaths, cfg: &OperatorConfig, rts: &Path, nonce: &str, operator_home: &str) -> Value {
+pub fn plugin_options(p: &SessionPaths, cfg: &OperatorConfig, tool_command: &[String], nonce: &str, operator_home: &str) -> Value {
     let mut bridge = json!({
         "machine": p.machine,
         "mvmctl": cfg.mvmctl,
@@ -988,7 +1059,7 @@ pub fn plugin_options(p: &SessionPaths, cfg: &OperatorConfig, rts: &Path, nonce:
         "auditFile": p.audit_file,
         "provider": cfg.provider.id,
         "models": cfg.provider.models,
-        "rts": rts,
+        "toolCommand": tool_command,
         "bridge": bridge,
     })
 }
@@ -1088,7 +1159,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     live.log.log(&format!("sampling host RSS of pid {} (found via {})", supervisor.pid, supervisor.pid_file.display()));
 
     let nonce = new_nonce();
-    let mut plugin_options = plugin_options(p, cfg, &deps.rts, &nonce, operator_home);
+    let mut plugin_options = plugin_options(p, cfg, &deps.tool_command, &nonce, operator_home);
     if let Some(registry) = &live.canaries {
         plugin_options["canaryManifest"] = json!(registry.manifest_path());
     }
@@ -1199,14 +1270,25 @@ mod tests {
         let mut cfg = parse_config("{}", Path::new("/cfg"), &Defaults { mvmctl: "/m".into(), plugin_dir: "/r/plugin".into(), opencode: "opencode".into(), sessions_dir: "/r/sessions".into() }).unwrap();
         cfg.provider.models = vec!["m-one".into(), "m-two".into()];
         let p = session_paths("0123456789ab", Path::new("/s"), Path::new("/rt"));
-        let o = plugin_options(&p, &cfg, Path::new("/x/rts"), &"ab".repeat(12), "/home/op");
+        let cmd = sv(&["/x/rts", "tool"]);
+        let o = plugin_options(&p, &cfg, &cmd, &"ab".repeat(12), "/home/op");
         assert_eq!(o["models"], serde_json::json!(["m-one", "m-two"]));
         assert_eq!(o["provider"], serde_json::json!(cfg.provider.id));
         assert_eq!(o["bridge"]["machine"], serde_json::json!("rts-0123456789ab"));
         assert_eq!(o["bridge"].get("proxy"), None);
         cfg.network = vec!["a.example".into()];
-        let o = plugin_options(&p, &cfg, Path::new("/x/rts"), &"ab".repeat(12), "/home/op");
+        let o = plugin_options(&p, &cfg, &cmd, &"ab".repeat(12), "/home/op");
         assert_eq!(o["bridge"].get("proxy"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn plugin_options_carry_the_configured_tool_command() {
+        let cfg = parse_config("{}", Path::new("/cfg"), &Defaults { mvmctl: "/m".into(), plugin_dir: "/r/plugin".into(), opencode: "opencode".into(), sessions_dir: "/r/sessions".into() }).unwrap();
+        let p = session_paths("0123456789ab", Path::new("/s"), Path::new("/rt"));
+        let cmd = sv(&["/x/gateway", "red-team", "tool"]);
+        let o = plugin_options(&p, &cfg, &cmd, &"ab".repeat(12), "/home/op");
+        assert_eq!(o["toolCommand"], serde_json::json!(["/x/gateway", "red-team", "tool"]));
+        assert_eq!(o.get("rts"), None);
     }
 
     fn provider() -> ProviderConfig {
@@ -1496,10 +1578,11 @@ mod tests {
         let d = tempdir("canary-options");
         let p = session_paths("0123456789ab", &d, &d.join("runtime"));
         let mut cfg = session_cfg(&d, &d, provider());
-        let disabled = plugin_options(&p, &cfg, Path::new("/x/rts"), "nonce", "/host");
+        let cmd = sv(&["/x/rts", "tool"]);
+        let disabled = plugin_options(&p, &cfg, &cmd, "nonce", "/host");
         assert!(disabled["bridge"].get("canaryRegistry").is_none());
         cfg.canaries = vec![crate::canary::CanarySpec { id: "decoy".into(), placement: crate::canary::Placement::Guest }];
-        let enabled = plugin_options(&p, &cfg, Path::new("/x/rts"), "nonce", "/host");
+        let enabled = plugin_options(&p, &cfg, &cmd, "nonce", "/host");
         assert_eq!(enabled["bridge"]["canaryRegistry"], json!(p.runtime.join("canaries/registry.json")));
         assert!(!enabled.to_string().contains("RTS_CANARY_"));
         fs::remove_dir_all(d).unwrap();
@@ -1949,7 +2032,7 @@ mod tests {
     fn external_sessions_refuse_an_unpatched_supervisor_before_any_vm_command() {
         let d = tempdir("unpatched");
         let f = Fake::new(|a| if a.last().map(String::as_str) == Some(SUPERVISOR_PROBE) { out(0, "stock", "") } else { healthy(a) });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None, resolver: Arc::new(NoResolve), clock: Arc::new(SystemTime::now) };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], tool_command: sv(&["/x/rts", "tool"]), session_id: None, fatal: None, resolver: Arc::new(NoResolve), clock: Arc::new(SystemTime::now) };
         let external = ProviderConfig { base_url: "https://cloud-api.near.ai/v1".into(), ..provider() };
         assert_eq!(run_session(&session_cfg(&d, &d, external), deps), 1);
         assert_eq!(f.calls(), ["opencode --version", "/fake/home/.local/share/nearai-red-sandbox/mvm-hvf-supervisor --rts-vsock-drain-fix-version"]);
@@ -2113,7 +2196,7 @@ mod tests {
     fn a_session_refuses_before_any_vm_exists_when_opencode_is_the_wrong_version() {
         let d = tempdir("sess");
         let f = Fake::new(|a| if a.last().map(String::as_str) == Some("--version") { out(0, "1.0.0", "") } else { out(0, "", "") });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None, resolver: Arc::new(NoResolve), clock: Arc::new(SystemTime::now) };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], tool_command: sv(&["/x/rts", "tool"]), session_id: None, fatal: None, resolver: Arc::new(NoResolve), clock: Arc::new(SystemTime::now) };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         assert!(!f.calls().iter().any(|c| c.starts_with("machine")), "{:?}", f.calls());
         fs::remove_dir_all(d).unwrap();
@@ -2123,7 +2206,7 @@ mod tests {
     fn a_session_uses_the_id_its_caller_chose() {
         let d = tempdir("sess-id");
         let f = Fake::new(|a| if a.last().map(String::as_str) == Some("--version") { out(0, "1.0.0", "") } else { out(0, "", "") });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], rts: "/x/rts".into(), session_id: Some("0123456789ab".into()), fatal: None, resolver: Arc::new(NoResolve), clock: Arc::new(SystemTime::now) };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![], tool_command: sv(&["/x/rts", "tool"]), session_id: Some("0123456789ab".into()), fatal: None, resolver: Arc::new(NoResolve), clock: Arc::new(SystemTime::now) };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         let log = fs::read_to_string(d.join("0123456789ab/launcher.log"));
         let entries: Vec<_> = fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -2161,7 +2244,7 @@ mod tests {
         let deps = Deps {
             host: f.clone(), runner: Some(f.clone()),
             env: vec![("HOME".into(), "/fake/home".into()), ("MVM_HOME".into(), d.join("mvm").to_string_lossy().into_owned())],
-            rts: "/x/rts".into(),
+            tool_command: sv(&["/x/rts", "tool"]),
             session_id: None,
             fatal: None,
             resolver: Arc::new(NoResolve),
@@ -2184,7 +2267,7 @@ mod tests {
             s if s.starts_with("machine create") => out(1, "", "image pull failed"),
             _ => healthy(a),
         });
-        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], rts: "/x/rts".into(), session_id: None, fatal: None, resolver: Arc::new(NoResolve), clock: Arc::new(SystemTime::now) };
+        let deps = Deps { host: f.clone(), runner: Some(f.clone()), env: vec![("HOME".into(), "/fake/home".into())], tool_command: sv(&["/x/rts", "tool"]), session_id: None, fatal: None, resolver: Arc::new(NoResolve), clock: Arc::new(SystemTime::now) };
         assert_eq!(run_session(&session_cfg(&d, &d, serve(MODELS_OK)), deps), 1);
         let calls = f.calls();
         assert!(calls.iter().any(|c| c.starts_with("machine rm rts-") && c.ends_with(" --force --yes")), "{calls:?}");
@@ -2300,7 +2383,7 @@ mod tests {
     fn net_deps(f: &Arc<Fake>, mvm: &Path, resolver: Arc<dyn crate::network::Resolver>, extra: &[(&str, &str)]) -> Deps {
         let mut env: Vec<(String, String)> = vec![("HOME".into(), "/fake/home".into()), ("MVM_HOME".into(), mvm.to_string_lossy().into_owned()), ("PATH".into(), "/usr/bin:/bin".into())];
         env.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
-        Deps { host: f.clone(), runner: Some(f.clone()), env, rts: "/x/rts".into(), session_id: Some("0123456789ab".into()), fatal: None, resolver, clock: Arc::new(SystemTime::now) }
+        Deps { host: f.clone(), runner: Some(f.clone()), env, tool_command: sv(&["/x/rts", "tool"]), session_id: Some("0123456789ab".into()), fatal: None, resolver, clock: Arc::new(SystemTime::now) }
     }
 
     fn read_log(s: &NetSession) -> String {
@@ -2681,5 +2764,77 @@ mod tests {
         assert!(log.contains("session-limit: 24h since boot") && !log.contains("plugin ready"), "{log}");
         assert!(log.contains("teardown: opencode stopped"), "{log}");
         assert!(calls.iter().any(|c| c.starts_with("machine rm rts-0123456789ab")), "{calls:?}");
+    }
+
+    #[test]
+    fn teardown_keeps_the_opencode_data_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempdir("keep-opencode-store");
+        let p = session_paths("0123456789ab", &d.join("sessions"), &d.join("runtime"));
+        prepare_session_dirs(&p).unwrap();
+        let src_dir = p.xdg_data.join("opencode");
+        fs::create_dir_all(&src_dir).unwrap();
+        let db = src_dir.join("opencode.db");
+        write_private(&db, b"sqlite-bytes").unwrap();
+        assert_eq!(fs::metadata(&db).unwrap().permissions().mode() & 0o777, 0o600);
+
+        let f = Fake::new(|_| out(0, "", ""));
+        let run: Arc<dyn Runner> = f.clone();
+        let sb = MvmSandbox::new(&p.machine, Box::new(run)).unwrap();
+        let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
+        let mut live = Live {
+            log: &log,
+            sb: &sb,
+            paths: &p,
+            host: f.as_ref(),
+            machine_attempted: true,
+            machine_created: true,
+            child: None,
+            network_pids: vec![],
+            audit_dir: None,
+            canaries: None,
+            monitoring_failed: false,
+            canary_setup_complete: false,
+        };
+        live.teardown("done");
+
+        let kept = p.opencode_data.join("opencode.db");
+        assert_eq!(fs::read(&kept).unwrap(), b"sqlite-bytes");
+        assert_eq!(fs::metadata(&kept).unwrap().permissions().mode() & 0o777, 0o600);
+        assert!(!src_dir.exists());
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn teardown_without_an_opencode_store_still_exports() {
+        let d = tempdir("no-opencode-store");
+        let p = session_paths("0123456789ab", &d.join("sessions"), &d.join("runtime"));
+        prepare_session_dirs(&p).unwrap();
+        let f = Fake::new(|_| out(0, "", ""));
+        let run: Arc<dyn Runner> = f.clone();
+        let sb = MvmSandbox::new(&p.machine, Box::new(run)).unwrap();
+        let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
+        let mut live = Live {
+            log: &log,
+            sb: &sb,
+            paths: &p,
+            host: f.as_ref(),
+            machine_attempted: true,
+            machine_created: true,
+            child: None,
+            network_pids: vec![],
+            audit_dir: None,
+            canaries: None,
+            monitoring_failed: false,
+            canary_setup_complete: false,
+        };
+        live.teardown("done");
+
+        let calls = f.calls();
+        let logged = fs::read_to_string(&p.log_file).unwrap();
+        assert!(logged.contains("opencode data: none to keep"), "{logged}");
+        assert!(calls.iter().any(|c| c.starts_with("machine rm rts-0123456789ab")), "{calls:?}");
+        assert!(calls.iter().any(|c| c.contains("/out")), "{calls:?}");
+        fs::remove_dir_all(d).unwrap();
     }
 }

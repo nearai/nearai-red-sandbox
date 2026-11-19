@@ -343,7 +343,7 @@ def launch(args: argparse.Namespace) -> int:
         "auditFile": str(root / "tools.jsonl"),
         "provider": "rth",
         "models": [model],
-        "rts": str(Path(__file__).resolve()),
+        "toolCommand": [str(Path(__file__).resolve()), "tool"],
         "bridge": {"machine": sid, "root": str(root), "network": network, "timeoutMs": 120_000},
     }
     opencode = {

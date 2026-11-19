@@ -66,7 +66,7 @@ fn options(h: &Harness, p: &SessionPaths, machine: &str, nonce: &str) -> Value {
         "auditFile": p.audit_file,
         "provider": "ironwire",
         "models": provider().models,
-        "rts": env!("CARGO_BIN_EXE_rts"),
+        "toolCommand": [env!("CARGO_BIN_EXE_rts"), "tool"],
         "bridge": bridge_options(h, machine, &p.state_dir),
         "debugFile": p.runtime.join("debug.json"),
     })

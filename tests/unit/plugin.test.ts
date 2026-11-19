@@ -110,7 +110,7 @@ beforeEach(() => {
     auditFile: join(dir, "tools.jsonl"),
     provider: "ironwire",
     models: ["z-ai/glm-5.3-flash"],
-    rts: "/nonexistent/rts",
+    toolCommand: ["/nonexistent/rts", "tool"],
     bridge: { machine: "rts-0123456789ab", stateDir: join(dir, "state") },
   }
 })
@@ -278,19 +278,19 @@ function fakeRts(exitCode: number, stdout: string, stderr: string) {
   return file
 }
 
-test("a sandboxed call sends the bridge options and the input to rts tool on stdin", async () => {
-  const o = { ...options, rts: fakeRts(0, "hello from the guest", "") } as PluginOptions
+test("a sandboxed call sends the bridge options and the input to the configured toolCommand on stdin", async () => {
+  const o = { ...options, toolCommand: [fakeRts(0, "hello from the guest", ""), "red-team", "tool"] } as PluginOptions
   const out = await makePluginTools(o).shell({ command: "echo hi" })
   expect(out).toBe("hello from the guest")
-  expect(readFileSync(join(dir, "argv"), "utf8").trim()).toBe("tool shell")
+  expect(readFileSync(join(dir, "argv"), "utf8").trim()).toBe("red-team tool shell")
   expect(JSON.parse(readFileSync(join(dir, "stdin"), "utf8"))).toEqual({ options: options.bridge, input: { command: "echo hi" } })
 })
 
 test("a failed call or a lost machine throws with rts's message and never runs on the host", async () => {
-  const failing = { ...options, rts: fakeRts(1, "", "oldString not found") } as PluginOptions
+  const failing = { ...options, toolCommand: [fakeRts(1, "", "oldString not found"), "tool"] } as PluginOptions
   await expect(makePluginTools(failing).edit({})).rejects.toThrow("edit failed: oldString not found")
-  const lost = { ...options, rts: fakeRts(3, "", "sandbox unavailable: sandbox removed") } as PluginOptions
+  const lost = { ...options, toolCommand: [fakeRts(3, "", "sandbox unavailable: sandbox removed"), "tool"] } as PluginOptions
   await expect(makePluginTools(lost).shell({ command: "id" })).rejects.toThrow(/^sandbox unavailable: sandbox removed$/)
-  const missing = { ...options, rts: join(dir, "no-such-rts") } as PluginOptions
+  const missing = { ...options, toolCommand: [join(dir, "no-such-rts"), "tool"] } as PluginOptions
   await expect(makePluginTools(missing).read({ path: "/etc/passwd" })).rejects.toThrow("cannot run")
 })

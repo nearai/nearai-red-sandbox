@@ -5,8 +5,8 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -21,7 +21,42 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(7);
 
-/// Owns a loopback proxy and its isolated, temporary runtime home.
+/// `[capture]` settings for the embedded IronWire configuration.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Capture {
+    pub enabled: bool,
+    pub bodies: bool,
+    pub logprobs: bool,
+    pub receipts: bool,
+}
+
+/// Options controlling the embedded IronWire instance's home and capture.
+#[derive(Default)]
+pub struct IronWireSetup {
+    /// When `Some`, IronWire uses this directory (which must be absent or
+    /// empty) and keeps it on shutdown instead of creating and deleting a
+    /// temporary home.
+    pub home: Option<PathBuf>,
+    pub capture: Capture,
+    /// Optional hook applied to `EmbedOptions` after `rts`'s defaults.
+    pub configure: Option<Box<dyn FnOnce(EmbedOptions) -> EmbedOptions + Send>>,
+}
+
+enum OwnedHome {
+    Temp(tempfile::TempDir),
+    Supplied(PathBuf),
+}
+
+impl OwnedHome {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Temp(dir) => dir.path(),
+            Self::Supplied(path) => path,
+        }
+    }
+}
+
+/// Owns a loopback proxy and its isolated runtime home.
 pub struct EmbeddedInference {
     home: PathBuf,
     provider: crate::config::ProviderConfig,
@@ -92,6 +127,56 @@ fn embed_options(key: HostSecret) -> EmbedOptions {
     options
 }
 
+fn build_embed_options(
+    key: HostSecret,
+    configure: Option<Box<dyn FnOnce(EmbedOptions) -> EmbedOptions + Send>>,
+) -> EmbedOptions {
+    let options = embed_options(key);
+    match configure {
+        Some(f) => f(options),
+        None => options,
+    }
+}
+
+fn prepare_home(supplied: Option<PathBuf>) -> Result<OwnedHome, String> {
+    match supplied {
+        None => {
+            let home = tempfile::Builder::new()
+                .prefix("rts-inference-")
+                .tempdir()
+                .map_err(|_| "inference: cannot create private runtime home")?;
+            fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
+                .map_err(|_| "inference: cannot restrict runtime home")?;
+            Ok(OwnedHome::Temp(home))
+        }
+        Some(dir) => {
+            match fs::symlink_metadata(&dir) {
+                Ok(meta) => {
+                    if !meta.is_dir() {
+                        return Err("inference: runtime home must be a directory".into());
+                    }
+                    let mut entries = fs::read_dir(&dir)
+                        .map_err(|_| "inference: cannot inspect runtime home")?;
+                    if entries.next().is_some() {
+                        return Err("inference: runtime home is not empty".into());
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(&dir)
+                        .map_err(|_| "inference: cannot create private runtime home")?;
+                }
+                Err(_) => return Err("inference: cannot inspect runtime home".into()),
+            }
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+                .map_err(|_| "inference: cannot restrict runtime home")?;
+            Ok(OwnedHome::Supplied(dir))
+        }
+    }
+}
+
 /// Start IronWire with only its NEAR AI backend at `endpoint`, without
 /// credential discovery or probes. In production `endpoint` is always the
 /// loopback forwarder: no path starts IronWire at NEAR AI directly. The
@@ -101,14 +186,15 @@ pub fn start_with_endpoint(
     key: HostSecret,
     models: &[String],
     endpoint: &str,
+    setup: IronWireSetup,
 ) -> Result<EmbeddedInference, String> {
-    let config = runtime_config(models, endpoint)?;
-    let home = tempfile::Builder::new()
-        .prefix("rts-inference-")
-        .tempdir()
-        .map_err(|_| "inference: cannot create private runtime home")?;
-    fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
-        .map_err(|_| "inference: cannot restrict runtime home")?;
+    let IronWireSetup {
+        home: supplied_home,
+        capture,
+        configure,
+    } = setup;
+    let config = runtime_config(models, endpoint, capture)?;
+    let home = prepare_home(supplied_home)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -119,13 +205,14 @@ pub fn start_with_endpoint(
         .map_err(|_| "inference: cannot write runtime configuration")?;
     drop(file);
     let home_path = home.path().to_path_buf();
+    let options = build_embed_options(key, configure);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (done_tx, finished) = mpsc::sync_channel(1);
     let (shutdown, shutdown_rx) = oneshot::channel();
     let worker = std::thread::Builder::new()
         .name("rts-inference".into())
         .spawn(move || {
-            run_worker(home, key, ready_tx, shutdown_rx);
+            run_worker(home, options, ready_tx, shutdown_rx);
             let _ = done_tx.send(());
         })
         .map_err(|_| "inference: cannot start runtime worker")?;
@@ -149,8 +236,8 @@ pub fn start_with_endpoint(
 }
 
 fn run_worker(
-    home: tempfile::TempDir,
-    key: HostSecret,
+    home: OwnedHome,
+    options: EmbedOptions,
     ready: mpsc::SyncSender<Result<u16, String>>,
     shutdown: oneshot::Receiver<()>,
 ) {
@@ -171,7 +258,7 @@ fn run_worker(
             ironwire_proxy::embed::start_with_options(
                 home.path(),
                 Some(0),
-                embed_options(key),
+                options,
                 |_, _| {},
             ),
         )
@@ -195,12 +282,11 @@ fn run_worker(
         let _ = tokio::time::timeout(DRAIN_TIMEOUT, proxy.shutdown()).await;
     });
     runtime.shutdown_timeout(RUNTIME_STOP_TIMEOUT);
-    // No shared IronWire home is ever removed, and only this worker owns the
-    // fresh directory's lifetime.
+    // Temp homes are removed here; caller-supplied homes are preserved.
     drop(home);
 }
 
-fn runtime_config(models: &[String], endpoint: &str) -> Result<String, String> {
+fn runtime_config(models: &[String], endpoint: &str, capture: Capture) -> Result<String, String> {
     if models.is_empty() || models.iter().any(String::is_empty) {
         return Err("inference: select at least one nonempty model ID".into());
     }
@@ -215,10 +301,10 @@ fn runtime_config(models: &[String], endpoint: &str) -> Result<String, String> {
     // prevents model IDs from injecting backend entries or configuration.
     Ok(format!(
         r#"[capture]
-enabled = false
-bodies = false
-logprobs = false
-receipts = false
+enabled = {enabled}
+bodies = {bodies}
+logprobs = {logprobs}
+receipts = {receipts}
 
 [updates]
 check = false
@@ -251,7 +337,11 @@ enabled = false
 id = "openai-key"
 kind = "openai-api"
 enabled = false
-"#
+"#,
+        enabled = capture.enabled,
+        bodies = capture.bodies,
+        logprobs = capture.logprobs,
+        receipts = capture.receipts,
     ))
 }
 
@@ -304,8 +394,13 @@ mod tests {
             vec!["m:alias".into()],
             vec!["m\r\nheader: value".into()],
         ] {
-            let error = start_with_endpoint(DUMMY_KEY.to_string().into(), &models, NEAR_BASE_URL)
-                .unwrap_err();
+            let error = start_with_endpoint(
+                DUMMY_KEY.to_string().into(),
+                &models,
+                NEAR_BASE_URL,
+                IronWireSetup::default(),
+            )
+            .unwrap_err();
             assert!(error.contains("model"));
             assert!(!error.contains(DUMMY_KEY));
         }
@@ -422,6 +517,7 @@ mod tests {
             DUMMY_KEY.to_string().into(),
             &["other-model".into(), "selected-model".into()],
             &endpoint,
+            IronWireSetup::default(),
         )
         .unwrap();
         let provider = inference.provider();
@@ -455,8 +551,13 @@ mod tests {
             "z-ai/glm-5.3-flash".into(),
             "explicitly-selected-model".into(),
         ];
-        let inference =
-            start_with_endpoint(DUMMY_KEY.to_string().into(), &models, NEAR_BASE_URL).unwrap();
+        let inference = start_with_endpoint(
+            DUMMY_KEY.to_string().into(),
+            &models,
+            NEAR_BASE_URL,
+            IronWireSetup::default(),
+        )
+        .unwrap();
         let provider = inference.provider();
         assert_eq!(provider.id, "nearai-red-embedded");
         let (_, port, path) = provider.loopback().unwrap();
@@ -495,5 +596,103 @@ mod tests {
         assert!(before.elapsed() < Duration::from_secs(8));
         assert!(!home.exists(), "owned runtime home survives shutdown");
         assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+    }
+
+    #[test]
+    fn runtime_config_renders_requested_capture() {
+        let rendered = runtime_config(
+            &["z-ai/glm-5.3-flash".into()],
+            "http://127.0.0.1:9999/v1",
+            Capture {
+                enabled: true,
+                bodies: true,
+                logprobs: false,
+                receipts: true,
+            },
+        )
+        .unwrap();
+        assert!(rendered.contains("[capture]\nenabled = true\nbodies = true\nlogprobs = false\nreceipts = true\n"), "{rendered}");
+        assert!(rendered.contains("base_url = \"http://127.0.0.1:9999/v1\""), "{rendered}");
+        assert!(runtime_config(&["bad\n[backends]".into()], NEAR_BASE_URL, Capture::default()).is_err());
+    }
+
+    #[test]
+    fn a_supplied_home_survives_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let iw_home = dir.path().join("iw");
+        let inference = start_with_endpoint(
+            DUMMY_KEY.to_string().into(),
+            &["z-ai/glm-5.3-flash".into()],
+            NEAR_BASE_URL,
+            IronWireSetup {
+                home: Some(iw_home.clone()),
+                capture: Capture::default(),
+                configure: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&iw_home).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(inference);
+        assert!(iw_home.join("config.toml").is_file());
+    }
+
+    #[test]
+    fn a_nonempty_supplied_home_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let iw_home = dir.path().join("iw");
+        fs::create_dir(&iw_home).unwrap();
+        fs::write(iw_home.join("existing"), b"prior").unwrap();
+        let err = start_with_endpoint(
+            DUMMY_KEY.to_string().into(),
+            &["z-ai/glm-5.3-flash".into()],
+            NEAR_BASE_URL,
+            IronWireSetup {
+                home: Some(iw_home),
+                capture: Capture::default(),
+                configure: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("inference: runtime home is not empty"), "{err}");
+    }
+
+    #[test]
+    fn configure_is_applied_after_the_defaults() {
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_flag = called.clone();
+        let options = build_embed_options(
+            DUMMY_KEY.to_string().into(),
+            Some(Box::new(move |mut opts| {
+                assert_eq!(opts.token_capture_enabled, Some(false));
+                opts.token_capture_enabled = Some(true);
+                called_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                opts
+            })),
+        );
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(options.token_capture_enabled, Some(true));
+
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started_flag = started.clone();
+        let inference = start_with_endpoint(
+            DUMMY_KEY.to_string().into(),
+            &["z-ai/glm-5.3-flash".into()],
+            NEAR_BASE_URL,
+            IronWireSetup {
+                home: None,
+                capture: Capture::default(),
+                configure: Some(Box::new(move |opts| {
+                    assert_eq!(opts.token_capture_enabled, Some(false));
+                    started_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    opts.with_credentials(|_| Some(DUMMY_KEY.to_string().into()))
+                })),
+            },
+        )
+        .unwrap();
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+        drop(inference);
     }
 }

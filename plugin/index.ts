@@ -31,9 +31,9 @@ export type PluginOptions = {
   provider: string
   // Exact model IDs of `provider` that stay enabled; everything else is removed.
   models: string[]
-  // The rts binary, and the options it needs to reach this session's
-  // machine (passed through to `rts tool` unchanged; see src/bridge.rs).
-  rts: string
+  // The command prefix spawned as `toolCommand ++ [<tool>]`, and the options
+  // it needs to reach this session's machine (passed through on stdin; see src/bridge.rs).
+  toolCommand: string[]
   bridge: Record<string, unknown>
   // When set, the verified tool, MCP and model state is written here as JSON.
   debugFile?: string
@@ -69,6 +69,10 @@ function checkOptions(o: any): PluginOptions {
   if (!Array.isArray(models) || models.length === 0 || models.some((m: unknown) => typeof m !== "string" || m === "")) {
     throw new Error("rts-sandbox: option models must be a non-empty list of model IDs")
   }
+  const toolCommand = o.toolCommand
+  if (!Array.isArray(toolCommand) || toolCommand.length === 0 || toolCommand.some((a: unknown) => typeof a !== "string" || a === "")) {
+    throw new Error("rts-sandbox: option toolCommand must be a non-empty list of strings")
+  }
   return {
     machine,
     nonce,
@@ -76,7 +80,7 @@ function checkOptions(o: any): PluginOptions {
     auditFile: str("auditFile"),
     provider: str("provider"),
     models: [...models],
-    rts: str("rts"),
+    toolCommand: [...toolCommand],
     bridge,
     debugFile: typeof o.debugFile === "string" && o.debugFile !== "" ? o.debugFile : undefined,
   }
@@ -168,17 +172,20 @@ export async function setupWith(ctx: any, makeImpl: (o: PluginOptions) => Record
 // Exit codes from `rts tool` (src/bridge.rs).
 const EXIT_UNAVAILABLE = 3
 
-// One sandboxed call: the request goes to `rts tool <name>` on stdin and the
-// tool's text comes back on stdout. Any failure, including a lost machine,
-// is thrown so opencode reports it to the model; nothing falls back to the host.
-export function runRts(rts: string, tool: ToolName, request: unknown): Promise<string> {
+// One sandboxed call: the request goes to `toolCommand ++ [<name>]` on stdin
+// and the tool's text comes back on stdout. Any failure, including a lost
+// machine, is thrown so opencode reports it to the model; nothing falls back
+// to the host.
+export function runTool(toolCommand: string[], tool: ToolName, request: unknown): Promise<string> {
   return new Promise((resolve, reject) => {
-    const p = spawn(rts, ["tool", tool], { stdio: ["pipe", "pipe", "pipe"] })
+    const [program, ...prefix] = toolCommand
+    if (!program) return reject(new Error("rts-sandbox: empty toolCommand"))
+    const p = spawn(program, [...prefix, tool], { stdio: ["pipe", "pipe", "pipe"] })
     const out: Buffer[] = []
     const err: Buffer[] = []
     p.stdout.on("data", (b: Buffer) => out.push(b))
     p.stderr.on("data", (b: Buffer) => err.push(b))
-    p.on("error", (e) => reject(new Error(`rts-sandbox: cannot run ${rts}: ${e.message}`)))
+    p.on("error", (e) => reject(new Error(`rts-sandbox: cannot run ${program}: ${e.message}`)))
     p.on("close", (code) => {
       const stderr = Buffer.concat(err).toString("utf8").trim()
       if (code === 0) return resolve(Buffer.concat(out).toString("utf8"))
@@ -193,7 +200,7 @@ export function runRts(rts: string, tool: ToolName, request: unknown): Promise<s
 // The tool implementations the plugin installs. Exported so the
 // containment suite exercises exactly this construction.
 export function makePluginTools(o: PluginOptions): Record<ToolName, (input: any) => Promise<string>> {
-  const mk = (tool: ToolName) => (input: unknown) => runRts(o.rts, tool, { options: o.bridge, input: input ?? {} })
+  const mk = (tool: ToolName) => (input: unknown) => runTool(o.toolCommand, tool, { options: o.bridge, input: input ?? {} })
   return { shell: mk("shell"), read: mk("read"), write: mk("write"), edit: mk("edit"), glob: mk("glob"), grep: mk("grep") }
 }
 
