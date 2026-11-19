@@ -125,6 +125,7 @@ fn attest_live() -> (Result<Attested, String>, Vec<[u8; 32]>, Arc<Recording>) {
         models: models(),
         options: AttestOptions::default(),
         policy: load_policy(POLICY_JSON).unwrap(),
+        continuity: Default::default(),
         nonce: Arc::new(move || {
             let n = urandom_nonce();
             seen.lock().unwrap().push(n);

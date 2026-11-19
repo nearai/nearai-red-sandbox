@@ -119,13 +119,39 @@ pub fn app_compose(info: Option<&serde_json::Value>) -> Result<String, String> {
         .ok_or_else(|| "info.tcb_info has no app_compose string".to_string())
 }
 
-/// mr_config_id[0] == 0x01 and [1..33] == sha256(app_compose); under Pinned the hash must be in the policy.
+/// Why a compose was accepted; recorded as `compose_acceptance`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposeAcceptance {
+    /// Listed in `opencode/attestation-policy.json`.
+    Pinned,
+    /// `--compose-policy mr-config-only`: `mr_config_id` vouches for it.
+    MrConfigOnly,
+    /// Not pinned, but the entry's quote binds a signing key this session
+    /// already attested (a NEAR redeploy mid-session, issue #25).
+    KeyContinuity,
+}
+
+impl ComposeAcceptance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pinned => "pinned",
+            Self::MrConfigOnly => "mr-config-only",
+            Self::KeyContinuity => "key-continuity",
+        }
+    }
+}
+
+/// mr_config_id[0] == 0x01 and [1..33] == sha256(app_compose), then the
+/// compose policy. Under Pinned an unpinned hash is accepted only when
+/// `continued`: the entry's quote-bound signing key was already attested
+/// this session.
 pub fn check_compose(
     mr_config_id: &[u8; 48],
     app_compose: &str,
     policy: &Policy,
     mode: ComposePolicy,
-) -> Result<[u8; 32], String> {
+    continued: bool,
+) -> Result<([u8; 32], ComposeAcceptance), String> {
     if mr_config_id[0] != 0x01 {
         return Err(format!(
             "mr_config_id starts with {:02x}, not 01 (compose hash)",
@@ -136,13 +162,19 @@ pub fn check_compose(
     if mr_config_id[1..33] != hash {
         return Err("mr_config_id does not match sha256(app_compose)".into());
     }
-    if mode == ComposePolicy::Pinned && !policy.compose_hashes.contains(&hash) {
+    let acceptance = if policy.compose_hashes.contains(&hash) {
+        ComposeAcceptance::Pinned
+    } else if mode == ComposePolicy::MrConfigOnly {
+        ComposeAcceptance::MrConfigOnly
+    } else if continued {
+        ComposeAcceptance::KeyContinuity
+    } else {
         return Err(format!(
-            "compose hash {} is not pinned in opencode/attestation-policy.json (pass --compose-policy mr-config-only to accept it)",
+            "compose hash {} is not pinned in opencode/attestation-policy.json (pass --compose-policy mr-config-only to accept it, or see scripts/refresh-attestation-policy.py)",
             hex::encode(hash)
         ));
-    }
-    Ok(hash)
+    };
+    Ok((hash, acceptance))
 }
 
 #[cfg(test)]
@@ -252,23 +284,33 @@ pub(crate) mod tests {
             compose_hashes: BTreeSet::new(),
         };
 
-        assert_eq!(
-            check_compose(&mr, compose, &pinned, ComposePolicy::Pinned),
-            Ok(hash)
-        );
-        let err = check_compose(&mr, compose, &empty, ComposePolicy::Pinned).unwrap_err();
+        use ComposeAcceptance as A;
+        for continued in [false, true] {
+            assert_eq!(
+                check_compose(&mr, compose, &pinned, ComposePolicy::Pinned, continued),
+                Ok((hash, A::Pinned))
+            );
+            assert_eq!(
+                check_compose(&mr, compose, &empty, ComposePolicy::MrConfigOnly, continued),
+                Ok((hash, A::MrConfigOnly))
+            );
+        }
+        let err = check_compose(&mr, compose, &empty, ComposePolicy::Pinned, false).unwrap_err();
         assert!(err.contains("attestation-policy.json"), "{err}");
         assert_eq!(
-            check_compose(&mr, compose, &empty, ComposePolicy::MrConfigOnly),
-            Ok(hash)
+            check_compose(&mr, compose, &empty, ComposePolicy::Pinned, true),
+            Ok((hash, A::KeyContinuity))
         );
 
+        // Continuity never excuses a compose that mr_config_id does not commit to.
         let mut mr2 = mr;
         mr2[0] = 2;
         for mode in [ComposePolicy::Pinned, ComposePolicy::MrConfigOnly] {
-            let err = check_compose(&mr2, compose, &pinned, mode).unwrap_err();
-            assert!(err.contains("mr_config_id"), "{err}");
-            assert!(check_compose(&mr, "services: {x: 1}", &pinned, mode).is_err());
+            for continued in [false, true] {
+                let err = check_compose(&mr2, compose, &pinned, mode, continued).unwrap_err();
+                assert!(err.contains("mr_config_id"), "{err}");
+                assert!(check_compose(&mr, "services: {x: 1}", &pinned, mode, continued).is_err());
+            }
         }
     }
 

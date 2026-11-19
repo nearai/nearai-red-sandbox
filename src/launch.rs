@@ -438,6 +438,10 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                 &record,
                 attested,
                 |seed| {
+                    // Keys from the launch attestation, which passed the full
+                    // policy: a re-attestation may accept a redeployed build
+                    // holding one of them (issue #25). Launch stays pinned.
+                    let continuity = attest::Continuity::from_attested(&seed);
                     forwarder::Forwarder::start(forwarder::ForwarderConfig {
                         credentials: Some(credentials.clone()),
                         upstream: inference::NEAR_BASE_URL.into(),
@@ -454,9 +458,18 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                                 let attest = |key| {
                                     attest::Attestor::real(Some(key), &models, options)
                                         .map_err(attest::AttestationFailure::Other)?
+                                        .with_continuity(continuity.clone())
                                         .attest_for_launch()
                                 };
-                                match attest(snapshot.key) {
+                                let warn = |attested: attest::Attested| {
+                                    for entry in attested.key_continuity() {
+                                        brand::progress::message(&format!(
+                                            "NEAR AI redeployed to a build that is not pinned; accepted because it holds this session's attested signing key: {entry}"
+                                        ));
+                                    }
+                                    attested
+                                };
+                                match attest(snapshot.key).map(warn) {
                                     Ok(attested) => Ok(attested),
                                     Err(attest::AttestationFailure::CredentialRefused { .. })
                                         if snapshot.sponsored =>
@@ -466,7 +479,7 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                                         // share any login already pending on its runtime.
                                         let next = tokio::runtime::Handle::current()
                                             .block_on(credentials.recover(snapshot.generation))?;
-                                        attest(next.key).map_err(attest::AttestationFailure::message)
+                                        attest(next.key).map(warn).map_err(attest::AttestationFailure::message)
                                     }
                                     Err(error) => Err(error.message()),
                                 }
