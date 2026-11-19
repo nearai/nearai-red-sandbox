@@ -464,6 +464,13 @@ pub struct PreflightInput<'a> {
     pub provider: &'a ProviderConfig,
 }
 
+/// `mvmctl doctor`, scoped to running a prebuilt bundle: the platform,
+/// security and disk checks, without the host rust toolchain (`rustup`,
+/// `cargo`) that unscoped doctor requires. rts boots a prebuilt guest image
+/// and builds nothing on the host, and a desktop app's daemon has no rust
+/// toolchain on its PATH, so unscoped doctor failed every app install.
+pub const DOCTOR: [&str; 3] = ["doctor", "--workflow", "bundle-run"];
+
 pub fn preflight(o: &PreflightInput) -> Result<(), String> {
     if o.leak_seam_set {
         return Err("RTS_TEST_LEAK is set; refusing to start a real session".into());
@@ -472,7 +479,7 @@ pub fn preflight(o: &PreflightInput) -> Result<(), String> {
     let supervisor = o.supervisor_path.filter(|p| p.is_absolute() && p.to_str().is_some())
         .ok_or_else(|| format!("An absolute patched HVF supervisor path is required ({SUPERVISOR_FIX_VERSION}). {SUPERVISOR_INSTALL}"))?;
     check_supervisor_marker(o.host, supervisor)?;
-    let doctor = o.run.run(&sv(&["doctor"]), Duration::from_secs(60)).map_err(|e| {
+    let doctor = o.run.run(&sv(&DOCTOR), Duration::from_secs(60)).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             format!("mvmctl not found at {}; run rts setup", o.mvmctl.display())
         } else {
@@ -1853,7 +1860,7 @@ mod tests {
         let external = ProviderConfig { base_url: "https://cloud-api.near.ai/v1".into(), ..provider() };
         let error = pre(&f, false, None, &external).unwrap_err();
         assert!(error.contains("rts-vsock-drain-v1"), "{error}");
-        assert!(!f.calls().iter().any(|a| a == "doctor"));
+        assert!(!f.calls().iter().any(|a| a.starts_with("doctor")));
     }
 
     #[test]
@@ -1961,7 +1968,9 @@ mod tests {
             assert_eq!(calls[1], (vec![path.to_str().unwrap().into(), SUPERVISOR_PROBE.into()], Duration::from_secs(5)));
             if valid {
                 result.unwrap();
-                assert_eq!(runner.calls(), ["doctor"]);
+                // Scoped to prebuilt bundles: a desktop app's daemon has no
+                // rust toolchain on its PATH, and running a bundle needs none.
+                assert_eq!(runner.calls(), ["doctor --workflow bundle-run"]);
             } else {
                 let error = result.unwrap_err();
                 assert!(error.contains("scripts/build-patched-mvm-supervisor.sh"), "{error}");

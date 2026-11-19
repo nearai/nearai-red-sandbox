@@ -574,7 +574,7 @@ pub(crate) fn run_with(o: &SetupOptions, c: &SetupContext, components: (&Compone
     // A missing or wrong mvmctl already failed above; running it again only repeats that.
     if mvm_ok {
         steps.record(
-            succeeded(c.mvm.run(&sv(&["doctor"]), DOCTOR_TIMEOUT), &format!("{} doctor", c.defaults.mvmctl.display()), DOCTOR_TIMEOUT)
+            succeeded(c.mvm.run(&sv(&crate::session::DOCTOR), DOCTOR_TIMEOUT), &format!("{} {}", c.defaults.mvmctl.display(), crate::session::DOCTOR.join(" ")), DOCTOR_TIMEOUT)
                 .map(|_| None)
                 .map_err(|e| format!("mvm {MVM_VERSION}: {e}; fix the problems it reports and re-run rts setup")),
         )?;
@@ -666,6 +666,19 @@ fn offline_check(c: &SetupContext) -> Result<Vec<String>, String> {
         .map(|p| format!("plugin: {} is missing or not a file; reinstall rts", p.display()))
         .collect();
     steps.record(if missing.is_empty() { Ok(Some(format!("plugin {} {}", env!("CARGO_PKG_VERSION"), plugin.display()))) } else { Err(missing.join("\n")) })?;
+    // OpenCode where setup installs it: a setup that stopped before this
+    // step must not read as installed. `--version` runs locally, so the
+    // check stays offline.
+    let oc = opencode_dir(c.home).join("opencode");
+    let oc_s = oc.to_string_lossy();
+    steps.record(if fs::metadata(&oc).map(|m| m.is_file()).unwrap_or(false) {
+        check_opencode(c.host, &oc_s)
+            .map(|_| Some(format!("opencode {OPENCODE_VERSION} {oc_s}")))
+            .map_err(|e| format!("opencode {OPENCODE_VERSION}: {oc_s}: {}", e.trim_end_matches("; run rts setup")))
+            .map_err(|e| format!("{e}; run rts setup"))
+    } else {
+        Err(format!("opencode {OPENCODE_VERSION}: not installed at {oc_s}; run rts setup"))
+    })?;
     steps.record(supervisor_step(c))?;
     for (name, path, fix) in [("rts", c.rts, "reinstall rts"), ("supervisor", c.supervisor, "reinstall rts, or rebuild it with scripts/build-patched-mvm-supervisor.sh")] {
         let p = path.to_string_lossy();
@@ -1104,7 +1117,8 @@ mod tests {
     /// Doctor passes; the image is not cached; a pull succeeds.
     fn mvm_ok(a: &[String]) -> io::Result<RunOutput> {
         Ok(match a.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-            ["doctor"] => out(0, "", ""),
+            // Scoped to prebuilt bundles: no host rust toolchain needed.
+            ["doctor", "--workflow", "bundle-run"] => out(0, "", ""),
             ["image", "inspect", _] => out(1, "", "not cached"),
             ["image", "pull", _] => out(0, "", ""),
             _ => panic!("unexpected mvm call {a:?}"),
@@ -1232,7 +1246,7 @@ mod tests {
                 "host /usr/bin/tar".into(),
                 "plain --version".into(),
                 "plain env sign".into(),
-                "mvm doctor".into(),
+                "mvm doctor --workflow bundle-run".into(),
                 format!("host {sup} --rts-vsock-drain-fix-version"),
                 format!("host {sup} --contract-version"),
                 format!("fetch {}", r.components.1.url),
@@ -1378,23 +1392,41 @@ mod tests {
 
         let s = r.seams(host_ok, plain_ok, mvm_cached);
         assert_eq!(r.run(check, &s).unwrap().len(), 4);
-        assert!(r.log().contains(&"mvm doctor".to_string()), "{:?}", r.log());
+        assert!(r.log().contains(&"mvm doctor --workflow bundle-run".to_string()), "{:?}", r.log());
         assert!(r.fetches().len() == 2, "{:?}", r.fetches());
+    }
+
+    #[test]
+    fn offline_check_fails_without_the_installed_opencode() {
+        // A setup that stopped before OpenCode must not read as installed:
+        // the app's offline check gates its Start button on this.
+        let r = SetupRig::new();
+        let offline = SetupOptions { check: true, offline: true };
+        let s = r.seams(host_ok, plain_ok, mvm_ok);
+        let e = r.run(offline, &s).unwrap_err();
+        let oc = opencode_dir(&r.home).join("opencode");
+        assert!(e.contains("opencode 2.2.2") && e.contains(&oc.display().to_string()), "{e}");
+        assert!(r.fetches().is_empty() && s.mvm.calls().is_empty());
     }
 
     #[test]
     fn offline_check_reads_only_the_installed_layout() {
         let r = SetupRig::new();
         let offline = SetupOptions { check: true, offline: true };
+        let oc = opencode_dir(&r.home).join("opencode");
+        fs::create_dir_all(oc.parent().unwrap()).unwrap();
+        fs::write(&oc, b"").unwrap();
         let s = r.seams(host_ok, plain_ok, mvm_ok);
         r.run(offline, &s).unwrap();
         assert!(s.mvm.calls().is_empty() && s.plain.calls().is_empty() && r.fetches().is_empty());
         let sup = r.supervisor.display().to_string();
+        let oc_s = oc.display().to_string();
         let programs: Vec<String> = s.host.calls().iter().map(|a| a[0].clone()).collect();
-        assert_eq!(programs, [sup.as_str(), sup.as_str(), "/usr/bin/codesign", "/usr/bin/codesign"]);
+        assert_eq!(programs, [oc_s.as_str(), sup.as_str(), sup.as_str(), "/usr/bin/codesign", "/usr/bin/codesign"]);
         let calls = s.host.calls();
-        assert_eq!(calls[2], ["/usr/bin/codesign", "--verify", "--strict", r.rts.to_str().unwrap()]);
-        assert_eq!(calls[3], ["/usr/bin/codesign", "--verify", "--strict", sup.as_str()]);
+        assert_eq!(calls[0], [oc_s.as_str(), "--version"]);
+        assert_eq!(calls[3], ["/usr/bin/codesign", "--verify", "--strict", r.rts.to_str().unwrap()]);
+        assert_eq!(calls[4], ["/usr/bin/codesign", "--verify", "--strict", sup.as_str()]);
 
         fs::remove_file(r.defaults.plugin_dir.join("index.ts")).unwrap();
         let s = r.seams(host_ok, plain_ok, mvm_ok);
