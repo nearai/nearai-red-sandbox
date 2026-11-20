@@ -100,6 +100,29 @@ impl Drop for EmbeddedInference {
 /// NEAR AI Cloud's production API base.
 pub const NEAR_BASE_URL: &str = "https://cloud-api.near.ai/v1";
 
+/// NEAR AI Cloud's staging API base.
+pub const NEAR_STAGING_BASE_URL: &str = "https://cloud-stg-api.near.ai/v1";
+
+/// Which NEAR AI Cloud deployment a session talks to. Each has its own API
+/// base and its own pinned compose list: a build trusted for one is never
+/// trusted for the other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NearEnvironment {
+    #[default]
+    Production,
+    Staging,
+}
+
+impl NearEnvironment {
+    /// The OpenAI-compatible API base, which also serves the attestation report.
+    pub fn base_url(self) -> &'static str {
+        match self {
+            Self::Production => NEAR_BASE_URL,
+            Self::Staging => NEAR_STAGING_BASE_URL,
+        }
+    }
+}
+
 /// Value for each model's `x-ironwire-route` request header.
 ///
 /// Required because the pinned IronWire revision otherwise chooses among an
@@ -155,8 +178,8 @@ fn prepare_home(supplied: Option<PathBuf>) -> Result<OwnedHome, String> {
                     if !meta.is_dir() {
                         return Err("inference: runtime home must be a directory".into());
                     }
-                    let mut entries = fs::read_dir(&dir)
-                        .map_err(|_| "inference: cannot inspect runtime home")?;
+                    let mut entries =
+                        fs::read_dir(&dir).map_err(|_| "inference: cannot inspect runtime home")?;
                     if entries.next().is_some() {
                         return Err("inference: runtime home is not empty".into());
                     }
@@ -255,12 +278,7 @@ fn run_worker(
     runtime.block_on(async {
         let proxy = match tokio::time::timeout(
             STARTUP_TIMEOUT,
-            ironwire_proxy::embed::start_with_options(
-                home.path(),
-                Some(0),
-                options,
-                |_, _| {},
-            ),
+            ironwire_proxy::embed::start_with_options(home.path(), Some(0), options, |_, _| {}),
         )
         .await
         {
@@ -384,6 +402,20 @@ mod tests {
                 "unrequested credential became available"
             );
         }
+    }
+
+    #[test]
+    fn near_environments_name_their_own_api_bases() {
+        assert_eq!(NearEnvironment::default(), NearEnvironment::Production);
+        assert_eq!(NearEnvironment::Production.base_url(), NEAR_BASE_URL);
+        assert_eq!(
+            NearEnvironment::Production.base_url(),
+            "https://cloud-api.near.ai/v1"
+        );
+        assert_eq!(
+            NearEnvironment::Staging.base_url(),
+            "https://cloud-stg-api.near.ai/v1"
+        );
     }
 
     #[test]
@@ -611,9 +643,24 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(rendered.contains("[capture]\nenabled = true\nbodies = true\nlogprobs = false\nreceipts = true\n"), "{rendered}");
-        assert!(rendered.contains("base_url = \"http://127.0.0.1:9999/v1\""), "{rendered}");
-        assert!(runtime_config(&["bad\n[backends]".into()], NEAR_BASE_URL, Capture::default()).is_err());
+        assert!(
+            rendered.contains(
+                "[capture]\nenabled = true\nbodies = true\nlogprobs = false\nreceipts = true\n"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("base_url = \"http://127.0.0.1:9999/v1\""),
+            "{rendered}"
+        );
+        assert!(
+            runtime_config(
+                &["bad\n[backends]".into()],
+                NEAR_BASE_URL,
+                Capture::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -656,7 +703,10 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(err.contains("inference: runtime home is not empty"), "{err}");
+        assert!(
+            err.contains("inference: runtime home is not empty"),
+            "{err}"
+        );
     }
 
     #[test]

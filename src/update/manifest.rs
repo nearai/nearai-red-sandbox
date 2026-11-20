@@ -71,11 +71,16 @@ pub fn verify(manifest: &[u8], signature: &[u8], key: &[u8; 32]) -> Result<Signe
     if let Some(min) = &m.manifest.minimum_supported
         && !is_version(min)
     {
-        return Err(format!("latest.json: minimum_supported {min:?} is not X.Y.Z"));
+        return Err(format!(
+            "latest.json: minimum_supported {min:?} is not X.Y.Z"
+        ));
     }
     let want = format!("rts-{latest}-aarch64-apple-darwin.tar.gz");
     if m.tarball.name != want {
-        return Err(format!("latest.json: tarball.name {:?} is not {want:?}", m.tarball.name));
+        return Err(format!(
+            "latest.json: tarball.name {:?} is not {want:?}",
+            m.tarball.name
+        ));
     }
     if !is_sha256(&m.tarball.sha256) {
         return Err("latest.json: tarball.sha256 is not 64 lowercase hex characters".into());
@@ -89,7 +94,10 @@ pub fn verify(manifest: &[u8], signature: &[u8], key: &[u8; 32]) -> Result<Signe
 /// `^[0-9]+\.[0-9]+\.[0-9]+$`.
 fn is_version(v: &str) -> bool {
     let parts: Vec<&str> = v.split('.').collect();
-    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn is_sha256(s: &str) -> bool {
@@ -209,12 +217,18 @@ mod tests {
             (GOOD.replace("0.2.0", "0.2"), "latest"),
             (GOOD.replace("\"0.1.0\"", "\"x\""), "minimum_supported"),
             (GOOD.replace("rts-0.2.0-", "rts-0.3.0-"), "tarball.name"),
-            (GOOD.replace("rts-0.2.0-aarch64-apple-darwin.tar.gz", "../rts.tar.gz"), "tarball.name"),
+            (
+                GOOD.replace("rts-0.2.0-aarch64-apple-darwin.tar.gz", "../rts.tar.gz"),
+                "tarball.name",
+            ),
             (GOOD.replace(A64, &A64.to_uppercase()), "tarball.sha256"),
             (GOOD.replace(A64, &A64[1..]), "tarball.sha256"),
             (GOOD.replace(B64, &B64.to_uppercase()), "install_sh.sha256"),
             (GOOD.replace(B64, &format!("{B64}b")), "install_sh.sha256"),
-            (GOOD.replace("2026-11-02T18:04:11Z", "yesterday"), "latest.json"),
+            (
+                GOOD.replace("2026-11-02T18:04:11Z", "yesterday"),
+                "latest.json",
+            ),
             (
                 GOOD.replace(
                     &format!(",\n  \"install_sh\": {{\n    \"sha256\": \"{B64}\"\n  }}"),
@@ -251,7 +265,10 @@ mod tests {
         let f = served(GOOD.as_bytes(), &sig(GOOD.as_bytes(), &key()));
         let m = fetch(&f, &public()).unwrap();
         assert_eq!(m.manifest.latest, "0.2.0");
-        assert_eq!(f.calls(), vec![MANIFEST_URL.to_string(), SIGNATURE_URL.to_string()]);
+        assert_eq!(
+            f.calls(),
+            vec![MANIFEST_URL.to_string(), SIGNATURE_URL.to_string()]
+        );
     }
 
     #[test]
@@ -283,7 +300,11 @@ mod tests {
         f.body("https://evil.example/latest.json", GOOD.as_bytes().to_vec());
         let e = fetch(&f, &public()).unwrap_err();
         assert!(e.contains("not allowed"), "{e}");
-        assert!(!f.calls().iter().any(|c| c.contains("evil")), "{:?}", f.calls());
+        assert!(
+            !f.calls().iter().any(|c| c.contains("evil")),
+            "{:?}",
+            f.calls()
+        );
     }
 
     #[test]

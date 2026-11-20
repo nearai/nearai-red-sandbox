@@ -32,6 +32,9 @@ pub struct LaunchSpec {
     pub tool_command: Option<Vec<String>>,
     pub ironwire: IronWireSetup,
     pub env: Vec<(String, String)>,
+    /// The NEAR AI deployment for attestation, its pinned compose list, and
+    /// inference. Staging needs `CredentialSource::Supplied` with a staging key.
+    pub near: inference::NearEnvironment,
 }
 
 /// Result of a completed session launch.
@@ -78,6 +81,7 @@ impl LaunchSpec {
             tool_command: None,
             ironwire: IronWireSetup::default(),
             env: std::env::vars().collect(),
+            near: inference::NearEnvironment::Production,
         })
     }
 }
@@ -271,8 +275,7 @@ fn resolve_and_attest(
                 let step = progress.step("sign-in", Live::Still);
                 step.ok("supplied NEAR AI key");
             }
-            let step = progress
-                .map(|p| p.step("attestation", Live::Decode(models.join(", "))));
+            let step = progress.map(|p| p.step("attestation", Live::Decode(models.join(", "))));
             let attested = attest_key(key.clone()).map_err(|error| refused(error.message()))?;
             let credentials = crate::sponsored::Credentials::new(
                 key.clone(),
@@ -299,8 +302,7 @@ fn resolve_and_attest(
                     "NEAR AI Cloud"
                 });
             }
-            let step = progress
-                .map(|p| p.step("attestation", Live::Decode(models.join(", "))));
+            let step = progress.map(|p| p.step("attestation", Live::Decode(models.join(", "))));
             let attested = match attest_key(credential.key.clone()) {
                 Ok(attested) => attested,
                 Err(attest::AttestationFailure::CredentialRefused { .. })
@@ -354,6 +356,7 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
         tool_command,
         ironwire,
         env,
+        near: _,
     } = spec;
     if initial_prompt.is_some() {
         // A source-built launcher paired with an older installed plugin must
@@ -471,15 +474,19 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                                 };
                                 match attest(snapshot.key).map(warn) {
                                     Ok(attested) => Ok(attested),
-                                    Err(attest::AttestationFailure::CredentialRefused { .. })
-                                        if snapshot.sponsored =>
-                                    {
-                                        brand::progress::message("Your sponsored API key is no longer available. Sign in to NEAR AI Cloud to continue.");
+                                    Err(attest::AttestationFailure::CredentialRefused {
+                                        ..
+                                    }) if snapshot.sponsored => {
+                                        brand::progress::message(
+                                            "Your sponsored API key is no longer available. Sign in to NEAR AI Cloud to continue.",
+                                        );
                                         // Reattest runs on the forwarder's blocking pool;
                                         // share any login already pending on its runtime.
                                         let next = tokio::runtime::Handle::current()
                                             .block_on(credentials.recover(snapshot.generation))?;
-                                        attest(next.key).map(warn).map_err(attest::AttestationFailure::message)
+                                        attest(next.key)
+                                            .map(warn)
+                                            .map_err(attest::AttestationFailure::message)
                                     }
                                     Err(error) => Err(error.message()),
                                 }
@@ -586,6 +593,8 @@ mod tests {
         assert_eq!(spec.initial_prompt.as_deref(), Some("hello"));
         assert!(spec.session_id.is_none());
         assert!(spec.tool_command.is_none());
+        // The CLI signs in natively, which is production only.
+        assert_eq!(spec.near, inference::NearEnvironment::Production);
 
         let no_net = LaunchSpec::from_cli(
             Some(&cfg_path),
@@ -976,7 +985,11 @@ mod tests {
         .unwrap();
         let snap = creds.snapshot().unwrap();
         assert!(!snap.sponsored);
-        let err = creds.recover(snap.generation).await.err().expect("recovery must fail");
+        let err = creds
+            .recover(snap.generation)
+            .await
+            .err()
+            .expect("recovery must fail");
         assert!(!err.is_empty());
     }
 }

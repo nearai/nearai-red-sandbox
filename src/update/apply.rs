@@ -27,7 +27,8 @@ pub struct UpdateOptions {
 
 pub const RELEASE_DOWNLOAD: &str = "https://github.com/nearai/nearai-red-sandbox/releases/download";
 pub const MAX_INSTALL_SH_BYTES: u64 = 64 << 10;
-pub const TEAM_REQUIREMENT: &str = r#"anchor apple generic and certificate leaf[subject.OU] = "KXSWJN7WY8""#;
+pub const TEAM_REQUIREMENT: &str =
+    r#"anchor apple generic and certificate leaf[subject.OU] = "KXSWJN7WY8""#;
 /// Each post-install check (codesign, `--version`).
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -47,7 +48,9 @@ impl Installer for BashInstaller {
             cmd.env_remove(k);
         }
         cmd.envs(set.iter().map(|(k, v)| (k, v)));
-        let status = cmd.status().map_err(|e| format!("running /bin/bash {}: {e}", script.display()))?;
+        let status = cmd
+            .status()
+            .map_err(|e| format!("running /bin/bash {}: {e}", script.display()))?;
         status
             .code()
             .ok_or_else(|| format!("/bin/bash {} was killed by a signal", script.display()))
@@ -91,10 +94,14 @@ pub fn run(o: &UpdateOptions, c: &UpdateContext) -> Result<Vec<String>, String> 
     match evaluate(current, &signed.manifest, c.channel.method()) {
         UpdateStatus::Available { .. } => {
             if o.check {
-                return Ok(vec![format!("rts {latest} is available (you have {current}): run rts update")]);
+                return Ok(vec![format!(
+                    "rts {latest} is available (you have {current}): run rts update"
+                )]);
             }
         }
-        UpdateStatus::Unsupported { minimum_supported, .. } => {
+        UpdateStatus::Unsupported {
+            minimum_supported, ..
+        } => {
             if o.check {
                 return Ok(vec![format!(
                     "rts {current} is older than the oldest supported release, {minimum_supported}, and may not work: run rts update to install {latest}"
@@ -103,7 +110,9 @@ pub fn run(o: &UpdateOptions, c: &UpdateContext) -> Result<Vec<String>, String> 
         }
         UpdateStatus::UpToDate => {
             if o.check {
-                return Ok(vec![format!("rts {current} is up to date (latest release {latest})")]);
+                return Ok(vec![format!(
+                    "rts {current} is up to date (latest release {latest})"
+                )]);
             }
             if !o.force {
                 return Err(format!(
@@ -135,7 +144,12 @@ pub fn run(o: &UpdateOptions, c: &UpdateContext) -> Result<Vec<String>, String> 
         .prefix("rts-update-")
         .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir_in(c.temp_dir)
-        .map_err(|e| format!("creating a private directory under {}: {e}", c.temp_dir.display()))?;
+        .map_err(|e| {
+            format!(
+                "creating a private directory under {}: {e}",
+                c.temp_dir.display()
+            )
+        })?;
     let path = stage.path().join("install.sh");
     std::fs::OpenOptions::new()
         .write(true)
@@ -147,17 +161,26 @@ pub fn run(o: &UpdateOptions, c: &UpdateContext) -> Result<Vec<String>, String> 
 
     // 6. Run it.
     let prefix_text = prefix.display().to_string();
-    (c.say)(&format!("installing rts {latest} over {current} to {prefix_text}"));
+    (c.say)(&format!(
+        "installing rts {latest} over {current} to {prefix_text}"
+    ));
     let set = [
         ("RTS_VERSION".to_string(), latest.to_string()),
         ("RTS_INSTALL_PREFIX".to_string(), prefix_text.clone()),
-        ("RTS_TARBALL_SHA256".to_string(), signed.tarball.sha256.clone()),
+        (
+            "RTS_TARBALL_SHA256".to_string(),
+            signed.tarball.sha256.clone(),
+        ),
     ];
     let status = c.installer.run(&path, &set, &["RTS_RELEASE_BASE"]);
     drop(stage);
     match status {
         Ok(0) => {}
-        Ok(n) => return Err(format!("install.sh for rts {latest} exited {n}; see its output above")),
+        Ok(n) => {
+            return Err(format!(
+                "install.sh for rts {latest} exited {n}; see its output above"
+            ));
+        }
         Err(e) => return Err(format!("install.sh for rts {latest}: {e}")),
     }
 
@@ -165,7 +188,9 @@ pub fn run(o: &UpdateOptions, c: &UpdateContext) -> Result<Vec<String>, String> 
     let rts = prefix.join("bin/rts");
     let rts_text = rts.display().to_string();
     let failed = |check: &str, detail: String| {
-        format!("rts {latest} was installed to {prefix_text} but {check} failed: {detail}; reinstall with the curl installer")
+        format!(
+            "rts {latest} was installed to {prefix_text} but {check} failed: {detail}; reinstall with the curl installer"
+        )
     };
     let argv = [
         "/usr/bin/codesign".to_string(),
@@ -174,33 +199,48 @@ pub fn run(o: &UpdateOptions, c: &UpdateContext) -> Result<Vec<String>, String> 
         format!("-R={TEAM_REQUIREMENT}"),
         rts_text.clone(),
     ];
-    let out = c
-        .host
-        .run(&argv, CHECK_TIMEOUT)
-        .map_err(|e| failed("the code signature check", format!("running /usr/bin/codesign: {e}")))?;
+    let out = c.host.run(&argv, CHECK_TIMEOUT).map_err(|e| {
+        failed(
+            "the code signature check",
+            format!("running /usr/bin/codesign: {e}"),
+        )
+    })?;
     if out.code != Some(0) {
         let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(failed(
             "the code signature check",
-            format!("/usr/bin/codesign exited {} ({detail})", exit_text(out.code, out.killed)),
+            format!(
+                "/usr/bin/codesign exited {} ({detail})",
+                exit_text(out.code, out.killed)
+            ),
         ));
     }
     let out = c
         .host
         .run(&[rts_text.clone(), "--version".to_string()], CHECK_TIMEOUT)
-        .map_err(|e| failed("the version check", format!("running {rts_text} --version: {e}")))?;
+        .map_err(|e| {
+            failed(
+                "the version check",
+                format!("running {rts_text} --version: {e}"),
+            )
+        })?;
     let reported = String::from_utf8_lossy(&out.stdout);
     let reported = reported.strip_suffix('\n').unwrap_or(&reported);
     let expected = format!("rts {latest}");
     if out.code != Some(0) || reported != expected {
         return Err(failed(
             "the version check",
-            format!("{rts_text} --version printed {reported:?} (exit {}), expected {expected:?}", exit_text(out.code, out.killed)),
+            format!(
+                "{rts_text} --version printed {reported:?} (exit {}), expected {expected:?}",
+                exit_text(out.code, out.killed)
+            ),
         ));
     }
 
     // 8.
-    Ok(vec![format!("rts updated from {current} to {latest} ({rts_text})")])
+    Ok(vec![format!(
+        "rts updated from {current} to {latest} ({rts_text})"
+    )])
 }
 
 fn exit_text(code: Option<i32>, killed: bool) -> String {
@@ -253,11 +293,15 @@ mod tests {
     use std::time::Duration;
 
     const INSTALL_SH: &[u8] = b"#!/bin/bash\necho fake\n";
-    const INSTALL_SH_URL: &str = "https://github.com/nearai/nearai-red-sandbox/releases/download/v0.2.0/install.sh";
+    const INSTALL_SH_URL: &str =
+        "https://github.com/nearai/nearai-red-sandbox/releases/download/v0.2.0/install.sh";
     const TARBALL_SHA: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
     fn sha256_hex(b: &[u8]) -> String {
-        Sha256::digest(b).iter().map(|b| format!("{b:02x}")).collect()
+        Sha256::digest(b)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     fn key() -> SigningKey {
@@ -275,7 +319,12 @@ mod tests {
     fn serving(served: &[u8]) -> FakeFetch {
         let text = manifest_text("0.2.0");
         let f = FakeFetch::new();
-        f.body(SIGNATURE_URL, STANDARD.encode(key().sign(text.as_bytes()).to_bytes()).into_bytes());
+        f.body(
+            SIGNATURE_URL,
+            STANDARD
+                .encode(key().sign(text.as_bytes()).to_bytes())
+                .into_bytes(),
+        );
         f.body(MANIFEST_URL, text.into_bytes());
         f.body(INSTALL_SH_URL, served.to_vec());
         f
@@ -296,7 +345,12 @@ mod tests {
     }
 
     impl Installer for FakeInstaller {
-        fn run(&self, script: &Path, set: &[(String, String)], remove: &[&str]) -> Result<i32, String> {
+        fn run(
+            &self,
+            script: &Path,
+            set: &[(String, String)],
+            remove: &[&str],
+        ) -> Result<i32, String> {
             self.events.lock().unwrap().push("installer".into());
             self.calls.lock().unwrap().push(Call {
                 script: script.to_path_buf(),
@@ -322,7 +376,12 @@ mod tests {
             } else {
                 (0, self.version.clone().into_bytes())
             };
-            Ok(RunOutput { code: Some(code), stdout, stderr: b"detail".to_vec(), killed: false })
+            Ok(RunOutput {
+                code: Some(code),
+                stdout,
+                stderr: b"detail".to_vec(),
+                killed: false,
+            })
         }
     }
 
@@ -350,13 +409,23 @@ mod tests {
             std::fs::create_dir(&temp).unwrap();
             let events = Arc::new(Mutex::new(Vec::new()));
             Rig {
-                channel: Channel::Release { prefix: prefix.clone() },
+                channel: Channel::Release {
+                    prefix: prefix.clone(),
+                },
                 prefix,
                 temp,
                 _dir: dir,
                 fetch: serving(INSTALL_SH),
-                host: FakeHost { codesign: 0, version: "rts 0.2.0\n".into(), calls: Mutex::new(Vec::new()) },
-                installer: FakeInstaller { code: 0, calls: Mutex::new(Vec::new()), events: Arc::clone(&events) },
+                host: FakeHost {
+                    codesign: 0,
+                    version: "rts 0.2.0\n".into(),
+                    calls: Mutex::new(Vec::new()),
+                },
+                installer: FakeInstaller {
+                    code: 0,
+                    calls: Mutex::new(Vec::new()),
+                    events: Arc::clone(&events),
+                },
                 events,
                 current: "0.1.0".into(),
                 key: Some(key().verifying_key().to_bytes()),
@@ -392,16 +461,31 @@ mod tests {
         }
     }
 
-    const PLAIN: UpdateOptions = UpdateOptions { check: false, force: false };
-    const CHECK: UpdateOptions = UpdateOptions { check: true, force: false };
-    const FORCE: UpdateOptions = UpdateOptions { check: false, force: true };
+    const PLAIN: UpdateOptions = UpdateOptions {
+        check: false,
+        force: false,
+    };
+    const CHECK: UpdateOptions = UpdateOptions {
+        check: true,
+        force: false,
+    };
+    const FORCE: UpdateOptions = UpdateOptions {
+        check: false,
+        force: true,
+    };
 
     #[test]
     fn homebrew_is_refused_with_the_brew_command() {
         let mut r = Rig::new();
         r.channel = Channel::Homebrew;
-        assert_eq!(r.run(PLAIN).unwrap_err(), "rts was installed with Homebrew: run brew upgrade rts");
-        assert_eq!(r.run(CHECK).unwrap_err(), "rts was installed with Homebrew: run brew upgrade rts");
+        assert_eq!(
+            r.run(PLAIN).unwrap_err(),
+            "rts was installed with Homebrew: run brew upgrade rts"
+        );
+        assert_eq!(
+            r.run(CHECK).unwrap_err(),
+            "rts was installed with Homebrew: run brew upgrade rts"
+        );
         assert!(r.fetch.calls().is_empty());
     }
 
@@ -409,9 +493,15 @@ mod tests {
     fn a_keyless_build_is_refused() {
         let mut r = Rig::new();
         r.key = None;
-        assert_eq!(r.run(PLAIN).unwrap_err(), "this build has no update key; install a release");
+        assert_eq!(
+            r.run(PLAIN).unwrap_err(),
+            "this build has no update key; install a release"
+        );
         r.channel = Channel::Source;
-        assert_eq!(r.run(CHECK).unwrap_err(), "this build has no update key; install a release");
+        assert_eq!(
+            r.run(CHECK).unwrap_err(),
+            "this build has no update key; install a release"
+        );
         assert!(r.fetch.calls().is_empty());
     }
 
@@ -430,13 +520,19 @@ mod tests {
         let r = Rig::new();
         let lines = r.run(CHECK).unwrap();
         assert!(lines.iter().any(|l| l.contains("0.2.0")), "{lines:?}");
-        assert_eq!(r.fetch.calls(), vec![MANIFEST_URL.to_string(), SIGNATURE_URL.to_string()]);
+        assert_eq!(
+            r.fetch.calls(),
+            vec![MANIFEST_URL.to_string(), SIGNATURE_URL.to_string()]
+        );
         assert!(r.installs().is_empty());
         assert!(r.host_calls().is_empty());
 
         let mut r = Rig::new();
         r.current = "0.2.0".into();
-        assert_eq!(r.run(CHECK).unwrap(), vec!["rts 0.2.0 is up to date (latest release 0.2.0)".to_string()]);
+        assert_eq!(
+            r.run(CHECK).unwrap(),
+            vec!["rts 0.2.0 is up to date (latest release 0.2.0)".to_string()]
+        );
         assert!(r.installs().is_empty());
     }
 
@@ -506,7 +602,10 @@ mod tests {
             c.set,
             vec![
                 ("RTS_VERSION".to_string(), "0.2.0".to_string()),
-                ("RTS_INSTALL_PREFIX".to_string(), r.prefix.display().to_string()),
+                (
+                    "RTS_INSTALL_PREFIX".to_string(),
+                    r.prefix.display().to_string()
+                ),
                 ("RTS_TARBALL_SHA256".to_string(), TARBALL_SHA.to_string()),
             ]
         );
@@ -514,11 +613,18 @@ mod tests {
         assert_eq!(c.bytes, INSTALL_SH);
         assert_eq!(c.script.file_name().unwrap(), "install.sh");
         assert!(c.script.starts_with(&r.temp));
-        assert!(!c.script.parent().unwrap().exists(), "the stage directory is left behind");
+        assert!(
+            !c.script.parent().unwrap().exists(),
+            "the stage directory is left behind"
+        );
         assert_eq!(std::fs::read_dir(&r.temp).unwrap().count(), 0);
         assert_eq!(
             r.fetch.calls(),
-            vec![MANIFEST_URL.to_string(), SIGNATURE_URL.to_string(), INSTALL_SH_URL.to_string()]
+            vec![
+                MANIFEST_URL.to_string(),
+                SIGNATURE_URL.to_string(),
+                INSTALL_SH_URL.to_string()
+            ]
         );
     }
 
@@ -527,7 +633,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         struct Modes(Mutex<Option<(u32, u32)>>);
         impl Installer for Modes {
-            fn run(&self, script: &Path, _: &[(String, String)], _: &[&str]) -> Result<i32, String> {
+            fn run(
+                &self,
+                script: &Path,
+                _: &[(String, String)],
+                _: &[&str],
+            ) -> Result<i32, String> {
                 let m = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
                 *self.0.lock().unwrap() = Some((m(script.parent().unwrap()), m(script)));
                 Ok(0)
@@ -579,7 +690,10 @@ mod tests {
             ]
         );
         assert_eq!(calls[1], vec![r.rts(), "--version".to_string()]);
-        assert_eq!(TEAM_REQUIREMENT, r#"anchor apple generic and certificate leaf[subject.OU] = "KXSWJN7WY8""#);
+        assert_eq!(
+            TEAM_REQUIREMENT,
+            r#"anchor apple generic and certificate leaf[subject.OU] = "KXSWJN7WY8""#
+        );
 
         r.host.codesign = 3;
         r.host.calls.lock().unwrap().clear();
@@ -607,30 +721,56 @@ mod tests {
     fn success_names_both_versions() {
         let r = Rig::new();
         let lines = r.run(PLAIN).unwrap();
-        assert_eq!(lines.last().unwrap(), &format!("rts updated from 0.1.0 to 0.2.0 ({})", r.rts()));
+        assert_eq!(
+            lines.last().unwrap(),
+            &format!("rts updated from 0.1.0 to 0.2.0 ({})", r.rts())
+        );
     }
 
     #[test]
     fn the_version_being_installed_is_announced_first() {
-        let announce = |r: &Rig, current: &str| format!("say: installing rts 0.2.0 over {current} to {}", r.prefix.display());
+        let announce = |r: &Rig, current: &str| {
+            format!(
+                "say: installing rts 0.2.0 over {current} to {}",
+                r.prefix.display()
+            )
+        };
         let r = Rig::new();
         r.run(PLAIN).unwrap();
-        assert_eq!(*r.events.lock().unwrap(), vec![announce(&r, "0.1.0"), "installer".to_string()]);
+        assert_eq!(
+            *r.events.lock().unwrap(),
+            vec![announce(&r, "0.1.0"), "installer".to_string()]
+        );
 
         let mut r = Rig::new();
         r.current = "0.2.0".into();
         r.run(FORCE).unwrap();
-        assert_eq!(*r.events.lock().unwrap(), vec![announce(&r, "0.2.0"), "installer".to_string()]);
+        assert_eq!(
+            *r.events.lock().unwrap(),
+            vec![announce(&r, "0.2.0"), "installer".to_string()]
+        );
     }
 
     #[test]
     fn a_bad_manifest_signature_names_the_url_and_runs_nothing() {
         let r = Rig::new();
-        r.fetch.body(SIGNATURE_URL, STANDARD.encode(SigningKey::from_bytes(&[8; 32]).sign(manifest_text("0.2.0").as_bytes()).to_bytes()).into_bytes());
+        r.fetch.body(
+            SIGNATURE_URL,
+            STANDARD
+                .encode(
+                    SigningKey::from_bytes(&[8; 32])
+                        .sign(manifest_text("0.2.0").as_bytes())
+                        .to_bytes(),
+                )
+                .into_bytes(),
+        );
         let e = r.run(PLAIN).unwrap_err();
         assert!(e.contains(MANIFEST_URL), "{e}");
         assert!(e.contains("signature"), "{e}");
         assert!(r.installs().is_empty());
-        assert_eq!(r.fetch.calls(), vec![MANIFEST_URL.to_string(), SIGNATURE_URL.to_string()]);
+        assert_eq!(
+            r.fetch.calls(),
+            vec![MANIFEST_URL.to_string(), SIGNATURE_URL.to_string()]
+        );
     }
 }

@@ -661,23 +661,23 @@ async fn handle_signature(state: &Arc<State>, req: Request<Incoming>, chat_id: &
             }
         };
         use secrecy::ExposeSecret;
-        let mut auth = match HeaderValue::from_str(&format!(
-            "Bearer {}",
-            snapshot.key.expose_secret()
-        )) {
-            Ok(auth) => auth,
-            Err(_) => {
-                return local(
-                    StatusCode::UNAUTHORIZED,
-                    "Invalid NEAR AI credential; run rts login",
-                );
-            }
-        };
+        let mut auth =
+            match HeaderValue::from_str(&format!("Bearer {}", snapshot.key.expose_secret())) {
+                Ok(auth) => auth,
+                Err(_) => {
+                    return local(
+                        StatusCode::UNAUTHORIZED,
+                        "Invalid NEAR AI credential; run rts login",
+                    );
+                }
+            };
         auth.set_sensitive(true);
         headers.insert(AUTHORIZATION, auth);
     }
-    let resp = match send_pinned(state, || state.client.get(&url).headers(headers.clone()).send())
-        .await
+    let resp = match send_pinned(state, || {
+        state.client.get(&url).headers(headers.clone()).send()
+    })
+    .await
     {
         Ok(resp) => resp,
         Err(reply) => return *reply,
@@ -693,11 +693,7 @@ async fn handle_signature(state: &Arc<State>, req: Request<Incoming>, chat_id: &
             );
         }
     };
-    let mut out = Response::new(
-        Full::new(body)
-            .map_err(|never| match never {})
-            .boxed(),
-    );
+    let mut out = Response::new(Full::new(body).map_err(|never| match never {}).boxed());
     *out.status_mut() = status;
     if let Some(ct) = content_type {
         out.headers_mut().insert(CONTENT_TYPE, ct);
@@ -3250,12 +3246,8 @@ mod tests {
 
     #[test]
     fn a_signature_fetch_for_a_relayed_completion_is_relayed_with_the_real_key() {
-        let reply = |_req: &Seen| {
-            Answer::Whole(
-                200,
-                br#"{"id":"chatcmpl-abc","choices":[]}"#.to_vec(),
-            )
-        };
+        let reply =
+            |_req: &Seen| Answer::Whole(200, br#"{"id":"chatcmpl-abc","choices":[]}"#.to_vec());
         let up = upstream(|_| "a", false, reply);
         let keys = crate::sponsored::Credentials::new(
             "real-nearai-secret".to_string().into(),
@@ -3289,7 +3281,9 @@ mod tests {
             .find(|r| r.head.contains("GET /v1/signature/chatcmpl-abc?model=m "))
             .expect("signature fetch with query string must reach upstream");
         assert!(
-            relayed.head.contains("authorization: Bearer real-nearai-secret"),
+            relayed
+                .head
+                .contains("authorization: Bearer real-nearai-secret"),
             "{}",
             relayed.head
         );

@@ -80,7 +80,8 @@ impl Terminal {
     /// characters are dropped so the title cannot end the escape early.
     pub fn set_title(&mut self, title: &str) {
         let clean: String = title.chars().filter(|c| !c.is_control()).collect();
-        self.output_queue.extend_from_slice(format!("\x1b]0;{clean}\x07").as_bytes());
+        self.output_queue
+            .extend_from_slice(format!("\x1b]0;{clean}\x07").as_bytes());
     }
 
     /// Called only after readiness verification. TCSANOW preserves queued
@@ -375,8 +376,12 @@ mod tests {
         let (reader, _writer) = UnixStream::pair().unwrap();
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "printf child"]);
-        let (mut child, mut terminal) =
-            Terminal::spawn_with_io(&mut command, reader.into(), File::create(&out).unwrap().into()).unwrap();
+        let (mut child, mut terminal) = Terminal::spawn_with_io(
+            &mut command,
+            reader.into(),
+            File::create(&out).unwrap().into(),
+        )
+        .unwrap();
         // Control characters cannot end the escape early or inject another.
         terminal.set_title("NEAR AI Red\x07\x1b]0;evil SandBox");
         // Darwin holds an exiting child until its terminal output drains.
@@ -394,7 +399,11 @@ mod tests {
         let written = std::fs::read(&out).unwrap();
         std::fs::remove_dir_all(d).unwrap();
         let expected: &[u8] = b"\x1b]0;NEAR AI Red]0;evil SandBox\x07";
-        assert!(written.starts_with(expected), "{:?}", String::from_utf8_lossy(&written));
+        assert!(
+            written.starts_with(expected),
+            "{:?}",
+            String::from_utf8_lossy(&written)
+        );
         assert!(String::from_utf8_lossy(&written).contains("child"));
     }
 
@@ -660,7 +669,11 @@ mod tests {
         assert!(text.contains(FOOTER), "footer missing; screen text: {text}");
         // rts set the title first; with terminal.title off opencode sets none
         // (at most the empty title its renderer writes on exit).
-        assert_eq!(titles.first().map(String::as_str), Some(TERMINAL_TITLE), "{titles:?}");
+        assert_eq!(
+            titles.first().map(String::as_str),
+            Some(TERMINAL_TITLE),
+            "{titles:?}"
+        );
         assert!(
             titles.iter().all(|t| t == TERMINAL_TITLE || t.is_empty()),
             "{titles:?}"
@@ -669,14 +682,25 @@ mod tests {
         // pewter textMuted and body text its TOP (opencode's default theme
         // has neither), on the terminal's own background.
         let raw = String::from_utf8_lossy(&output);
-        assert!(raw.contains("\x1b[38;2;128;128;136m\x1b[49magents"), "theme textMuted missing");
-        assert!(raw.contains("\x1b[38;2;233;231;225m\x1b[49mctrl+p"), "theme text missing");
+        assert!(
+            raw.contains("\x1b[38;2;128;128;136m\x1b[49magents"),
+            "theme textMuted missing"
+        );
+        assert!(
+            raw.contains("\x1b[38;2;233;231;225m\x1b[49mctrl+p"),
+            "theme text missing"
+        );
         // The footer is drawn in sand, with "attested" in NEAR AI Red.
         assert!(
-            raw.contains("\x1b[38;2;161;151;127m\x1b[49mNEAR AI Red · SandBox · test-no-inference · "),
+            raw.contains(
+                "\x1b[38;2;161;151;127m\x1b[49mNEAR AI Red · SandBox · test-no-inference · "
+            ),
             "footer not in sand"
         );
-        assert!(raw.contains("\x1b[38;2;235;25;36m\x1b[49mattested"), "attested not in red");
+        assert!(
+            raw.contains("\x1b[38;2;235;25;36m\x1b[49mattested"),
+            "attested not in red"
+        );
         eprintln!("footer found; title escapes: {titles:?}");
         if let Ok(dump) = std::env::var("RTS_PTY_DUMP") {
             std::fs::write(dump, &output).unwrap();
@@ -708,7 +732,8 @@ mod tests {
                         end += 1;
                     }
                     let body = String::from_utf8_lossy(&output[start..end]);
-                    if let Some(title) = body.strip_prefix("0;").or_else(|| body.strip_prefix("2;")) {
+                    if let Some(title) = body.strip_prefix("0;").or_else(|| body.strip_prefix("2;"))
+                    {
                         titles.push(title.to_string());
                     }
                     i = end + if output.get(end) == Some(&0x07) { 1 } else { 2 };

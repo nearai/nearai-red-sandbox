@@ -10,11 +10,23 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
-use super::{CREASE, DEFBG, Depth, FRONT, INK, PEWTER, PILE, RED, RESET, Rgb, S0, S1, S2, SIDE, TOP, WHITE};
+use super::{
+    CREASE, DEFBG, Depth, FRONT, INK, PEWTER, PILE, RED, RESET, Rgb, S0, S1, S2, SIDE, TOP, WHITE,
+};
 
 const MARK: [&str; 12] = [
-    "....RRRR....", "...RRRRR....", "..RRRR####..", "..RR..#####.", "##RR.....###", "##RR.....###",
-    "###.....####", "###.....####", ".#####..##..", "..########..", "....#####...", "....####....",
+    "....RRRR....",
+    "...RRRRR....",
+    "..RRRR####..",
+    "..RR..#####.",
+    "##RR.....###",
+    "##RR.....###",
+    "###.....####",
+    "###.....####",
+    ".#####..##..",
+    "..########..",
+    "....#####...",
+    "....####....",
 ];
 const WM: [&str; 9] = [
     "110111100001111100000111110011011110000022000022000222222000000000000022",
@@ -41,7 +53,13 @@ pub(crate) fn mark() -> &'static [&'static str; 12] {
 }
 
 fn clamp(v: f64, a: f64, b: f64) -> f64 {
-    if v < a { a } else if v > b { b } else { v }
+    if v < a {
+        a
+    } else if v > b {
+        b
+    } else {
+        v
+    }
 }
 
 fn ease(t: f64) -> f64 {
@@ -53,11 +71,19 @@ fn sst(a: f64, b: f64, x: f64) -> f64 {
 }
 
 fn mix(a: Rgb, b: Rgb, t: f64) -> Rgb {
-    Rgb(a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t, a.2 + (b.2 - a.2) * t)
+    Rgb(
+        a.0 + (b.0 - a.0) * t,
+        a.1 + (b.1 - a.1) * t,
+        a.2 + (b.2 - a.2) * t,
+    )
 }
 
 fn sand(b: f64) -> Rgb {
-    if b < 0.5 { mix(S0, S1, b * 2.0) } else { mix(S1, S2, (b - 0.5) * 2.0) }
+    if b < 0.5 {
+        mix(S0, S1, b * 2.0)
+    } else {
+        mix(S1, S2, (b - 0.5) * 2.0)
+    }
 }
 
 /// Nearest of four fixed sand shades, to keep the terminal's glyph cache small.
@@ -67,7 +93,10 @@ fn sand_q(b: f64) -> Rgb {
 
 /// The prototype's integer hash, with Python's 32-bit masking of negative inputs.
 fn hash2(i: i64, j: i64) -> f64 {
-    let h = (i.wrapping_mul(374_761_393).wrapping_add(j.wrapping_mul(668_265_263)) as u64) & 0xFFFF_FFFF;
+    let h = (i
+        .wrapping_mul(374_761_393)
+        .wrapping_add(j.wrapping_mul(668_265_263)) as u64)
+        & 0xFFFF_FFFF;
     let h = ((h ^ (h >> 13)).wrapping_mul(1_274_126_177)) & 0xFFFF_FFFF;
     (h ^ (h >> 16)) as f64 / 4_294_967_296.0
 }
@@ -126,7 +155,11 @@ impl Splash {
         if !full && (cols < 52 || rows < 16) {
             return None;
         }
-        let (width, height, fx) = if full { (80, 23, 32) } else { (cols.min(60), 14, 7) };
+        let (width, height, fx) = if full {
+            (80, 23, 32)
+        } else {
+            (cols.min(60), 14, 7)
+        };
         let mut sp = Splash {
             full,
             width,
@@ -148,21 +181,33 @@ impl Splash {
             for (y, row) in WM.iter().enumerate() {
                 for (x, ch) in row.chars().enumerate() {
                     if ch != '0' {
-                        sp.put(4 + x as i64, 28 + y as i64, if ch == '1' { WHITE } else { RED });
+                        sp.put(
+                            4 + x as i64,
+                            28 + y as i64,
+                            if ch == '1' { WHITE } else { RED },
+                        );
                     }
                 }
             }
             sp.place(20, &[("Cybersecurity Program", None)], None);
             sp.place(22, &[("S A N D B O X", Some(PEWTER))], None);
             sp.center = (40.0, 22.0);
-            sp.boxes = vec![(0, 13, 25, 55), (14, 18, 3, 76), (20, 20, 28, 52), (22, 22, 30, 50)];
+            sp.boxes = vec![
+                (0, 13, 25, 55),
+                (14, 18, 3, 76),
+                (20, 20, 28, 52),
+                (22, 22, 30, 50),
+            ];
         } else {
             let c = (fx + sp.s + 3) as usize;
             sp.place(5, &[("near ", None), ("AI Red", Some(RED))], Some(c));
             sp.place(7, &[("Cybersecurity Program", None)], Some(c));
             sp.place(9, &[("S A N D B O X", Some(PEWTER))], Some(c));
             sp.center = ((fx + 10) as f64, 14.0);
-            sp.boxes = vec![(0, 13, 1, (fx + sp.s + 2) as usize), (4, 10, c - 1, width - 1)];
+            sp.boxes = vec![
+                (0, 13, 1, (fx + sp.s + 2) as usize),
+                (4, 10, c - 1, width - 1),
+            ];
         }
         Some(sp)
     }
@@ -204,7 +249,11 @@ impl Splash {
         for (j, row) in MARK.iter().enumerate() {
             for (i, ch) in row.chars().enumerate() {
                 if ch != '.' {
-                    self.put(fx + 4 + i as i64, fy + 4 + j as i64, if ch == 'R' { RED } else { INK });
+                    self.put(
+                        fx + 4 + i as i64,
+                        fy + 4 + j as i64,
+                        if ch == 'R' { RED } else { INK },
+                    );
                 }
             }
         }
@@ -224,7 +273,9 @@ impl Splash {
     }
 
     fn quiet(&self, r: usize, c: usize) -> bool {
-        self.boxes.iter().any(|&(r0, r1, c0, c1)| (r0..=r1).contains(&r) && (c0..=c1).contains(&c))
+        self.boxes
+            .iter()
+            .any(|&(r0, r1, c0, c1)| (r0..=r1).contains(&r) && (c0..=c1).contains(&c))
     }
 
     /// Storm density, the clearing around the lockup, and the drift at the cube's base.
@@ -248,7 +299,11 @@ impl Splash {
         if k < 48.0 {
             d
         } else if k < 144.0 {
-            settled(sst(0.0, 0.6, ease((k - 48.0) / 96.0) * 1.6 - dist / (49.0 * self.f) * 0.9))
+            settled(sst(
+                0.0,
+                0.6,
+                ease((k - 48.0) / 96.0) * 1.6 - dist / (49.0 * self.f) * 0.9,
+            ))
         } else {
             settled(1.0)
         }
@@ -260,7 +315,9 @@ impl Splash {
             .map(|xx| {
                 let x = (xx as f64 + 0.5) / 2.0;
                 let mut h = g1(x, fx - 2.0, 3.5, 3.4) + g1(x, fx + s + 1.5, 4.5, 5.0);
-                h += 1.3 * sst(fx - d - 4.0, fx - d + 2.0, x) * (1.0 - sst(fx + s + 4.0, fx + s + 13.0, x));
+                h += 1.3
+                    * sst(fx - d - 4.0, fx - d + 2.0, x)
+                    * (1.0 - sst(fx + s + 4.0, fx + s + 13.0, x));
                 h += 0.7 * (vn(x * 0.55, 3.3) - 0.5);
                 (h * a).max(0.0)
             })
@@ -272,7 +329,11 @@ impl Splash {
     pub fn frame(&self, k: usize, depth: Depth) -> Vec<String> {
         let kf = k as f64;
         let t = kf / 24.0;
-        let a = if kf < 48.0 { 0.45 + 0.15 * kf / 48.0 } else { 0.6 + 0.4 * ease(((kf - 48.0) / 96.0).min(1.0)) };
+        let a = if kf < 48.0 {
+            0.45 + 0.15 * kf / 48.0
+        } else {
+            0.6 + 0.4 * ease(((kf - 48.0) / 96.0).min(1.0))
+        };
         let hc = self.piles(a);
         let base_y = (self.fy + self.s) as f64;
         let (lc, lr) = (self.width / 2 + 1, self.height / 2 + 1);
@@ -287,7 +348,10 @@ impl Splash {
             })
             .collect();
         let dens = |fx: f64, fy: f64| {
-            let (fx, fy) = (clamp(fx, 0.0, lc as f64 - 1.001), clamp(fy, 0.0, lr as f64 - 1.001));
+            let (fx, fy) = (
+                clamp(fx, 0.0, lc as f64 - 1.001),
+                clamp(fy, 0.0, lr as f64 - 1.001),
+            );
             let (i, j) = (fx as usize, fy as usize);
             let (tx, ty) = (fx - i as f64, fy - j as f64);
             lat[j][i] * (1.0 - tx) * (1.0 - ty)
@@ -310,7 +374,10 @@ impl Splash {
                 for dy in 0..4 {
                     for dx in 0..2 {
                         let (xx, yy) = ((2 * c + dx) as i64, (4 * r + dy) as i64);
-                        let dd = dens((xx as f64 + 0.5) / 4.0 - 0.25, (yy as f64 + 0.5) / 8.0 - 0.125);
+                        let dd = dens(
+                            (xx as f64 + 0.5) / 4.0 - 0.25,
+                            (yy as f64 + 0.5) / 8.0 - 0.125,
+                        );
                         let shift = (t * (30.0 + 34.0 * hash2(yy, 77))) as i64;
                         if hash2(xx + shift, yy) < dd * 1.05 - 0.04 {
                             ns += 1;
@@ -320,7 +387,8 @@ impl Splash {
                             let (y, top_y) = ((yy as f64 + 0.5) / 2.0, base_y - h);
                             if top_y <= y
                                 && y < base_y + 1.2
-                                && hash2(xx * 3 + 11, yy * 7 + 5) < 0.5 + 0.45 * clamp((y - top_y) / 2.5, 0.0, 1.0)
+                                && hash2(xx * 3 + 11, yy * 7 + 5)
+                                    < 0.5 + 0.45 * clamp((y - top_y) / 2.5, 0.0, 1.0)
                             {
                                 npile += 1;
                             }
@@ -338,14 +406,21 @@ impl Splash {
                     let dl = dens((c as f64 - 1.0) / 2.0, (r as f64 - 1.0) / 2.0);
                     let b = clamp(0.22 + 0.62 * d + 0.9 * (d - dl), 0.0, 1.0);
                     match under {
-                        Some(u) if d < 0.6 => {
-                            (depth.fg(Some(S1)) + &depth.bg(u), if ns + npile < 5 { '░' } else { '▒' })
-                        }
-                        _ => (depth.fg(Some(sand_q(b))) + DEFBG, GRAINS[(ns + npile).min(8)]),
+                        Some(u) if d < 0.6 => (
+                            depth.fg(Some(S1)) + &depth.bg(u),
+                            if ns + npile < 5 { '░' } else { '▒' },
+                        ),
+                        _ => (
+                            depth.fg(Some(sand_q(b))) + DEFBG,
+                            GRAINS[(ns + npile).min(8)],
+                        ),
                     }
                 } else if npile > 0 {
                     match under {
-                        Some(u) => (depth.fg(Some(PILE)) + &depth.bg(u), if npile < 5 { '░' } else { '▒' }),
+                        Some(u) => (
+                            depth.fg(Some(PILE)) + &depth.bg(u),
+                            if npile < 5 { '░' } else { '▒' },
+                        ),
                         None => (depth.fg(Some(PILE)) + DEFBG, GRAINS[npile]),
                     }
                 } else if let Some(&(g, colour)) = tx {
@@ -396,7 +471,12 @@ fn step_at(e: Duration) -> usize {
 /// Play the splash: frames are chosen by wall-clock time, so a slow terminal
 /// drops frames instead of stretching the splash; a key skips to the final
 /// frame. The cursor is hidden while drawing and shown again on every exit.
-pub fn play(out: &mut dyn Write, keys: &mut dyn Keys, sp: &Splash, depth: Depth) -> io::Result<Ended> {
+pub fn play(
+    out: &mut dyn Write,
+    keys: &mut dyn Keys,
+    sp: &Splash,
+    depth: Depth,
+) -> io::Result<Ended> {
     let start = Instant::now();
     let mut drawn = false;
     let mut draw = |out: &mut dyn Write, k: usize| -> io::Result<()> {
@@ -429,7 +509,11 @@ pub fn play(out: &mut dyn Write, keys: &mut dyn Keys, sp: &Splash, depth: Depth)
                 None => {}
             }
             let e = start.elapsed();
-            k = if e >= DURATION { LAST_STEP } else { step_at(e).max(k + 1).min(LAST_STEP) };
+            k = if e >= DURATION {
+                LAST_STEP
+            } else {
+                step_at(e).max(k + 1).min(LAST_STEP)
+            };
         }
     })();
     // Leave the final frame on screen, the cursor on the line below it.
@@ -469,7 +553,11 @@ impl Default for StdinKeys {
 
 impl Keys for StdinKeys {
     fn wait(&mut self, timeout: Duration) -> Option<bool> {
-        let mut fds = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
+        let mut fds = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
         // SAFETY: one pollfd we own.
         let ready = unsafe { libc::poll(&mut fds, 1, ms) };
@@ -511,7 +599,9 @@ pub fn show(wanted: bool, depth: Depth) -> Result<(), String> {
     let ended = play(&mut io::stdout().lock(), &mut keys, &sp, depth);
     drop(keys);
     match ended {
-        Ok(Ended::Interrupted) => Err("interrupted (Ctrl-C) during the splash; nothing was started".into()),
+        Ok(Ended::Interrupted) => {
+            Err("interrupted (Ctrl-C) during the splash; nothing was started".into())
+        }
         _ => Ok(()),
     }
 }
@@ -522,16 +612,30 @@ mod tests {
     use super::*;
 
     fn text_rows(rows: &[String]) -> Vec<String> {
-        rows.iter().map(|r| strip_escapes(r).trim_start_matches('\r').to_string()).collect()
+        rows.iter()
+            .map(|r| strip_escapes(r).trim_start_matches('\r').to_string())
+            .collect()
     }
 
     #[test]
     fn hash_and_noise_match_the_prototype() {
         // Values from scripts/splash/sandbox_demo.py.
         assert_eq!(hash2(0, 0), 0.0);
-        assert!((hash2(3, 5) - 0.09490608680061996).abs() < 1e-12, "{}", hash2(3, 5));
-        assert!((hash2(-2, 7) - 0.4271658475045115).abs() < 1e-12, "{}", hash2(-2, 7));
-        assert!((fbm(1.3, -0.7, 3) - 0.4434597246656345).abs() < 1e-12, "{}", fbm(1.3, -0.7, 3));
+        assert!(
+            (hash2(3, 5) - 0.09490608680061996).abs() < 1e-12,
+            "{}",
+            hash2(3, 5)
+        );
+        assert!(
+            (hash2(-2, 7) - 0.4271658475045115).abs() < 1e-12,
+            "{}",
+            hash2(-2, 7)
+        );
+        assert!(
+            (fbm(1.3, -0.7, 3) - 0.4434597246656345).abs() < 1e-12,
+            "{}",
+            fbm(1.3, -0.7, 3)
+        );
     }
 
     #[test]
@@ -555,8 +659,15 @@ mod tests {
         assert!(rows[6].contains(&Depth::TrueColor.fg(Some(RED))) && rows[6].contains(&front));
         // Wordmark: cell rows 14..=18, white "near" and red "AI Red".
         for r in 14..=18 {
-            assert!(text[r].contains('▀') || text[r].contains('▄'), "{:?}", text[r]);
-            assert!(rows[r].contains(&Depth::TrueColor.fg(Some(WHITE))) || rows[r].contains(&Depth::TrueColor.bg(WHITE)));
+            assert!(
+                text[r].contains('▀') || text[r].contains('▄'),
+                "{:?}",
+                text[r]
+            );
+            assert!(
+                rows[r].contains(&Depth::TrueColor.fg(Some(WHITE)))
+                    || rows[r].contains(&Depth::TrueColor.bg(WHITE))
+            );
         }
         assert!(text[20].contains("Cybersecurity Program"), "{:?}", text[20]);
         assert!(text[22].contains("S A N D B O X"), "{:?}", text[22]);
@@ -569,8 +680,17 @@ mod tests {
     #[test]
     fn the_storm_covers_the_scene_before_it_clears() {
         let sp = Splash::new(80, 24).unwrap();
-        let grains = |rows: Vec<String>| text_rows(&rows).concat().chars().filter(|c| "░▒.·:".contains(*c)).count();
-        assert!(grains(sp.frame(0, Depth::TrueColor)) > 3 * grains(sp.frame(LAST_STEP, Depth::TrueColor)));
+        let grains = |rows: Vec<String>| {
+            text_rows(&rows)
+                .concat()
+                .chars()
+                .filter(|c| "░▒.·:".contains(*c))
+                .count()
+        };
+        assert!(
+            grains(sp.frame(0, Depth::TrueColor))
+                > 3 * grains(sp.frame(LAST_STEP, Depth::TrueColor))
+        );
     }
 
     #[test]
@@ -601,7 +721,11 @@ mod tests {
     impl Keys for Scripted {
         fn wait(&mut self, timeout: Duration) -> Option<bool> {
             self.1 += 1;
-            let k = if self.0.is_empty() { None } else { self.0.remove(0) };
+            let k = if self.0.is_empty() {
+                None
+            } else {
+                self.0.remove(0)
+            };
             if k.is_none() {
                 std::thread::sleep(timeout);
             }
@@ -621,10 +745,17 @@ mod tests {
         let ended = play(&mut out, &mut Scripted(vec![], 0), &sp, Depth::TrueColor).unwrap();
         let took = start.elapsed();
         assert_eq!(ended, Ended::Finished);
-        assert!(took >= DURATION && took < DURATION + Duration::from_millis(900), "{took:?}");
+        assert!(
+            took >= DURATION && took < DURATION + Duration::from_millis(900),
+            "{took:?}"
+        );
         let out = String::from_utf8(out).unwrap();
         assert!(out.starts_with("\x1b[?25l"));
-        assert!(out.ends_with("\x1b[0m\x1b[?25h\r\n"), "{:?}", &out[out.len() - 20..]);
+        assert!(
+            out.ends_with("\x1b[0m\x1b[?25h\r\n"),
+            "{:?}",
+            &out[out.len() - 20..]
+        );
         assert!((2..=30).contains(&frames(&out)), "{}", frames(&out));
         // The last frame drawn is the settled scene.
         let last = sp.frame(LAST_STEP, Depth::TrueColor).join("\n");
@@ -639,11 +770,21 @@ mod tests {
         let sp = Splash::new(80, 24).unwrap();
         let mut out = Vec::new();
         let start = Instant::now();
-        let ended = play(&mut out, &mut Scripted(vec![None, Some(false)], 0), &sp, Depth::TrueColor).unwrap();
+        let ended = play(
+            &mut out,
+            &mut Scripted(vec![None, Some(false)], 0),
+            &sp,
+            Depth::TrueColor,
+        )
+        .unwrap();
         assert_eq!(ended, Ended::Skipped);
         assert!(start.elapsed() < Duration::from_millis(600));
         let out = String::from_utf8(out).unwrap();
-        assert_eq!(out.matches("\x1b[22F").count(), 2, "two frames, then the final one");
+        assert_eq!(
+            out.matches("\x1b[22F").count(),
+            2,
+            "two frames, then the final one"
+        );
         assert!(out.contains(&sp.frame(LAST_STEP, Depth::TrueColor).join("\n")));
         assert!(out.ends_with("\x1b[0m\x1b[?25h\r\n"));
     }
@@ -652,7 +793,13 @@ mod tests {
     fn ctrl_c_ends_the_splash_and_still_restores_the_cursor() {
         let sp = Splash::new(80, 24).unwrap();
         let mut out = Vec::new();
-        let ended = play(&mut out, &mut Scripted(vec![Some(true)], 0), &sp, Depth::TrueColor).unwrap();
+        let ended = play(
+            &mut out,
+            &mut Scripted(vec![Some(true)], 0),
+            &sp,
+            Depth::TrueColor,
+        )
+        .unwrap();
         assert_eq!(ended, Ended::Interrupted);
         let out = String::from_utf8(out).unwrap();
         assert!(!out.contains("\x1b[22F"), "no frame after the interrupt");

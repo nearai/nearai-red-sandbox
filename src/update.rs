@@ -52,7 +52,9 @@ pub const UPDATE_KEY: Option<[u8; 32]> = match option_env!("RTS_UPDATE_PUBLIC_KE
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Channel {
     /// A curl (install.sh) install under this prefix.
-    Release { prefix: PathBuf },
+    Release {
+        prefix: PathBuf,
+    },
     Homebrew,
     Source,
 }
@@ -65,7 +67,10 @@ pub fn channel(exe: &Path) -> Channel {
     let Some(prefix) = install_prefix(exe) else {
         return Channel::Source;
     };
-    let cellar = prefix.parent().and_then(Path::parent).and_then(Path::file_name);
+    let cellar = prefix
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name);
     if cellar.is_some_and(|n| n == "Cellar") {
         Channel::Homebrew
     } else if prefix_plugin(&prefix).is_dir() {
@@ -135,9 +140,11 @@ pub fn launch_check(c: &LaunchCheck) -> LaunchOutcome {
     let path = update_cache(home);
     let cache = load_cache(&path);
     if cache.is_none() && path.exists() {
-        out.log.push(format!("{} is unreadable; checking anyway", path.display()));
+        out.log
+            .push(format!("{} is unreadable; checking anyway", path.display()));
     }
-    let due = should_check(true, cache.as_ref(), c.now) || cache.as_ref().is_some_and(|k| k.at > c.now);
+    let due =
+        should_check(true, cache.as_ref(), c.now) || cache.as_ref().is_some_and(|k| k.at > c.now);
     let previous = cache.map(|k| k.status);
     let status = if due {
         let status = match fetch_within(Arc::clone(&c.fetch), key, c.timeout) {
@@ -147,7 +154,13 @@ pub fn launch_check(c: &LaunchCheck) -> LaunchOutcome {
                 previous.unwrap_or(UpdateStatus::Unknown)
             }
         };
-        if let Err(e) = save(&path, &CheckedAt { at: c.now, status: status.clone() }) {
+        if let Err(e) = save(
+            &path,
+            &CheckedAt {
+                at: c.now,
+                status: status.clone(),
+            },
+        ) {
             out.log.push(format!("writing {}: {e}", path.display()));
         }
         status
@@ -161,7 +174,11 @@ pub fn launch_check(c: &LaunchCheck) -> LaunchOutcome {
 /// `manifest::fetch` on a worker thread; the deadline holds whatever the
 /// HTTP layer does. On timeout the worker finishes on its own and its
 /// result is dropped.
-fn fetch_within(f: Arc<dyn Fetch>, key: [u8; 32], timeout: Duration) -> Result<manifest::SignedManifest, String> {
+fn fetch_within(
+    f: Arc<dyn Fetch>,
+    key: [u8; 32],
+    timeout: Duration,
+) -> Result<manifest::SignedManifest, String> {
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("rts-update-check".into())
@@ -172,19 +189,28 @@ fn fetch_within(f: Arc<dyn Fetch>, key: [u8; 32], timeout: Duration) -> Result<m
     match rx.recv_timeout(timeout) {
         Ok(r) => r,
         Err(mpsc::RecvTimeoutError::Timeout) => Err(format!("timed out after {}", human(timeout))),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err("the update check stopped without a result".into()),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err("the update check stopped without a result".into())
+        }
     }
 }
 
 fn human(d: Duration) -> String {
-    if d.subsec_nanos() == 0 { format!("{} s", d.as_secs()) } else { format!("{} ms", d.as_millis()) }
+    if d.subsec_nanos() == 0 {
+        format!("{} s", d.as_secs())
+    } else {
+        format!("{} ms", d.as_millis())
+    }
 }
 
 /// The cache parent is created 0700 first: `save_cache` would use the
 /// umask's mode, and install.sh requires 0700 there.
 fn save(path: &Path, checked: &CheckedAt) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
     }
     save_cache(path, checked)
 }
@@ -200,10 +226,16 @@ pub fn notice(current: &str, status: &UpdateStatus, channel: &Channel) -> Option
         Channel::Source => return None,
     };
     let m = match status {
-        UpdateStatus::Available { latest, .. } => {
-            ironwire_update::Manifest { latest: latest.clone(), minimum_supported: None, summary: None }
-        }
-        UpdateStatus::Unsupported { latest, minimum_supported, .. } => ironwire_update::Manifest {
+        UpdateStatus::Available { latest, .. } => ironwire_update::Manifest {
+            latest: latest.clone(),
+            minimum_supported: None,
+            summary: None,
+        },
+        UpdateStatus::Unsupported {
+            latest,
+            minimum_supported,
+            ..
+        } => ironwire_update::Manifest {
             latest: latest.clone(),
             minimum_supported: Some(minimum_supported.clone()),
             summary: None,
@@ -211,10 +243,14 @@ pub fn notice(current: &str, status: &UpdateStatus, channel: &Channel) -> Option
         UpdateStatus::UpToDate | UpdateStatus::Unknown => return None,
     };
     match evaluate(current, &m, channel.method()) {
-        UpdateStatus::Available { latest, .. } => {
-            Some(format!("rts {latest} is available (you have {current}): run {command}"))
-        }
-        UpdateStatus::Unsupported { latest, minimum_supported, .. } => Some(format!(
+        UpdateStatus::Available { latest, .. } => Some(format!(
+            "rts {latest} is available (you have {current}): run {command}"
+        )),
+        UpdateStatus::Unsupported {
+            latest,
+            minimum_supported,
+            ..
+        } => Some(format!(
             "rts {current} is older than the oldest supported release, {minimum_supported}, and may not work: run {command} to install {latest}"
         )),
         UpdateStatus::UpToDate | UpdateStatus::Unknown => None,
@@ -228,7 +264,11 @@ pub fn append_log(log_file: &Path, lines: &[String]) {
         return;
     }
     if let Some(parent) = log_file.parent()
-        && std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent).is_err()
+        && std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .is_err()
     {
         return;
     }
@@ -236,7 +276,11 @@ pub fn append_log(log_file: &Path, lines: &[String]) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_file) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file)
+    {
         for line in lines {
             let _ = writeln!(f, "{secs} update check: {line}");
         }
@@ -252,11 +296,17 @@ pub fn launch_notice(update_check: bool, log_file: &Path) {
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .collect();
     let enabled = update_check && !opted_out(&env);
-    let home = env.iter().find(|(k, _)| k == "HOME").map(|(_, v)| PathBuf::from(v)).filter(|p| p.is_absolute());
+    let home = env
+        .iter()
+        .find(|(k, _)| k == "HOME")
+        .map(|(_, v)| PathBuf::from(v))
+        .filter(|p| p.is_absolute());
     if !enabled || UPDATE_KEY.is_none() || home.is_none() {
         return;
     }
-    let channel = std::env::current_exe().map(|e| channel(&e)).unwrap_or(Channel::Source);
+    let channel = std::env::current_exe()
+        .map(|e| channel(&e))
+        .unwrap_or(Channel::Source);
     if channel == Channel::Source {
         return;
     }
@@ -335,7 +385,12 @@ mod tests {
         touch(&local.join("bin/rts"));
         std::fs::create_dir_all(local.join("share/nearai-red-sandbox/plugin")).unwrap();
         let release = channel(&local.join("bin/rts"));
-        assert_eq!(release, Channel::Release { prefix: std::fs::canonicalize(&local).unwrap() });
+        assert_eq!(
+            release,
+            Channel::Release {
+                prefix: std::fs::canonicalize(&local).unwrap()
+            }
+        );
 
         // A plugin path that is a file, not a directory, is no release layout.
         let odd = t.join("odd");
@@ -378,11 +433,15 @@ mod tests {
             DateTime::from_timestamp(1_800_000_000, 0).unwrap()
         }
         fn release() -> Channel {
-            Channel::Release { prefix: "/p".into() }
+            Channel::Release {
+                prefix: "/p".into(),
+            }
         }
 
         fn manifest_text(latest: &str, minimum: Option<&str>) -> String {
-            let floor = minimum.map(|m| format!("  \"minimum_supported\": \"{m}\",\n")).unwrap_or_default();
+            let floor = minimum
+                .map(|m| format!("  \"minimum_supported\": \"{m}\",\n"))
+                .unwrap_or_default();
             format!(
                 "{{\n  \"latest\": \"{latest}\",\n{floor}  \"published\": \"2026-11-02T18:04:11Z\",\n  \"tarball\": {{\n    \"name\": \"rts-{latest}-aarch64-apple-darwin.tar.gz\",\n    \"sha256\": \"{a}\"\n  }},\n  \"install_sh\": {{\n    \"sha256\": \"{b}\"\n  }}\n}}\n",
                 a = "a".repeat(64),
@@ -400,7 +459,11 @@ mod tests {
             f
         }
 
-        fn check<'a>(home: &'a Path, channel: &'a Channel, fetch: Arc<dyn Fetch>) -> LaunchCheck<'a> {
+        fn check<'a>(
+            home: &'a Path,
+            channel: &'a Channel,
+            fetch: Arc<dyn Fetch>,
+        ) -> LaunchCheck<'a> {
             LaunchCheck {
                 current: "0.1.0",
                 channel,
@@ -418,7 +481,11 @@ mod tests {
         }
 
         fn available(latest: &str) -> UpdateStatus {
-            UpdateStatus::Available { latest: latest.into(), summary: None, upgrade_command: None }
+            UpdateStatus::Available {
+                latest: latest.into(),
+                summary: None,
+                upgrade_command: None,
+            }
         }
 
         #[test]
@@ -431,7 +498,11 @@ mod tests {
             assert_eq!(out.log, Vec::<String>::new());
             let c = cached(t.path()).unwrap();
             assert_eq!(c.at, t0());
-            assert!(matches!(c.status, UpdateStatus::Available { ref latest, .. } if latest == "0.2.0"), "{:?}", c.status);
+            assert!(
+                matches!(c.status, UpdateStatus::Available { ref latest, .. } if latest == "0.2.0"),
+                "{:?}",
+                c.status
+            );
         }
 
         #[test]
@@ -449,18 +520,28 @@ mod tests {
         fn the_floor_gets_the_stronger_warning() {
             let t = tempfile::tempdir().unwrap();
             let ch = release();
-            let c = LaunchCheck { current: "0.0.9", ..check(t.path(), &ch, serving("0.2.0", Some("0.1.0"), &key(7))) };
+            let c = LaunchCheck {
+                current: "0.0.9",
+                ..check(t.path(), &ch, serving("0.2.0", Some("0.1.0"), &key(7)))
+            };
             assert_eq!(
                 launch_check(&c).notice.as_deref(),
-                Some("rts 0.0.9 is older than the oldest supported release, 0.1.0, and may not work: run rts update to install 0.2.0")
+                Some(
+                    "rts 0.0.9 is older than the oldest supported release, 0.1.0, and may not work: run rts update to install 0.2.0"
+                )
             );
 
             let t = tempfile::tempdir().unwrap();
             let ch = Channel::Homebrew;
-            let c = LaunchCheck { current: "0.0.9", ..check(t.path(), &ch, serving("0.2.0", Some("0.1.0"), &key(7))) };
+            let c = LaunchCheck {
+                current: "0.0.9",
+                ..check(t.path(), &ch, serving("0.2.0", Some("0.1.0"), &key(7)))
+            };
             assert_eq!(
                 launch_check(&c).notice.as_deref(),
-                Some("rts 0.0.9 is older than the oldest supported release, 0.1.0, and may not work: run brew upgrade rts to install 0.2.0")
+                Some(
+                    "rts 0.0.9 is older than the oldest supported release, 0.1.0, and may not work: run brew upgrade rts to install 0.2.0"
+                )
             );
         }
 
@@ -470,7 +551,10 @@ mod tests {
                 let t = tempfile::tempdir().unwrap();
                 let ch = release();
                 let f = serving("0.2.0", None, &key(7));
-                let out = launch_check(&LaunchCheck { current, ..check(t.path(), &ch, f.clone()) });
+                let out = launch_check(&LaunchCheck {
+                    current,
+                    ..check(t.path(), &ch, f.clone())
+                });
                 assert_eq!(out, LaunchOutcome::default(), "{current}");
                 assert_eq!(f.calls().len(), 2);
             }
@@ -481,14 +565,25 @@ mod tests {
             let t = tempfile::tempdir().unwrap();
             let ch = release();
             let f = serving("0.2.0", None, &key(7));
-            assert_eq!(launch_check(&check(t.path(), &ch, f.clone())).notice.as_deref(), Some(AVAILABLE));
+            assert_eq!(
+                launch_check(&check(t.path(), &ch, f.clone()))
+                    .notice
+                    .as_deref(),
+                Some(AVAILABLE)
+            );
             assert_eq!(f.calls().len(), 2);
 
-            let later = LaunchCheck { now: t0() + chrono::Duration::hours(1), ..check(t.path(), &ch, f.clone()) };
+            let later = LaunchCheck {
+                now: t0() + chrono::Duration::hours(1),
+                ..check(t.path(), &ch, f.clone())
+            };
             assert_eq!(launch_check(&later).notice.as_deref(), Some(AVAILABLE));
             assert_eq!(f.calls().len(), 2);
 
-            let next_day = LaunchCheck { now: t0() + chrono::Duration::hours(25), ..check(t.path(), &ch, f.clone()) };
+            let next_day = LaunchCheck {
+                now: t0() + chrono::Duration::hours(25),
+                ..check(t.path(), &ch, f.clone())
+            };
             assert_eq!(launch_check(&next_day).notice.as_deref(), Some(AVAILABLE));
             assert_eq!(f.calls().len(), 4);
         }
@@ -498,9 +593,21 @@ mod tests {
             let t = tempfile::tempdir().unwrap();
             let ch = release();
             let at = t0() + chrono::Duration::days(30);
-            save_cache(&update_cache(t.path()), &CheckedAt { at, status: UpdateStatus::UpToDate }).unwrap();
+            save_cache(
+                &update_cache(t.path()),
+                &CheckedAt {
+                    at,
+                    status: UpdateStatus::UpToDate,
+                },
+            )
+            .unwrap();
             let f = serving("0.2.0", None, &key(7));
-            assert_eq!(launch_check(&check(t.path(), &ch, f.clone())).notice.as_deref(), Some(AVAILABLE));
+            assert_eq!(
+                launch_check(&check(t.path(), &ch, f.clone()))
+                    .notice
+                    .as_deref(),
+                Some(AVAILABLE)
+            );
             assert_eq!(f.calls().len(), 2);
             assert_eq!(cached(t.path()).unwrap().at, t0());
         }
@@ -510,9 +617,19 @@ mod tests {
             let t = tempfile::tempdir().unwrap();
             let ch = release();
             let at = t0() - chrono::Duration::hours(1);
-            save_cache(&update_cache(t.path()), &CheckedAt { at, status: available("0.2.0") }).unwrap();
+            save_cache(
+                &update_cache(t.path()),
+                &CheckedAt {
+                    at,
+                    status: available("0.2.0"),
+                },
+            )
+            .unwrap();
             let f = Arc::new(FakeFetch::new());
-            let out = launch_check(&LaunchCheck { current: "0.2.0", ..check(t.path(), &ch, f.clone()) });
+            let out = launch_check(&LaunchCheck {
+                current: "0.2.0",
+                ..check(t.path(), &ch, f.clone())
+            });
             assert_eq!(out, LaunchOutcome::default());
             assert_eq!(f.calls(), Vec::<String>::new());
         }
@@ -522,7 +639,14 @@ mod tests {
             let t = tempfile::tempdir().unwrap();
             let ch = release();
             let at = t0() - chrono::Duration::hours(25);
-            save_cache(&update_cache(t.path()), &CheckedAt { at, status: available("0.2.0") }).unwrap();
+            save_cache(
+                &update_cache(t.path()),
+                &CheckedAt {
+                    at,
+                    status: available("0.2.0"),
+                },
+            )
+            .unwrap();
             let f = Arc::new(FakeFetch::new());
             let out = launch_check(&check(t.path(), &ch, f.clone()));
             assert_eq!(out.notice.as_deref(), Some(AVAILABLE));
@@ -557,8 +681,16 @@ mod tests {
             let t = tempfile::tempdir().unwrap();
             let ch = release();
             let start = Instant::now();
-            let out = launch_check(&check(t.path(), &ch, Arc::new(Slow(Duration::from_secs(10)))));
-            assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+            let out = launch_check(&check(
+                t.path(),
+                &ch,
+                Arc::new(Slow(Duration::from_secs(10))),
+            ));
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "{:?}",
+                start.elapsed()
+            );
             assert_eq!(out.notice, None);
             assert_eq!(out.log.len(), 1, "{:?}", out.log);
             assert!(out.log[0].contains("timed out"), "{:?}", out.log);
@@ -573,10 +705,19 @@ mod tests {
             let f = serving("0.2.0", None, &key(7));
             let variants = |f: &Arc<FakeFetch>| {
                 vec![
-                    LaunchCheck { enabled: false, ..check(home, &rel, f.clone()) },
+                    LaunchCheck {
+                        enabled: false,
+                        ..check(home, &rel, f.clone())
+                    },
                     check(home, &source, f.clone()),
-                    LaunchCheck { key: None, ..check(home, &rel, f.clone()) },
-                    LaunchCheck { home: None, ..check(home, &rel, f.clone()) },
+                    LaunchCheck {
+                        key: None,
+                        ..check(home, &rel, f.clone())
+                    },
+                    LaunchCheck {
+                        home: None,
+                        ..check(home, &rel, f.clone())
+                    },
                 ]
             };
             for c in variants(&f) {
@@ -628,13 +769,19 @@ mod tests {
             let t = tempfile::tempdir().unwrap();
             let file = t.path().join("s/abc/launcher.log");
             append_log(&file, &["x".to_string()]);
-            let mode = std::fs::metadata(t.path().join("s/abc")).unwrap().permissions().mode();
+            let mode = std::fs::metadata(t.path().join("s/abc"))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o700, "{mode:o}");
             let text = std::fs::read_to_string(&file).unwrap();
             let lines: Vec<&str> = text.lines().collect();
             assert_eq!(lines.len(), 1, "{text:?}");
             let (secs, rest) = lines[0].split_once(' ').unwrap();
-            assert!(!secs.is_empty() && secs.bytes().all(|b| b.is_ascii_digit()), "{text:?}");
+            assert!(
+                !secs.is_empty() && secs.bytes().all(|b| b.is_ascii_digit()),
+                "{text:?}"
+            );
             assert_eq!(rest, "update check: x");
             assert!(text.ends_with('\n'));
         }
