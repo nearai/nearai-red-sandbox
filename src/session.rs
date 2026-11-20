@@ -472,13 +472,21 @@ pub struct PreflightInput<'a> {
 pub const DOCTOR: [&str; 3] = ["doctor", "--workflow", "bundle-run"];
 
 pub fn preflight(o: &PreflightInput) -> Result<(), String> {
+    preflight_with(o, &|| {
+        let supervisor = o.supervisor_path.filter(|p| p.is_absolute() && p.to_str().is_some())
+            .ok_or_else(|| format!("An absolute patched HVF supervisor path is required ({SUPERVISOR_FIX_VERSION}). {SUPERVISOR_INSTALL}"))?;
+        check_supervisor_marker(o.host, supervisor)
+    })
+}
+
+/// [`preflight`] with the VMM prerequisite check supplied: it runs after
+/// the OpenCode check and before `mvmctl doctor`.
+pub(crate) fn preflight_with(o: &PreflightInput, vmm_check: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
     if o.leak_seam_set {
         return Err("RTS_TEST_LEAK is set; refusing to start a real session".into());
     }
     check_opencode(o.host, o.opencode)?;
-    let supervisor = o.supervisor_path.filter(|p| p.is_absolute() && p.to_str().is_some())
-        .ok_or_else(|| format!("An absolute patched HVF supervisor path is required ({SUPERVISOR_FIX_VERSION}). {SUPERVISOR_INSTALL}"))?;
-    check_supervisor_marker(o.host, supervisor)?;
+    vmm_check()?;
     let doctor = o.run.run(&sv(&DOCTOR), Duration::from_secs(60)).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             format!("mvmctl not found at {}; run rts setup", o.mvmctl.display())
@@ -593,31 +601,39 @@ pub fn mvm_root(env: &[(String, String)]) -> Result<PathBuf, String> {
         .ok_or_else(|| "neither HOME nor MVM_HOME is set".to_string())
 }
 
-fn supervisor_pid_file(name: &str, env: &[(String, String)]) -> Result<PathBuf, String> {
-    let root = mvm_root(env).map_err(|e| format!("cannot monitor HVF supervisor: {e}"))?;
-    Ok(root.join("vms").join(name).join("hvf.pid"))
-}
-
+/// The VMM process held to the host RSS ceiling: the HVF supervisor, or
+/// another flavor's VMM through [`Supervisor::discover_vmm`].
 pub(crate) struct Supervisor {
     pub(crate) pid: u32,
     pub(crate) pid_file: PathBuf,
+    /// The executable name the PID must have.
+    pub(crate) vmm: &'static str,
+    /// What the errors call it.
+    pub(crate) what: &'static str,
 }
 
 impl Supervisor {
     pub(crate) fn discover(name: &str, env: &[(String, String)]) -> Result<Self, String> {
-        let pid_file = supervisor_pid_file(name, env)?;
+        let root = mvm_root(env).map_err(|e| format!("cannot monitor HVF supervisor: {e}"))?;
+        Self::discover_vmm(&root.join("vms").join(name).join("hvf.pid"), "mvm-hvf-supervisor", "HVF supervisor")
+    }
+
+    /// The VMM named `vmm` whose PID mvm wrote to `pid_file`.
+    pub(crate) fn discover_vmm(pid_file: &Path, vmm: &'static str, what: &'static str) -> Result<Self, String> {
+        let pid_file = pid_file.to_path_buf();
         let pid = fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok())
             .filter(|&pid| pid > 0 && pid <= i32::MAX as u32)
-            .ok_or_else(|| format!("cannot monitor HVF supervisor: missing or invalid PID in {}", pid_file.display()))?;
-        Ok(Self { pid, pid_file })
+            .ok_or_else(|| format!("cannot monitor {what}: missing or invalid PID in {}", pid_file.display()))?;
+        Ok(Self { pid, pid_file, vmm, what })
     }
 
     pub(crate) fn sample(&self, host: &dyn Host, ceiling_mib: u64) -> Result<u64, String> {
+        let what = self.what;
         let current = fs::read_to_string(&self.pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok());
         if current != Some(self.pid) {
-            return Err("cannot monitor HVF supervisor: PID file changed or disappeared".into());
+            return Err(format!("cannot monitor {what}: PID file changed or disappeared"));
         }
-        let rss = host_rss_mib(host, self.pid).ok_or_else(|| format!("cannot monitor HVF supervisor: PID {} is gone, has the wrong executable, or has no RSS sample", self.pid))?;
+        let rss = host_rss_mib_of(host, self.pid, self.vmm).ok_or_else(|| format!("cannot monitor {what}: PID {} is gone, has the wrong executable, or has no RSS sample", self.pid))?;
         if rss > ceiling_mib {
             return Err(format!("host RSS {rss} MiB over the {ceiling_mib} MiB ceiling (pid {} via {})", self.pid, self.pid_file.display()));
         }
@@ -637,7 +653,12 @@ pub(crate) fn process_name(host: &dyn Host, pid: u32) -> Option<String> {
 }
 
 pub fn host_rss_mib(host: &dyn Host, pid: u32) -> Option<u64> {
-    if process_name(host, pid)? != "mvm-hvf-supervisor" {
+    host_rss_mib_of(host, pid, "mvm-hvf-supervisor")
+}
+
+/// Host RSS of `pid` in MiB, only while its executable is named `vmm`.
+pub(crate) fn host_rss_mib_of(host: &dyn Host, pid: u32, vmm: &str) -> Option<u64> {
+    if process_name(host, pid)? != vmm {
         return None;
     }
     let r = host.run(&sv(&["ps", "-o", "rss=", "-p", &pid.to_string()]), Duration::from_secs(5)).ok()?;
@@ -647,7 +668,7 @@ pub fn host_rss_mib(host: &dyn Host, pid: u32) -> Option<u64> {
 
 // --- network processes ---
 
-const ENDPOINT: &str = "mvm-network-endpoint";
+pub(crate) const ENDPOINT: &str = "mvm-network-endpoint";
 pub(crate) const NETWORK_PROCESSES: [&str; 2] = [ENDPOINT, "mvm-hvf-supervisor"];
 
 /// The children of the attached `machine run` (`attach_pid`) that are mvm's
@@ -655,6 +676,12 @@ pub(crate) const NETWORK_PROCESSES: [&str; 2] = [ENDPOINT, "mvm-hvf-supervisor"]
 /// Refuses unless an endpoint is among them: without it the network path
 /// cannot be confirmed, or confirmed gone at teardown.
 pub fn network_children(host: &dyn Host, attach_pid: u32) -> Result<Vec<u32>, String> {
+    network_children_of(host, attach_pid, &NETWORK_PROCESSES)
+}
+
+/// [`network_children`] keeping the children named in `names`, which must
+/// include the endpoint.
+pub(crate) fn network_children_of(host: &dyn Host, attach_pid: u32, names: &[&str]) -> Result<Vec<u32>, String> {
     let fail = |why: String| format!("cannot find the network processes of mvmctl machine run (pid {attach_pid}): {why}");
     let r = host.run(&sv(&["pgrep", "-P", &attach_pid.to_string()]), Duration::from_secs(5)).map_err(|e| fail(format!("pgrep failed: {e}")))?;
     if r.killed || r.code != Some(0) {
@@ -664,7 +691,7 @@ pub fn network_children(host: &dyn Host, attach_pid: u32) -> Result<Vec<u32>, St
     let mut endpoint = false;
     for pid in String::from_utf8_lossy(&r.stdout).split_whitespace() {
         let pid: u32 = pid.parse().ok().filter(|&p| p > 0 && p <= i32::MAX as u32).ok_or_else(|| fail(format!("pgrep printed {pid:?}")))?;
-        if let Some(name) = process_name(host, pid).filter(|n| NETWORK_PROCESSES.contains(&n.as_str())) {
+        if let Some(name) = process_name(host, pid).filter(|n| names.contains(&n.as_str())) {
             endpoint |= name == ENDPOINT;
             kept.push(pid);
         }

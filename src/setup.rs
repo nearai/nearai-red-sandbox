@@ -152,7 +152,32 @@ fn hex(b: &[u8]) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unpack {
     TarGzStrip1,
+    /// A tar.gz whose entries sit at the top level.
+    TarGz,
     Zip,
+}
+
+/// A host platform rts has pinned release assets for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    MacosAarch64,
+    LinuxX86_64,
+    LinuxAarch64,
+}
+
+impl Target {
+    /// The platform this build runs on, if rts pins assets for it.
+    pub fn host() -> Option<Self> {
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            Some(Self::MacosAarch64)
+        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            Some(Self::LinuxX86_64)
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            Some(Self::LinuxAarch64)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -166,26 +191,49 @@ pub struct Component {
     pub binary: &'static str,
 }
 
+/// mvm for this host; Apple-silicon macOS's assets on a host rts pins none for.
 pub fn mvm() -> Component {
+    mvm_for(Target::host().unwrap_or(Target::MacosAarch64))
+}
+
+/// mvm's release asset for `t`. Digests are GitHub's asset digests,
+/// matching mvm's signed `checksums-sha256.txt` for the release.
+pub fn mvm_for(t: Target) -> Component {
+    let (triple, sha256) = match t {
+        Target::MacosAarch64 => ("aarch64-apple-darwin", "1f2c80b253add28c3856080e3f3a10aa1163f1aef0a7d413ded15100bdcd0c69"),
+        Target::LinuxX86_64 => ("x86_64-unknown-linux-gnu", "502e84ea3fa1ff04b0138fb6c3cb47b3a72c730d72c8f468df55e01d99c94d64"),
+        Target::LinuxAarch64 => ("aarch64-unknown-linux-gnu", "dafb1d9ebb9480b26841c772bee6322015b727b8cc2bc67d82056631101122f9"),
+    };
     Component {
         name: "mvm",
         version: MVM_VERSION,
-        url: format!("https://github.com/tinylabscom/mvm/releases/download/v{MVM_VERSION}/mvmctl-aarch64-apple-darwin.tar.gz"),
-        sha256: "1f2c80b253add28c3856080e3f3a10aa1163f1aef0a7d413ded15100bdcd0c69".into(),
+        url: format!("https://github.com/tinylabscom/mvm/releases/download/v{MVM_VERSION}/mvmctl-{triple}.tar.gz"),
+        sha256: sha256.into(),
         max_bytes: 64 << 20,
         unpack: Unpack::TarGzStrip1,
         binary: "mvmctl",
     }
 }
 
+/// OpenCode for this host; Apple-silicon macOS's assets on a host rts pins none for.
 pub fn opencode() -> Component {
+    opencode_for(Target::host().unwrap_or(Target::MacosAarch64))
+}
+
+/// OpenCode's release asset for `t`, by GitHub's asset digest.
+pub fn opencode_for(t: Target) -> Component {
+    let (asset, sha256, unpack) = match t {
+        Target::MacosAarch64 => ("opencode-darwin-arm64.zip", "c1c901a6379d667b7a30a3eea5a8f6e93416dba43e889e834771f6fb174f35c9", Unpack::Zip),
+        Target::LinuxX86_64 => ("opencode-linux-x64.tar.gz", "3a38b8c284450a5ca81a2c1ebbf29ebe05e618518f095da0066652167eb0eb33", Unpack::TarGz),
+        Target::LinuxAarch64 => ("opencode-linux-arm64.tar.gz", "dd866cebb72d11c91a7a7c4c3fd961ee06e03a9d0a5ff8eaa2a8ebebf25de7ba", Unpack::TarGz),
+    };
     Component {
         name: "opencode",
         version: OPENCODE_VERSION,
-        url: format!("https://github.com/anomalyco/opencode/releases/download/v{OPENCODE_VERSION}/opencode-darwin-arm64.zip"),
-        sha256: "c1c901a6379d667b7a30a3eea5a8f6e93416dba43e889e834771f6fb174f35c9".into(),
+        url: format!("https://github.com/anomalyco/opencode/releases/download/v{OPENCODE_VERSION}/{asset}"),
+        sha256: sha256.into(),
         max_bytes: 256 << 20,
-        unpack: Unpack::Zip,
+        unpack,
         binary: "opencode",
     }
 }
@@ -228,6 +276,7 @@ pub fn install_component(c: &Component, target: &Path, f: &dyn Fetch, host: &dyn
     let (dl, un) = (download_path.to_string_lossy().into_owned(), unpacked.to_string_lossy().into_owned());
     let argv: Vec<String> = match c.unpack {
         Unpack::TarGzStrip1 => vec!["/usr/bin/tar".into(), "-xzf".into(), dl, "-C".into(), un, "--strip-components".into(), "1".into()],
+        Unpack::TarGz => vec!["/usr/bin/tar".into(), "-xzf".into(), dl, "-C".into(), un],
         Unpack::Zip => vec!["/usr/bin/ditto".into(), "-x".into(), "-k".into(), dl, un],
     };
     let tool = argv[0].clone();
@@ -1024,6 +1073,56 @@ mod tests {
         assert_eq!((m.max_bytes, o.max_bytes), (64 << 20, 256 << 20));
         assert_eq!((m.name, m.version, m.unpack, m.binary), ("mvm", "0.22.0", Unpack::TarGzStrip1, "mvmctl"));
         assert_eq!((o.name, o.version, o.unpack, o.binary), ("opencode", "2.2.2", Unpack::Zip, "opencode"));
+    }
+
+    #[test]
+    fn each_target_pins_its_released_mvm_and_opencode_assets() {
+        let mac = (mvm_for(Target::MacosAarch64), opencode_for(Target::MacosAarch64));
+        assert_eq!((mac.0.url, mac.0.sha256), (mvm().url, mvm().sha256));
+        assert_eq!((mac.1.url, mac.1.sha256, mac.1.unpack), (opencode().url, opencode().sha256, Unpack::Zip));
+        let cases = [
+            (Target::LinuxX86_64, "mvmctl-x86_64-unknown-linux-gnu.tar.gz", "502e84ea3fa1ff04b0138fb6c3cb47b3a72c730d72c8f468df55e01d99c94d64", "opencode-linux-x64.tar.gz", "3a38b8c284450a5ca81a2c1ebbf29ebe05e618518f095da0066652167eb0eb33"),
+            (Target::LinuxAarch64, "mvmctl-aarch64-unknown-linux-gnu.tar.gz", "dafb1d9ebb9480b26841c772bee6322015b727b8cc2bc67d82056631101122f9", "opencode-linux-arm64.tar.gz", "dd866cebb72d11c91a7a7c4c3fd961ee06e03a9d0a5ff8eaa2a8ebebf25de7ba"),
+        ];
+        for (target, mvm_asset, mvm_sha, oc_asset, oc_sha) in cases {
+            let (m, o) = (mvm_for(target), opencode_for(target));
+            assert_eq!(m.url, format!("https://github.com/tinylabscom/mvm/releases/download/v0.22.0/{mvm_asset}"));
+            assert_eq!(o.url, format!("https://github.com/anomalyco/opencode/releases/download/v2.2.2/{oc_asset}"));
+            assert_eq!((m.sha256.as_str(), o.sha256.as_str()), (mvm_sha, oc_sha));
+            assert_eq!((m.unpack, o.unpack), (Unpack::TarGzStrip1, Unpack::TarGz));
+            assert_eq!((m.binary, o.binary), ("mvmctl", "opencode"));
+            assert!(allowed_url(&m.url).is_ok() && allowed_url(&o.url).is_ok());
+        }
+    }
+
+    #[test]
+    fn the_host_target_matches_this_build() {
+        let t = Target::host();
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            assert_eq!(t, Some(Target::MacosAarch64));
+        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            assert_eq!(t, Some(Target::LinuxX86_64));
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            assert_eq!(t, Some(Target::LinuxAarch64));
+        }
+    }
+
+    #[test]
+    fn a_flat_tarball_installs_its_top_level_binary() {
+        fn flat(dir: &Path) -> Vec<u8> {
+            let src = dir.join("src-flat");
+            fs::create_dir_all(&src).unwrap();
+            let bin = src.join("opencode");
+            fs::write(&bin, "#!/bin/sh\necho fixture\n").unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+            let out = dir.join("flat.tar.gz");
+            run(Command::new("/usr/bin/tar").arg("-czf").arg(&out).arg("-C").arg(&src).arg("opencode"));
+            fs::read(out).unwrap()
+        }
+        let r = rig_with(flat, "opencode", Unpack::TarGz, "opencode");
+        install_component(&r.c, &r.target, &r.fetch, &RealHost).unwrap();
+        assert!(r.target.join("opencode").is_file());
+        assert!(leftovers(&r.parent).is_empty());
     }
 
     // --- rts setup: checks, order and modes ---

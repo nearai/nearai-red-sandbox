@@ -14,6 +14,7 @@ use crate::network::Plan;
 use crate::sandbox::Sandbox;
 use crate::session::{Clock, Deps, Host, SessionPaths};
 
+pub mod kvm;
 pub mod mvm;
 
 /// IPs the egress path pinned for each allowlisted name.
