@@ -14,10 +14,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use crate::config::{EMBEDDED_PROVIDER_ID, OperatorConfig, PLACEHOLDER_API_KEY, ProviderConfig, model_display_name};
-use crate::copy::CopyLimits;
-use crate::mvm::{MvmSandbox, RunOutput, Runner, SpawnRunner, StateDir, list_machines, run_captured, tail};
+use crate::mvm::{RunOutput, Runner, StateDir, list_machines, run_captured, tail};
 use crate::protocol::{new_nonce, random_hex};
-use crate::sandbox::{CopyOutResult, CreateSpec, Exec, ExecOptions, Sandbox, sv};
+use crate::backend::{Backend, HostCheck, Machine};
+use crate::sandbox::{CopyOutResult, CreateSpec, Exec, ExecOptions, sv};
 use crate::sys;
 use crate::terminal::Terminal;
 use crate::brand::progress::Live as Shown;
@@ -598,13 +598,13 @@ fn supervisor_pid_file(name: &str, env: &[(String, String)]) -> Result<PathBuf, 
     Ok(root.join("vms").join(name).join("hvf.pid"))
 }
 
-struct Supervisor {
-    pid: u32,
-    pid_file: PathBuf,
+pub(crate) struct Supervisor {
+    pub(crate) pid: u32,
+    pub(crate) pid_file: PathBuf,
 }
 
 impl Supervisor {
-    fn discover(name: &str, env: &[(String, String)]) -> Result<Self, String> {
+    pub(crate) fn discover(name: &str, env: &[(String, String)]) -> Result<Self, String> {
         let pid_file = supervisor_pid_file(name, env)?;
         let pid = fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok())
             .filter(|&pid| pid > 0 && pid <= i32::MAX as u32)
@@ -612,7 +612,7 @@ impl Supervisor {
         Ok(Self { pid, pid_file })
     }
 
-    fn sample(&self, host: &dyn Host, ceiling_mib: u64) -> Result<u64, String> {
+    pub(crate) fn sample(&self, host: &dyn Host, ceiling_mib: u64) -> Result<u64, String> {
         let current = fs::read_to_string(&self.pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok());
         if current != Some(self.pid) {
             return Err("cannot monitor HVF supervisor: PID file changed or disappeared".into());
@@ -627,7 +627,7 @@ impl Supervisor {
 
 /// The basename of `pid`'s executable from `ps -o comm=` (macOS prints a
 /// full path), or None if `ps` fails or prints nothing.
-fn process_name(host: &dyn Host, pid: u32) -> Option<String> {
+pub(crate) fn process_name(host: &dyn Host, pid: u32) -> Option<String> {
     let command = host.run(&sv(&["ps", "-o", "comm=", "-p", &pid.to_string()]), Duration::from_secs(5)).ok()?;
     if command.code != Some(0) {
         return None;
@@ -648,7 +648,7 @@ pub fn host_rss_mib(host: &dyn Host, pid: u32) -> Option<u64> {
 // --- network processes ---
 
 const ENDPOINT: &str = "mvm-network-endpoint";
-const NETWORK_PROCESSES: [&str; 2] = [ENDPOINT, "mvm-hvf-supervisor"];
+pub(crate) const NETWORK_PROCESSES: [&str; 2] = [ENDPOINT, "mvm-hvf-supervisor"];
 
 /// The children of the attached `machine run` (`attach_pid`) that are mvm's
 /// network endpoint or HVF supervisor, by `pgrep -P` and `ps -o comm=`.
@@ -753,16 +753,11 @@ impl Logger {
 
 struct Live<'a> {
     log: &'a Logger,
-    sb: &'a MvmSandbox,
+    sb: &'a dyn Machine,
     paths: &'a SessionPaths,
-    host: &'a dyn Host,
     machine_attempted: bool,
     machine_created: bool,
     child: Option<Child>,
-    /// The attach process's endpoint and supervisor, checked after removal.
-    network_pids: Vec<u32>,
-    /// mvm's audit directory, read at teardown into `network.jsonl`.
-    audit_dir: Option<PathBuf>,
     canaries: Option<crate::canary::Registry>,
     monitoring_failed: bool,
     canary_setup_complete: bool,
@@ -903,19 +898,8 @@ impl Live<'_> {
             Ok(()) => self.log.log(&format!("teardown: removed {}", self.paths.machine)),
             Err(e) => self.log.log(&format!("teardown: MACHINE REMOVAL FAILED: {e}")),
         }
-        // Both run after export and removal, so neither can stop them.
-        for &pid in &self.network_pids {
-            if let Some(name) = process_name(self.host, pid).filter(|n| NETWORK_PROCESSES.contains(&n.as_str())) {
-                self.log.log(&format!("teardown: NETWORK PROCESS REMAINED: pid {pid} ({name}); killed"));
-                let _ = self.host.run(&sv(&["kill", "-KILL", &pid.to_string()]), Duration::from_secs(5));
-            }
-        }
-        if let Some(dir) = &self.audit_dir {
-            match crate::network::extract_audit(dir, &self.paths.machine, &self.paths.network_audit) {
-                Ok(n) => self.log.log(&format!("teardown: copied {n} network audit entries to {}", self.paths.network_audit.display())),
-                Err(e) => self.log.log(&format!("teardown: NETWORK AUDIT FAILED: {e}")),
-            }
-        }
+        // Residue and audit run after export and removal, so neither can stop them.
+        self.sb.finish(&self.paths.network_audit, &|m| self.log.log(m));
     }
 }
 
@@ -942,39 +926,24 @@ pub fn run_session_with_prompt(cfg: &OperatorConfig, deps: Deps, initial_prompt:
         log.log("tool command must not be empty");
         return 1;
     }
-    let install_prefix = deps
-        .tool_command
-        .first()
-        .map(Path::new)
-        .and_then(crate::install::install_prefix);
-    let supervisor = match supervisor_path(&deps.env, install_prefix.as_deref()) {
-        Ok(path) => path,
+    let backend = match crate::backend::for_session(cfg, &deps, &p) {
+        Ok(backend) => backend,
         Err(error) => {
             log.log(&error);
             return 1;
         }
     };
     let operator_home = deps.env.iter().find(|(k, _)| k == "HOME").map(|(_, v)| v.clone()).unwrap_or_default();
-    let run: Arc<dyn Runner> = deps.runner.clone().unwrap_or_else(|| {
-        Arc::new(SpawnRunner {
-            mvmctl: cfg.mvmctl.clone(),
-            empty_git_config: p.empty_git_config.clone(),
-            extra_env: mvm_environment(&deps.env, &supervisor),
-            remove_env: Vec::new(),
-        })
-    });
-    // The launcher's handle does not share the state dir's marker: teardown
-    // marks every tool process's view unavailable first, then still exports.
-    let sb = match MvmSandbox::new(&p.machine, Box::new(run.clone())) {
-        Ok(sb) => sb.with_copy_limits(CopyLimits::default()),
+    let sb = match backend.machine(&p.machine) {
+        Ok(sb) => sb,
         Err(e) => {
-            log.log(&e.to_string());
+            log.log(&e);
             return 1;
         }
     };
     sys::catch_termination_signals();
-    let mut live = Live { log: &log, sb: &sb, paths: &p, host: deps.host.as_ref(), machine_attempted: false, machine_created: false, child: None, network_pids: vec![], audit_dir: None, canaries: None, monitoring_failed: false, canary_setup_complete: false };
-    let code = match session_body(cfg, &deps, &run, &operator_home, &supervisor, &mut live, initial_prompt) {
+    let mut live = Live { log: &log, sb: sb.as_ref(), paths: &p, machine_attempted: false, machine_created: false, child: None, canaries: None, monitoring_failed: false, canary_setup_complete: false };
+    let code = match session_body(cfg, &deps, backend.as_ref(), &operator_home, &mut live, initial_prompt) {
         Ok(code) => code,
         Err(e) => {
             log.log(&e);
@@ -1014,7 +983,7 @@ const PIN_WAIT: Duration = Duration::from_secs(10);
 /// with no names reads nothing. A missing log counts as no pins yet, and
 /// ends the session if it is still missing at the deadline; an unreadable
 /// or malformed one ends it at once.
-fn wait_for_pins(plan: &crate::network::Plan, audit_dir: &Path, machine: &str, clock: &Clock) -> Result<Pinned, String> {
+pub(crate) fn wait_for_pins(plan: &crate::network::Plan, audit_dir: &Path, machine: &str, clock: &Clock) -> Result<Pinned, String> {
     let names = plan.pinning_names();
     if names.is_empty() {
         return Ok(Pinned::new());
@@ -1071,35 +1040,30 @@ pub fn plugin_options(p: &SessionPaths, cfg: &OperatorConfig, tool_command: &[St
     })
 }
 
-fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operator_home: &str, supervisor: &Path, live: &mut Live, initial_prompt: Option<&str>) -> Result<i32, String> {
+fn session_body(cfg: &OperatorConfig, deps: &Deps, backend: &dyn Backend, operator_home: &str, live: &mut Live, initial_prompt: Option<&str>) -> Result<i32, String> {
     let p = live.paths;
     let leak_seam_set = deps.env.iter().any(|(k, _)| k == "RTS_TEST_LEAK");
     let step = crate::brand::progress::step("host check", Shown::Sweep);
-    preflight(&PreflightInput {
+    backend.preflight(&HostCheck {
         host: deps.host.as_ref(),
-        run: run.as_ref(),
-        mvmctl: &cfg.mvmctl,
         opencode: &cfg.opencode,
         leak_seam_set,
-        supervisor_path: Some(supervisor),
         work_dir: Some(&p.work),
         provider: &cfg.provider,
     })?;
     // Every launch, with or without an allowlist, before any machine command.
-    let root = mvm_root(&deps.env)?;
-    crate::network::check_mvm_host(&deps.env, &root)?;
+    backend.check_host_config()?;
     step.ok("opencode, mvm, supervisor and provider");
     let step = crate::brand::progress::step("allowlist", Shown::Sweep);
     let plan = crate::network::plan(&cfg.network, deps.resolver.as_ref())?;
     write_session_record(p, &plan, &[], &Pinned::new())?;
     step.ok(&plan.allowlist_line());
-    sweep_orphans(run, &mut |m| live.log.log(m))?;
+    backend.sweep(&mut |m| live.log.log(m))?;
     if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)) {
         return Err(why);
     }
 
     live.machine_attempted = true;
-    live.audit_dir = Some(root.join("audit"));
     let hosts = plan.allow_hosts();
     let egress = (!plan.is_empty()).then(|| crate::sandbox::Egress { allow_hosts: &hosts, attach_log: &p.attach_log, session_hours: cfg.limits.session_hours });
     // Read before create, so this limit ends no later than the attach `--ttl`.
@@ -1113,8 +1077,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     live.machine_created = true;
     live.log.log(&format!("created {}", p.machine));
     if !plan.is_empty() {
-        let attach = live.sb.attach_pid().ok_or("network machine has no attached mvmctl machine run")?;
-        live.network_pids = network_children(live.host, attach)?;
+        live.sb.track_network()?;
     }
     step.ok(&format!("{} · {} MiB · {} vCPU · {}", p.machine, cfg.limits.memory_mib, cfg.limits.cpus, plan.net_label()));
     let step = crate::brand::progress::step("probes", Shown::Sweep);
@@ -1126,7 +1089,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     // An empty plan has no egress to pin, and no status line for it.
     let pin_line = plan.pinned_line();
     let step = pin_line.as_ref().map(|_| crate::brand::progress::step("pinned IPs", Shown::Sweep));
-    let pinned = wait_for_pins(&plan, &root.join("audit"), &p.machine, &deps.clock)?;
+    let pinned = live.sb.wait_for_pins(&plan, &deps.clock)?;
     write_session_record(p, &plan, &probes, &pinned)?;
     crate::network::check_pinned(&plan, &pinned)?;
     if let (Some(step), Some(line)) = (step, pin_line) {
@@ -1161,9 +1124,9 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         return Err(format!("{why} before opencode started"));
     }
 
-    let supervisor = Supervisor::discover(&p.machine, &deps.env)?;
-    supervisor.sample(deps.host.as_ref(), cfg.limits.host_rss_ceiling_mib)?;
-    live.log.log(&format!("sampling host RSS of pid {} (found via {})", supervisor.pid, supervisor.pid_file.display()));
+    let monitor = live.sb.monitor()?;
+    monitor.sample(cfg.limits.host_rss_ceiling_mib)?;
+    live.log.log(&format!("sampling host RSS of {}", monitor.describe()));
 
     let nonce = new_nonce();
     let mut plugin_options = plugin_options(p, cfg, &deps.tool_command, &nonce, operator_home);
@@ -1249,7 +1212,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         }
         if Instant::now() >= next_sample {
             next_sample = Instant::now() + Duration::from_secs(5);
-            supervisor.sample(deps.host.as_ref(), cfg.limits.host_rss_ceiling_mib)?;
+            monitor.sample(cfg.limits.host_rss_ceiling_mib)?;
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -1258,6 +1221,8 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::mvm::MvmMachine;
+    use crate::mvm::MvmSandbox;
     use crate::config::{Defaults, parse_config};
     use crate::testutil::tempdir;
     use std::net::TcpListener;
@@ -2180,7 +2145,8 @@ mod tests {
         let worker = thread::spawn(move || {
             let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
             let sb = MvmSandbox::new(&p.machine, Box::new(f.clone())).unwrap();
-            let mut live = Live { log: &log, sb: &sb, paths: &p, host: f.as_ref(), machine_attempted: true, machine_created: true, child: None, network_pids: vec![], audit_dir: None, canaries: None, monitoring_failed: false, canary_setup_complete: false };
+            let sb = MvmMachine::from_parts(sb, f.clone(), vec![], vec![]);
+            let mut live = Live { log: &log, sb: &sb, paths: &p, machine_attempted: true, machine_created: true, child: None, canaries: None, monitoring_failed: false, canary_setup_complete: false };
             started_tx.send(()).unwrap();
             live.teardown("test");
         });
@@ -2658,10 +2624,10 @@ mod tests {
         });
         let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
         let sb = MvmSandbox::new(&p.machine, Box::new(f.clone())).unwrap();
+        let sb = MvmMachine::from_parts(sb, f.clone(), vec![("MVM_HOME".into(), d.join("no-such-mvm").to_string_lossy().into_owned())], vec![4243, 4245]);
         let mut live = Live {
-            log: &log, sb: &sb, paths: &p, host: f.as_ref(),
+            log: &log, sb: &sb, paths: &p,
             machine_attempted: true, machine_created: false, child: None,
-            network_pids: vec![4243, 4245], audit_dir: Some(d.join("no-such-audit")),
             canaries: None, monitoring_failed: false, canary_setup_complete: false,
         };
         live.teardown("test");
@@ -2790,17 +2756,15 @@ mod tests {
         let f = Fake::new(|_| out(0, "", ""));
         let run: Arc<dyn Runner> = f.clone();
         let sb = MvmSandbox::new(&p.machine, Box::new(run)).unwrap();
+        let sb = MvmMachine::from_parts(sb, f.clone(), vec![], vec![]);
         let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
         let mut live = Live {
             log: &log,
             sb: &sb,
             paths: &p,
-            host: f.as_ref(),
             machine_attempted: true,
             machine_created: true,
             child: None,
-            network_pids: vec![],
-            audit_dir: None,
             canaries: None,
             monitoring_failed: false,
             canary_setup_complete: false,
@@ -2822,17 +2786,15 @@ mod tests {
         let f = Fake::new(|_| out(0, "", ""));
         let run: Arc<dyn Runner> = f.clone();
         let sb = MvmSandbox::new(&p.machine, Box::new(run)).unwrap();
+        let sb = MvmMachine::from_parts(sb, f.clone(), vec![], vec![]);
         let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
         let mut live = Live {
             log: &log,
             sb: &sb,
             paths: &p,
-            host: f.as_ref(),
             machine_attempted: true,
             machine_created: true,
             child: None,
-            network_pids: vec![],
-            audit_dir: None,
             canaries: None,
             monitoring_failed: false,
             canary_setup_complete: false,
