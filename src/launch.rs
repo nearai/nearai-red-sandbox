@@ -231,7 +231,7 @@ fn start_connected<F, I>(
     Ok((forwarder, inference))
 }
 
-fn run_connected<G>(
+pub(crate) fn run_connected<G>(
     cfg: &mut config::OperatorConfig,
     preflight: impl FnOnce(&config::OperatorConfig) -> Result<(), String>,
     connect: impl FnOnce(&config::OperatorConfig) -> Result<(config::ProviderConfig, G), String>,

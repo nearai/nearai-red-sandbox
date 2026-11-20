@@ -14,6 +14,8 @@ use crate::network::Plan;
 use crate::sandbox::Sandbox;
 use crate::session::{Clock, Deps, Host, SessionPaths};
 
+#[cfg(test)]
+mod invariants;
 pub mod kvm;
 pub mod mvm;
 

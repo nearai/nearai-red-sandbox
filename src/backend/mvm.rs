@@ -199,7 +199,7 @@ impl MvmBackend {
 
     /// Use `device` instead of `/dev/kvm` (tests).
     #[cfg(test)]
-    fn with_kvm(mut self, device: &Path) -> Self {
+    pub(crate) fn with_kvm(mut self, device: &Path) -> Self {
         self.kvm = device.to_path_buf();
         self
     }
