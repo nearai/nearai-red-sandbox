@@ -181,7 +181,12 @@ RUSTFLAGS="-D warnings" CARGO_INCREMENTAL=0 \
 ```
 
 It defaults to production (`https://cloud-api.near.ai/v1`) and the default
-models; `RTS_LIVE_NEAR_BASE_URL` and `RTS_LIVE_NEAR_MODELS` override them.
+models. `RTS_LIVE_NEAR_ENVIRONMENT=staging` selects staging
+(`https://cloud-stg-api.near.ai/v1`) and its pinned policy together, and
+`RTS_LIVE_NEAR_MODELS` overrides the models. `RTS_LIVE_COMPOSE_POLICY=mr-config-only`
+relaxes only the compose pin, and `RTS_LIVE_RECORD_DIR` writes what verified as
+rts's own `live-<environment>/attestation.json` for
+`scripts/refresh-attestation-policy.py --environment <environment>`.
 NEAR AI serves the attestation report without an API key, so none is needed;
 `RTS_LIVE_NEAR_API_KEY`, when set, is sent as the bearer. `RTS_LIVE_SAVE_DIR`
 saves every exchange (report, PCS, CRL, NRAS) as `live-run.json`, the source
@@ -197,6 +202,15 @@ with the default options (TCB `UpToDate` required, pinned compose):
 | Compose hash | `f571e5da...7bcc7ce` (`dstack-0.5.12`) | `ae66f844...8389265b` (`dstack-nvidia-0.5.11`) |
 | `tls_cert_fingerprint` (SPKI sha256) | `73862c25...ba8ba5ad` | `4066aed3...47796408` |
 | NRAS | | overall `true`, kid `nv-eat-kid-prod-20261029142518307-...` |
+
+On 2026-11-20 both environments verified keyless under strict pinning after
+the policies were refreshed. Production's gateway had redeployed to
+`53cd435e...a7e1fb` (`dstack-0.5.12`), with model entries `e3902667...a45959`
+and `edabf803...0da850d4` (`dstack-nvidia-0.5.11`). Staging's gateway is
+`10d29b73...bdf441` (`dstack-0.5.15`, SPKI `986c6303...ee02d84`) and it serves
+the same two model entries. `tests/fixtures/near-staging/live-run-2026-11-20.json`
+is the staging replay fixture. It attests under the staging policy and is
+refused under production's.
 
 The live `cloud-api.near.ai` leaf's SPKI sha256 was `73862c25...ba8ba5ad`,
 the gateway's attested fingerprint, and the forwarder's pinned client config

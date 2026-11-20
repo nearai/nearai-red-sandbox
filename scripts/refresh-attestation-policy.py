@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Propose compose hashes for opencode/attestation-policy.json from a session
-that rts verified.
+"""Propose compose hashes for a NEAR AI environment's attestation policy from
+a session that rts verified.
 
 NEAR AI redeploys a model or the gateway to a new TEE build, the compose hash
 changes, and a strictly pinned launch refuses it (issue #25). To record the
@@ -9,6 +9,13 @@ new build, run one session with `rts launch --compose-policy mr-config-only`
 
     scripts/refresh-attestation-policy.py ~/.../sessions/<id>/attestation.json
     scripts/refresh-attestation-policy.py <attestation.json> --write
+    scripts/refresh-attestation-policy.py <attestation.json> --environment staging --write
+
+Each environment has its own policy: production
+opencode/attestation-policy.json, staging
+opencode/attestation-policy-staging.json. Every evidence entry must carry the
+`base_url` of the chosen environment, so a staging build cannot be pinned for
+production or the reverse.
 
 Only entries rts accepted after every check (TDX quote, TCB, report_data,
 mr_config_id == sha256(app_compose), and for models the GPU verdict) but
@@ -27,7 +34,12 @@ import pathlib
 import re
 import sys
 
-POLICY = pathlib.Path(__file__).resolve().parent.parent / "opencode" / "attestation-policy.json"
+OPENCODE = pathlib.Path(__file__).resolve().parent.parent / "opencode"
+# As rts::inference::NearEnvironment::base_url.
+ENVIRONMENTS = {
+    "production": ("https://cloud-api.near.ai/v1", "attestation-policy.json"),
+    "staging": ("https://cloud-stg-api.near.ai/v1", "attestation-policy-staging.json"),
+}
 UNPINNED = {"mr-config-only", "key-continuity"}
 HASH = re.compile(r"^[0-9a-f]{64}$")
 
@@ -45,9 +57,15 @@ def _entry(model, report, entry):
     return where, info
 
 
-def candidates(doc, policy, today):
+def policy_path(environment):
+    return OPENCODE / ENVIRONMENTS[environment][1]
+
+
+def candidates(doc, policy, today, environment="production"):
     """New, verified, unpinned compose hashes in first-seen order. Each
     carries `app_compose` for review; it is not written to the policy."""
+    base_url = ENVIRONMENTS[environment][0]
+    host = base_url.split("/")[2]
     # Evidence is written only once attestation verified; a session that
     # verified and later ended keeps it under one of these statuses.
     if doc.get("status") not in ("verified", "pin-failed", "signature-failed", "model-refused"):
@@ -61,6 +79,10 @@ def candidates(doc, policy, today):
     out, seen = [], set(pinned)
     for batch in batches:
         for ev in batch:
+            if ev.get("base_url") != base_url:
+                raise ValueError(
+                    f"evidence base_url {ev.get('base_url')!r} is not the {environment} API base {base_url!r}"
+                )
             for entry in ev.get("entries", []):
                 how = entry.get("compose_acceptance")
                 if how not in UNPINNED:
@@ -89,7 +111,7 @@ def candidates(doc, policy, today):
                 out.append({
                     "sha256": h,
                     "recorded": today,
-                    "source": f"NEAR AI production cloud-api.near.ai: {where}, info.app_name {app} ({how}, verified by rts)",
+                    "source": f"NEAR AI {environment} {host}: {where}, info.app_name {app} ({how}, verified by rts)",
                     "app_compose": compose,
                 })
     return out
@@ -98,13 +120,15 @@ def candidates(doc, policy, today):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("attestation", type=pathlib.Path, help="a session's attestation.json")
-    ap.add_argument("--policy", type=pathlib.Path, default=POLICY)
+    ap.add_argument("--environment", choices=sorted(ENVIRONMENTS), default="production")
+    ap.add_argument("--policy", type=pathlib.Path, help="default: the environment's policy file")
     ap.add_argument("--write", action="store_true", help="append the proposed entries to the policy")
     args = ap.parse_args(argv)
+    args.policy = args.policy or policy_path(args.environment)
     try:
         doc = json.loads(args.attestation.read_text())
         policy = json.loads(args.policy.read_text())
-        found = candidates(doc, policy, datetime.date.today().isoformat())
+        found = candidates(doc, policy, datetime.date.today().isoformat(), args.environment)
     except (OSError, ValueError, KeyError) as e:
         print(f"refresh-attestation-policy: {e}", file=sys.stderr)
         return 1

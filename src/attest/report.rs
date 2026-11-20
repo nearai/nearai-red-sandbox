@@ -170,7 +170,7 @@ pub fn check_compose(
         ComposeAcceptance::KeyContinuity
     } else {
         return Err(format!(
-            "compose hash {} is not pinned in opencode/attestation-policy.json (pass --compose-policy mr-config-only to accept it, or see scripts/refresh-attestation-policy.py)",
+            "compose hash {} is not pinned in this NEAR AI environment's policy, opencode/attestation-policy.json or opencode/attestation-policy-staging.json (pass --compose-policy mr-config-only to accept it, or see scripts/refresh-attestation-policy.py)",
             hex::encode(hash)
         ));
     };

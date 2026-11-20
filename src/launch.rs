@@ -32,6 +32,9 @@ pub struct LaunchSpec {
     pub tool_command: Option<Vec<String>>,
     pub ironwire: IronWireSetup,
     pub env: Vec<(String, String)>,
+    /// The NEAR AI deployment for attestation, its pinned compose list, and
+    /// inference. Staging needs `CredentialSource::Supplied` with a staging key.
+    pub near: inference::NearEnvironment,
 }
 
 /// Result of a completed session launch.
@@ -78,6 +81,7 @@ impl LaunchSpec {
             tool_command: None,
             ironwire: IronWireSetup::default(),
             env: std::env::vars().collect(),
+            near: inference::NearEnvironment::Production,
         })
     }
 }
@@ -103,6 +107,7 @@ fn local_preflight(
     cfg: &config::OperatorConfig,
     host: &dyn session::Host,
     env: &[(String, String)],
+    near: inference::NearEnvironment,
 ) -> Result<(), String> {
     let (temp, empty_git_config) = private_git_config("rts-preflight-")?;
     let work = temp.path().join("work");
@@ -117,7 +122,7 @@ fn local_preflight(
     // A pinned HTTPS placeholder skips the loopback-provider probe. Local
     // prerequisites must succeed before any native credential read or browser.
     let provider = config::ProviderConfig {
-        base_url: "https://cloud-api.near.ai/v1".into(),
+        base_url: near.base_url().into(),
         ..cfg.provider.clone()
     };
     session::preflight(&session::PreflightInput {
@@ -152,6 +157,21 @@ fn check_launch(
         return Err("the config names an external provider (provider.id, baseURL or apiKeyEnv), which rts cannot attest; pass --allow-unattested-provider to use it anyway".into());
     }
     Ok(())
+}
+
+/// Native sign-in and its sponsored allowance are NEAR AI production only;
+/// staging takes a caller-supplied staging key.
+fn check_credential_environment(
+    credential: &CredentialSource,
+    near: inference::NearEnvironment,
+) -> Result<(), String> {
+    match (credential, near) {
+        (CredentialSource::Native(_), inference::NearEnvironment::Staging) => Err(
+            "NEAR AI staging needs a supplied staging key; native sign-in is production only"
+                .into(),
+        ),
+        _ => Ok(()),
+    }
 }
 
 /// Apply `--cpus` and `--memory` over the session file's limits.
@@ -354,6 +374,7 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
         tool_command,
         ironwire,
         env,
+        near,
     } = spec;
     if initial_prompt.is_some() {
         // A source-built launcher paired with an older installed plugin must
@@ -367,6 +388,7 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
         crate::sys::host_memory_mib().ok_or("cannot read this host's physical memory")?;
     config::check_host_fit(&config.limits, host_cpus, host_memory_mib)?;
     check_launch(&config, &env, &attest_options)?;
+    check_credential_environment(&credential, near)?;
     let (stdin_tty, stdout_tty) = brand::stdin_stdout_are_ttys();
     brand::splash::show(
         brand::splash_wanted(stdin_tty, stdout_tty, &env, no_splash),
@@ -401,7 +423,7 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
         &mut config,
         |cfg| {
             let step = progress.step("preflight", Live::Sweep);
-            local_preflight(cfg, preflight_host.as_ref(), &preflight_env)?;
+            local_preflight(cfg, preflight_host.as_ref(), &preflight_env, near)?;
             step.ok(&format!(
                 "mvm supervisor · opencode {}",
                 session::OPENCODE_VERSION
@@ -428,7 +450,7 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                 Some(&progress),
                 &sign_in,
                 |key| {
-                    attest::Attestor::real(Some(key), &cfg.provider.models, attest_options)
+                    attest::Attestor::real(near, Some(key), &cfg.provider.models, attest_options)
                         .map_err(attest::AttestationFailure::Other)?
                         .attest_for_launch()
                 },
@@ -444,7 +466,7 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                     let continuity = attest::Continuity::from_attested(&seed);
                     forwarder::Forwarder::start(forwarder::ForwarderConfig {
                         credentials: Some(credentials.clone()),
-                        upstream: inference::NEAR_BASE_URL.into(),
+                        upstream: near.base_url().into(),
                         models: cfg.provider.models.clone(),
                         roots: forwarder::pin::native_roots()?,
                         seed,
@@ -456,7 +478,7 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                             Arc::new(move || {
                                 let snapshot = credentials.snapshot()?;
                                 let attest = |key| {
-                                    attest::Attestor::real(Some(key), &models, options)
+                                    attest::Attestor::real(near, Some(key), &models, options)
                                         .map_err(attest::AttestationFailure::Other)?
                                         .with_continuity(continuity.clone())
                                         .attest_for_launch()
@@ -586,6 +608,8 @@ mod tests {
         assert_eq!(spec.initial_prompt.as_deref(), Some("hello"));
         assert!(spec.session_id.is_none());
         assert!(spec.tool_command.is_none());
+        // The CLI signs in natively, which is production only.
+        assert_eq!(spec.near, inference::NearEnvironment::Production);
 
         let no_net = LaunchSpec::from_cli(
             Some(&cfg_path),
@@ -601,6 +625,18 @@ mod tests {
         .unwrap();
         assert!(no_net.config.network.is_empty());
         assert_eq!(no_net.config.limits, default_config().limits);
+    }
+
+    #[test]
+    fn staging_needs_a_supplied_key() {
+        use inference::NearEnvironment::{Production, Staging};
+        let native = CredentialSource::Native(auth::LoginOptions::default());
+        let supplied = CredentialSource::Supplied("sk-staging-test-key".to_string().into());
+        assert!(check_credential_environment(&native, Production).is_ok());
+        assert!(check_credential_environment(&supplied, Production).is_ok());
+        assert!(check_credential_environment(&supplied, Staging).is_ok());
+        let e = check_credential_environment(&native, Staging).unwrap_err();
+        assert!(e.contains("staging"), "{e}");
     }
 
     #[test]
@@ -801,7 +837,14 @@ mod tests {
         let env = vec![("HOME".into(), "/fake/operator".into())];
         let result = run_connected::<()>(
             &mut default_config(),
-            |cfg| local_preflight(cfg, &StockSupervisor, &env),
+            |cfg| {
+                local_preflight(
+                    cfg,
+                    &StockSupervisor,
+                    &env,
+                    inference::NearEnvironment::Production,
+                )
+            },
             |_| panic!("must not read credentials or open browser login"),
             |_| panic!("must not start session"),
         );

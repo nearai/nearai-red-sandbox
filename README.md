@@ -383,8 +383,15 @@ proof that a particular model generated the answer.
 
 #### Compose pins and NEAR redeploys
 
-A launch accepts only compose hashes pinned in
-[`opencode/attestation-policy.json`](opencode/attestation-policy.json).
+A launch accepts only compose hashes pinned for its NEAR AI environment:
+[`opencode/attestation-policy.json`](opencode/attestation-policy.json) for
+production (`https://cloud-api.near.ai/v1`), and
+[`opencode/attestation-policy-staging.json`](opencode/attestation-policy-staging.json)
+for staging (`https://cloud-stg-api.near.ai/v1`). A build pinned for one is
+never trusted for the other. `rts launch` always uses production; an embedder
+selects staging with `LaunchSpec.near = NearEnvironment::Staging` and must
+supply a staging key (`CredentialSource::Supplied`), because native sign-in is
+production only.
 NEAR AI may redeploy a model or the gateway to a new TEE build mid-session,
 which changes its compose hash. When the forwarder re-attests, it accepts an
 unpinned compose only if that entry passes every other check and its quote
@@ -396,7 +403,9 @@ A new launch against the new build is still refused until it is pinned. To pin
 it, run one session with `--compose-policy mr-config-only` (or use a session
 that continued by key), then run
 `scripts/refresh-attestation-policy.py <session>/attestation.json`, review
-each printed `app_compose`, then rerun it with `--write` and rebuild.
+each printed `app_compose`, then rerun it with `--write` and rebuild. For
+staging, add `--environment staging`; the script refuses evidence whose
+recorded `base_url` belongs to the other environment.
 
 The attested inference behavior above describes the default embedded NEAR AI
 path. External providers require an explicit opt-out of required attestation;

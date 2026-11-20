@@ -34,9 +34,14 @@ def report(gw_app, model_app, gw_hash, m_hash):
     })
 
 
-def evidence(model, gw_hash, gw_how, m_hash, m_how, gw_app="dstack-0.5.12", m_app="dstack-nvidia-0.5.12"):
+PROD = "https://cloud-api.near.ai/v1"
+STG = "https://cloud-stg-api.near.ai/v1"
+
+
+def evidence(model, gw_hash, gw_how, m_hash, m_how, gw_app="dstack-0.5.12", m_app="dstack-nvidia-0.5.12", base_url=PROD):
     return {
         "model": model,
+        "base_url": base_url,
         "report": report(gw_app, m_app, gw_hash, m_hash),
         "entries": [
             {"role": "gateway", "compose_hash": gw_hash, "compose_acceptance": gw_how},
@@ -138,3 +143,33 @@ def test_rejects_a_malformed_hash(tmp_path):
     a, p = write(tmp_path, doc, policy_with(PINNED))
     r = subprocess.run([sys.executable, str(SCRIPT), str(a), "--policy", str(p)], capture_output=True, text=True)
     assert r.returncode != 0
+
+
+def test_each_environment_has_its_own_policy_file():
+    assert refresh.policy_path("production").name == "attestation-policy.json"
+    assert refresh.policy_path("staging").name == "attestation-policy-staging.json"
+    assert refresh.policy_path("production").parent == refresh.policy_path("staging").parent
+
+
+def test_staging_evidence_is_proposed_for_the_staging_policy(tmp_path):
+    doc = {"status": "verified", "evidence": [evidence("q", NEW_GW, "mr-config-only", NEW_MODEL, "mr-config-only", base_url=STG)]}
+    a, p = write(tmp_path, doc, policy_with())
+    found = refresh.candidates(json.loads(a.read_text()), json.loads(p.read_text()), "2026-11-20", "staging")
+    assert [c["sha256"] for c in found] == [NEW_GW, NEW_MODEL]
+    assert all(c["source"].startswith("NEAR AI staging cloud-stg-api.near.ai: ") for c in found)
+
+
+def test_refuses_evidence_from_the_other_environment(tmp_path):
+    for env, base in (("staging", PROD), ("production", STG), ("production", None)):
+        ev = evidence("q", NEW_GW, "mr-config-only", NEW_MODEL, "mr-config-only", base_url=base)
+        if base is None:
+            del ev["base_url"]
+        a, p = write(tmp_path, {"status": "verified", "evidence": [ev]}, policy_with())
+        before = p.read_text()
+        r = subprocess.run(
+            [sys.executable, str(SCRIPT), str(a), "--environment", env, "--policy", str(p), "--write"],
+            capture_output=True, text=True,
+        )
+        assert r.returncode != 0, (env, base)
+        assert "base_url" in r.stderr
+        assert p.read_text() == before
