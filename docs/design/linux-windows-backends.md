@@ -256,6 +256,42 @@ stopped at this document because:
   the trait's shape before the Linux spike (phase 1 above) risks guessing the
   wrong seams; the spike tells us what `Machine` actually needs.
 
+Superseded: the owner asked for the refactor now; see 9a.
+
+## 9a. Status, 2026-11-20
+
+Owner decisions: move every platform to a newer mvm once a release has the
+Linux egress fix (none yet: latest stable is v0.22.0; only `v0.28.0-rc.*`
+tags exist, without release assets); no root VMs; refuse hosts without KVM
+or nested virtualization; Windows 11 with nested virtualization is the
+floor, pending a spike.
+
+Done on this branch (macOS host only):
+
+- `src/backend.rs`: `Backend`, `Machine`, `Monitor`. `session_body`, its
+  teardown and the launch preflight use them; `backend::mvm::MvmBackend`
+  adapts the existing mvm plumbing with no behaviour change.
+- `backend::mvm::Flavor::{Hvf, Firecracker}`, Firecracker selected on
+  Linux. `src/backend/kvm.rs`: `/dev/kvm` access check, a `sudo` shim that
+  never elevates placed first on mvmctl's PATH, and a check that the VMM
+  is not root before OpenCode starts. `setup::Target` pins the Linux
+  mvmctl and OpenCode assets.
+- `src/backend/invariants.rs` (per flavor, fake mvmctl) and
+  `tests/contain/invariants.rs` (this host's flavor, real machine).
+
+Still needs a real Linux KVM host, then a Windows 11 host:
+
+- Whether mvm v0.22.0's Firecracker path works with the non-elevating
+  `sudo` (or needs a patch), and whether `machine exec` from `rts tool`
+  needs it too (`bridge::run` does not set it today).
+- A post-#3962 mvm release, then re-pin every platform.
+- `rts setup` on Linux: skip the HVF supervisor and codesign steps, check
+  KVM; the release archive layout for Linux.
+- The session unit tests in `session.rs` assume HVF (supervisor probe in
+  the call lists); on Linux they need the HVF flavor injected or gating.
+- A guest image digest for x86_64; the live invariants and the rest of
+  `tests/contain` on a KVM host; trace-commons' Linux dependency.
+
 ## 10. Open questions for the owner
 
 1. Is Linux-on-mvm acceptable given that it requires moving off mvm v0.22.0
