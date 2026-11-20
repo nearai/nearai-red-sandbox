@@ -35,9 +35,7 @@ pub fn new_nonce() -> String {
 }
 
 pub fn is_nonce(s: &str) -> bool {
-    s.len() == 24
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == 24 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Fixed text. Operands: $1 nonce, $2 timeout seconds, $3 output cap,
@@ -95,10 +93,7 @@ pub fn parse_result(stdout: &[u8], stderr: &[u8], nonce: &str) -> Option<ParsedR
     if end > 0 && stderr[end - 1] == b'\n' {
         end -= 1;
     }
-    let start = stderr[..end]
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map_or(0, |i| i + 1);
+    let start = stderr[..end].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
     let line = std::str::from_utf8(&stderr[start..end]).ok()?;
     let rest = line.strip_prefix("RTS_EXIT_")?;
     let mut parts = rest.split(' ');
@@ -106,9 +101,7 @@ pub fn parse_result(stdout: &[u8], stderr: &[u8], nonce: &str) -> Option<ParsedR
     if parts.next().is_some() || !is_nonce(n) || n != nonce {
         return None;
     }
-    let digits = |s: &str, max: usize| {
-        !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_digit())
-    };
+    let digits = |s: &str, max: usize| !s.is_empty() && s.len() <= max && s.bytes().all(|b| b.is_ascii_digit());
     if !digits(status, 10) || !digits(out, 16) || !digits(err, 16) {
         return None;
     }
@@ -146,12 +139,7 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
     fn opts(nonce: &str) -> WrapOptions<'_> {
-        WrapOptions {
-            nonce,
-            timeout_sec: 120,
-            max_output_bytes: 65536,
-            workdir: None,
-        }
+        WrapOptions { nonce, timeout_sec: 120, max_output_bytes: 65536, workdir: None }
     }
 
     #[test]
@@ -162,46 +150,23 @@ mod tests {
         assert_eq!(argv[1], "-c");
         assert!(argv[2].contains(r#"timeout -s KILL "$2""#));
         assert!(!argv[2].contains("rm -rf"));
-        assert_eq!(
-            &argv[argv.len() - 5..],
-            &s(&["grep", "-n", "--", "$(rm -rf /)", "/in"])[..]
-        );
+        assert_eq!(&argv[argv.len() - 5..], &s(&["grep", "-n", "--", "$(rm -rf /)", "/in"])[..]);
     }
 
     #[test]
     fn wrap_passes_operands_by_position() {
         let n = "f".repeat(24);
-        let o = WrapOptions {
-            nonce: &n,
-            timeout_sec: 7,
-            max_output_bytes: 99,
-            workdir: Some("/a b"),
-        };
-        assert_eq!(
-            &wrap_argv(&s(&["true"]), &o).unwrap()[3..],
-            &s(&["rts", &n, "7", "99", "/a b", "true"])[..]
-        );
+        let o = WrapOptions { nonce: &n, timeout_sec: 7, max_output_bytes: 99, workdir: Some("/a b") };
+        assert_eq!(&wrap_argv(&s(&["true"]), &o).unwrap()[3..], &s(&["rts", &n, "7", "99", "/a b", "true"])[..]);
         let o = WrapOptions { workdir: None, ..o };
-        assert_eq!(
-            &wrap_argv(&s(&["true"]), &o).unwrap()[3..],
-            &s(&["rts", &n, "7", "99", "", "true"])[..]
-        );
+        assert_eq!(&wrap_argv(&s(&["true"]), &o).unwrap()[3..], &s(&["rts", &n, "7", "99", "", "true"])[..]);
     }
 
     #[test]
     fn wrap_rejects_bad_input() {
         let n = "a".repeat(24);
         assert!(wrap_argv(&s(&["true"]), &opts("x")).is_err());
-        assert!(
-            wrap_argv(
-                &s(&["true"]),
-                &WrapOptions {
-                    timeout_sec: 0,
-                    ..opts(&n)
-                }
-            )
-            .is_err()
-        );
+        assert!(wrap_argv(&s(&["true"]), &WrapOptions { timeout_sec: 0, ..opts(&n) }).is_err());
         assert!(wrap_argv(&[], &opts(&n)).is_err());
     }
 
@@ -211,27 +176,14 @@ mod tests {
         let r = parse_result(b"hi", format!("warn\nRTS_EXIT_{n} 3 2 4\n").as_bytes(), &n).unwrap();
         assert_eq!(
             r,
-            ParsedResult {
-                exit_code: 3,
-                timed_out: false,
-                stdout: b"hi".to_vec(),
-                stderr: b"warn".to_vec(),
-                stdout_bytes: 2,
-                stderr_bytes: 4,
-                truncated: false
-            }
+            ParsedResult { exit_code: 3, timed_out: false, stdout: b"hi".to_vec(), stderr: b"warn".to_vec(), stdout_bytes: 2, stderr_bytes: 4, truncated: false }
         );
     }
 
     #[test]
     fn status_137_is_timeout_and_big_sizes_are_truncation() {
         let n = "c".repeat(24);
-        let r = parse_result(
-            &[b'x'; 10],
-            format!("RTS_EXIT_{n} 137 2097152 0\n").as_bytes(),
-            &n,
-        )
-        .unwrap();
+        let r = parse_result(&[b'x'; 10], format!("RTS_EXIT_{n} 137 2097152 0\n").as_bytes(), &n).unwrap();
         assert!(r.timed_out);
         assert!(r.truncated);
         assert_eq!(r.stdout_bytes, 2097152);
@@ -240,14 +192,7 @@ mod tests {
     #[test]
     fn other_nonce_or_bad_trailer_is_none() {
         let e = "e".repeat(24);
-        assert!(
-            parse_result(
-                b"",
-                format!("RTS_EXIT_{} 0 0 0\n", "d".repeat(24)).as_bytes(),
-                &e
-            )
-            .is_none()
-        );
+        assert!(parse_result(b"", format!("RTS_EXIT_{} 0 0 0\n", "d".repeat(24)).as_bytes(), &e).is_none());
         assert!(parse_result(b"", b"boom\n", &e).is_none());
         assert!(parse_result(b"", format!("RTS_EXIT_{e} 0 0 0\nmore\n").as_bytes(), &e).is_none());
         assert!(parse_result(b"", format!("RTS_EXIT_{e} 0 0\n").as_bytes(), &e).is_none());
@@ -256,9 +201,7 @@ mod tests {
 
     #[test]
     fn poison_text() {
-        assert!(is_poisoned(
-            "Error: machine input sequence 1 has no durable finish; refuse exec"
-        ));
+        assert!(is_poisoned("Error: machine input sequence 1 has no durable finish; refuse exec"));
         assert!(!is_poisoned("all good"));
     }
 
@@ -273,12 +216,7 @@ mod tests {
 
     #[test]
     fn host_sh_reports_real_status_and_streams() {
-        let r = run_wrapped_locally(
-            &s(&["sh", "-c", "echo out; echo err >&2; exit 3"]),
-            10,
-            65536,
-            None,
-        );
+        let r = run_wrapped_locally(&s(&["sh", "-c", "echo out; echo err >&2; exit 3"]), 10, 65536, None);
         assert_eq!(r.exit_code, 3);
         assert_eq!(r.stdout, b"out\n");
         assert_eq!(r.stderr, b"err\n");
@@ -287,12 +225,7 @@ mod tests {
 
     #[test]
     fn host_sh_does_not_interpolate() {
-        let r = run_wrapped_locally(
-            &s(&["printf", "%s", "$(echo pwned) `id` ; rm -rf /nope"]),
-            10,
-            65536,
-            None,
-        );
+        let r = run_wrapped_locally(&s(&["printf", "%s", "$(echo pwned) `id` ; rm -rf /nope"]), 10, 65536, None);
         assert_eq!(r.stdout, b"$(echo pwned) `id` ; rm -rf /nope");
     }
 

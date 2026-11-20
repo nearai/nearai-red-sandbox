@@ -46,9 +46,7 @@ pub fn mvm_dir(home: &Path) -> PathBuf {
 }
 
 pub fn opencode_dir(home: &Path) -> PathBuf {
-    home.join(HOME_SHARE)
-        .join("opencode")
-        .join(crate::session::OPENCODE_VERSION)
+    home.join(HOME_SHARE).join("opencode").join(crate::session::OPENCODE_VERSION)
 }
 
 /// Where an installed `rts` keeps sessions when the config names no
@@ -123,12 +121,7 @@ mod tests {
     fn source_builds_have_no_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let t = dir.path();
-        for p in [
-            "target/debug/rts",
-            "target/release/rts",
-            "target/debug/deps/rts-0123abcd",
-            "binx/rts",
-        ] {
+        for p in ["target/debug/rts", "target/release/rts", "target/debug/deps/rts-0123abcd", "binx/rts"] {
             touch(&t.join(p));
             assert_eq!(install_prefix(&t.join(p)), None, "{p}");
         }
@@ -141,18 +134,10 @@ mod tests {
         let prefix = dir.path().join("prefix");
         let home = dir.path().join("home");
         fs::create_dir_all(prefix.join("share/nearai-red-sandbox/plugin")).unwrap();
-        let lookup = Lookup {
-            source: Path::new("/src"),
-            prefix: Some(&prefix),
-            home: &home,
-            rts_mvmctl: None,
-        };
+        let lookup = Lookup { source: Path::new("/src"), prefix: Some(&prefix), home: &home, rts_mvmctl: None };
         let d = defaults(&lookup);
         assert_eq!(d.plugin_dir, prefix.join("share/nearai-red-sandbox/plugin"));
-        assert_eq!(
-            d.sessions_dir,
-            home.join(".local/share/nearai-red-sandbox/sessions")
-        );
+        assert_eq!(d.sessions_dir, home.join(".local/share/nearai-red-sandbox/sessions"));
         assert_eq!(d.mvmctl, home.join(".local/mvm/v0.22.0/mvmctl"));
         assert_eq!(d.opencode, "opencode");
         let opencode = home.join(".local/share/nearai-red-sandbox/opencode/2.2.2/opencode");
@@ -165,29 +150,15 @@ mod tests {
     fn a_source_build_keeps_the_checkout_paths_and_rts_mvmctl_wins() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let d = defaults(&Lookup {
-            source: Path::new("/src"),
-            prefix: None,
-            home: &home,
-            rts_mvmctl: Some(Path::new("/x/mvmctl")),
-        });
+        let d = defaults(&Lookup { source: Path::new("/src"), prefix: None, home: &home, rts_mvmctl: Some(Path::new("/x/mvmctl")) });
         assert_eq!(
             (d.plugin_dir, d.sessions_dir, d.mvmctl),
-            (
-                PathBuf::from("/src/plugin"),
-                PathBuf::from("/src/sessions"),
-                PathBuf::from("/x/mvmctl")
-            )
+            (PathBuf::from("/src/plugin"), PathBuf::from("/src/sessions"), PathBuf::from("/x/mvmctl"))
         );
         // A prefix without share/nearai-red-sandbox/plugin behaves like a source build.
         let bare = dir.path().join("bare");
         fs::create_dir_all(&bare).unwrap();
-        let d = defaults(&Lookup {
-            source: Path::new("/src"),
-            prefix: Some(&bare),
-            home: &home,
-            rts_mvmctl: None,
-        });
+        let d = defaults(&Lookup { source: Path::new("/src"), prefix: Some(&bare), home: &home, rts_mvmctl: None });
         assert_eq!(d.plugin_dir, PathBuf::from("/src/plugin"));
         assert_eq!(d.sessions_dir, PathBuf::from("/src/sessions"));
         assert_eq!(d.mvmctl, home.join(".local/mvm/v0.22.0/mvmctl"));
@@ -197,30 +168,12 @@ mod tests {
     fn layout_paths_match_the_spec() {
         let p = Path::new("/p");
         let h = Path::new("/h");
-        assert_eq!(
-            prefix_plugin(p),
-            PathBuf::from("/p/share/nearai-red-sandbox/plugin")
-        );
-        assert_eq!(
-            prefix_supervisor(p),
-            PathBuf::from("/p/libexec/nearai-red-sandbox/mvm-hvf-supervisor")
-        );
-        assert_eq!(
-            home_supervisor(h),
-            PathBuf::from("/h/.local/share/nearai-red-sandbox/mvm-hvf-supervisor")
-        );
+        assert_eq!(prefix_plugin(p), PathBuf::from("/p/share/nearai-red-sandbox/plugin"));
+        assert_eq!(prefix_supervisor(p), PathBuf::from("/p/libexec/nearai-red-sandbox/mvm-hvf-supervisor"));
+        assert_eq!(home_supervisor(h), PathBuf::from("/h/.local/share/nearai-red-sandbox/mvm-hvf-supervisor"));
         assert_eq!(mvm_dir(h), PathBuf::from("/h/.local/mvm/v0.22.0"));
-        assert_eq!(
-            opencode_dir(h),
-            PathBuf::from("/h/.local/share/nearai-red-sandbox/opencode/2.2.2")
-        );
-        assert_eq!(
-            home_sessions(h),
-            PathBuf::from("/h/.local/share/nearai-red-sandbox/sessions")
-        );
-        assert_eq!(
-            update_cache(h),
-            PathBuf::from("/h/.local/share/nearai-red-sandbox/update-check.json")
-        );
+        assert_eq!(opencode_dir(h), PathBuf::from("/h/.local/share/nearai-red-sandbox/opencode/2.2.2"));
+        assert_eq!(home_sessions(h), PathBuf::from("/h/.local/share/nearai-red-sandbox/sessions"));
+        assert_eq!(update_cache(h), PathBuf::from("/h/.local/share/nearai-red-sandbox/update-check.json"));
     }
 }

@@ -178,8 +178,8 @@ fn prepare_home(supplied: Option<PathBuf>) -> Result<OwnedHome, String> {
                     if !meta.is_dir() {
                         return Err("inference: runtime home must be a directory".into());
                     }
-                    let mut entries =
-                        fs::read_dir(&dir).map_err(|_| "inference: cannot inspect runtime home")?;
+                    let mut entries = fs::read_dir(&dir)
+                        .map_err(|_| "inference: cannot inspect runtime home")?;
                     if entries.next().is_some() {
                         return Err("inference: runtime home is not empty".into());
                     }
@@ -278,7 +278,12 @@ fn run_worker(
     runtime.block_on(async {
         let proxy = match tokio::time::timeout(
             STARTUP_TIMEOUT,
-            ironwire_proxy::embed::start_with_options(home.path(), Some(0), options, |_, _| {}),
+            ironwire_proxy::embed::start_with_options(
+                home.path(),
+                Some(0),
+                options,
+                |_, _| {},
+            ),
         )
         .await
         {
@@ -643,24 +648,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(
-            rendered.contains(
-                "[capture]\nenabled = true\nbodies = true\nlogprobs = false\nreceipts = true\n"
-            ),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("base_url = \"http://127.0.0.1:9999/v1\""),
-            "{rendered}"
-        );
-        assert!(
-            runtime_config(
-                &["bad\n[backends]".into()],
-                NEAR_BASE_URL,
-                Capture::default()
-            )
-            .is_err()
-        );
+        assert!(rendered.contains("[capture]\nenabled = true\nbodies = true\nlogprobs = false\nreceipts = true\n"), "{rendered}");
+        assert!(rendered.contains("base_url = \"http://127.0.0.1:9999/v1\""), "{rendered}");
+        assert!(runtime_config(&["bad\n[backends]".into()], NEAR_BASE_URL, Capture::default()).is_err());
     }
 
     #[test]
@@ -703,10 +693,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(
-            err.contains("inference: runtime home is not empty"),
-            "{err}"
-        );
+        assert!(err.contains("inference: runtime home is not empty"), "{err}");
     }
 
     #[test]

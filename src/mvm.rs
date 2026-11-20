@@ -4,9 +4,9 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
@@ -14,9 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::copy::{CopyLimits, copy_in_via, copy_out_via};
 use crate::protocol::{WrapOptions, is_poisoned, new_nonce, parse_result, wrap_argv};
-use crate::sandbox::{
-    CopyOutResult, CreateSpec, Error, Exec, ExecOptions, ExecResult, Result, Sandbox, sv,
-};
+use crate::sandbox::{CopyOutResult, CreateSpec, Error, Exec, ExecOptions, ExecResult, Result, Sandbox, sv};
 
 /// Host backstop on top of the guest-side limit. If it fires, the exec
 /// client was killed from the host, which poisons the machine.
@@ -59,10 +57,7 @@ pub trait Runner: Send + Sync {
     /// `log`. Runners that cannot do this refuse.
     fn attach(&self, argv: &[String], log: &Path) -> io::Result<Box<dyn Attached>> {
         let _ = (argv, log);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "this runner cannot start an attached mvmctl",
-        ))
+        Err(io::Error::new(io::ErrorKind::Unsupported, "this runner cannot start an attached mvmctl"))
     }
 }
 
@@ -78,24 +73,16 @@ impl<R: Runner + ?Sized> Runner for std::sync::Arc<R> {
 pub fn is_machine_name(name: &str) -> bool {
     name.len() == 16
         && name.starts_with("rts-")
-        && name[4..]
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && name[4..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// `^[a-z0-9./-]+@sha256:[0-9a-f]{64}$`
 pub fn is_image_ref(image: &str) -> bool {
-    let Some((name, digest)) = image.split_once("@sha256:") else {
-        return false;
-    };
+    let Some((name, digest)) = image.split_once("@sha256:") else { return false };
     !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"./-".contains(&b))
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"./-".contains(&b))
         && digest.len() == 64
-        && digest
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn read_capped(mut r: impl Read, cap: usize) -> Vec<u8> {
@@ -128,9 +115,7 @@ impl SpawnRunner {
     /// The mvmctl command for `argv`, before stdio and spawning.
     pub fn command(&self, argv: &[String]) -> Command {
         let mut cmd = Command::new(&self.mvmctl);
-        cmd.args(argv)
-            .envs(&self.extra_env)
-            .env("GIT_CONFIG_GLOBAL", &self.empty_git_config);
+        cmd.args(argv).envs(&self.extra_env).env("GIT_CONFIG_GLOBAL", &self.empty_git_config);
         // Last, so a removed name wins over both the parent and extra_env.
         for name in &self.remove_env {
             cmd.env_remove(name);
@@ -148,11 +133,7 @@ impl Runner for SpawnRunner {
     /// 0600 log, and its own process group so the operator's Ctrl-C never
     /// reaches it.
     fn attach(&self, argv: &[String], log: &Path) -> io::Result<Box<dyn Attached>> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(log)?;
+        let file = OpenOptions::new().create(true).append(true).mode(0o600).open(log)?;
         // The mode above applies only to a new file.
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         let child = self
@@ -162,10 +143,7 @@ impl Runner for SpawnRunner {
             .stderr(Stdio::from(file))
             .process_group(0)
             .spawn()?;
-        Ok(Box::new(SpawnedAttach {
-            child,
-            status: None,
-        }))
+        Ok(Box::new(SpawnedAttach { child, status: None }))
     }
 }
 
@@ -248,12 +226,7 @@ pub fn run_captured(mut cmd: Command, timeout: Duration) -> io::Result<RunOutput
     };
     let stdout = t_out.join().unwrap_or_default();
     let stderr = t_err.join().unwrap_or_default();
-    Ok(RunOutput {
-        code: if killed { None } else { status.code() },
-        stdout,
-        stderr,
-        killed,
-    })
+    Ok(RunOutput { code: if killed { None } else { status.code() }, stdout, stderr, killed })
 }
 
 pub(crate) fn tail(b: &[u8]) -> String {
@@ -270,25 +243,16 @@ fn ps_names(text: &str) -> Vec<String> {
 /// Whether `machine ps` lists `name` as running: a line whose first field
 /// is the name and which says `running`.
 fn ps_running(text: &str, name: &str) -> bool {
-    text.lines()
-        .any(|l| l.split_whitespace().next() == Some(name) && l.contains("running"))
+    text.lines().any(|l| l.split_whitespace().next() == Some(name) && l.contains("running"))
 }
 
 /// Machine names from `machine ps`, restricted to ones this harness creates.
 pub fn list_machines(run: &dyn Runner) -> Result<Vec<String>> {
-    let r = run
-        .run(&sv(&["machine", "ps"]), CONTROL_TIMEOUT)
-        .map_err(|e| Error::Other(format!("machine ps failed: {e}")))?;
+    let r = run.run(&sv(&["machine", "ps"]), CONTROL_TIMEOUT).map_err(|e| Error::Other(format!("machine ps failed: {e}")))?;
     if r.code != Some(0) {
-        return Err(Error::Other(format!(
-            "machine ps failed: {}",
-            tail(&r.stderr)
-        )));
+        return Err(Error::Other(format!("machine ps failed: {}", tail(&r.stderr))));
     }
-    Ok(ps_names(&String::from_utf8_lossy(&r.stdout))
-        .into_iter()
-        .filter(|n| is_machine_name(n))
-        .collect())
+    Ok(ps_names(&String::from_utf8_lossy(&r.stdout)).into_iter().filter(|n| is_machine_name(n)).collect())
 }
 
 /// Shared between the launcher and every tool-bridge process for one
@@ -303,13 +267,7 @@ impl StateDir {
         self.0.join("unavailable")
     }
     pub fn dead_reason(&self) -> Option<String> {
-        fs::read_to_string(self.marker()).ok().map(|s| {
-            if s.is_empty() {
-                "unavailable".into()
-            } else {
-                s
-            }
-        })
+        fs::read_to_string(self.marker()).ok().map(|s| if s.is_empty() { "unavailable".into() } else { s })
     }
     pub fn mark(&self, reason: &str) {
         let _ = fs::create_dir_all(&self.0);
@@ -324,24 +282,13 @@ impl StateDir {
         if !self.marker().exists() {
             fs::write(self.marker(), "session ended")?;
         }
-        let f = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.0.join("exec.lock"))?;
+        let f = OpenOptions::new().create(true).truncate(false).write(true).open(self.0.join("exec.lock"))?;
         let deadline = Instant::now() + timeout;
         loop {
             match f.try_lock() {
                 Ok(()) => return Ok(f),
-                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(20))
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "active tool did not finish before teardown deadline",
-                    ));
-                }
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                Err(std::fs::TryLockError::WouldBlock) => return Err(io::Error::new(io::ErrorKind::TimedOut, "active tool did not finish before teardown deadline")),
                 Err(std::fs::TryLockError::Error(e)) => return Err(e),
             }
         }
@@ -349,11 +296,7 @@ impl StateDir {
 
     fn lock(&self) -> io::Result<File> {
         fs::create_dir_all(&self.0)?;
-        let f = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.0.join("exec.lock"))?;
+        let f = OpenOptions::new().create(true).truncate(false).write(true).open(self.0.join("exec.lock"))?;
         f.lock()?;
         Ok(f)
     }
@@ -374,19 +317,9 @@ pub struct MvmSandbox {
 impl MvmSandbox {
     pub fn new(name: &str, run: Box<dyn Runner>) -> Result<Self> {
         if !is_machine_name(name) {
-            return Err(Error::Other(format!(
-                "machine name must match rts-<12 hex chars>: {name:?}"
-            )));
+            return Err(Error::Other(format!("machine name must match rts-<12 hex chars>: {name:?}")));
         }
-        Ok(Self {
-            name: name.into(),
-            run,
-            state: None,
-            dead: Mutex::new(None),
-            serial: Mutex::new(()),
-            copy_limits: CopyLimits::default(),
-            attach: Mutex::new(None),
-        })
+        Ok(Self { name: name.into(), run, state: None, dead: Mutex::new(None), serial: Mutex::new(()), copy_limits: CopyLimits::default(), attach: Mutex::new(None) })
     }
 
     /// Share the exec lock and the unavailable marker through a directory.
@@ -410,9 +343,7 @@ impl MvmSandbox {
     pub fn network_lost(&self) -> Option<String> {
         let mut a = self.attach.lock().unwrap();
         let status = a.as_mut()?.exited()?;
-        Some(format!(
-            "network-lost: mvmctl machine run exited ({status})"
-        ))
+        Some(format!("network-lost: mvmctl machine run exited ({status})"))
     }
 
     /// Start the attached `machine run` (once more if it exits before
@@ -420,31 +351,14 @@ impl MvmSandbox {
     fn attached_start(&self, log: &Path, session_hours: u32) -> Result<()> {
         let ttl = attach_ttl(session_hours);
         let argv = sv(&["machine", "run", "--name", &self.name, "--ttl", &ttl]);
-        let refused = || {
-            Error::Other(format!(
-                "machine run exited before boot (see {})",
-                log.display()
-            ))
-        };
+        let refused = || Error::Other(format!("machine run exited before boot (see {})", log.display()));
         for _ in 0..2 {
-            let a = self.run.attach(&argv, log).map_err(|e| {
-                Error::Other(format!(
-                    "machine run failed to start: {e} (see {})",
-                    log.display()
-                ))
-            })?;
+            let a = self.run.attach(&argv, log).map_err(|e| Error::Other(format!("machine run failed to start: {e} (see {})", log.display())))?;
             // Held at once, so remove() terminates it on every path.
             *self.attach.lock().unwrap() = Some(a);
             let deadline = Instant::now() + CONTROL_TIMEOUT;
             loop {
-                if self
-                    .attach
-                    .lock()
-                    .unwrap()
-                    .as_mut()
-                    .and_then(|a| a.exited())
-                    .is_some()
-                {
+                if self.attach.lock().unwrap().as_mut().and_then(|a| a.exited()).is_some() {
                     break; // exited before boot: start it once more
                 }
                 let ps = self.control(&sv(&["machine", "ps"]), "machine ps")?;
@@ -474,12 +388,7 @@ impl MvmSandbox {
     fn mark_unavailable(&self, reason: &str) -> Error {
         let mut d = self.dead.lock().unwrap();
         if d.is_none() {
-            *d = Some(
-                self.state
-                    .as_ref()
-                    .and_then(|s| s.dead_reason())
-                    .unwrap_or_else(|| reason.into()),
-            );
+            *d = Some(self.state.as_ref().and_then(|s| s.dead_reason()).unwrap_or_else(|| reason.into()));
         }
         if let Some(s) = &self.state {
             s.mark(reason);
@@ -488,23 +397,13 @@ impl MvmSandbox {
     }
 
     fn control(&self, argv: &[String], what: &str) -> Result<RunOutput> {
-        let r = self
-            .run
-            .run(argv, CONTROL_TIMEOUT)
-            .map_err(|e| Error::Other(format!("{what} failed: {e}")))?;
+        let r = self.run.run(argv, CONTROL_TIMEOUT).map_err(|e| Error::Other(format!("{what} failed: {e}")))?;
         if r.killed {
             return Err(Error::Other(format!("{what} timed out")));
         }
         if r.code != Some(0) {
             let t = tail(&r.stderr);
-            return Err(Error::Other(format!(
-                "{what} failed: {}",
-                if t.is_empty() {
-                    format!("exit {:?}", r.code)
-                } else {
-                    t
-                }
-            )));
+            return Err(Error::Other(format!("{what} failed: {}", if t.is_empty() { format!("exit {:?}", r.code) } else { t })));
         }
         Ok(r)
     }
@@ -519,10 +418,7 @@ impl Exec for MvmSandbox {
         // poisoned machine must stop every queued call from reaching it.
         let _guard = self.serial.lock().unwrap();
         let _file_lock = match &self.state {
-            Some(s) => Some(
-                s.lock()
-                    .map_err(|e| Error::Other(format!("exec lock: {e}")))?,
-            ),
+            Some(s) => Some(s.lock().map_err(|e| Error::Other(format!("exec lock: {e}")))?),
             None => None,
         };
         if let Some(r) = self.dead_reason() {
@@ -530,22 +426,11 @@ impl Exec for MvmSandbox {
         }
         let nonce = new_nonce();
         let timeout_sec = o.timeout_ms.div_ceil(1000).max(1);
-        let wrapped = wrap_argv(
-            argv,
-            &WrapOptions {
-                nonce: &nonce,
-                timeout_sec,
-                max_output_bytes: o.max_output_bytes,
-                workdir: o.workdir.as_deref(),
-            },
-        )
-        .map_err(Error::Other)?;
+        let wrapped = wrap_argv(argv, &WrapOptions { nonce: &nonce, timeout_sec, max_output_bytes: o.max_output_bytes, workdir: o.workdir.as_deref() })
+            .map_err(Error::Other)?;
         let mut full = sv(&["machine", "exec", &self.name, "--"]);
         full.extend(wrapped);
-        let r = match self
-            .run
-            .run(&full, Duration::from_secs(timeout_sec) + BACKSTOP)
-        {
+        let r = match self.run.run(&full, Duration::from_secs(timeout_sec) + BACKSTOP) {
             Ok(r) => r,
             Err(e) => return Err(self.mark_unavailable(&format!("mvmctl exec failed to run: {e}"))),
         };
@@ -562,9 +447,7 @@ impl Exec for MvmSandbox {
                 if is_poisoned(&String::from_utf8_lossy(&r.stderr)) {
                     Err(self.mark_unavailable("machine refused exec (no durable finish)"))
                 } else if parsed.is_none() {
-                    Err(self.mark_unavailable(&format!(
-                        "exec returned no valid trailer (mvmctl exit {code:?})"
-                    )))
+                    Err(self.mark_unavailable(&format!("exec returned no valid trailer (mvmctl exit {code:?})")))
                 } else {
                     Err(self.mark_unavailable(&format!("mvmctl exec exited {code:?}")))
                 }
@@ -576,55 +459,25 @@ impl Exec for MvmSandbox {
 impl Sandbox for MvmSandbox {
     fn create(&self, spec: &CreateSpec) -> Result<()> {
         if spec.name != self.name {
-            return Err(Error::Other(format!(
-                "create name {} does not match sandbox {}",
-                spec.name, self.name
-            )));
+            return Err(Error::Other(format!("create name {} does not match sandbox {}", spec.name, self.name)));
         }
         if !is_image_ref(spec.image) {
-            return Err(Error::Other(format!(
-                "image must be digest-pinned: {:?}",
-                spec.image
-            )));
+            return Err(Error::Other(format!("image must be digest-pinned: {:?}", spec.image)));
         }
         if spec.cpus < 1 || spec.memory_mib < 64 {
             return Err("cpus must be at least 1 and memory at least 64 MiB".into());
         }
-        if spec
-            .egress
-            .as_ref()
-            .is_some_and(|e| e.allow_hosts.is_empty())
-        {
+        if spec.egress.as_ref().is_some_and(|e| e.allow_hosts.is_empty()) {
             return Err("a network machine needs at least one allowed host".into());
         }
-        if let Some(e) = spec
-            .egress
-            .as_ref()
-            .filter(|e| !(1..=crate::config::MAX_SESSION_HOURS).contains(&e.session_hours))
-        {
-            return Err(Error::Other(format!(
-                "session limit must be 1 to {} hours, not {}",
-                crate::config::MAX_SESSION_HOURS,
-                e.session_hours
-            )));
+        if let Some(e) = spec.egress.as_ref().filter(|e| !(1..=crate::config::MAX_SESSION_HOURS).contains(&e.session_hours)) {
+            return Err(Error::Other(format!("session limit must be 1 to {} hours, not {}", crate::config::MAX_SESSION_HOURS, e.session_hours)));
         }
         if let Some(r) = self.dead_reason() {
             return Err(Error::Unavailable(r));
         }
         let (cpus, mem) = (spec.cpus.to_string(), format!("{}M", spec.memory_mib));
-        let mut argv = sv(&[
-            "machine",
-            "create",
-            &self.name,
-            "--image",
-            spec.image,
-            "--profile",
-            "dev",
-            "--cpus",
-            &cpus,
-            "--memory",
-            &mem,
-        ]);
+        let mut argv = sv(&["machine", "create", &self.name, "--image", spec.image, "--profile", "dev", "--cpus", &cpus, "--memory", &mem]);
         for h in spec.egress.iter().flat_map(|e| e.allow_hosts) {
             argv.extend(sv(&["--allow-host", h.as_str()]));
         }
@@ -649,10 +502,7 @@ impl Sandbox for MvmSandbox {
 
     fn remove(&self) -> Result<()> {
         self.mark_unavailable("sandbox removed");
-        let rm = self.run.run(
-            &sv(&["machine", "rm", &self.name, "--force", "--yes"]),
-            CONTROL_TIMEOUT,
-        );
+        let rm = self.run.run(&sv(&["machine", "rm", &self.name, "--force", "--yes"]), CONTROL_TIMEOUT);
         // rm does not stop an attached machine run, so it goes second.
         if let Some(mut a) = self.attach.lock().unwrap().take() {
             a.terminate(ATTACH_GRACE);
@@ -664,10 +514,7 @@ impl Sandbox for MvmSandbox {
                 Err(e) => format!(" (rm: {e})"),
                 _ => String::new(),
             };
-            return Err(Error::Other(format!(
-                "machine still present after rm: {}{detail}",
-                self.name
-            )));
+            return Err(Error::Other(format!("machine still present after rm: {}{detail}", self.name)));
         }
         Ok(())
     }
@@ -677,10 +524,10 @@ impl Sandbox for MvmSandbox {
 mod tests {
     use super::*;
     use crate::protocol::wrap_argv;
-    use crate::sandbox::Egress;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use crate::sandbox::Egress;
 
     const NAME: &str = "rts-0123456789ab";
     const IMAGE: &str = "docker.io/library/alpine@sha256:e311ae748be7f56ae5cba304bc488f0786df68ee507513f654a5cc8597cffb42";
@@ -699,21 +546,10 @@ mod tests {
     }
     fn fake(reply: impl Fn(&[String]) -> RunOutput + Send + Sync + 'static) -> (Box<Fake>, Calls) {
         let calls = Arc::new(Mutex::new(vec![]));
-        (
-            Box::new(Fake {
-                calls: calls.clone(),
-                reply: Box::new(reply),
-            }),
-            calls,
-        )
+        (Box::new(Fake { calls: calls.clone(), reply: Box::new(reply) }), calls)
     }
     fn out(code: i32, stdout: &str, stderr: &str) -> RunOutput {
-        RunOutput {
-            code: Some(code),
-            stdout: stdout.into(),
-            stderr: stderr.into(),
-            killed: false,
-        }
+        RunOutput { code: Some(code), stdout: stdout.into(), stderr: stderr.into(), killed: false }
     }
     // For `machine exec`, argv[8] is the nonce.
     fn trailer(argv: &[String], status: u32, o: u64, e: u64) -> String {
@@ -731,30 +567,11 @@ mod tests {
     fn create_issues_exact_lines_and_no_network_flag() {
         let (f, calls) = fake(|_| out(0, "", ""));
         let sb = MvmSandbox::new(NAME, f).unwrap();
-        sb.create(&CreateSpec {
-            name: NAME,
-            image: IMAGE,
-            memory_mib: 2048,
-            cpus: 2,
-            egress: None,
-        })
-        .unwrap();
+        sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: None }).unwrap();
         assert_eq!(
             argvs(&calls),
             vec![
-                sv(&[
-                    "machine",
-                    "create",
-                    NAME,
-                    "--image",
-                    IMAGE,
-                    "--profile",
-                    "dev",
-                    "--cpus",
-                    "2",
-                    "--memory",
-                    "2048M"
-                ]),
+                sv(&["machine", "create", NAME, "--image", IMAGE, "--profile", "dev", "--cpus", "2", "--memory", "2048M"]),
                 sv(&["machine", "start", NAME]),
             ]
         );
@@ -807,15 +624,8 @@ mod tests {
             self.inner.run(argv, t)
         }
         fn attach(&self, argv: &[String], log: &Path) -> io::Result<Box<dyn Attached>> {
-            self.attaches
-                .lock()
-                .unwrap()
-                .push((argv.to_vec(), log.to_path_buf()));
-            let flag = if self.exit_at_once {
-                Arc::new(AtomicBool::new(true))
-            } else {
-                self.exited_flag.clone()
-            };
+            self.attaches.lock().unwrap().push((argv.to_vec(), log.to_path_buf()));
+            let flag = if self.exit_at_once { Arc::new(AtomicBool::new(true)) } else { self.exited_flag.clone() };
             Ok(Box::new(FakeAttached {
                 pid: 4242,
                 exits: self.exits.clone(),
@@ -831,10 +641,7 @@ mod tests {
         exited_flag: Arc<AtomicBool>,
         terminated: Arc<AtomicBool>,
     }
-    fn fake_with_attach(
-        exit_at_once: bool,
-        reply: impl Fn(&[String]) -> RunOutput + Send + Sync + 'static,
-    ) -> (Box<AttachFake>, AttachHandles) {
+    fn fake_with_attach(exit_at_once: bool, reply: impl Fn(&[String]) -> RunOutput + Send + Sync + 'static) -> (Box<AttachFake>, AttachHandles) {
         let calls: Calls = Arc::new(Mutex::new(vec![]));
         let h = AttachHandles {
             calls: calls.clone(),
@@ -843,10 +650,7 @@ mod tests {
             terminated: Arc::new(AtomicBool::new(false)),
         };
         let f = AttachFake {
-            inner: Fake {
-                calls,
-                reply: Box::new(reply),
-            },
+            inner: Fake { calls, reply: Box::new(reply) },
             attaches: h.attaches.clone(),
             exit_at_once,
             exited_flag: h.exited_flag.clone(),
@@ -856,11 +660,7 @@ mod tests {
         (Box::new(f), h)
     }
     fn running_ps(a: &[String]) -> RunOutput {
-        if a[1] == "ps" {
-            out(0, &format!("NAME STATUS\n{NAME} running\n"), "")
-        } else {
-            out(0, "", "")
-        }
+        if a[1] == "ps" { out(0, &format!("NAME STATUS\n{NAME} running\n"), "") } else { out(0, "", "") }
     }
 
     #[test]
@@ -869,55 +669,15 @@ mod tests {
         let (f, h) = fake_with_attach(false, running_ps);
         let sb = MvmSandbox::new(NAME, f).unwrap();
         let log = Path::new("/s/mvm-attach.log");
-        sb.create(&CreateSpec {
-            name: NAME,
-            image: IMAGE,
-            memory_mib: 2048,
-            cpus: 2,
-            egress: Some(Egress {
-                allow_hosts: &hosts,
-                attach_log: log,
-                session_hours: 24,
-            }),
-        })
-        .unwrap();
+        sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &hosts, attach_log: log, session_hours: 24 }) }).unwrap();
         let calls = argvs(&h.calls);
         assert_eq!(
             calls[0],
-            sv(&[
-                "machine",
-                "create",
-                NAME,
-                "--image",
-                IMAGE,
-                "--profile",
-                "dev",
-                "--cpus",
-                "2",
-                "--memory",
-                "2048M",
-                "--allow-host",
-                "198.51.100.7:443",
-                "--allow-host",
-                "198.51.100.8:8443"
-            ])
+            sv(&["machine", "create", NAME, "--image", IMAGE, "--profile", "dev", "--cpus", "2", "--memory", "2048M", "--allow-host", "198.51.100.7:443", "--allow-host", "198.51.100.8:8443"])
         );
-        assert!(
-            !calls
-                .iter()
-                .any(|a| a.get(1).map(String::as_str) == Some("start"))
-        );
-        assert_eq!(
-            h.attaches.lock().unwrap().clone(),
-            vec![(
-                sv(&["machine", "run", "--name", NAME, "--ttl", "24h"]),
-                log.to_path_buf()
-            )]
-        );
-        for a in calls
-            .iter()
-            .chain(h.attaches.lock().unwrap().iter().map(|(a, _)| a))
-        {
+        assert!(!calls.iter().any(|a| a.get(1).map(String::as_str) == Some("start")));
+        assert_eq!(h.attaches.lock().unwrap().clone(), vec![(sv(&["machine", "run", "--name", NAME, "--ttl", "24h"]), log.to_path_buf())]);
+        for a in calls.iter().chain(h.attaches.lock().unwrap().iter().map(|(a, _)| a)) {
             for flag in FORBIDDEN {
                 assert!(!a.contains(&flag.to_string()), "{a:?}");
             }
@@ -940,20 +700,7 @@ mod tests {
             let (f, h) = fake_with_attach(false, running_ps);
             let sb = MvmSandbox::new(NAME, f).unwrap();
             let log = Path::new("/s/mvm-attach.log");
-            assert!(
-                sb.create(&CreateSpec {
-                    name: NAME,
-                    image: IMAGE,
-                    memory_mib: 2048,
-                    cpus: 2,
-                    egress: Some(Egress {
-                        allow_hosts: &hosts,
-                        attach_log: log,
-                        session_hours: hours
-                    })
-                })
-                .is_err()
-            );
+            assert!(sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &hosts, attach_log: log, session_hours: hours }) }).is_err());
             assert!(h.calls.lock().unwrap().is_empty());
             assert!(h.attaches.lock().unwrap().is_empty());
         }
@@ -964,20 +711,7 @@ mod tests {
         let (f, h) = fake_with_attach(false, running_ps);
         let sb = MvmSandbox::new(NAME, f).unwrap();
         let log = Path::new("/s/mvm-attach.log");
-        assert!(
-            sb.create(&CreateSpec {
-                name: NAME,
-                image: IMAGE,
-                memory_mib: 2048,
-                cpus: 2,
-                egress: Some(Egress {
-                    allow_hosts: &[],
-                    attach_log: log,
-                    session_hours: 24
-                })
-            })
-            .is_err()
-        );
+        assert!(sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &[], attach_log: log, session_hours: 24 }) }).is_err());
         assert!(h.calls.lock().unwrap().is_empty());
         assert!(h.attaches.lock().unwrap().is_empty());
     }
@@ -985,57 +719,23 @@ mod tests {
     #[test]
     fn an_attach_that_exits_before_boot_is_retried_once_then_refused() {
         let hosts = crate::network::test_allow_hosts(&["198.51.100.7:443"]);
-        let (f, h) = fake_with_attach(true, |a| {
-            if a[1] == "ps" {
-                out(0, "NAME STATUS\n", "")
-            } else {
-                out(0, "", "")
-            }
-        });
+        let (f, h) = fake_with_attach(true, |a| if a[1] == "ps" { out(0, "NAME STATUS\n", "") } else { out(0, "", "") });
         let sb = MvmSandbox::new(NAME, f).unwrap();
         let log = Path::new("/s/mvm-attach.log");
-        let e = sb
-            .create(&CreateSpec {
-                name: NAME,
-                image: IMAGE,
-                memory_mib: 2048,
-                cpus: 2,
-                egress: Some(Egress {
-                    allow_hosts: &hosts,
-                    attach_log: log,
-                    session_hours: 24,
-                }),
-            })
-            .unwrap_err()
-            .to_string();
+        let e = sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &hosts, attach_log: log, session_hours: 24 }) }).unwrap_err().to_string();
         let attaches = h.attaches.lock().unwrap().clone();
         assert_eq!(attaches.len(), 2);
-        assert!(
-            attaches.iter().all(|(_, l)| l == log),
-            "both runs append to the same log"
-        );
-        assert!(
-            e.contains("before boot") && e.contains("/s/mvm-attach.log"),
-            "{e}"
-        );
-        assert!(
-            !e.contains("exit status"),
-            "the error carries no attach output: {e}"
-        );
+        assert!(attaches.iter().all(|(_, l)| l == log), "both runs append to the same log");
+        assert!(e.contains("before boot") && e.contains("/s/mvm-attach.log"), "{e}");
+        assert!(!e.contains("exit status"), "the error carries no attach output: {e}");
     }
 
     #[test]
     fn ps_running_needs_the_name_as_first_field_and_running() {
         assert!(ps_running(&format!("NAME STATUS\n{NAME} running\n"), NAME));
         assert!(!ps_running(&format!("NAME STATUS\n{NAME} stopped\n"), NAME));
-        assert!(!ps_running(
-            &format!("NAME STATUS\nweb running {NAME}\n"),
-            NAME
-        ));
-        assert!(!ps_running(
-            &format!("NAME STATUS\n{NAME}x running\n"),
-            NAME
-        ));
+        assert!(!ps_running(&format!("NAME STATUS\nweb running {NAME}\n"), NAME));
+        assert!(!ps_running(&format!("NAME STATUS\n{NAME}x running\n"), NAME));
     }
 
     #[test]
@@ -1049,33 +749,17 @@ mod tests {
                 b.store(true, Ordering::SeqCst);
                 out(0, "", "")
             }
-            "ps" if !b.load(Ordering::SeqCst) => {
-                out(0, &format!("NAME STATUS\n{NAME} running\n"), "")
-            }
+            "ps" if !b.load(Ordering::SeqCst) => out(0, &format!("NAME STATUS\n{NAME} running\n"), ""),
             "ps" => out(0, "NAME STATUS\n", ""),
             _ => out(0, "", ""),
         });
         let sb = MvmSandbox::new(NAME, f).unwrap();
         let log = Path::new("/s/mvm-attach.log");
-        sb.create(&CreateSpec {
-            name: NAME,
-            image: IMAGE,
-            memory_mib: 2048,
-            cpus: 2,
-            egress: Some(Egress {
-                allow_hosts: &hosts,
-                attach_log: log,
-                session_hours: 24,
-            }),
-        })
-        .unwrap();
+        sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &hosts, attach_log: log, session_hours: 24 }) }).unwrap();
         assert_eq!(sb.network_lost(), None);
         h.exited_flag.store(true, Ordering::SeqCst);
         let lost = sb.network_lost().unwrap();
-        assert!(
-            lost.starts_with("network-lost: mvmctl machine run exited ("),
-            "{lost}"
-        );
+        assert!(lost.starts_with("network-lost: mvmctl machine run exited ("), "{lost}");
         assert_eq!(sb.network_lost(), Some(lost));
         h.calls.lock().unwrap().clear();
         sb.remove().unwrap();
@@ -1084,10 +768,7 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                (
-                    sv(&["machine", "rm", NAME, "--force", "--yes"]),
-                    CONTROL_TIMEOUT
-                ),
+                (sv(&["machine", "rm", NAME, "--force", "--yes"]), CONTROL_TIMEOUT),
                 (sv(&["terminate"]), Duration::from_secs(5)),
                 (sv(&["machine", "ps"]), CONTROL_TIMEOUT),
             ]
@@ -1104,18 +785,7 @@ mod tests {
         });
         let sb = MvmSandbox::new(NAME, f).unwrap();
         let log = Path::new("/s/mvm-attach.log");
-        sb.create(&CreateSpec {
-            name: NAME,
-            image: IMAGE,
-            memory_mib: 2048,
-            cpus: 2,
-            egress: Some(Egress {
-                allow_hosts: &hosts,
-                attach_log: log,
-                session_hours: 24,
-            }),
-        })
-        .unwrap();
+        sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: &hosts, attach_log: log, session_hours: 24 }) }).unwrap();
         assert!(sb.remove().is_err());
         assert!(h.terminated.load(Ordering::SeqCst));
     }
@@ -1123,10 +793,7 @@ mod tests {
     #[test]
     fn the_default_runner_attach_is_unsupported() {
         let (f, _) = fake(|_| out(0, "", ""));
-        let e = f
-            .attach(&sv(&["machine", "run"]), Path::new("/s/log"))
-            .err()
-            .unwrap();
+        let e = f.attach(&sv(&["machine", "run"]), Path::new("/s/log")).err().unwrap();
         assert_eq!(e.kind(), io::ErrorKind::Unsupported);
     }
 
@@ -1135,15 +802,7 @@ mod tests {
         let (f, calls) = fake(|_| out(0, "", ""));
         let sb = MvmSandbox::new(NAME, f).unwrap();
         for img in ["alpine:latest", "Error: no such image", "Alpine@sha256:00"] {
-            let e = sb
-                .create(&CreateSpec {
-                    name: NAME,
-                    image: img,
-                    memory_mib: 2048,
-                    cpus: 2,
-                    egress: None,
-                })
-                .unwrap_err();
+            let e = sb.create(&CreateSpec { name: NAME, image: img, memory_mib: 2048, cpus: 2, egress: None }).unwrap_err();
             assert!(e.to_string().contains("image must be digest-pinned"));
         }
         assert!(calls.lock().unwrap().is_empty());
@@ -1151,47 +810,18 @@ mod tests {
 
     #[test]
     fn create_refuses_other_name_and_reports_failures() {
-        let (f, calls) = fake(|a| {
-            if a[1] == "start" {
-                out(1, "", "bad image")
-            } else {
-                out(0, "", "")
-            }
-        });
+        let (f, calls) = fake(|a| if a[1] == "start" { out(1, "", "bad image") } else { out(0, "", "") });
         let sb = MvmSandbox::new(NAME, f).unwrap();
-        assert!(
-            sb.create(&CreateSpec {
-                name: "rts-ffffffffffff",
-                image: IMAGE,
-                memory_mib: 2048,
-                cpus: 2,
-                egress: None
-            })
-            .is_err()
-        );
+        assert!(sb.create(&CreateSpec { name: "rts-ffffffffffff", image: IMAGE, memory_mib: 2048, cpus: 2, egress: None }).is_err());
         assert!(calls.lock().unwrap().is_empty());
-        let e = sb
-            .create(&CreateSpec {
-                name: NAME,
-                image: IMAGE,
-                memory_mib: 2048,
-                cpus: 2,
-                egress: None,
-            })
-            .unwrap_err();
+        let e = sb.create(&CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: None }).unwrap_err();
         assert_eq!(e.to_string(), "machine start failed: bad image");
     }
 
     #[test]
     fn machine_names() {
         assert!(is_machine_name(NAME));
-        for bad in [
-            "web",
-            "-rf",
-            "rts-0123456789AB",
-            "rts-0123456789a",
-            "rts-0123456789abc",
-        ] {
+        for bad in ["web", "-rf", "rts-0123456789AB", "rts-0123456789a", "rts-0123456789abc"] {
             assert!(!is_machine_name(bad), "{bad}");
             assert!(MvmSandbox::new(bad, fake(|_| out(0, "", "")).0).is_err());
         }
@@ -1205,18 +835,7 @@ mod tests {
         let (sent, t) = calls.lock().unwrap()[0].clone();
         let nonce = sent[8].clone();
         let mut want = sv(&["machine", "exec", NAME, "--"]);
-        want.extend(
-            wrap_argv(
-                &sv(&["true"]),
-                &WrapOptions {
-                    nonce: &nonce,
-                    timeout_sec: 120,
-                    max_output_bytes: 65536,
-                    workdir: None,
-                },
-            )
-            .unwrap(),
-        );
+        want.extend(wrap_argv(&sv(&["true"]), &WrapOptions { nonce: &nonce, timeout_sec: 120, max_output_bytes: 65536, workdir: None }).unwrap());
         assert_eq!(sent, want);
         assert_eq!(t, Duration::from_secs(150));
         assert_eq!(r.stdout, b"ok\n");
@@ -1227,14 +846,7 @@ mod tests {
     fn fresh_nonce_workdir_and_rounding() {
         let (f, calls) = fake(|a| out(0, "", &trailer(a, 0, 0, 0)));
         let sb = MvmSandbox::new(NAME, f).unwrap();
-        sb.exec(
-            &sv(&["true"]),
-            &ExecOptions {
-                workdir: Some("/in".into()),
-                ..opts()
-            },
-        )
-        .unwrap();
+        sb.exec(&sv(&["true"]), &ExecOptions { workdir: Some("/in".into()), ..opts() }).unwrap();
         sb.exec(&sv(&["true"]), &ExecOptions::new(1, 10)).unwrap();
         let a = argvs(&calls);
         assert_ne!(a[0][8], a[1][8]);
@@ -1245,10 +857,7 @@ mod tests {
     fn assert_dead_after_first(reply: impl Fn(&[String]) -> RunOutput + Send + Sync + 'static) {
         let (f, calls) = fake(reply);
         let sb = MvmSandbox::new(NAME, f).unwrap();
-        assert!(matches!(
-            sb.exec(&sv(&["true"]), &opts()),
-            Err(Error::Unavailable(_))
-        ));
+        assert!(matches!(sb.exec(&sv(&["true"]), &opts()), Err(Error::Unavailable(_))));
         assert!(sb.unavailable());
         let e = sb.exec(&sv(&["true"]), &opts()).unwrap_err();
         assert!(e.to_string().starts_with("sandbox unavailable"));
@@ -1257,20 +866,12 @@ mod tests {
 
     #[test]
     fn poisoned_machine_is_unavailable_for_good() {
-        assert_dead_after_first(|_| {
-            out(
-                1,
-                "",
-                "Error: machine input sequence 1 has no durable finish; refuse exec and checkpoint",
-            )
-        });
+        assert_dead_after_first(|_| out(1, "", "Error: machine input sequence 1 has no durable finish; refuse exec and checkpoint"));
     }
 
     #[test]
     fn no_valid_trailer_is_unavailable() {
-        assert_dead_after_first(|_| {
-            out(0, "hi", &format!("\nRTS_EXIT_{} 0 2 0\n", "0".repeat(24)))
-        });
+        assert_dead_after_first(|_| out(0, "hi", &format!("\nRTS_EXIT_{} 0 2 0\n", "0".repeat(24))));
     }
 
     #[test]
@@ -1280,22 +881,12 @@ mod tests {
 
     #[test]
     fn host_backstop_kill_is_unavailable() {
-        assert_dead_after_first(|_| RunOutput {
-            code: None,
-            killed: true,
-            ..Default::default()
-        });
+        assert_dead_after_first(|_| RunOutput { code: None, killed: true, ..Default::default() });
     }
 
     #[test]
     fn guest_stderr_mentioning_poison_text_is_fine() {
-        let (f, _) = fake(|a| {
-            out(
-                0,
-                "",
-                &format!("grep: no durable finish{}", trailer(a, 0, 0, 23)),
-            )
-        });
+        let (f, _) = fake(|a| out(0, "", &format!("grep: no durable finish{}", trailer(a, 0, 0, 23))));
         let sb = MvmSandbox::new(NAME, f).unwrap();
         assert_eq!(sb.exec(&sv(&["true"]), &opts()).unwrap().exit_code, 0);
         assert!(!sb.unavailable());
@@ -1310,10 +901,7 @@ mod tests {
             }
         }
         let sb = MvmSandbox::new(NAME, Box::new(Broken)).unwrap();
-        assert!(matches!(
-            sb.exec(&sv(&["true"]), &opts()),
-            Err(Error::Unavailable(_))
-        ));
+        assert!(matches!(sb.exec(&sv(&["true"]), &opts()), Err(Error::Unavailable(_))));
     }
 
     #[test]
@@ -1329,12 +917,7 @@ mod tests {
             out(0, "", &trailer(a, 0, 0, 0))
         });
         let sb = Arc::new(MvmSandbox::new(NAME, f).unwrap());
-        let hs: Vec<_> = (0..3)
-            .map(|_| {
-                let s = sb.clone();
-                thread::spawn(move || s.exec(&sv(&["x"]), &opts()).unwrap())
-            })
-            .collect();
+        let hs: Vec<_> = (0..3).map(|_| { let s = sb.clone(); thread::spawn(move || s.exec(&sv(&["x"]), &opts()).unwrap()) }).collect();
         for h in hs {
             h.join().unwrap();
         }
@@ -1344,38 +927,17 @@ mod tests {
 
     #[test]
     fn remove_force_removes_confirms_and_kills_later_execs() {
-        let (f, calls) = fake(|a| {
-            if a[1] == "ps" {
-                out(0, "NAME STATUS\nweb running\n", "")
-            } else {
-                out(0, "", "")
-            }
-        });
+        let (f, calls) = fake(|a| if a[1] == "ps" { out(0, "NAME STATUS\nweb running\n", "") } else { out(0, "", "") });
         let sb = MvmSandbox::new(NAME, f).unwrap();
         sb.remove().unwrap();
-        assert_eq!(
-            argvs(&calls),
-            vec![
-                sv(&["machine", "rm", NAME, "--force", "--yes"]),
-                sv(&["machine", "ps"])
-            ]
-        );
-        assert!(matches!(
-            sb.exec(&sv(&["true"]), &opts()),
-            Err(Error::Unavailable(_))
-        ));
+        assert_eq!(argvs(&calls), vec![sv(&["machine", "rm", NAME, "--force", "--yes"]), sv(&["machine", "ps"])]);
+        assert!(matches!(sb.exec(&sv(&["true"]), &opts()), Err(Error::Unavailable(_))));
         assert_eq!(calls.lock().unwrap().len(), 2);
     }
 
     #[test]
     fn remove_fails_when_ps_still_lists_it() {
-        let (f, _) = fake(|a| {
-            if a[1] == "ps" {
-                out(0, &format!("NAME STATUS\n{NAME} running\n"), "")
-            } else {
-                out(0, "", "")
-            }
-        });
+        let (f, _) = fake(|a| if a[1] == "ps" { out(0, &format!("NAME STATUS\n{NAME} running\n"), "") } else { out(0, "", "") });
         let e = MvmSandbox::new(NAME, f).unwrap().remove().unwrap_err();
         assert!(e.to_string().contains("machine still present"));
     }
@@ -1384,15 +946,11 @@ mod tests {
     fn state_dir_shares_unavailability_across_instances() {
         let dir = crate::testutil::tempdir("state");
         let (f1, _) = fake(|_| out(1, "", "no durable finish"));
-        let a = MvmSandbox::new(NAME, f1)
-            .unwrap()
-            .with_state(StateDir(dir.clone()));
+        let a = MvmSandbox::new(NAME, f1).unwrap().with_state(StateDir(dir.clone()));
         assert!(a.exec(&sv(&["true"]), &opts()).is_err());
         // A second process attaching to the same machine refuses without running anything.
         let (f2, calls2) = fake(|a| out(0, "", &trailer(a, 0, 0, 0)));
-        let b = MvmSandbox::new(NAME, f2)
-            .unwrap()
-            .with_state(StateDir(dir.clone()));
+        let b = MvmSandbox::new(NAME, f2).unwrap().with_state(StateDir(dir.clone()));
         let e = b.exec(&sv(&["true"]), &opts()).unwrap_err();
         assert!(e.to_string().contains("no durable finish"));
         assert!(calls2.lock().unwrap().is_empty());
@@ -1404,13 +962,8 @@ mod tests {
         let dir = crate::testutil::tempdir("state");
         StateDir(dir.clone()).mark("sandbox removed");
         let (f, calls) = fake(|a| out(0, "", &trailer(a, 0, 0, 0)));
-        let sb = MvmSandbox::new(NAME, f)
-            .unwrap()
-            .with_state(StateDir(dir.clone()));
-        assert_eq!(
-            sb.exec(&sv(&["true"]), &opts()).unwrap_err().to_string(),
-            "sandbox unavailable: sandbox removed"
-        );
+        let sb = MvmSandbox::new(NAME, f).unwrap().with_state(StateDir(dir.clone()));
+        assert_eq!(sb.exec(&sv(&["true"]), &opts()).unwrap_err().to_string(), "sandbox unavailable: sandbox removed");
         assert!(calls.lock().unwrap().is_empty());
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1426,10 +979,7 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2));
         let (runner, calls) = fake(|_| panic!("a stopped tool must never run mvmctl"));
         let tool = MvmSandbox::new(NAME, runner).unwrap().with_state(state);
-        assert!(matches!(
-            tool.exec(&sv(&["true"]), &opts()),
-            Err(Error::Unavailable(_))
-        ));
+        assert!(matches!(tool.exec(&sv(&["true"]), &opts()), Err(Error::Unavailable(_))));
         assert!(calls.lock().unwrap().is_empty());
         drop(active);
         fs::remove_dir_all(dir).unwrap();
@@ -1437,17 +987,8 @@ mod tests {
 
     #[test]
     fn list_machines_filters_rts_names() {
-        let (f, _) = fake(|_| {
-            out(
-                0,
-                "NAME STATUS\nrts-aaaaaaaaaaaa running\nweb stopped\nrts-short x\nrts-bbbbbbbbbbbb stopped\n",
-                "",
-            )
-        });
-        assert_eq!(
-            list_machines(f.as_ref()).unwrap(),
-            sv(&["rts-aaaaaaaaaaaa", "rts-bbbbbbbbbbbb"])
-        );
+        let (f, _) = fake(|_| out(0, "NAME STATUS\nrts-aaaaaaaaaaaa running\nweb stopped\nrts-short x\nrts-bbbbbbbbbbbb stopped\n", ""));
+        assert_eq!(list_machines(f.as_ref()).unwrap(), sv(&["rts-aaaaaaaaaaaa", "rts-bbbbbbbbbbbb"]));
     }
 
     #[test]
@@ -1461,41 +1002,18 @@ mod tests {
             remove_env: vec!["RTS_REMOVED_TEST_VAR".into()],
         };
         let cmd = r.command(&sv(&["-c", "true"]));
-        assert!(
-            cmd.get_envs()
-                .any(|(k, v)| k == "RTS_REMOVED_TEST_VAR" && v.is_none())
-        );
-        let o = r
-            .run(
-                &sv(&["-c", "echo ${RTS_REMOVED_TEST_VAR-unset}"]),
-                Duration::from_secs(5),
-            )
-            .unwrap();
+        assert!(cmd.get_envs().any(|(k, v)| k == "RTS_REMOVED_TEST_VAR" && v.is_none()));
+        let o = r.run(&sv(&["-c", "echo ${RTS_REMOVED_TEST_VAR-unset}"]), Duration::from_secs(5)).unwrap();
         assert_eq!(o.stdout, b"unset\n");
     }
 
     #[test]
     fn spawn_runner_captures_and_kills_on_timeout() {
-        let r = SpawnRunner {
-            mvmctl: "/bin/sh".into(),
-            empty_git_config: "/dev/null".into(),
-            extra_env: HashMap::new(),
-            remove_env: Vec::new(),
-        };
-        let o = r
-            .run(
-                &sv(&["-c", "echo $GIT_CONFIG_GLOBAL; echo e >&2; exit 4"]),
-                Duration::from_secs(5),
-            )
-            .unwrap();
-        assert_eq!(
-            (o.code, o.stdout.as_slice(), o.stderr.as_slice(), o.killed),
-            (Some(4), &b"/dev/null\n"[..], &b"e\n"[..], false)
-        );
+        let r = SpawnRunner { mvmctl: "/bin/sh".into(), empty_git_config: "/dev/null".into(), extra_env: HashMap::new(), remove_env: Vec::new() };
+        let o = r.run(&sv(&["-c", "echo $GIT_CONFIG_GLOBAL; echo e >&2; exit 4"]), Duration::from_secs(5)).unwrap();
+        assert_eq!((o.code, o.stdout.as_slice(), o.stderr.as_slice(), o.killed), (Some(4), &b"/dev/null\n"[..], &b"e\n"[..], false));
         let t = Instant::now();
-        let o = r
-            .run(&sv(&["-c", "sleep 10"]), Duration::from_millis(200))
-            .unwrap();
+        let o = r.run(&sv(&["-c", "sleep 10"]), Duration::from_millis(200)).unwrap();
         assert!(o.killed && o.code.is_none() && t.elapsed() < Duration::from_secs(5));
     }
 
@@ -1506,39 +1024,20 @@ mod tests {
         // A pre-existing, wider file is narrowed to 0600.
         fs::write(&log, "").unwrap();
         fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
-        let r = SpawnRunner {
-            mvmctl: "/bin/sh".into(),
-            empty_git_config: "/dev/null".into(),
-            extra_env: HashMap::new(),
-            remove_env: Vec::new(),
-        };
-        let mut a = r
-            .attach(&sv(&["-c", "echo out; echo err >&2; sleep 30"]), &log)
-            .unwrap();
+        let r = SpawnRunner { mvmctl: "/bin/sh".into(), empty_git_config: "/dev/null".into(), extra_env: HashMap::new(), remove_env: Vec::new() };
+        let mut a = r.attach(&sv(&["-c", "echo out; echo err >&2; sleep 30"]), &log).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let t = fs::read_to_string(&log).unwrap();
             if t.contains("out\n") && t.contains("err\n") {
                 break;
             }
-            assert!(
-                Instant::now() < deadline,
-                "log never got both streams: {t:?}"
-            );
+            assert!(Instant::now() < deadline, "log never got both streams: {t:?}");
             thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(
-            fs::metadata(&log).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        let pgid = Command::new("ps")
-            .args(["-o", "pgid=", "-p", &a.pid().to_string()])
-            .output()
-            .unwrap();
-        assert_eq!(
-            String::from_utf8_lossy(&pgid.stdout).trim(),
-            a.pid().to_string()
-        );
+        assert_eq!(fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
+        let pgid = Command::new("ps").args(["-o", "pgid=", "-p", &a.pid().to_string()]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&pgid.stdout).trim(), a.pid().to_string());
         assert_eq!(a.exited(), None);
         let t = Instant::now();
         a.terminate(Duration::from_secs(2));
@@ -1557,30 +1056,14 @@ mod tests {
         let mut extra_env = HashMap::new();
         extra_env.insert("RTS_ATTACH_KEPT".to_string(), "kept".to_string());
         extra_env.insert("RTS_ATTACH_REMOVED".to_string(), "set".to_string());
-        let r = SpawnRunner {
-            mvmctl: "/bin/sh".into(),
-            empty_git_config: "/dev/null".into(),
-            extra_env,
-            remove_env: vec!["RTS_ATTACH_REMOVED".into()],
-        };
-        let mut a = r
-            .attach(
-                &sv(&[
-                    "-c",
-                    "echo $RTS_ATTACH_KEPT ${RTS_ATTACH_REMOVED-unset} $GIT_CONFIG_GLOBAL",
-                ]),
-                &log,
-            )
-            .unwrap();
+        let r = SpawnRunner { mvmctl: "/bin/sh".into(), empty_git_config: "/dev/null".into(), extra_env, remove_env: vec!["RTS_ATTACH_REMOVED".into()] };
+        let mut a = r.attach(&sv(&["-c", "echo $RTS_ATTACH_KEPT ${RTS_ATTACH_REMOVED-unset} $GIT_CONFIG_GLOBAL"]), &log).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while a.exited().is_none() {
             assert!(Instant::now() < deadline, "attach did not exit");
             thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(
-            fs::read_to_string(&log).unwrap(),
-            "earlier\nkept unset /dev/null\n"
-        );
+        assert_eq!(fs::read_to_string(&log).unwrap(), "earlier\nkept unset /dev/null\n");
         a.terminate(Duration::from_millis(100));
         fs::remove_dir_all(d).unwrap();
     }

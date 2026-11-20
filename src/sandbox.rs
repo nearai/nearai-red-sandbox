@@ -17,11 +17,7 @@ pub struct ExecOptions {
 
 impl ExecOptions {
     pub fn new(timeout_ms: u64, max_output_bytes: u64) -> Self {
-        Self {
-            timeout_ms,
-            max_output_bytes,
-            workdir: None,
-        }
+        Self { timeout_ms, max_output_bytes, workdir: None }
     }
 }
 

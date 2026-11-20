@@ -47,12 +47,7 @@ pub fn take_signal() -> Option<i32> {
 /// Physical memory in MiB, from sysconf (macOS and Linux).
 pub fn host_memory_mib() -> Option<u64> {
     // SAFETY: sysconf only reads system configuration values.
-    let (pages, page) = unsafe {
-        (
-            libc::sysconf(libc::_SC_PHYS_PAGES),
-            libc::sysconf(libc::_SC_PAGESIZE),
-        )
-    };
+    let (pages, page) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
     if pages <= 0 || page <= 0 {
         return None;
     }

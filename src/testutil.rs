@@ -8,28 +8,10 @@ use std::sync::Mutex;
 use crate::protocol::{ParsedResult, WrapOptions, new_nonce, parse_result, wrap_argv};
 use crate::sandbox::{Exec, ExecOptions, ExecResult, Result};
 
-pub fn run_wrapped_locally(
-    cmd: &[String],
-    timeout_sec: u64,
-    cap: u64,
-    workdir: Option<&str>,
-) -> ParsedResult {
+pub fn run_wrapped_locally(cmd: &[String], timeout_sec: u64, cap: u64, workdir: Option<&str>) -> ParsedResult {
     let nonce = new_nonce();
-    let argv = wrap_argv(
-        cmd,
-        &WrapOptions {
-            nonce: &nonce,
-            timeout_sec,
-            max_output_bytes: cap,
-            workdir,
-        },
-    )
-    .unwrap();
-    let out = Command::new(&argv[0])
-        .args(&argv[1..])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let argv = wrap_argv(cmd, &WrapOptions { nonce: &nonce, timeout_sec, max_output_bytes: cap, workdir }).unwrap();
+    let out = Command::new(&argv[0]).args(&argv[1..]).stdin(Stdio::null()).output().unwrap();
     assert!(out.status.success());
     parse_result(&out.stdout, &out.stderr, &nonce).expect("trailer")
 }
@@ -42,12 +24,7 @@ pub struct HostShell {
 impl Exec for HostShell {
     fn exec(&self, argv: &[String], o: &ExecOptions) -> Result<ExecResult> {
         self.execs.lock().unwrap().push(argv.to_vec());
-        Ok(run_wrapped_locally(
-            argv,
-            o.timeout_ms.div_ceil(1000).max(1),
-            o.max_output_bytes,
-            o.workdir.as_deref(),
-        ))
+        Ok(run_wrapped_locally(argv, o.timeout_ms.div_ceil(1000).max(1), o.max_output_bytes, o.workdir.as_deref()))
     }
 }
 
@@ -59,18 +36,10 @@ pub struct Recorder<F: Fn(&[String], &ExecOptions) -> ExecResult> {
 
 impl<F: Fn(&[String], &ExecOptions) -> ExecResult> Recorder<F> {
     pub fn new(reply: F) -> Self {
-        Self {
-            execs: Mutex::new(vec![]),
-            reply,
-        }
+        Self { execs: Mutex::new(vec![]), reply }
     }
     pub fn argvs(&self) -> Vec<Vec<String>> {
-        self.execs
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(a, _)| a.clone())
-            .collect()
+        self.execs.lock().unwrap().iter().map(|(a, _)| a.clone()).collect()
     }
 }
 

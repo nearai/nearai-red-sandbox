@@ -67,18 +67,10 @@ pub struct Outcome {
 
 impl Outcome {
     fn ok(text: String) -> Self {
-        Self {
-            code: EXIT_OK,
-            stdout: text,
-            stderr: String::new(),
-        }
+        Self { code: EXIT_OK, stdout: text, stderr: String::new() }
     }
     fn fail(code: i32, msg: String) -> Self {
-        Self {
-            code,
-            stdout: String::new(),
-            stderr: msg,
-        }
+        Self { code, stdout: String::new(), stderr: msg }
     }
 }
 
@@ -86,10 +78,7 @@ pub fn parse_request(raw: &[u8]) -> Result<Request, String> {
     let r: Request = serde_json::from_slice(raw).map_err(|e| format!("bad tool request: {e}"))?;
     let o = &r.options;
     if !is_machine_name(&o.machine) {
-        return Err(format!(
-            "bad tool request: machine must match rts-<12 hex chars>, got {:?}",
-            o.machine
-        ));
+        return Err(format!("bad tool request: machine must match rts-<12 hex chars>, got {:?}", o.machine));
     }
     if o.timeout_ms == 0 || o.max_output_bytes == 0 {
         return Err("bad tool request: timeoutMs and maxOutputBytes must be positive".into());
@@ -112,9 +101,7 @@ fn monitoring_failure(o: &BridgeOptions, message: &str) -> Outcome {
     use std::os::unix::fs::OpenOptionsExt;
     StateDir(o.state_dir.clone()).mark("canary monitoring failed");
     let marker = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+        .write(true).create_new(true).mode(0o600)
         .open(o.state_dir.join("canary-monitoring-failed"));
     if let Ok(mut marker) = marker {
         let _ = marker.write_all(b"canary monitoring failed; observation coverage incomplete\n");
@@ -124,32 +111,16 @@ fn monitoring_failure(o: &BridgeOptions, message: &str) -> Outcome {
 
 /// Run one call against any `Exec`. Split out so tests can drive it
 /// without mvmctl.
-pub fn call(
-    tool: &str,
-    sb: &dyn Exec,
-    o: &BridgeOptions,
-    input: &Value,
-    leak_shell: bool,
-) -> Outcome {
+pub fn call(tool: &str, sb: &dyn Exec, o: &BridgeOptions, input: &Value, leak_shell: bool) -> Outcome {
     if !SANDBOXED_TOOLS.contains(&tool) {
-        return Outcome::fail(
-            EXIT_BAD_REQUEST,
-            format!("tool not allowed in sandbox: {tool}"),
-        );
+        return Outcome::fail(EXIT_BAD_REQUEST, format!("tool not allowed in sandbox: {tool}"));
     }
     // Load before any guest action: a configured but unavailable monitor is
     // not permission to execute an unobserved tool call. Keep registry errors
     // generic: a malformed host file must never surface token material.
-    let registry = match o
-        .canary_registry
-        .as_deref()
-        .map(crate::canary::Registry::load)
-        .transpose()
-    {
+    let registry = match o.canary_registry.as_deref().map(crate::canary::Registry::load).transpose() {
         Ok(registry) => registry,
-        Err(_) => {
-            return monitoring_failure(o, "canary monitoring unavailable; tool was not executed");
-        }
+        Err(_) => return monitoring_failure(o, "canary monitoring unavailable; tool was not executed"),
     };
     let limits = ToolLimits {
         timeout_ms: o.timeout_ms,
@@ -168,18 +139,12 @@ pub fn call(
         // canonicalInputSha256, not tools.jsonl's insertion-ordered JS hash.
         let canonical = serde_json::to_vec(input).expect("JSON Value serialization is infallible");
         let hash = hex::encode(ring::digest::digest(&ring::digest::SHA256, &canonical));
-        let matches =
-            match registry.observe_tool(tool, &hash, &mut outcome.stdout, &mut outcome.stderr) {
-                Ok(matches) => matches,
-                // Discard both channels on monitoring failure. They can contain
-                // tokens even when observation/redaction failed part way through.
-                Err(_) => {
-                    return monitoring_failure(
-                        o,
-                        "canary monitoring failed after tool execution; result withheld",
-                    );
-                }
-            };
+        let matches = match registry.observe_tool(tool, &hash, &mut outcome.stdout, &mut outcome.stderr) {
+            Ok(matches) => matches,
+            // Discard both channels on monitoring failure. They can contain
+            // tokens even when observation/redaction failed part way through.
+            Err(_) => return monitoring_failure(o, "canary monitoring failed after tool execution; result withheld"),
+        };
         if matches > 0 {
             let notice = format!(
                 "\n\n[rts canary observation] {matches} exact token match observation(s) recorded in canaries.jsonl. \
@@ -199,20 +164,11 @@ pub fn call(
 /// The real entry point: read stdin, attach to the session's machine, run.
 pub fn run(tool: &str) -> Outcome {
     let mut raw = vec![];
-    if let Err(e) = std::io::stdin()
-        .take(MAX_REQUEST_BYTES + 1)
-        .read_to_end(&mut raw)
-    {
-        return Outcome::fail(
-            EXIT_BAD_REQUEST,
-            format!("reading the tool request failed: {e}"),
-        );
+    if let Err(e) = std::io::stdin().take(MAX_REQUEST_BYTES + 1).read_to_end(&mut raw) {
+        return Outcome::fail(EXIT_BAD_REQUEST, format!("reading the tool request failed: {e}"));
     }
     if raw.len() as u64 > MAX_REQUEST_BYTES {
-        return Outcome::fail(
-            EXIT_BAD_REQUEST,
-            format!("tool request is over {MAX_REQUEST_BYTES} bytes"),
-        );
+        return Outcome::fail(EXIT_BAD_REQUEST, format!("tool request is over {MAX_REQUEST_BYTES} bytes"));
     }
     let req = match parse_request(&raw) {
         Ok(r) => r,
@@ -223,12 +179,7 @@ pub fn run(tool: &str) -> Outcome {
     if let Some(h) = &o.mvm_home {
         extra_env.insert("HOME".to_string(), h.clone());
     }
-    let runner = SpawnRunner {
-        mvmctl: o.mvmctl.clone(),
-        empty_git_config: o.empty_git_config.clone(),
-        extra_env,
-        remove_env: Vec::new(),
-    };
+    let runner = SpawnRunner { mvmctl: o.mvmctl.clone(), empty_git_config: o.empty_git_config.clone(), extra_env, remove_env: Vec::new() };
     let sb = match MvmSandbox::new(&o.machine, Box::new(runner)) {
         Ok(sb) => sb.with_state(StateDir(o.state_dir.clone())),
         Err(e) => return Outcome::fail(EXIT_BAD_REQUEST, e.to_string()),
@@ -252,9 +203,7 @@ mod tests {
             "machine": "rts-0123456789ab", "mvmctl": "/x/mvmctl", "emptyGitConfig": "/x/g",
             "stateDir": "/x/state", "timeoutMs": 1000, "maxOutputBytes": 100,
         });
-        o.as_object_mut()
-            .unwrap()
-            .extend(extra.as_object().unwrap().clone());
+        o.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         json!({ "options": o, "input": { "command": "true" } })
     }
 
@@ -272,18 +221,8 @@ mod tests {
     #[test]
     fn proxy_defaults_to_false_and_parses_when_set() {
         assert!(!parse(request(json!({}))).unwrap().options.proxy);
-        assert!(
-            parse(request(json!({ "proxy": true })))
-                .unwrap()
-                .options
-                .proxy
-        );
-        assert!(
-            !parse(request(json!({ "proxy": false })))
-                .unwrap()
-                .options
-                .proxy
-        );
+        assert!(parse(request(json!({ "proxy": true }))).unwrap().options.proxy);
+        assert!(!parse(request(json!({ "proxy": false }))).unwrap().options.proxy);
         assert!(parse(request(json!({ "proxy": "yes" }))).is_err());
     }
 
@@ -291,13 +230,7 @@ mod tests {
     fn a_proxied_request_runs_shell_under_the_proxy_env() {
         let rec = Recorder::new(|_, _| ok(b""));
         let r = parse(request(json!({ "proxy": true }))).unwrap();
-        let out = call(
-            "shell",
-            &rec,
-            &r.options,
-            &json!({ "command": "id" }),
-            false,
-        );
+        let out = call("shell", &rec, &r.options, &json!({ "command": "id" }), false);
         assert_eq!(out.code, EXIT_OK);
         let a = &rec.argvs()[0];
         assert_eq!(a[0], "env");
@@ -307,26 +240,10 @@ mod tests {
 
     #[test]
     fn bad_requests_are_refused_before_anything_runs() {
-        assert!(
-            parse(request(json!({ "machine": "other-vm" })))
-                .unwrap_err()
-                .contains("machine")
-        );
-        assert!(
-            parse(request(json!({ "timeoutMs": 0 })))
-                .unwrap_err()
-                .contains("positive")
-        );
-        assert!(
-            parse(request(json!({ "cwd": "relative" })))
-                .unwrap_err()
-                .contains("absolute")
-        );
-        assert!(
-            parse(request(json!({ "net": true })))
-                .unwrap_err()
-                .contains("unknown field")
-        );
+        assert!(parse(request(json!({ "machine": "other-vm" }))).unwrap_err().contains("machine"));
+        assert!(parse(request(json!({ "timeoutMs": 0 }))).unwrap_err().contains("positive"));
+        assert!(parse(request(json!({ "cwd": "relative" }))).unwrap_err().contains("absolute"));
+        assert!(parse(request(json!({ "net": true }))).unwrap_err().contains("unknown field"));
         assert!(parse_request(b"not json").is_err());
     }
 
@@ -336,28 +253,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
         std::fs::create_dir(&state).unwrap();
-        let r = parse(request(
-            json!({ "canaryRegistry": dir.path().join("missing.json"), "stateDir": state }),
-        ))
-        .unwrap();
-        let out = call(
-            "shell",
-            &rec,
-            &r.options,
-            &json!({ "command": "id" }),
-            false,
-        );
+        let r = parse(request(json!({ "canaryRegistry": dir.path().join("missing.json"), "stateDir": state }))).unwrap();
+        let out = call("shell", &rec, &r.options, &json!({ "command": "id" }), false);
         assert_eq!(out.code, EXIT_TOOL_ERROR);
         assert!(out.stderr.contains("canary monitoring unavailable"));
         assert!(out.stdout.is_empty());
         assert!(rec.argvs().is_empty());
         assert!(state.join("canary-monitoring-failed").is_file());
-        assert!(
-            StateDir(state)
-                .dead_reason()
-                .unwrap()
-                .contains("canary monitoring failed")
-        );
+        assert!(StateDir(state).dead_reason().unwrap().contains("canary monitoring failed"));
     }
 
     #[test]
@@ -366,47 +269,23 @@ mod tests {
         assert!(error.contains("absolute"), "{error}");
     }
 
-    fn canary_fixture() -> (
-        tempfile::TempDir,
-        crate::canary::Registry,
-        Request,
-        String,
-        String,
-    ) {
+    fn canary_fixture() -> (tempfile::TempDir, crate::canary::Registry, Request, String, String) {
         use crate::canary::{CanarySpec, Placement, Registry};
         let dir = tempfile::tempdir().unwrap();
         let registry = Registry::create(
             &[
-                CanarySpec {
-                    id: "host-key".into(),
-                    placement: Placement::Host,
-                },
-                CanarySpec {
-                    id: "guest-key".into(),
-                    placement: Placement::Guest,
-                },
+                CanarySpec { id: "host-key".into(), placement: Placement::Host },
+                CanarySpec { id: "guest-key".into(), placement: Placement::Guest },
             ],
             &dir.path().join("canaries"),
             &dir.path().join("canaries.jsonl"),
-        )
-        .unwrap();
-        let host = std::fs::read_to_string(dir.path().join("canaries/host/host-key.token"))
-            .unwrap()
-            .trim()
-            .to_string();
-        let guest = registry
-            .guest_files()
-            .into_iter()
-            .find(|(p, _)| p.ends_with("/guest-key.token"))
-            .unwrap()
-            .1;
+        ).unwrap();
+        let host = std::fs::read_to_string(dir.path().join("canaries/host/host-key.token")).unwrap().trim().to_string();
+        let guest = registry.guest_files().into_iter().find(|(p, _)| p.ends_with("/guest-key.token")).unwrap().1;
         let guest = String::from_utf8(guest).unwrap().trim().to_string();
         let state = dir.path().join("state");
         std::fs::create_dir(&state).unwrap();
-        let request = parse(request(
-            json!({ "canaryRegistry": registry.path(), "stateDir": state }),
-        ))
-        .unwrap();
+        let request = parse(request(json!({ "canaryRegistry": registry.path(), "stateDir": state }))).unwrap();
         (dir, registry, request, host, guest)
     }
 
@@ -414,8 +293,7 @@ mod tests {
     fn tool_output_matches_are_redacted_and_observed_without_raw_values() {
         let (dir, _registry, request, host, guest) = canary_fixture();
         // The shell tool combines guest stdout and stderr into returned text.
-        let rec =
-            Recorder::new(|_, _| crate::testutil::reply(7, host.as_bytes(), guest.as_bytes()));
+        let rec = Recorder::new(|_, _| crate::testutil::reply(7, host.as_bytes(), guest.as_bytes()));
         let input = json!({ "workdir": "/in", "command": "inspect" });
         let out = call("shell", &rec, &request.options, &input, false);
         assert_eq!(out.code, EXIT_OK);
@@ -428,42 +306,22 @@ mod tests {
         let audit = std::fs::read_to_string(dir.path().join("canaries.jsonl")).unwrap();
         assert!(!audit.contains(&host));
         assert!(!audit.contains(&guest));
-        let records: Vec<Value> = audit
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect();
+        let records: Vec<Value> = audit.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(records.len(), 2);
-        let expected = hex::encode(ring::digest::digest(
-            &ring::digest::SHA256,
-            &serde_json::to_vec(&input).unwrap(),
-        ));
-        assert!(
-            records
-                .iter()
-                .all(|r| r["canonicalInputSha256"] == expected)
-        );
+        let expected = hex::encode(ring::digest::digest(&ring::digest::SHA256, &serde_json::to_vec(&input).unwrap()));
+        assert!(records.iter().all(|r| r["canonicalInputSha256"] == expected));
     }
 
     #[test]
     fn tool_error_channels_are_redacted_and_keep_failure_status() {
         struct Failing(String);
         impl Exec for Failing {
-            fn exec(
-                &self,
-                _: &[String],
-                _: &crate::sandbox::ExecOptions,
-            ) -> crate::sandbox::Result<crate::sandbox::ExecResult> {
+            fn exec(&self, _: &[String], _: &crate::sandbox::ExecOptions) -> crate::sandbox::Result<crate::sandbox::ExecResult> {
                 Err(Error::Other(format!("failed with {}", self.0)))
             }
         }
         let (_dir, _registry, request, host, _) = canary_fixture();
-        let out = call(
-            "shell",
-            &Failing(host.clone()),
-            &request.options,
-            &json!({"command":"fail"}),
-            false,
-        );
+        let out = call("shell", &Failing(host.clone()), &request.options, &json!({"command":"fail"}), false);
         assert_eq!(out.code, EXIT_TOOL_ERROR);
         assert!(out.stdout.is_empty());
         assert!(!out.stderr.contains(&host));
@@ -482,43 +340,21 @@ mod tests {
             std::fs::create_dir(&audit).unwrap();
             ok(host.as_bytes())
         });
-        let out = call(
-            "shell",
-            &rec,
-            &request.options,
-            &json!({"command":"inspect"}),
-            false,
-        );
+        let out = call("shell", &rec, &request.options, &json!({"command":"inspect"}), false);
         assert_eq!(rec.argvs().len(), 1);
         assert_eq!(out.code, EXIT_TOOL_ERROR);
         assert!(out.stdout.is_empty());
         assert!(out.stderr.contains("result withheld"));
         assert!(!out.stderr.contains(&host));
-        assert!(
-            request
-                .options
-                .state_dir
-                .join("canary-monitoring-failed")
-                .is_file()
-        );
-        assert!(
-            StateDir(request.options.state_dir.clone())
-                .dead_reason()
-                .is_some()
-        );
+        assert!(request.options.state_dir.join("canary-monitoring-failed").is_file());
+        assert!(StateDir(request.options.state_dir.clone()).dead_reason().is_some());
     }
 
     #[test]
     fn configured_monitor_does_not_change_unmatched_tool_output() {
         let (_dir, _registry, request, _, _) = canary_fixture();
         let rec = Recorder::new(|_, _| ok(b"ordinary output"));
-        let out = call(
-            "shell",
-            &rec,
-            &request.options,
-            &json!({"command":"inspect"}),
-            false,
-        );
+        let out = call("shell", &rec, &request.options, &json!({"command":"inspect"}), false);
         assert_eq!(out.code, EXIT_OK);
         assert_eq!(out.stdout, "ordinary output");
         assert!(out.stderr.is_empty());
@@ -537,22 +373,12 @@ mod tests {
     fn an_unavailable_machine_gets_its_own_exit_code() {
         struct Dead;
         impl Exec for Dead {
-            fn exec(
-                &self,
-                _: &[String],
-                _: &crate::sandbox::ExecOptions,
-            ) -> crate::sandbox::Result<crate::sandbox::ExecResult> {
+            fn exec(&self, _: &[String], _: &crate::sandbox::ExecOptions) -> crate::sandbox::Result<crate::sandbox::ExecResult> {
                 Err(Error::Unavailable("sandbox removed".into()))
             }
         }
         let r = parse(request(json!({}))).unwrap();
-        let out = call(
-            "shell",
-            &Dead,
-            &r.options,
-            &json!({ "command": "id" }),
-            false,
-        );
+        let out = call("shell", &Dead, &r.options, &json!({ "command": "id" }), false);
         assert_eq!(out.code, EXIT_UNAVAILABLE);
         assert!(out.stderr.contains("sandbox removed"));
     }
@@ -561,13 +387,7 @@ mod tests {
     fn a_tool_error_is_exit_one_and_success_is_stdout() {
         let rec = Recorder::new(|_, _| ok(b"hello"));
         let r = parse(request(json!({}))).unwrap();
-        let out = call(
-            "shell",
-            &rec,
-            &r.options,
-            &json!({ "command": "echo hello" }),
-            false,
-        );
+        let out = call("shell", &rec, &r.options, &json!({ "command": "echo hello" }), false);
         assert_eq!((out.code, out.stdout.as_str()), (EXIT_OK, "hello"));
         let out = call("shell", &rec, &r.options, &json!({}), false);
         assert_eq!(out.code, EXIT_TOOL_ERROR);

@@ -5,9 +5,7 @@
 /// Expand `{a,b}` alternatives (nested allowed) into plain patterns.
 fn expand_braces(p: &str) -> Vec<String> {
     let b = p.as_bytes();
-    let Some(open) = b.iter().position(|&c| c == b'{') else {
-        return vec![p.to_string()];
-    };
+    let Some(open) = b.iter().position(|&c| c == b'{') else { return vec![p.to_string()] };
     let mut depth = 0;
     let mut close = None;
     let mut commas = vec![];
@@ -25,9 +23,7 @@ fn expand_braces(p: &str) -> Vec<String> {
             _ => {}
         }
     }
-    let Some(close) = close else {
-        return vec![p.to_string()];
-    };
+    let Some(close) = close else { return vec![p.to_string()] };
     let (pre, post) = (&p[..open], &p[close + 1..]);
     let mut bounds = vec![open];
     bounds.extend(&commas);
@@ -140,9 +136,7 @@ fn m(p: &[char], s: &[char]) -> bool {
 
 pub fn glob_match(pattern: &str, path: &str) -> bool {
     let s: Vec<char> = path.chars().collect();
-    expand_braces(pattern)
-        .iter()
-        .any(|p| m(&p.chars().collect::<Vec<_>>(), &s))
+    expand_braces(pattern).iter().any(|p| m(&p.chars().collect::<Vec<_>>(), &s))
 }
 
 #[cfg(test)]

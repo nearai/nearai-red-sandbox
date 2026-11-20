@@ -20,11 +20,7 @@ use std::io::IsTerminal;
 pub struct Rgb(pub f64, pub f64, pub f64);
 
 const fn hex(v: u32) -> Rgb {
-    Rgb(
-        ((v >> 16) & 0xff) as f64,
-        ((v >> 8) & 0xff) as f64,
-        (v & 0xff) as f64,
-    )
+    Rgb(((v >> 16) & 0xff) as f64, ((v >> 8) & 0xff) as f64, (v & 0xff) as f64)
 }
 
 pub const TOP: Rgb = hex(0xE9E7E1);
@@ -59,9 +55,7 @@ impl Depth {
     /// COLORTERM=truecolor or 24bit means 24-bit colour; otherwise the 256-colour palette.
     pub fn from_env(env: &[(String, String)]) -> Self {
         match get(env, "COLORTERM") {
-            Some(v) if v.eq_ignore_ascii_case("truecolor") || v.eq_ignore_ascii_case("24bit") => {
-                Depth::TrueColor
-            }
+            Some(v) if v.eq_ignore_ascii_case("truecolor") || v.eq_ignore_ascii_case("24bit") => Depth::TrueColor,
             _ => Depth::Ansi256,
         }
     }
@@ -92,10 +86,7 @@ pub fn nearest_256(r: u8, g: u8, b: u8) -> u8 {
     const STEPS: [i32; 6] = [0, 95, 135, 175, 215, 255];
     let level = |v: u8| -> usize {
         // Ties go to the brighter level.
-        (0..6)
-            .rev()
-            .min_by_key(|&i| (STEPS[i] - v as i32).abs())
-            .unwrap()
+        (0..6).rev().min_by_key(|&i| (STEPS[i] - v as i32).abs()).unwrap()
     };
     let (ri, gi, bi) = (level(r), level(g), level(b));
     let dist = |(x, y, z): (i32, i32, i32)| {
@@ -113,10 +104,7 @@ pub fn nearest_256(r: u8, g: u8, b: u8) -> u8 {
 }
 
 fn get<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    env.iter()
-        .rev()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.as_str())
+    env.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
 
 /// Colour is allowed: NO_COLOR is unset or empty (no-color.org) and TERM is not `dumb`.
@@ -126,35 +114,19 @@ pub fn colour_allowed(env: &[(String, String)]) -> bool {
 
 /// The splash is drawn only for an interactive terminal on stdin and stdout,
 /// with colour allowed and without `--no-splash`.
-pub fn splash_wanted(
-    stdin_tty: bool,
-    stdout_tty: bool,
-    env: &[(String, String)],
-    no_splash: bool,
-) -> bool {
+pub fn splash_wanted(stdin_tty: bool, stdout_tty: bool, env: &[(String, String)], no_splash: bool) -> bool {
     stdin_tty && stdout_tty && !no_splash && colour_allowed(env)
 }
 
 pub fn stdin_stdout_are_ttys() -> (bool, bool) {
-    (
-        std::io::stdin().is_terminal(),
-        std::io::stdout().is_terminal(),
-    )
+    (std::io::stdin().is_terminal(), std::io::stdout().is_terminal())
 }
 
 /// The window size of a terminal file descriptor, as (cols, rows).
 pub fn window_size(fd: i32) -> Option<(usize, usize)> {
-    let mut size = libc::winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
+    let mut size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
     // SAFETY: TIOCGWINSZ writes one winsize into the struct we own.
-    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ as _, &mut size) } < 0
-        || size.ws_col == 0
-        || size.ws_row == 0
-    {
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ as _, &mut size) } < 0 || size.ws_col == 0 || size.ws_row == 0 {
         return None;
     }
     Some((size.ws_col as usize, size.ws_row as usize))
@@ -195,26 +167,14 @@ mod tests {
     use super::*;
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
 
     #[test]
     fn truecolor_needs_colorterm_and_otherwise_maps_to_the_256_palette() {
-        assert_eq!(
-            Depth::from_env(&env(&[("COLORTERM", "truecolor")])),
-            Depth::TrueColor
-        );
-        assert_eq!(
-            Depth::from_env(&env(&[("COLORTERM", "24bit")])),
-            Depth::TrueColor
-        );
-        assert_eq!(
-            Depth::from_env(&env(&[("COLORTERM", "yes")])),
-            Depth::Ansi256
-        );
+        assert_eq!(Depth::from_env(&env(&[("COLORTERM", "truecolor")])), Depth::TrueColor);
+        assert_eq!(Depth::from_env(&env(&[("COLORTERM", "24bit")])), Depth::TrueColor);
+        assert_eq!(Depth::from_env(&env(&[("COLORTERM", "yes")])), Depth::Ansi256);
         assert_eq!(Depth::from_env(&env(&[])), Depth::Ansi256);
         assert_eq!(Depth::TrueColor.fg(Some(RED)), "\x1b[38;2;235;25;36m");
         assert_eq!(Depth::Ansi256.fg(Some(RED)), "\x1b[38;5;196m");
@@ -231,24 +191,13 @@ mod tests {
         assert!(!splash_wanted(false, true, &plain, false));
         assert!(!splash_wanted(true, false, &plain, false));
         assert!(!splash_wanted(true, true, &plain, true), "--no-splash");
-        assert!(!splash_wanted(
-            true,
-            true,
-            &env(&[("NO_COLOR", "1")]),
-            false
-        ));
-        assert!(
-            splash_wanted(true, true, &env(&[("NO_COLOR", "")]), false),
-            "an empty NO_COLOR is unset"
-        );
+        assert!(!splash_wanted(true, true, &env(&[("NO_COLOR", "1")]), false));
+        assert!(splash_wanted(true, true, &env(&[("NO_COLOR", "")]), false), "an empty NO_COLOR is unset");
         assert!(!splash_wanted(true, true, &env(&[("TERM", "dumb")]), false));
     }
 
     #[test]
     fn strip_escapes_removes_csi_and_osc() {
-        assert_eq!(
-            strip_escapes("\x1b[38;2;1;2;3ma\x1b[0m\x1b]2;title\x07b\x1b]0;t\x1b\\c"),
-            "abc"
-        );
+        assert_eq!(strip_escapes("\x1b[38;2;1;2;3ma\x1b[0m\x1b]2;title\x07b\x1b]0;t\x1b\\c"), "abc");
     }
 }

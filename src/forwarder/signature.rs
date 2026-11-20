@@ -682,10 +682,7 @@ mod tests {
         assert!(e.contains("no signature within"), "{e}");
         assert!(!e.contains("dummy"), "{e}");
         let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(8),
-            "gave up after {elapsed:?}"
-        );
+        assert!(elapsed < Duration::from_secs(8), "gave up after {elapsed:?}");
         let attempts = heads.lock().unwrap().len();
         assert!(attempts >= 3, "only {attempts} attempts inside the window");
 

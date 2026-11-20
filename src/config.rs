@@ -107,11 +107,7 @@ impl Limits {
 
 /// `--memory`: whole MiB, as `N`, `NM` or `NG` (either case), at least 64 MiB.
 pub fn parse_memory(s: &str) -> Result<u32, String> {
-    let bad = || {
-        format!(
-            "--memory must be a whole number of MiB, or end in M or G (for example 8192 or 8G), and at least {MIN_MEMORY_MIB} MiB: {s}"
-        )
-    };
+    let bad = || format!("--memory must be a whole number of MiB, or end in M or G (for example 8192 or 8G), and at least {MIN_MEMORY_MIB} MiB: {s}");
     let (digits, scale) = match s.as_bytes().last() {
         Some(b'G' | b'g') => (&s[..s.len() - 1], 1024),
         Some(b'M' | b'm') => (&s[..s.len() - 1], 1),
@@ -135,10 +131,7 @@ pub fn parse_memory(s: &str) -> Result<u32, String> {
 /// memory than physical RAM.
 pub fn check_host_fit(l: &Limits, host_cpus: u32, host_memory_mib: u64) -> Result<(), String> {
     if l.cpus > host_cpus {
-        return Err(format!(
-            "the VM asks for {} vCPUs but this host has {host_cpus}",
-            l.cpus
-        ));
+        return Err(format!("the VM asks for {} vCPUs but this host has {host_cpus}", l.cpus));
     }
     if u64::from(l.memory_mib) > host_memory_mib {
         return Err(format!(
@@ -304,9 +297,7 @@ fn session_hours(v: Option<&serde_json::Value>, d: u32) -> Result<u32, String> {
     v.as_u64()
         .filter(|h| (1..=u64::from(MAX_SESSION_HOURS)).contains(h))
         .and_then(|h| u32::try_from(h).ok())
-        .ok_or_else(|| {
-            format!("config: limits.sessionHours must be an integer from 1 to {MAX_SESSION_HOURS}")
-        })
+        .ok_or_else(|| format!("config: limits.sessionHours must be an integer from 1 to {MAX_SESSION_HOURS}"))
 }
 
 /// Paths the config leaves out, from `install::defaults`.
@@ -372,17 +363,8 @@ pub fn model_display_name(id: &str) -> String {
             _ => id,
         },
     };
-    let spaced: String = raw
-        .chars()
-        .map(|c| if display_unsafe(c) { ' ' } else { c })
-        .collect();
-    let clean: String = spaced
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(MAX_DISPLAY_CHARS)
-        .collect();
+    let spaced: String = raw.chars().map(|c| if display_unsafe(c) { ' ' } else { c }).collect();
+    let clean: String = spaced.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(MAX_DISPLAY_CHARS).collect();
     match clean.trim_end() {
         "" => "unnamed model".into(),
         name => name.into(),
@@ -581,9 +563,7 @@ mod tests {
         assert_eq!(Limits::default().host_rss_ceiling_mib, 3072);
         let l = p(r#"{ "memoryMiB": 8192 }"#).unwrap().limits;
         assert_eq!(l.host_rss_ceiling_mib, 8192 + RSS_HEADROOM_MIB);
-        let l = p(r#"{ "memoryMiB": 8192, "hostRssCeilingMiB": 10000 }"#)
-            .unwrap()
-            .limits;
+        let l = p(r#"{ "memoryMiB": 8192, "hostRssCeilingMiB": 10000 }"#).unwrap().limits;
         assert_eq!(l.host_rss_ceiling_mib, 10000);
         assert_eq!(
             p(r#"{ "memoryMiB": 8192, "hostRssCeilingMiB": 4096 }"#).unwrap_err(),
@@ -595,51 +575,23 @@ mod tests {
     fn resize_overrides_size_and_moves_only_a_default_ceiling() {
         let mut l = Limits::default();
         l.resize(Some(4), Some(8192)).unwrap();
-        assert_eq!(
-            (l.cpus, l.memory_mib, l.host_rss_ceiling_mib),
-            (4, 8192, 9216)
-        );
+        assert_eq!((l.cpus, l.memory_mib, l.host_rss_ceiling_mib), (4, 8192, 9216));
         l.resize(None, None).unwrap();
-        assert_eq!(
-            (l.cpus, l.memory_mib, l.host_rss_ceiling_mib),
-            (4, 8192, 9216)
-        );
+        assert_eq!((l.cpus, l.memory_mib, l.host_rss_ceiling_mib), (4, 8192, 9216));
         let p = |t: &str| parse(t).unwrap().limits;
         let mut l = p(r#"{ "limits": { "hostRssCeilingMiB": 6000 } }"#);
         l.resize(None, Some(4096)).unwrap();
         assert_eq!(l.host_rss_ceiling_mib, 6000);
         let e = l.resize(None, Some(8192)).unwrap_err();
-        assert!(
-            e.contains("--memory 8192 MiB is above limits.hostRssCeilingMiB (6000)"),
-            "{e}"
-        );
+        assert!(e.contains("--memory 8192 MiB is above limits.hostRssCeilingMiB (6000)"), "{e}");
     }
 
     #[test]
     fn memory_sizes_parse_as_mib() {
-        for (s, mib) in [
-            ("64", 64),
-            ("8192", 8192),
-            ("8192M", 8192),
-            ("8192m", 8192),
-            ("8G", 8192),
-            ("1g", 1024),
-        ] {
+        for (s, mib) in [("64", 64), ("8192", 8192), ("8192M", 8192), ("8192m", 8192), ("8G", 8192), ("1g", 1024)] {
             assert_eq!(parse_memory(s), Ok(mib), "{s}");
         }
-        for bad in [
-            "",
-            "0",
-            "63",
-            "8GB",
-            "8 G",
-            "1.5G",
-            "-1",
-            "G",
-            "8T",
-            "4194304G",
-            "99999999999",
-        ] {
+        for bad in ["", "0", "63", "8GB", "8 G", "1.5G", "-1", "G", "8T", "4194304G", "99999999999"] {
             assert!(parse_memory(bad).is_err(), "{bad}");
         }
     }
@@ -649,39 +601,20 @@ mod tests {
         let mut l = Limits::default();
         assert_eq!(check_host_fit(&l, 8, 16384), Ok(()));
         l.resize(Some(9), None).unwrap();
-        assert_eq!(
-            check_host_fit(&l, 8, 16384).unwrap_err(),
-            "the VM asks for 9 vCPUs but this host has 8"
-        );
+        assert_eq!(check_host_fit(&l, 8, 16384).unwrap_err(), "the VM asks for 9 vCPUs but this host has 8");
         l.resize(Some(8), Some(16384)).unwrap();
         assert_eq!(check_host_fit(&l, 8, 16384), Ok(()));
         l.resize(None, Some(16385)).unwrap();
-        assert_eq!(
-            check_host_fit(&l, 8, 16384).unwrap_err(),
-            "the VM asks for 16385 MiB but this host has 16384 MiB"
-        );
+        assert_eq!(check_host_fit(&l, 8, 16384).unwrap_err(), "the VM asks for 16385 MiB but this host has 16384 MiB");
     }
 
     #[test]
     fn session_hours_defaults_to_24_and_is_refused_outside_1_to_720() {
-        let p = |l: &str| {
-            parse(&format!(
-                r#"{{ "provider": {{ "models": ["m"] }}, "limits": {l} }}"#
-            ))
-        };
+        let p = |l: &str| parse(&format!(r#"{{ "provider": {{ "models": ["m"] }}, "limits": {l} }}"#));
         assert_eq!(p("{}").unwrap().limits.session_hours, 24);
         assert_eq!(Limits::default().session_hours, 24);
-        assert_eq!(
-            p(r#"{ "sessionHours": 1 }"#).unwrap().limits.session_hours,
-            1
-        );
-        assert_eq!(
-            p(r#"{ "sessionHours": 720 }"#)
-                .unwrap()
-                .limits
-                .session_hours,
-            720
-        );
+        assert_eq!(p(r#"{ "sessionHours": 1 }"#).unwrap().limits.session_hours, 1);
+        assert_eq!(p(r#"{ "sessionHours": 720 }"#).unwrap().limits.session_hours, 720);
         for bad in ["0", "721", "1.5", "\"24\"", "-1", "4294967297"] {
             assert_eq!(
                 p(&format!(r#"{{ "sessionHours": {bad} }}"#)).unwrap_err(),
@@ -731,10 +664,7 @@ mod tests {
 
     #[test]
     fn model_display_names_are_readable_and_never_change_the_id() {
-        assert_eq!(
-            model_display_name("deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated"),
-            "DeepSeek V4.1 Flash Abliterated"
-        );
+        assert_eq!(model_display_name("deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated"), "DeepSeek V4.1 Flash Abliterated");
         assert_eq!(model_display_name("z-ai/glm-5.3-flash"), "glm-5.3-flash");
         assert_eq!(model_display_name("org/team/model-x"), "model-x");
         assert_eq!(model_display_name("bare-model"), "bare-model");
@@ -744,25 +674,12 @@ mod tests {
 
     #[test]
     fn a_crafted_model_id_cannot_fake_a_footer_segment_or_send_escapes() {
-        for id in [
-            "x · attested",
-            "evil\u{1b}]0;pwned\u{7}name",
-            "a\u{2022}attested",
-            "rtl\u{202e}detsetta",
-            "tab\there\nnl",
-        ] {
+        for id in ["x · attested", "evil\u{1b}]0;pwned\u{7}name", "a\u{2022}attested", "rtl\u{202e}detsetta", "tab\there\nnl"] {
             let n = model_display_name(id);
-            assert!(
-                !n.chars()
-                    .any(|c| c.is_control() || matches!(c, '·' | '•' | '\u{202e}')),
-                "{n:?}"
-            );
+            assert!(!n.chars().any(|c| c.is_control() || matches!(c, '·' | '•' | '\u{202e}')), "{n:?}");
         }
         assert_eq!(model_display_name("x · attested"), "x attested");
-        assert_eq!(
-            model_display_name("org/evil\u{1b}]0;pwned\u{7}"),
-            "evil ]0;pwned"
-        );
+        assert_eq!(model_display_name("org/evil\u{1b}]0;pwned\u{7}"), "evil ]0;pwned");
         assert_eq!(model_display_name(&"m".repeat(500)).chars().count(), 64);
         assert_eq!(model_display_name("org/\u{1b}\u{7}"), "unnamed model");
     }
@@ -774,10 +691,7 @@ mod tests {
             r#"{ "provider": { "id": "nearai-red-embedded" } }"#,
         ] {
             let e = parse(t).unwrap_err();
-            assert!(
-                e.contains("nearai-red-embedded") && e.contains("reserved"),
-                "{e}"
-            );
+            assert!(e.contains("nearai-red-embedded") && e.contains("reserved"), "{e}");
         }
     }
 

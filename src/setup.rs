@@ -15,16 +15,9 @@ use url::Url;
 use crate::config::{DEFAULT_IMAGE, Defaults};
 use crate::install::{MVM_VERSION, mvm_dir, opencode_dir};
 use crate::mvm::{RunOutput, Runner, SpawnRunner, tail};
-use crate::session::{
-    Host, OPENCODE_VERSION, SUPERVISOR_FIX_VERSION, check_opencode, check_supervisor_contract,
-    check_supervisor_marker,
-};
+use crate::session::{Host, OPENCODE_VERSION, SUPERVISOR_FIX_VERSION, check_opencode, check_supervisor_contract, check_supervisor_marker};
 
-pub const ALLOWED_HOSTS: [&str; 3] = [
-    "github.com",
-    "objects.githubusercontent.com",
-    "release-assets.githubusercontent.com",
-];
+pub const ALLOWED_HOSTS: [&str; 3] = ["github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"];
 pub const MAX_REDIRECTS: usize = 5;
 
 const CHUNK: usize = 64 * 1024;
@@ -40,9 +33,7 @@ pub fn allowed_url(url: &str) -> Result<Url, String> {
         return Err(format!("{url}: only https downloads are allowed"));
     }
     if !u.username().is_empty() || u.password().is_some() {
-        return Err(format!(
-            "{url}: a download URL may not carry a user name or password"
-        ));
+        return Err(format!("{url}: a download URL may not carry a user name or password"));
     }
     // `Url` drops the scheme's default port, so `:443` reads as None here.
     if let Some(port) = u.port() {
@@ -50,10 +41,7 @@ pub fn allowed_url(url: &str) -> Result<Url, String> {
     }
     match u.host() {
         Some(url::Host::Domain(h)) if ALLOWED_HOSTS.contains(&h) => Ok(u),
-        _ => Err(format!(
-            "{url}: host is not one of {}",
-            ALLOWED_HOSTS.join(", ")
-        )),
+        _ => Err(format!("{url}: host is not one of {}", ALLOWED_HOSTS.join(", "))),
     }
 }
 
@@ -94,38 +82,23 @@ impl HttpsFetch {
 
 impl Fetch for HttpsFetch {
     fn get(&self, url: &Url) -> Result<Hop, String> {
-        let resp = self
-            .client
-            .get(url.clone())
-            .send()
-            .map_err(|e| format!("GET {url}: {e}; check the network and re-run rts setup"))?;
+        let resp = self.client.get(url.clone()).send().map_err(|e| format!("GET {url}: {e}; check the network and re-run rts setup"))?;
         let status = resp.status();
         if status.is_redirection() {
-            let location = resp
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .map(|v| {
-                    v.to_str()
-                        .map_err(|_| format!("GET {url}: {status} with a non-ASCII Location"))
-                })
-                .transpose()?;
+            let location = resp.headers().get(reqwest::header::LOCATION).map(|v| v.to_str().map_err(|_| format!("GET {url}: {status} with a non-ASCII Location"))).transpose()?;
             return redirect_target(url, location).map(Hop::Redirect);
         }
         if status.is_success() {
             return Ok(Hop::Body(Box::new(resp)));
         }
-        Err(format!(
-            "GET {url}: HTTP {status}; check the network and re-run rts setup"
-        ))
+        Err(format!("GET {url}: HTTP {status}; check the network and re-run rts setup"))
     }
 }
 
 /// A redirect's `Location`, resolved against the URL that returned it.
 fn redirect_target(url: &Url, location: Option<&str>) -> Result<String, String> {
     let loc = location.ok_or_else(|| format!("GET {url}: redirect without a Location header"))?;
-    url.join(loc)
-        .map(String::from)
-        .map_err(|e| format!("GET {url}: bad redirect Location {loc:?}: {e}"))
+    url.join(loc).map(String::from).map_err(|e| format!("GET {url}: bad redirect Location {loc:?}: {e}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,12 +110,7 @@ pub struct Downloaded {
 /// Fetch `url`, following at most `MAX_REDIRECTS` redirects, each checked with
 /// `allowed_url` before it is fetched, and stream the body into `out` and a
 /// SHA-256, refusing more than `max_bytes`.
-pub fn download(
-    f: &dyn Fetch,
-    url: &str,
-    max_bytes: u64,
-    out: &mut dyn Write,
-) -> Result<Downloaded, String> {
+pub fn download(f: &dyn Fetch, url: &str, max_bytes: u64, out: &mut dyn Write) -> Result<Downloaded, String> {
     let mut current = allowed_url(url)?;
     let mut redirects = 0;
     let mut body = loop {
@@ -153,8 +121,7 @@ pub fn download(
                 if redirects > MAX_REDIRECTS {
                     return Err(format!("{url}: more than {MAX_REDIRECTS} redirects"));
                 }
-                current = allowed_url(&to)
-                    .map_err(|e| format!("{url} redirected to a URL that is not allowed: {e}"))?;
+                current = allowed_url(&to).map_err(|e| format!("{url} redirected to a URL that is not allowed: {e}"))?;
             }
         }
     };
@@ -173,13 +140,9 @@ pub fn download(
             return Err(format!("{url} exceeds {max_bytes} bytes"));
         }
         hasher.update(&buf[..n]);
-        out.write_all(&buf[..n])
-            .map_err(|e| format!("writing the download of {url}: {e}"))?;
+        out.write_all(&buf[..n]).map_err(|e| format!("writing the download of {url}: {e}"))?;
     }
-    Ok(Downloaded {
-        sha256: hex(&hasher.finalize()),
-        bytes: total,
-    })
+    Ok(Downloaded { sha256: hex(&hasher.finalize()), bytes: total })
 }
 
 fn hex(b: &[u8]) -> String {
@@ -207,9 +170,7 @@ pub fn mvm() -> Component {
     Component {
         name: "mvm",
         version: MVM_VERSION,
-        url: format!(
-            "https://github.com/tinylabscom/mvm/releases/download/v{MVM_VERSION}/mvmctl-aarch64-apple-darwin.tar.gz"
-        ),
+        url: format!("https://github.com/tinylabscom/mvm/releases/download/v{MVM_VERSION}/mvmctl-aarch64-apple-darwin.tar.gz"),
         sha256: "1f2c80b253add28c3856080e3f3a10aa1163f1aef0a7d413ded15100bdcd0c69".into(),
         max_bytes: 64 << 20,
         unpack: Unpack::TarGzStrip1,
@@ -221,9 +182,7 @@ pub fn opencode() -> Component {
     Component {
         name: "opencode",
         version: OPENCODE_VERSION,
-        url: format!(
-            "https://github.com/anomalyco/opencode/releases/download/v{OPENCODE_VERSION}/opencode-darwin-arm64.zip"
-        ),
+        url: format!("https://github.com/anomalyco/opencode/releases/download/v{OPENCODE_VERSION}/opencode-darwin-arm64.zip"),
         sha256: "c1c901a6379d667b7a30a3eea5a8f6e93416dba43e889e834771f6fb174f35c9".into(),
         max_bytes: 256 << 20,
         unpack: Unpack::Zip,
@@ -234,25 +193,14 @@ pub fn opencode() -> Component {
 /// Download, check the digest, unpack into `<parent>/.rts-setup-XXXX/unpacked`,
 /// check `binary`, rename to `target`.
 /// Errs when `target` exists: the caller decides to skip or refuse it.
-pub fn install_component(
-    c: &Component,
-    target: &Path,
-    f: &dyn Fetch,
-    host: &dyn Host,
-) -> Result<(), String> {
+pub fn install_component(c: &Component, target: &Path, f: &dyn Fetch, host: &dyn Host) -> Result<(), String> {
     let label = format!("{} {}", c.name, c.version);
-    let parent = target
-        .parent()
-        .ok_or_else(|| format!("{label}: {} has no parent directory", target.display()))?;
+    let parent = target.parent().ok_or_else(|| format!("{label}: {} has no parent directory", target.display()))?;
     if parent.exists() {
         remove_stale_temp_dirs(parent).map_err(|e| format!("{label}: {e}"))?;
     } else {
         use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)
-            .map_err(|e| format!("{label}: creating {}: {e}", parent.display()))?;
+        fs::DirBuilder::new().recursive(true).mode(0o700).create(parent).map_err(|e| format!("{label}: creating {}: {e}", parent.display()))?;
     }
     let exists = || fs::symlink_metadata(target).is_ok();
     if exists() {
@@ -261,87 +209,42 @@ pub fn install_component(
     let tmp = tempfile::Builder::new()
         .prefix(TEMP_PREFIX)
         .tempdir_in(parent)
-        .map_err(|e| {
-            format!(
-                "{label}: creating a temp directory in {}: {e}",
-                parent.display()
-            )
-        })?;
+        .map_err(|e| format!("{label}: creating a temp directory in {}: {e}", parent.display()))?;
     let download_path = tmp.path().join("download");
     let unpacked = tmp.path().join("unpacked");
 
     let got = {
-        let mut file = fs::File::create(&download_path)
-            .map_err(|e| format!("{label}: creating {}: {e}", download_path.display()))?;
-        let d = download(f, &c.url, c.max_bytes, &mut file)
-            .map_err(|e| format!("{label}: {e}; nothing was installed"))?;
-        file.sync_all()
-            .map_err(|e| format!("{label}: writing {}: {e}", download_path.display()))?;
+        let mut file = fs::File::create(&download_path).map_err(|e| format!("{label}: creating {}: {e}", download_path.display()))?;
+        let d = download(f, &c.url, c.max_bytes, &mut file).map_err(|e| format!("{label}: {e}; nothing was installed"))?;
+        file.sync_all().map_err(|e| format!("{label}: writing {}: {e}", download_path.display()))?;
         d
     };
     if !got.sha256.eq_ignore_ascii_case(&c.sha256) {
         let _ = fs::remove_file(&download_path);
-        return Err(format!(
-            "{label}: sha256 mismatch for {}: expected {}, got {}; nothing was installed",
-            c.url, c.sha256, got.sha256
-        ));
+        return Err(format!("{label}: sha256 mismatch for {}: expected {}, got {}; nothing was installed", c.url, c.sha256, got.sha256));
     }
 
-    fs::create_dir(&unpacked)
-        .map_err(|e| format!("{label}: creating {}: {e}", unpacked.display()))?;
-    let (dl, un) = (
-        download_path.to_string_lossy().into_owned(),
-        unpacked.to_string_lossy().into_owned(),
-    );
+    fs::create_dir(&unpacked).map_err(|e| format!("{label}: creating {}: {e}", unpacked.display()))?;
+    let (dl, un) = (download_path.to_string_lossy().into_owned(), unpacked.to_string_lossy().into_owned());
     let argv: Vec<String> = match c.unpack {
-        Unpack::TarGzStrip1 => vec![
-            "/usr/bin/tar".into(),
-            "-xzf".into(),
-            dl,
-            "-C".into(),
-            un,
-            "--strip-components".into(),
-            "1".into(),
-        ],
+        Unpack::TarGzStrip1 => vec!["/usr/bin/tar".into(), "-xzf".into(), dl, "-C".into(), un, "--strip-components".into(), "1".into()],
         Unpack::Zip => vec!["/usr/bin/ditto".into(), "-x".into(), "-k".into(), dl, un],
     };
     let tool = argv[0].clone();
-    let out = host
-        .run(&argv, UNPACK_TIMEOUT)
-        .map_err(|e| format!("{label}: running {tool}: {e}; nothing was installed"))?;
+    let out = host.run(&argv, UNPACK_TIMEOUT).map_err(|e| format!("{label}: running {tool}: {e}; nothing was installed"))?;
     if out.killed || out.code != Some(0) {
-        let how = if out.killed {
-            "was killed".to_string()
-        } else {
-            format!("exited with {:?}", out.code)
-        };
-        return Err(format!(
-            "{label}: {tool} {how} unpacking {}: {}; nothing was installed",
-            c.url,
-            tail(&out.stderr)
-        ));
+        let how = if out.killed { "was killed".to_string() } else { format!("exited with {:?}", out.code) };
+        return Err(format!("{label}: {tool} {how} unpacking {}: {}; nothing was installed", c.url, tail(&out.stderr)));
     }
 
     let binary = unpacked.join(c.binary);
-    if !fs::symlink_metadata(&binary)
-        .map(|m| m.is_file())
-        .unwrap_or(false)
-    {
-        return Err(format!(
-            "{label}: {} does not contain a regular file {}; nothing was installed",
-            c.url, c.binary
-        ));
+    if !fs::symlink_metadata(&binary).map(|m| m.is_file()).unwrap_or(false) {
+        return Err(format!("{label}: {} does not contain a regular file {}; nothing was installed", c.url, c.binary));
     }
     if exists() {
         return Err(format!("{} already exists", target.display()));
     }
-    fs::rename(&unpacked, target).map_err(|e| {
-        format!(
-            "{label}: moving {} to {}: {e}; nothing was installed",
-            unpacked.display(),
-            target.display()
-        )
-    })?;
+    fs::rename(&unpacked, target).map_err(|e| format!("{label}: moving {} to {}: {e}; nothing was installed", unpacked.display(), target.display()))?;
     // `tmp` drops here and removes the download.
     Ok(())
 }
@@ -358,12 +261,7 @@ fn remove_stale_temp_dirs(parent: &Path) -> Result<(), String> {
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if is_dir {
             let path = entry.path();
-            fs::remove_dir_all(&path).map_err(|e| {
-                format!(
-                    "removing the stale {}: {e}; remove it and re-run rts setup",
-                    path.display()
-                )
-            })?;
+            fs::remove_dir_all(&path).map_err(|e| format!("removing the stale {}: {e}; remove it and re-run rts setup", path.display()))?;
         }
     }
     Ok(())
@@ -412,10 +310,7 @@ pub struct ReleaseArchive {
 }
 
 const RELEASE_MAX_BYTES: u64 = 128 << 20;
-const RELEASE_OWNED: [&str; 2] = [
-    "libexec/nearai-red-sandbox",
-    "share/nearai-red-sandbox/plugin",
-];
+const RELEASE_OWNED: [&str; 2] = ["libexec/nearai-red-sandbox", "share/nearai-red-sandbox/plugin"];
 
 fn swap_into_prefix(prefix: &Path, stage: &Path, rel: &str) -> Result<(), String> {
     use std::os::unix::fs::DirBuilderExt;
@@ -430,14 +325,12 @@ fn swap_into_prefix(prefix: &Path, stage: &Path, rel: &str) -> Result<(), String
     if exists(&dst) {
         let backup = stage.join("old").join(rel);
         if let Some(parent) = backup.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
         }
         fs::rename(&dst, &backup).map_err(|e| format!("moving {} aside: {e}", dst.display()))?;
     }
     let src = stage.join("unpacked").join(rel);
-    fs::rename(&src, &dst)
-        .map_err(|e| format!("moving {} into {}: {e}", src.display(), dst.display()))
+    fs::rename(&src, &dst).map_err(|e| format!("moving {} into {}: {e}", src.display(), dst.display()))
 }
 
 fn install_release_components(
@@ -460,12 +353,7 @@ fn install_release_components(
     let tmp = tempfile::Builder::new()
         .prefix(TEMP_PREFIX)
         .tempdir_in(prefix)
-        .map_err(|e| {
-            format!(
-                "{label}: creating a temp directory in {}: {e}",
-                prefix.display()
-            )
-        })?;
+        .map_err(|e| format!("{label}: creating a temp directory in {}: {e}", prefix.display()))?;
     let download_path = tmp.path().join("release.tar.gz");
     let unpacked = tmp.path().join("unpacked");
     let expected = hex(&release.sha256);
@@ -516,20 +404,14 @@ fn install_release_components(
     }
 
     let sup = unpacked.join("libexec/nearai-red-sandbox/mvm-hvf-supervisor");
-    if !fs::symlink_metadata(&sup)
-        .map(|m| m.is_file())
-        .unwrap_or(false)
-    {
+    if !fs::symlink_metadata(&sup).map(|m| m.is_file()).unwrap_or(false) {
         return Err(format!(
             "{label}: {} does not contain a regular file libexec/nearai-red-sandbox/mvm-hvf-supervisor; nothing was installed",
             release.url
         ));
     }
     let plugin = unpacked.join("share/nearai-red-sandbox/plugin");
-    if !fs::symlink_metadata(&plugin)
-        .map(|m| m.is_dir())
-        .unwrap_or(false)
-    {
+    if !fs::symlink_metadata(&plugin).map(|m| m.is_dir()).unwrap_or(false) {
         return Err(format!(
             "{label}: {} does not contain share/nearai-red-sandbox/plugin; nothing was installed",
             release.url
@@ -601,20 +483,13 @@ pub fn run(o: &SetupOptions, c: &SetupContext) -> Result<Vec<String>, String> {
 /// The environment for `mvm_plain`: only HOME and MVM_HOME from `env`, never
 /// MVM_HVF_SUPERVISOR_PATH, so `env sign` cannot re-sign the supervisor.
 pub fn plain_mvm_env(env: &[(String, String)]) -> std::collections::HashMap<String, String> {
-    env.iter()
-        .filter(|(k, _)| matches!(k.as_str(), "HOME" | "MVM_HOME"))
-        .cloned()
-        .collect()
+    env.iter().filter(|(k, _)| matches!(k.as_str(), "HOME" | "MVM_HOME")).cloned().collect()
 }
 
 /// The runner for `mvmctl env sign` and other plain mvmctl calls. It sets
 /// only `plain_mvm_env` and removes MVM_HVF_SUPERVISOR_PATH from the child,
 /// so an override exported in the operator's shell never reaches mvmctl.
-pub fn plain_mvm_runner(
-    mvmctl: &Path,
-    empty_git_config: &Path,
-    env: &[(String, String)],
-) -> SpawnRunner {
+pub fn plain_mvm_runner(mvmctl: &Path, empty_git_config: &Path, env: &[(String, String)]) -> SpawnRunner {
     SpawnRunner {
         mvmctl: mvmctl.to_path_buf(),
         empty_git_config: empty_git_config.to_path_buf(),
@@ -625,17 +500,11 @@ pub fn plain_mvm_runner(
 
 /// `mvmctl --version` prints exactly `mvmctl <MVM_VERSION>`.
 pub fn verify_mvm(mvm: &dyn Runner) -> Result<(), String> {
-    let r = succeeded(
-        mvm.run(&["--version".to_string()], VERSION_TIMEOUT),
-        "mvmctl --version",
-        VERSION_TIMEOUT,
-    )?;
+    let r = succeeded(mvm.run(&["--version".to_string()], VERSION_TIMEOUT), "mvmctl --version", VERSION_TIMEOUT)?;
     let out = String::from_utf8_lossy(&r.stdout);
     let found = out.trim();
     if found != format!("mvmctl {MVM_VERSION}") {
-        return Err(format!(
-            "mvmctl --version printed {found:?}, expected \"mvmctl {MVM_VERSION}\""
-        ));
+        return Err(format!("mvmctl --version printed {found:?}, expected \"mvmctl {MVM_VERSION}\""));
     }
     Ok(())
 }
@@ -644,22 +513,11 @@ pub fn verify_mvm(mvm: &dyn Runner) -> Result<(), String> {
 fn succeeded(r: io::Result<RunOutput>, what: &str, timeout: Duration) -> Result<RunOutput, String> {
     let out = r.map_err(|e| format!("{what} could not run: {e}"))?;
     if out.killed {
-        return Err(format!(
-            "{what} did not finish within {} s",
-            timeout.as_secs()
-        ));
+        return Err(format!("{what} did not finish within {} s", timeout.as_secs()));
     }
     if out.code != Some(0) {
         let t = tail(&out.stderr);
-        return Err(format!(
-            "{what} exited with {:?}{}",
-            out.code,
-            if t.is_empty() {
-                String::new()
-            } else {
-                format!(": {t}")
-            }
-        ));
+        return Err(format!("{what} exited with {:?}{}", out.code, if t.is_empty() { String::new() } else { format!(": {t}") }));
     }
     Ok(out)
 }
@@ -691,20 +549,12 @@ impl Steps {
         }
     }
     fn finish(self) -> Result<Vec<String>, String> {
-        if self.failures.is_empty() {
-            Ok(self.lines)
-        } else {
-            Err(self.failures.join("\n"))
-        }
+        if self.failures.is_empty() { Ok(self.lines) } else { Err(self.failures.join("\n")) }
     }
 }
 
 /// `run` with the two components supplied, so tests serve fixtures.
-pub(crate) fn run_with(
-    o: &SetupOptions,
-    c: &SetupContext,
-    components: (&Component, &Component),
-) -> Result<Vec<String>, String> {
+pub(crate) fn run_with(o: &SetupOptions, c: &SetupContext, components: (&Component, &Component)) -> Result<Vec<String>, String> {
     if o.offline {
         if !o.check {
             return Err("--offline requires --check".into());
@@ -712,41 +562,21 @@ pub(crate) fn run_with(
         return offline_check(c);
     }
     let (mvm_c, opencode_c) = components;
-    let mut steps = Steps {
-        check: o.check,
-        lines: Vec::new(),
-        failures: Vec::new(),
-    };
+    let mut steps = Steps { check: o.check, lines: Vec::new(), failures: Vec::new() };
     let mvm_ok = steps.record(mvm_step(o.check, c, mvm_c))?;
     if !o.check {
         steps.record(
-            succeeded(
-                c.mvm_plain.run(&sv(&["env", "sign"]), SIGN_TIMEOUT),
-                "mvmctl env sign",
-                SIGN_TIMEOUT,
-            )
-            .map(|_| None)
-            .map_err(|e| {
-                format!("mvm {MVM_VERSION}: {e}; fix the problem it reports and re-run rts setup")
-            }),
+            succeeded(c.mvm_plain.run(&sv(&["env", "sign"]), SIGN_TIMEOUT), "mvmctl env sign", SIGN_TIMEOUT)
+                .map(|_| None)
+                .map_err(|e| format!("mvm {MVM_VERSION}: {e}; fix the problem it reports and re-run rts setup")),
         )?;
     }
     // A missing or wrong mvmctl already failed above; running it again only repeats that.
     if mvm_ok {
         steps.record(
-            succeeded(
-                c.mvm.run(&sv(&crate::session::DOCTOR), DOCTOR_TIMEOUT),
-                &format!(
-                    "{} {}",
-                    c.defaults.mvmctl.display(),
-                    crate::session::DOCTOR.join(" ")
-                ),
-                DOCTOR_TIMEOUT,
-            )
-            .map(|_| None)
-            .map_err(|e| {
-                format!("mvm {MVM_VERSION}: {e}; fix the problems it reports and re-run rts setup")
-            }),
+            succeeded(c.mvm.run(&sv(&crate::session::DOCTOR), DOCTOR_TIMEOUT), &format!("{} {}", c.defaults.mvmctl.display(), crate::session::DOCTOR.join(" ")), DOCTOR_TIMEOUT)
+                .map(|_| None)
+                .map_err(|e| format!("mvm {MVM_VERSION}: {e}; fix the problems it reports and re-run rts setup")),
         )?;
     }
     steps.record(supervisor_step(c))?;
@@ -772,10 +602,7 @@ fn mvm_step(check: bool, c: &SetupContext, comp: &Component) -> Result<Option<St
         return Ok(line);
     }
     if check {
-        return Err(format!(
-            "{label}: not installed at {}; run rts setup",
-            dir.display()
-        ));
+        return Err(format!("{label}: not installed at {}; run rts setup", dir.display()));
     }
     install_component(comp, &dir, c.fetch, c.host)?;
     verify_mvm(c.mvm_plain).map_err(|e| format!("{label}: the copy just installed at {} does not verify ({e}); remove it and re-run rts setup", dir.display()))?;
@@ -787,17 +614,10 @@ fn supervisor_step(c: &SetupContext) -> Result<Option<String>, String> {
     check_supervisor_marker(c.host, path)
         .and_then(|()| check_supervisor_contract(c.host, path))
         .map_err(|e| format!("supervisor {}: {e}", path.display()))?;
-    Ok(Some(format!(
-        "mvm-hvf-supervisor {SUPERVISOR_FIX_VERSION} {}",
-        path.display()
-    )))
+    Ok(Some(format!("mvm-hvf-supervisor {SUPERVISOR_FIX_VERSION} {}", path.display())))
 }
 
-fn opencode_step(
-    check: bool,
-    c: &SetupContext,
-    comp: &Component,
-) -> Result<Option<String>, String> {
+fn opencode_step(check: bool, c: &SetupContext, comp: &Component) -> Result<Option<String>, String> {
     let label = format!("{} {}", comp.name, comp.version);
     let dir = opencode_dir(c.home);
     let bin = dir.join(comp.binary);
@@ -811,10 +631,7 @@ fn opencode_step(
         return Ok(line);
     }
     if check {
-        return Err(format!(
-            "{label}: not installed at {}; run rts setup",
-            bin.display()
-        ));
+        return Err(format!("{label}: not installed at {}; run rts setup", bin.display()));
     }
     install_component(comp, &dir, c.fetch, c.host)?;
     check_opencode(c.host, &bin_s)
@@ -824,68 +641,31 @@ fn opencode_step(
 
 fn image_step(check: bool, c: &SetupContext) -> Result<Option<String>, String> {
     let line = Some(format!("guest-image {DEFAULT_IMAGE} (mvm image cache)"));
-    let inspect = c
-        .mvm
-        .run(&sv(&["image", "inspect", DEFAULT_IMAGE]), INSPECT_TIMEOUT);
+    let inspect = c.mvm.run(&sv(&["image", "inspect", DEFAULT_IMAGE]), INSPECT_TIMEOUT);
     if matches!(&inspect, Ok(r) if !r.killed && r.code == Some(0)) {
         return Ok(line);
     }
     if check {
-        let why = succeeded(inspect, "mvmctl image inspect", INSPECT_TIMEOUT)
-            .err()
-            .unwrap_or_default();
-        return Err(format!(
-            "guest image {DEFAULT_IMAGE}: not in mvm's image cache ({why}); run rts setup"
-        ));
+        let why = succeeded(inspect, "mvmctl image inspect", INSPECT_TIMEOUT).err().unwrap_or_default();
+        return Err(format!("guest image {DEFAULT_IMAGE}: not in mvm's image cache ({why}); run rts setup"));
     }
-    succeeded(
-        c.mvm
-            .run(&sv(&["image", "pull", DEFAULT_IMAGE]), PULL_TIMEOUT),
-        "mvmctl image pull",
-        PULL_TIMEOUT,
-    )
-    .map_err(|e| {
-        format!("guest image {DEFAULT_IMAGE}: {e}; check the network and re-run rts setup")
-    })?;
+    succeeded(c.mvm.run(&sv(&["image", "pull", DEFAULT_IMAGE]), PULL_TIMEOUT), "mvmctl image pull", PULL_TIMEOUT)
+        .map_err(|e| format!("guest image {DEFAULT_IMAGE}: {e}; check the network and re-run rts setup"))?;
     Ok(line)
 }
 
 /// `--check --offline`: the plugin's files, both supervisor probes, and the
 /// signatures of `rts` and the supervisor. No mvmctl, no network.
 fn offline_check(c: &SetupContext) -> Result<Vec<String>, String> {
-    let mut steps = Steps {
-        check: true,
-        lines: Vec::new(),
-        failures: Vec::new(),
-    };
+    let mut steps = Steps { check: true, lines: Vec::new(), failures: Vec::new() };
     let plugin = &c.defaults.plugin_dir;
-    let missing: Vec<String> = [
-        "package.json",
-        "index.ts",
-        "branding/tui.tsx",
-        "branding/footer.ts",
-        "branding/startup.ts",
-        crate::brand::theme::THEME_FILE,
-    ]
-    .iter()
-    .map(|f| plugin.join(f))
-    .filter(|p| !fs::metadata(p).map(|m| m.is_file()).unwrap_or(false))
-    .map(|p| {
-        format!(
-            "plugin: {} is missing or not a file; reinstall rts",
-            p.display()
-        )
-    })
-    .collect();
-    steps.record(if missing.is_empty() {
-        Ok(Some(format!(
-            "plugin {} {}",
-            env!("CARGO_PKG_VERSION"),
-            plugin.display()
-        )))
-    } else {
-        Err(missing.join("\n"))
-    })?;
+    let missing: Vec<String> = ["package.json", "index.ts", "branding/tui.tsx", "branding/footer.ts", "branding/startup.ts", crate::brand::theme::THEME_FILE]
+        .iter()
+        .map(|f| plugin.join(f))
+        .filter(|p| !fs::metadata(p).map(|m| m.is_file()).unwrap_or(false))
+        .map(|p| format!("plugin: {} is missing or not a file; reinstall rts", p.display()))
+        .collect();
+    steps.record(if missing.is_empty() { Ok(Some(format!("plugin {} {}", env!("CARGO_PKG_VERSION"), plugin.display()))) } else { Err(missing.join("\n")) })?;
     // OpenCode where setup installs it: a setup that stopped before this
     // step must not read as installed. `--version` runs locally, so the
     // check stays offline.
@@ -894,38 +674,17 @@ fn offline_check(c: &SetupContext) -> Result<Vec<String>, String> {
     steps.record(if fs::metadata(&oc).map(|m| m.is_file()).unwrap_or(false) {
         check_opencode(c.host, &oc_s)
             .map(|_| Some(format!("opencode {OPENCODE_VERSION} {oc_s}")))
-            .map_err(|e| {
-                format!(
-                    "opencode {OPENCODE_VERSION}: {oc_s}: {}",
-                    e.trim_end_matches("; run rts setup")
-                )
-            })
+            .map_err(|e| format!("opencode {OPENCODE_VERSION}: {oc_s}: {}", e.trim_end_matches("; run rts setup")))
             .map_err(|e| format!("{e}; run rts setup"))
     } else {
-        Err(format!(
-            "opencode {OPENCODE_VERSION}: not installed at {oc_s}; run rts setup"
-        ))
+        Err(format!("opencode {OPENCODE_VERSION}: not installed at {oc_s}; run rts setup"))
     })?;
     steps.record(supervisor_step(c))?;
-    for (name, path, fix) in [
-        ("rts", c.rts, "reinstall rts"),
-        (
-            "supervisor",
-            c.supervisor,
-            "reinstall rts, or rebuild it with scripts/build-patched-mvm-supervisor.sh",
-        ),
-    ] {
+    for (name, path, fix) in [("rts", c.rts, "reinstall rts"), ("supervisor", c.supervisor, "reinstall rts, or rebuild it with scripts/build-patched-mvm-supervisor.sh")] {
         let p = path.to_string_lossy();
-        let r = succeeded(
-            c.host.run(
-                &sv(&["/usr/bin/codesign", "--verify", "--strict", &p]),
-                CODESIGN_TIMEOUT,
-            ),
-            "codesign --verify --strict",
-            CODESIGN_TIMEOUT,
-        )
-        .map(|_| Some(format!("{name} signature {p}")))
-        .map_err(|e| format!("{name} {p}: {e}; {fix}"));
+        let r = succeeded(c.host.run(&sv(&["/usr/bin/codesign", "--verify", "--strict", &p]), CODESIGN_TIMEOUT), "codesign --verify --strict", CODESIGN_TIMEOUT)
+            .map(|_| Some(format!("{name} signature {p}")))
+            .map_err(|e| format!("{name} {p}: {e}; {fix}"));
         steps.record(r)?;
     }
     steps.finish()
@@ -955,16 +714,10 @@ impl FakeFetch {
         Self::default()
     }
     pub fn body(&self, url: &str, bytes: Vec<u8>) {
-        self.hops
-            .lock()
-            .unwrap()
-            .insert(url.to_string(), FakeHop::Body(bytes));
+        self.hops.lock().unwrap().insert(url.to_string(), FakeHop::Body(bytes));
     }
     pub fn redirect(&self, url: &str, to: &str) {
-        self.hops
-            .lock()
-            .unwrap()
-            .insert(url.to_string(), FakeHop::Redirect(to.to_string()));
+        self.hops.lock().unwrap().insert(url.to_string(), FakeHop::Redirect(to.to_string()));
     }
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
@@ -998,11 +751,7 @@ mod tests {
 
     fn run(cmd: &mut Command) {
         let out = cmd.output().unwrap();
-        assert!(
-            out.status.success(),
-            "{cmd:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert!(out.status.success(), "{cmd:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
 
     /// A tar.gz of `top/<binary>` (a two-line shell script), built with the real tar.
@@ -1013,12 +762,7 @@ mod tests {
         fs::write(&bin, "#!/bin/sh\necho fixture\n").unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
         let out = dir.join("fixture.tar.gz");
-        run(Command::new("/usr/bin/tar")
-            .arg("-czf")
-            .arg(&out)
-            .arg("-C")
-            .arg(&src)
-            .arg("top"));
+        run(Command::new("/usr/bin/tar").arg("-czf").arg(&out).arg("-C").arg(&src).arg("top"));
         fs::read(out).unwrap()
     }
 
@@ -1030,10 +774,7 @@ mod tests {
         fs::write(&bin, "#!/bin/sh\necho fixture\n").unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
         let out = dir.join("fixture.zip");
-        run(Command::new("/usr/bin/ditto")
-            .args(["-c", "-k"])
-            .arg(&bin)
-            .arg(&out));
+        run(Command::new("/usr/bin/ditto").args(["-c", "-k"]).arg(&bin).arg(&out));
         fs::read(out).unwrap()
     }
 
@@ -1046,12 +787,7 @@ mod tests {
         digest: String,
     }
 
-    fn rig_with(
-        archive: impl FnOnce(&Path) -> Vec<u8>,
-        name: &'static str,
-        unpack: Unpack,
-        binary: &'static str,
-    ) -> Rig {
+    fn rig_with(archive: impl FnOnce(&Path) -> Vec<u8>, name: &'static str, unpack: Unpack, binary: &'static str) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let bytes = archive(dir.path());
         let digest = sha256_hex(&bytes);
@@ -1060,51 +796,22 @@ mod tests {
         fetch.body(&url, bytes);
         let parent = dir.path().join("home/.local/mvm");
         let target = parent.join("v0.22.0");
-        let c = Component {
-            name,
-            version: "0.0.1",
-            url,
-            sha256: digest.clone(),
-            max_bytes: 1 << 20,
-            unpack,
-            binary,
-        };
-        Rig {
-            _dir: dir,
-            parent,
-            target,
-            fetch,
-            c,
-            digest,
-        }
+        let c = Component { name, version: "0.0.1", url, sha256: digest.clone(), max_bytes: 1 << 20, unpack, binary };
+        Rig { _dir: dir, parent, target, fetch, c, digest }
     }
 
     fn tar_rig() -> Rig {
-        rig_with(
-            |d| tarball(d, "mvmctl"),
-            "mvm",
-            Unpack::TarGzStrip1,
-            "mvmctl",
-        )
+        rig_with(|d| tarball(d, "mvmctl"), "mvm", Unpack::TarGzStrip1, "mvmctl")
     }
 
     fn leftovers(parent: &Path) -> Vec<String> {
-        let Ok(rd) = fs::read_dir(parent) else {
-            return Vec::new();
-        };
-        rd.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with(TEMP_PREFIX))
-            .collect()
+        let Ok(rd) = fs::read_dir(parent) else { return Vec::new() };
+        rd.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with(TEMP_PREFIX)).collect()
     }
 
     #[test]
     fn allowed_urls_are_exact() {
-        for ok in [
-            "https://github.com/a/b",
-            "https://objects.githubusercontent.com/x",
-            "https://release-assets.githubusercontent.com/x?sig=1",
-            "https://github.com:443/a",
-        ] {
+        for ok in ["https://github.com/a/b", "https://objects.githubusercontent.com/x", "https://release-assets.githubusercontent.com/x?sig=1", "https://github.com:443/a"] {
             assert!(allowed_url(ok).is_ok(), "{ok}");
         }
         for bad in [
@@ -1149,49 +856,24 @@ mod tests {
         let f = FakeFetch::new();
         // r0 -> r1 -> ... -> r5 alternate between two allowed hosts; r5 is the body.
         for i in 0..MAX_REDIRECTS {
-            let host = |j: usize| {
-                if j.is_multiple_of(2) {
-                    "github.com"
-                } else {
-                    "release-assets.githubusercontent.com"
-                }
-            };
-            f.redirect(
-                &format!("https://{}/r{i}", host(i)),
-                &format!("https://{}/r{}", host(i + 1), i + 1),
-            );
+            let host = |j: usize| if j.is_multiple_of(2) { "github.com" } else { "release-assets.githubusercontent.com" };
+            f.redirect(&format!("https://{}/r{i}", host(i)), &format!("https://{}/r{}", host(i + 1), i + 1));
         }
-        f.body(
-            "https://release-assets.githubusercontent.com/r5",
-            b"hello".to_vec(),
-        );
+        f.body("https://release-assets.githubusercontent.com/r5", b"hello".to_vec());
         let mut out = Vec::new();
         let d = download(&f, "https://github.com/r0", 1 << 20, &mut out).unwrap();
         assert_eq!(out, b"hello");
-        assert_eq!(
-            d,
-            Downloaded {
-                sha256: sha256_hex(b"hello"),
-                bytes: 5
-            }
-        );
+        assert_eq!(d, Downloaded { sha256: sha256_hex(b"hello"), bytes: 5 });
         assert_eq!(f.calls().len(), 6);
 
         let f = FakeFetch::new();
         for i in 0..=MAX_REDIRECTS {
-            f.redirect(
-                &format!("https://github.com/r{i}"),
-                &format!("https://github.com/r{}", i + 1),
-            );
+            f.redirect(&format!("https://github.com/r{i}"), &format!("https://github.com/r{}", i + 1));
         }
         f.body("https://github.com/r6", b"hello".to_vec());
         let e = download(&f, "https://github.com/r0", 1 << 20, &mut Vec::new()).unwrap_err();
         assert!(e.contains("redirects"), "{e}");
-        assert!(
-            !f.calls().contains(&"https://github.com/r6".to_string()),
-            "{:?}",
-            f.calls()
-        );
+        assert!(!f.calls().contains(&"https://github.com/r6".to_string()), "{:?}", f.calls());
     }
 
     #[test]
@@ -1200,19 +882,11 @@ mod tests {
         f.body("https://github.com/x/big", vec![7; 1025]);
         let mut out = Vec::new();
         let e = download(&f, "https://github.com/x/big", 1024, &mut out).unwrap_err();
-        assert!(
-            e.contains("exceeds 1024 bytes") && e.contains("https://github.com/x/big"),
-            "{e}"
-        );
+        assert!(e.contains("exceeds 1024 bytes") && e.contains("https://github.com/x/big"), "{e}");
         assert!(out.len() <= 1024);
 
         f.body("https://github.com/x/fits", vec![7; 1024]);
-        assert_eq!(
-            download(&f, "https://github.com/x/fits", 1024, &mut Vec::new())
-                .unwrap()
-                .bytes,
-            1024
-        );
+        assert_eq!(download(&f, "https://github.com/x/fits", 1024, &mut Vec::new()).unwrap().bytes, 1024);
     }
 
     #[test]
@@ -1229,19 +903,10 @@ mod tests {
     #[test]
     fn a_relative_location_is_resolved_against_the_url() {
         let u = Url::parse("https://github.com/a/b/c").unwrap();
-        assert_eq!(
-            redirect_target(&u, Some("/x/y")).unwrap(),
-            "https://github.com/x/y"
-        );
-        assert_eq!(
-            redirect_target(&u, Some("https://objects.githubusercontent.com/z?s=1")).unwrap(),
-            "https://objects.githubusercontent.com/z?s=1"
-        );
+        assert_eq!(redirect_target(&u, Some("/x/y")).unwrap(), "https://github.com/x/y");
+        assert_eq!(redirect_target(&u, Some("https://objects.githubusercontent.com/z?s=1")).unwrap(), "https://objects.githubusercontent.com/z?s=1");
         let e = redirect_target(&u, None).unwrap_err();
-        assert!(
-            e.contains("https://github.com/a/b/c") && e.contains("Location"),
-            "{e}"
-        );
+        assert!(e.contains("https://github.com/a/b/c") && e.contains("Location"), "{e}");
     }
 
     #[test]
@@ -1254,13 +919,7 @@ mod tests {
         let mut r = tar_rig();
         r.c.sha256 = "00".repeat(32);
         let e = install_component(&r.c, &r.target, &r.fetch, &RealHost).unwrap_err();
-        assert!(
-            e.contains(&"00".repeat(32))
-                && e.contains(&r.digest)
-                && e.contains("sha256 mismatch")
-                && e.contains(&r.c.url),
-            "{e}"
-        );
+        assert!(e.contains(&"00".repeat(32)) && e.contains(&r.digest) && e.contains("sha256 mismatch") && e.contains(&r.c.url), "{e}");
         assert!(e.contains("nothing was installed"), "{e}");
         assert!(!r.target.exists());
         assert_eq!(leftovers(&r.parent), Vec::<String>::new());
@@ -1276,21 +935,14 @@ mod tests {
         assert_ne!(meta.permissions().mode() & 0o111, 0, "not executable");
         assert!(!r.target.join("top").exists());
         assert_eq!(leftovers(&r.parent), Vec::<String>::new());
-        assert_eq!(
-            fs::metadata(&r.parent).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
+        assert_eq!(fs::metadata(&r.parent).unwrap().permissions().mode() & 0o777, 0o700);
     }
 
     #[test]
     fn a_zip_is_unpacked_with_ditto() {
         let r = rig_with(zip, "opencode", Unpack::Zip, "opencode");
         install_component(&r.c, &r.target, &r.fetch, &RealHost).unwrap();
-        assert!(
-            fs::symlink_metadata(r.target.join("opencode"))
-                .unwrap()
-                .is_file()
-        );
+        assert!(fs::symlink_metadata(r.target.join("opencode")).unwrap().is_file());
         assert_eq!(leftovers(&r.parent), Vec::<String>::new());
     }
 
@@ -1301,12 +953,7 @@ mod tests {
             assert_eq!(argv[0], "/usr/bin/tar");
             assert_eq!(argv[3], "-C");
             fs::write(Path::new(&argv[4]).join("partial"), b"half").unwrap();
-            Ok(RunOutput {
-                code: None,
-                stdout: Vec::new(),
-                stderr: b"tar: interrupted".to_vec(),
-                killed: true,
-            })
+            Ok(RunOutput { code: None, stdout: Vec::new(), stderr: b"tar: interrupted".to_vec(), killed: true })
         }
     }
 
@@ -1327,10 +974,7 @@ mod tests {
         f.body(&c.url, b"not a tarball".to_vec());
         c.sha256 = sha256_hex(b"not a tarball");
         let e = install_component(&c, &r.target, &f, &RealHost).unwrap_err();
-        assert!(
-            e.contains("/usr/bin/tar") && e.contains("nothing was installed"),
-            "{e}"
-        );
+        assert!(e.contains("/usr/bin/tar") && e.contains("nothing was installed"), "{e}");
         assert!(!r.target.exists());
         assert_eq!(leftovers(&r.parent), Vec::<String>::new());
     }
@@ -1351,12 +995,7 @@ mod tests {
 
     #[test]
     fn an_archive_without_the_binary_is_refused() {
-        let r = rig_with(
-            |d| tarball(d, "other"),
-            "mvm",
-            Unpack::TarGzStrip1,
-            "mvmctl",
-        );
+        let r = rig_with(|d| tarball(d, "other"), "mvm", Unpack::TarGzStrip1, "mvmctl");
         let e = install_component(&r.c, &r.target, &r.fetch, &RealHost).unwrap_err();
         assert!(e.contains("mvmctl") && e.contains(&r.c.url), "{e}");
         assert!(!r.target.exists());
@@ -1369,10 +1008,7 @@ mod tests {
         fs::create_dir_all(&r.target).unwrap();
         fs::write(r.target.join("mine"), b"x").unwrap();
         let e = install_component(&r.c, &r.target, &r.fetch, &RealHost).unwrap_err();
-        assert!(
-            e.contains(&format!("{} already exists", r.target.display())),
-            "{e}"
-        );
+        assert!(e.contains(&format!("{} already exists", r.target.display())), "{e}");
         assert!(r.target.join("mine").exists());
         assert!(r.fetch.calls().is_empty(), "downloaded anyway");
     }
@@ -1380,32 +1016,14 @@ mod tests {
     #[test]
     fn the_pinned_components_match_the_spec() {
         let (m, o) = (mvm(), opencode());
-        assert_eq!(
-            m.url,
-            "https://github.com/tinylabscom/mvm/releases/download/v0.22.0/mvmctl-aarch64-apple-darwin.tar.gz"
-        );
-        assert_eq!(
-            o.url,
-            "https://github.com/anomalyco/opencode/releases/download/v2.2.2/opencode-darwin-arm64.zip"
-        );
-        assert_eq!(
-            m.sha256,
-            "1f2c80b253add28c3856080e3f3a10aa1163f1aef0a7d413ded15100bdcd0c69"
-        );
-        assert_eq!(
-            o.sha256,
-            "c1c901a6379d667b7a30a3eea5a8f6e93416dba43e889e834771f6fb174f35c9"
-        );
+        assert_eq!(m.url, "https://github.com/tinylabscom/mvm/releases/download/v0.22.0/mvmctl-aarch64-apple-darwin.tar.gz");
+        assert_eq!(o.url, "https://github.com/anomalyco/opencode/releases/download/v2.2.2/opencode-darwin-arm64.zip");
+        assert_eq!(m.sha256, "1f2c80b253add28c3856080e3f3a10aa1163f1aef0a7d413ded15100bdcd0c69");
+        assert_eq!(o.sha256, "c1c901a6379d667b7a30a3eea5a8f6e93416dba43e889e834771f6fb174f35c9");
         assert!(allowed_url(&m.url).is_ok() && allowed_url(&o.url).is_ok());
         assert_eq!((m.max_bytes, o.max_bytes), (64 << 20, 256 << 20));
-        assert_eq!(
-            (m.name, m.version, m.unpack, m.binary),
-            ("mvm", "0.22.0", Unpack::TarGzStrip1, "mvmctl")
-        );
-        assert_eq!(
-            (o.name, o.version, o.unpack, o.binary),
-            ("opencode", "2.2.2", Unpack::Zip, "opencode")
-        );
+        assert_eq!((m.name, m.version, m.unpack, m.binary), ("mvm", "0.22.0", Unpack::TarGzStrip1, "mvmctl"));
+        assert_eq!((o.name, o.version, o.unpack, o.binary), ("opencode", "2.2.2", Unpack::Zip, "opencode"));
     }
 
     // --- rts setup: checks, order and modes ---
@@ -1420,12 +1038,7 @@ mod tests {
     type Answer = Box<dyn Fn(&[String]) -> io::Result<RunOutput> + Send + Sync>;
 
     fn out(code: i32, stdout: &str, stderr: &str) -> RunOutput {
-        RunOutput {
-            code: Some(code),
-            stdout: stdout.into(),
-            stderr: stderr.into(),
-            killed: false,
-        }
+        RunOutput { code: Some(code), stdout: stdout.into(), stderr: stderr.into(), killed: false }
     }
 
     /// A `Host` and a `Runner` that answers from a closure, recording each argv
@@ -1438,17 +1051,8 @@ mod tests {
     }
 
     impl Recorder {
-        fn new(
-            tag: &'static str,
-            log: &Log,
-            answer: impl Fn(&[String]) -> io::Result<RunOutput> + Send + Sync + 'static,
-        ) -> Self {
-            Self {
-                tag,
-                answer: Box::new(answer),
-                calls: Mutex::new(Vec::new()),
-                log: log.clone(),
-            }
+        fn new(tag: &'static str, log: &Log, answer: impl Fn(&[String]) -> io::Result<RunOutput> + Send + Sync + 'static) -> Self {
+            Self { tag, answer: Box::new(answer), calls: Mutex::new(Vec::new()), log: log.clone() }
         }
         fn calls(&self) -> Vec<Vec<String>> {
             self.calls.lock().unwrap().clone()
@@ -1456,15 +1060,8 @@ mod tests {
         fn record(&self, argv: &[String]) -> io::Result<RunOutput> {
             self.calls.lock().unwrap().push(argv.to_vec());
             // The unpack tools' argv names temp paths; log only the tool.
-            let shown = if argv[0] == "/usr/bin/tar" || argv[0] == "/usr/bin/ditto" {
-                argv[0].clone()
-            } else {
-                argv.join(" ")
-            };
-            self.log
-                .lock()
-                .unwrap()
-                .push(format!("{} {shown}", self.tag));
+            let shown = if argv[0] == "/usr/bin/tar" || argv[0] == "/usr/bin/ditto" { argv[0].clone() } else { argv.join(" ") };
+            self.log.lock().unwrap().push(format!("{} {shown}", self.tag));
             (self.answer)(argv)
         }
     }
@@ -1502,9 +1099,7 @@ mod tests {
             "/usr/bin/codesign" => Ok(out(0, "", "")),
             _ => Ok(match a.last().map(String::as_str) {
                 Some(SUPERVISOR_PROBE) => out(0, "rts-vsock-drain-v1\n", ""),
-                Some(SUPERVISOR_CONTRACT_PROBE) => {
-                    out(0, "mvm-hvf-supervisor contract-version=4\n", "")
-                }
+                Some(SUPERVISOR_CONTRACT_PROBE) => out(0, "mvm-hvf-supervisor contract-version=4\n", ""),
                 Some("--version") => out(0, "2.2.2\n", ""),
                 _ => panic!("unexpected host call {a:?}"),
             }),
@@ -1531,11 +1126,7 @@ mod tests {
     }
 
     fn mvm_cached(a: &[String]) -> io::Result<RunOutput> {
-        if a.get(1).map(String::as_str) == Some("inspect") {
-            Ok(out(0, "", ""))
-        } else {
-            mvm_ok(a)
-        }
+        if a.get(1).map(String::as_str) == Some("inspect") { Ok(out(0, "", "")) } else { mvm_ok(a) }
     }
 
     struct SetupRig {
@@ -1563,18 +1154,8 @@ mod tests {
             fs::create_dir_all(&fixtures).unwrap();
             let (tgz, zipped) = (tarball(&fixtures, "mvmctl"), zip(&fixtures));
             let fetch = FakeFetch::new();
-            let mvm_c = Component {
-                url: "https://github.com/fixture/mvm.tar.gz".into(),
-                sha256: sha256_hex(&tgz),
-                max_bytes: 1 << 20,
-                ..mvm()
-            };
-            let oc_c = Component {
-                url: "https://github.com/fixture/opencode.zip".into(),
-                sha256: sha256_hex(&zipped),
-                max_bytes: 1 << 20,
-                ..opencode()
-            };
+            let mvm_c = Component { url: "https://github.com/fixture/mvm.tar.gz".into(), sha256: sha256_hex(&tgz), max_bytes: 1 << 20, ..mvm() };
+            let oc_c = Component { url: "https://github.com/fixture/opencode.zip".into(), sha256: sha256_hex(&zipped), max_bytes: 1 << 20, ..opencode() };
             fetch.body(&mvm_c.url, tgz);
             fetch.body(&oc_c.url, zipped);
             let home = dir.path().join("home");
@@ -1603,10 +1184,7 @@ mod tests {
                 defaults,
                 explicit_mvmctl: false,
                 components: (mvm_c, oc_c),
-                fetch: LoggedFetch {
-                    inner: fetch,
-                    log: log.clone(),
-                },
+                fetch: LoggedFetch { inner: fetch, log: log.clone() },
                 log,
                 _dir: dir,
             }
@@ -1619,11 +1197,7 @@ mod tests {
             mvm: impl Fn(&[String]) -> io::Result<RunOutput> + Send + Sync + 'static,
         ) -> Seams {
             self.log.lock().unwrap().clear();
-            Seams {
-                host: Recorder::new("host", &self.log, host),
-                plain: Recorder::new("plain", &self.log, plain),
-                mvm: Recorder::new("mvm", &self.log, mvm),
-            }
+            Seams { host: Recorder::new("host", &self.log, host), plain: Recorder::new("plain", &self.log, plain), mvm: Recorder::new("mvm", &self.log, mvm) }
         }
 
         fn run(&self, o: SetupOptions, s: &Seams) -> Result<Vec<String>, String> {
@@ -1682,23 +1256,11 @@ mod tests {
                 format!("mvm image pull {DEFAULT_IMAGE}"),
             ]
         );
-        assert!(
-            !has_word(&s.mvm.calls(), "sign"),
-            "env sign went to the supervisor-pinned runner"
-        );
+        assert!(!has_word(&s.mvm.calls(), "sign"), "env sign went to the supervisor-pinned runner");
         assert_eq!(lines.len(), 4, "{lines:?}"); // mvm, supervisor, opencode, image
-        assert!(
-            lines[0].contains("mvm 0.22.0") && lines[0].contains(".local/mvm/v0.22.0"),
-            "{lines:?}"
-        );
-        assert!(
-            lines[1].contains("rts-vsock-drain-v1") && lines[1].contains(&sup),
-            "{lines:?}"
-        );
-        assert!(
-            lines[2].contains("opencode 2.2.2") && lines[2].contains(&oc),
-            "{lines:?}"
-        );
+        assert!(lines[0].contains("mvm 0.22.0") && lines[0].contains(".local/mvm/v0.22.0"), "{lines:?}");
+        assert!(lines[1].contains("rts-vsock-drain-v1") && lines[1].contains(&sup), "{lines:?}");
+        assert!(lines[2].contains("opencode 2.2.2") && lines[2].contains(&oc), "{lines:?}");
         assert!(lines[3].contains(DEFAULT_IMAGE), "{lines:?}");
         assert!(mvm_dir(&r.home).join("mvmctl").is_file() && r.opencode().is_file());
     }
@@ -1706,19 +1268,12 @@ mod tests {
     #[test]
     fn a_correct_install_is_skipped() {
         let r = SetupRig::new();
-        r.run(SetupOptions::default(), &r.seams(host_ok, plain_ok, mvm_ok))
-            .unwrap();
+        r.run(SetupOptions::default(), &r.seams(host_ok, plain_ok, mvm_ok)).unwrap();
         let fetched = r.fetches().len();
         let s = r.seams(host_ok, plain_ok, mvm_cached);
         let lines = r.run(SetupOptions::default(), &s).unwrap();
         assert_eq!(r.fetches().len(), fetched, "downloaded again");
-        assert!(
-            !r.log().iter().any(|l| l.starts_with("fetch")
-                || l.contains("/usr/bin/tar")
-                || l.contains("/usr/bin/ditto")),
-            "{:?}",
-            r.log()
-        );
+        assert!(!r.log().iter().any(|l| l.starts_with("fetch") || l.contains("/usr/bin/tar") || l.contains("/usr/bin/ditto")), "{:?}", r.log());
         assert!(!has_word(&s.mvm.calls(), "pull"));
         assert_eq!(lines.len(), 4, "{lines:?}");
     }
@@ -1741,76 +1296,30 @@ mod tests {
 
     #[test]
     fn the_plain_runner_removes_an_inherited_supervisor_override() {
-        let env: Vec<(String, String)> = vec![
-            ("HOME".into(), "/h".into()),
-            ("MVM_HVF_SUPERVISOR_PATH".into(), "/s".into()),
-        ];
+        let env: Vec<(String, String)> = vec![("HOME".into(), "/h".into()), ("MVM_HVF_SUPERVISOR_PATH".into(), "/s".into())];
         let r = plain_mvm_runner(Path::new("/bin/mvmctl"), Path::new("/g"), &env);
         let cmd = r.command(&["env".to_string(), "sign".to_string()]);
-        let envs: Vec<_> = cmd
-            .get_envs()
-            .map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string())))
-            .collect();
-        assert!(
-            envs.contains(&("MVM_HVF_SUPERVISOR_PATH".into(), None)),
-            "{envs:?}"
-        );
-        assert!(
-            envs.contains(&("HOME".into(), Some("/h".into()))),
-            "{envs:?}"
-        );
+        let envs: Vec<_> = cmd.get_envs().map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string()))).collect();
+        assert!(envs.contains(&("MVM_HVF_SUPERVISOR_PATH".into(), None)), "{envs:?}");
+        assert!(envs.contains(&("HOME".into(), Some("/h".into()))), "{envs:?}");
     }
 
     #[test]
     fn a_missing_or_old_supervisor_marker_fails_with_the_fix() {
         let r = SetupRig::new();
-        for bad in [
-            out(0, "", ""),
-            out(0, "rts-vsock-drain-v0\n", ""),
-            out(1, "rts-vsock-drain-v1\n", ""),
-        ] {
-            let s = r.seams(
-                move |a| {
-                    if a.last().map(String::as_str) == Some(SUPERVISOR_PROBE) {
-                        Ok(bad.clone())
-                    } else {
-                        host_ok(a)
-                    }
-                },
-                plain_ok,
-                mvm_ok,
-            );
+        for bad in [out(0, "", ""), out(0, "rts-vsock-drain-v0\n", ""), out(1, "rts-vsock-drain-v1\n", "")] {
+            let s = r.seams(move |a| if a.last().map(String::as_str) == Some(SUPERVISOR_PROBE) { Ok(bad.clone()) } else { host_ok(a) }, plain_ok, mvm_ok);
             let e = r.run(SetupOptions::default(), &s).unwrap_err();
-            assert!(
-                e.contains("rts-vsock-drain-v1")
-                    && e.contains("rts setup")
-                    && e.contains(&r.supervisor.display().to_string()),
-                "{e}"
-            );
-            assert!(
-                !r.log()
-                    .iter()
-                    .any(|l| l.contains("opencode") || l.contains("image")),
-                "went on after the failure: {:?}",
-                r.log()
-            );
+            assert!(e.contains("rts-vsock-drain-v1") && e.contains("rts setup") && e.contains(&r.supervisor.display().to_string()), "{e}");
+            assert!(!r.log().iter().any(|l| l.contains("opencode") || l.contains("image")), "went on after the failure: {:?}", r.log());
         }
         let s = r.seams(
-            |a| {
-                if a.last().map(String::as_str) == Some(SUPERVISOR_CONTRACT_PROBE) {
-                    Ok(out(0, "mvm-hvf-supervisor contract-version=3\n", ""))
-                } else {
-                    host_ok(a)
-                }
-            },
+            |a| if a.last().map(String::as_str) == Some(SUPERVISOR_CONTRACT_PROBE) { Ok(out(0, "mvm-hvf-supervisor contract-version=3\n", "")) } else { host_ok(a) },
             plain_ok,
             mvm_ok,
         );
         let e = r.run(SetupOptions::default(), &s).unwrap_err();
-        assert!(
-            e.contains("contract-version=4") && e.contains("rts setup"),
-            "{e}"
-        );
+        assert!(e.contains("contract-version=4") && e.contains("rts setup"), "{e}");
     }
 
     #[test]
@@ -1818,30 +1327,11 @@ mod tests {
         let r = SetupRig::new();
         fs::create_dir_all(opencode_dir(&r.home)).unwrap();
         fs::write(r.opencode(), "old").unwrap();
-        let s = r.seams(
-            |a| {
-                if a.last().map(String::as_str) == Some("--version") {
-                    Ok(out(0, "2.1.4\n", ""))
-                } else {
-                    host_ok(a)
-                }
-            },
-            plain_ok,
-            mvm_ok,
-        );
+        let s = r.seams(|a| if a.last().map(String::as_str) == Some("--version") { Ok(out(0, "2.1.4\n", "")) } else { host_ok(a) }, plain_ok, mvm_ok);
         let e = r.run(SetupOptions::default(), &s).unwrap_err();
-        assert!(
-            e.contains("2.2.2")
-                && e.contains("2.1.4")
-                && e.contains(&opencode_dir(&r.home).display().to_string()),
-            "{e}"
-        );
+        assert!(e.contains("2.2.2") && e.contains("2.1.4") && e.contains(&opencode_dir(&r.home).display().to_string()), "{e}");
         assert!(e.contains("remove it and re-run rts setup"), "{e}");
-        assert!(
-            !r.fetches().contains(&r.components.1.url),
-            "{:?}",
-            r.fetches()
-        );
+        assert!(!r.fetches().contains(&r.components.1.url), "{:?}", r.fetches());
         assert_eq!(fs::read(r.opencode()).unwrap(), b"old");
     }
 
@@ -1851,24 +1341,9 @@ mod tests {
         let dir = mvm_dir(&r.home);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("mvmctl"), "mine").unwrap();
-        let s = r.seams(
-            host_ok,
-            |a| {
-                if a == ["--version"] {
-                    Ok(out(0, "mvmctl 0.21.0\n", ""))
-                } else {
-                    plain_ok(a)
-                }
-            },
-            mvm_ok,
-        );
+        let s = r.seams(host_ok, |a| if a == ["--version"] { Ok(out(0, "mvmctl 0.21.0\n", "")) } else { plain_ok(a) }, mvm_ok);
         let e = r.run(SetupOptions::default(), &s).unwrap_err();
-        assert!(
-            e.contains("remove it")
-                && e.contains(&dir.display().to_string())
-                && e.contains("0.21.0"),
-            "{e}"
-        );
+        assert!(e.contains("remove it") && e.contains(&dir.display().to_string()) && e.contains("0.21.0"), "{e}");
         assert_eq!(fs::read(dir.join("mvmctl")).unwrap(), b"mine");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         assert!(r.fetches().is_empty());
@@ -1886,77 +1361,38 @@ mod tests {
         assert!(!r.fetches().contains(&r.components.0.url));
         assert!(!mvm_dir(&r.home).exists());
 
-        let s = r.seams(
-            host_ok,
-            |a| {
-                if a == ["--version"] {
-                    Ok(out(0, "mvmctl 0.21.0\n", ""))
-                } else {
-                    plain_ok(a)
-                }
-            },
-            mvm_ok,
-        );
+        let s = r.seams(host_ok, |a| if a == ["--version"] { Ok(out(0, "mvmctl 0.21.0\n", "")) } else { plain_ok(a) }, mvm_ok);
         let e = r.run(SetupOptions::default(), &s).unwrap_err();
-        assert!(
-            e.contains("RTS_MVMCTL") && e.contains("/opt/custom/mvmctl"),
-            "{e}"
-        );
+        assert!(e.contains("RTS_MVMCTL") && e.contains("/opt/custom/mvmctl"), "{e}");
     }
 
     #[test]
     fn check_makes_no_network_calls_and_changes_nothing() {
         let r = SetupRig::new();
         let s = r.seams(host_ok, plain_ok, mvm_ok);
-        let e = r
-            .run(
-                SetupOptions {
-                    check: true,
-                    offline: false,
-                },
-                &s,
-            )
-            .unwrap_err();
+        let e = r.run(SetupOptions { check: true, offline: false }, &s).unwrap_err();
         assert!(r.fetches().is_empty());
         for calls in [s.plain.calls(), s.mvm.calls()] {
-            assert!(
-                !has_word(&calls, "sign") && !has_word(&calls, "pull"),
-                "{calls:?}"
-            );
+            assert!(!has_word(&calls, "sign") && !has_word(&calls, "pull"), "{calls:?}");
         }
         assert!(e.lines().count() >= 2 && e.contains("run rts setup"), "{e}"); // every failure reported, not just the first
-        assert!(
-            e.contains("mvm 0.22.0") && e.contains("opencode 2.2.2"),
-            "{e}"
-        );
+        assert!(e.contains("mvm 0.22.0") && e.contains("opencode 2.2.2"), "{e}");
         assert!(!r.home.join(".local").exists());
     }
 
     #[test]
     fn check_reports_an_uncached_image_and_passes_a_complete_install() {
         let r = SetupRig::new();
-        r.run(SetupOptions::default(), &r.seams(host_ok, plain_ok, mvm_ok))
-            .unwrap();
-        let check = SetupOptions {
-            check: true,
-            offline: false,
-        };
+        r.run(SetupOptions::default(), &r.seams(host_ok, plain_ok, mvm_ok)).unwrap();
+        let check = SetupOptions { check: true, offline: false };
         let s = r.seams(host_ok, plain_ok, mvm_ok);
         let e = r.run(check, &s).unwrap_err();
-        assert!(
-            e.contains(DEFAULT_IMAGE) && e.contains("run rts setup") && e.lines().count() == 1,
-            "{e}"
-        );
+        assert!(e.contains(DEFAULT_IMAGE) && e.contains("run rts setup") && e.lines().count() == 1, "{e}");
         assert!(!has_word(&s.mvm.calls(), "pull") && !has_word(&s.plain.calls(), "sign"));
 
         let s = r.seams(host_ok, plain_ok, mvm_cached);
         assert_eq!(r.run(check, &s).unwrap().len(), 4);
-        assert!(
-            r.log()
-                .contains(&"mvm doctor --workflow bundle-run".to_string()),
-            "{:?}",
-            r.log()
-        );
+        assert!(r.log().contains(&"mvm doctor --workflow bundle-run".to_string()), "{:?}", r.log());
         assert!(r.fetches().len() == 2, "{:?}", r.fetches());
     }
 
@@ -1965,27 +1401,18 @@ mod tests {
         // A setup that stopped before OpenCode must not read as installed:
         // the app's offline check gates its Start button on this.
         let r = SetupRig::new();
-        let offline = SetupOptions {
-            check: true,
-            offline: true,
-        };
+        let offline = SetupOptions { check: true, offline: true };
         let s = r.seams(host_ok, plain_ok, mvm_ok);
         let e = r.run(offline, &s).unwrap_err();
         let oc = opencode_dir(&r.home).join("opencode");
-        assert!(
-            e.contains("opencode 2.2.2") && e.contains(&oc.display().to_string()),
-            "{e}"
-        );
+        assert!(e.contains("opencode 2.2.2") && e.contains(&oc.display().to_string()), "{e}");
         assert!(r.fetches().is_empty() && s.mvm.calls().is_empty());
     }
 
     #[test]
     fn offline_check_reads_only_the_installed_layout() {
         let r = SetupRig::new();
-        let offline = SetupOptions {
-            check: true,
-            offline: true,
-        };
+        let offline = SetupOptions { check: true, offline: true };
         let oc = opencode_dir(&r.home).join("opencode");
         fs::create_dir_all(oc.parent().unwrap()).unwrap();
         fs::write(&oc, b"").unwrap();
@@ -1995,138 +1422,50 @@ mod tests {
         let sup = r.supervisor.display().to_string();
         let oc_s = oc.display().to_string();
         let programs: Vec<String> = s.host.calls().iter().map(|a| a[0].clone()).collect();
-        assert_eq!(
-            programs,
-            [
-                oc_s.as_str(),
-                sup.as_str(),
-                sup.as_str(),
-                "/usr/bin/codesign",
-                "/usr/bin/codesign"
-            ]
-        );
+        assert_eq!(programs, [oc_s.as_str(), sup.as_str(), sup.as_str(), "/usr/bin/codesign", "/usr/bin/codesign"]);
         let calls = s.host.calls();
         assert_eq!(calls[0], [oc_s.as_str(), "--version"]);
-        assert_eq!(
-            calls[3],
-            [
-                "/usr/bin/codesign",
-                "--verify",
-                "--strict",
-                r.rts.to_str().unwrap()
-            ]
-        );
-        assert_eq!(
-            calls[4],
-            ["/usr/bin/codesign", "--verify", "--strict", sup.as_str()]
-        );
+        assert_eq!(calls[3], ["/usr/bin/codesign", "--verify", "--strict", r.rts.to_str().unwrap()]);
+        assert_eq!(calls[4], ["/usr/bin/codesign", "--verify", "--strict", sup.as_str()]);
 
         fs::remove_file(r.defaults.plugin_dir.join("index.ts")).unwrap();
         let s = r.seams(host_ok, plain_ok, mvm_ok);
         let e = r.run(offline, &s).unwrap_err();
-        assert!(
-            e.contains(&r.defaults.plugin_dir.join("index.ts").display().to_string()),
-            "{e}"
-        );
+        assert!(e.contains(&r.defaults.plugin_dir.join("index.ts").display().to_string()), "{e}");
         fs::remove_file(r.defaults.plugin_dir.join("branding/tui.tsx")).unwrap();
         let s = r.seams(host_ok, plain_ok, mvm_ok);
         let e = r.run(offline, &s).unwrap_err();
-        assert!(
-            e.contains(
-                &r.defaults
-                    .plugin_dir
-                    .join("branding/tui.tsx")
-                    .display()
-                    .to_string()
-            ),
-            "{e}"
-        );
+        assert!(e.contains(&r.defaults.plugin_dir.join("branding/tui.tsx").display().to_string()), "{e}");
         fs::remove_file(r.defaults.plugin_dir.join("branding/footer.ts")).unwrap();
         let s = r.seams(host_ok, plain_ok, mvm_ok);
         let e = r.run(offline, &s).unwrap_err();
-        assert!(
-            e.contains(
-                &r.defaults
-                    .plugin_dir
-                    .join("branding/footer.ts")
-                    .display()
-                    .to_string()
-            ),
-            "{e}"
-        );
+        assert!(e.contains(&r.defaults.plugin_dir.join("branding/footer.ts").display().to_string()), "{e}");
         fs::remove_file(r.defaults.plugin_dir.join("branding/startup.ts")).unwrap();
         let s = r.seams(host_ok, plain_ok, mvm_ok);
         let e = r.run(offline, &s).unwrap_err();
-        assert!(
-            e.contains(
-                &r.defaults
-                    .plugin_dir
-                    .join("branding/startup.ts")
-                    .display()
-                    .to_string()
-            ),
-            "{e}"
-        );
+        assert!(e.contains(&r.defaults.plugin_dir.join("branding/startup.ts").display().to_string()), "{e}");
         fs::remove_file(r.defaults.plugin_dir.join(crate::brand::theme::THEME_FILE)).unwrap();
         let s = r.seams(host_ok, plain_ok, mvm_ok);
         let e = r.run(offline, &s).unwrap_err();
         assert!(e.contains("branding/theme/nearai-red.json"), "{e}");
 
-        let s = r.seams(
-            |a| {
-                if a[0] == "/usr/bin/codesign" {
-                    Ok(out(1, "", "invalid signature"))
-                } else {
-                    host_ok(a)
-                }
-            },
-            plain_ok,
-            mvm_ok,
-        );
+        let s = r.seams(|a| if a[0] == "/usr/bin/codesign" { Ok(out(1, "", "invalid signature")) } else { host_ok(a) }, plain_ok, mvm_ok);
         let e = r.run(offline, &s).unwrap_err();
-        assert!(
-            e.contains(r.rts.to_str().unwrap())
-                && e.contains(&sup)
-                && e.contains("invalid signature"),
-            "{e}"
-        );
+        assert!(e.contains(r.rts.to_str().unwrap()) && e.contains(&sup) && e.contains("invalid signature"), "{e}");
         assert!(s.mvm.calls().is_empty() && s.plain.calls().is_empty());
     }
 
-    fn release_tarball(
-        work: &Path,
-        supervisor_bytes: &[u8],
-        plugin_marker: &str,
-    ) -> (Vec<u8>, [u8; 32]) {
+    fn release_tarball(work: &Path, supervisor_bytes: &[u8], plugin_marker: &str) -> (Vec<u8>, [u8; 32]) {
         let root = work.join("release-stage");
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("libexec/nearai-red-sandbox")).unwrap();
         fs::create_dir_all(root.join("share/nearai-red-sandbox/plugin")).unwrap();
-        fs::write(
-            root.join("libexec/nearai-red-sandbox/mvm-hvf-supervisor"),
-            supervisor_bytes,
-        )
-        .unwrap();
-        fs::write(
-            root.join("libexec/nearai-red-sandbox/mvm-hvf-supervisor.build-info"),
-            "build=1\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("share/nearai-red-sandbox/plugin/index.ts"),
-            plugin_marker,
-        )
-        .unwrap();
+        fs::write(root.join("libexec/nearai-red-sandbox/mvm-hvf-supervisor"), supervisor_bytes).unwrap();
+        fs::write(root.join("libexec/nearai-red-sandbox/mvm-hvf-supervisor.build-info"), "build=1\n").unwrap();
+        fs::write(root.join("share/nearai-red-sandbox/plugin/index.ts"), plugin_marker).unwrap();
         let archive = work.join("rts-release.tar.gz");
         let st = std::process::Command::new("/usr/bin/tar")
-            .args([
-                "-czf",
-                archive.to_str().unwrap(),
-                "-C",
-                root.to_str().unwrap(),
-                "libexec/nearai-red-sandbox",
-                "share/nearai-red-sandbox/plugin",
-            ])
+            .args(["-czf", archive.to_str().unwrap(), "-C", root.to_str().unwrap(), "libexec/nearai-red-sandbox", "share/nearai-red-sandbox/plugin"])
             .status()
             .unwrap();
         assert!(st.success());
@@ -2140,13 +1479,9 @@ mod tests {
         let r = SetupRig::new();
         let prefix = r._dir.path().join("embedded-prefix");
         let (bytes, sha256) = release_tarball(r._dir.path(), b"signed-supervisor-v2", "plugin-v2");
-        let url =
-            "https://github.com/nearai/nearai-red-sandbox/releases/download/v0.1.5/rts.tar.gz";
+        let url = "https://github.com/nearai/nearai-red-sandbox/releases/download/v0.1.5/rts.tar.gz";
         r.fetch.inner.body(url, bytes);
-        let release = ReleaseArchive {
-            url: url.into(),
-            sha256,
-        };
+        let release = ReleaseArchive { url: url.into(), sha256 };
         let s = r.seams(host_ok, plain_ok, mvm_ok);
         let ctx = SetupContext {
             home: &r.home,
@@ -2159,30 +1494,10 @@ mod tests {
             mvm_plain: &s.plain,
             mvm: &s.mvm,
         };
-        let lines = run_in_prefix_with(
-            &SetupOptions::default(),
-            &ctx,
-            &prefix,
-            &release,
-            (&r.components.0, &r.components.1),
-        )
-        .unwrap();
-        assert_eq!(
-            fs::read(crate::install::prefix_supervisor(&prefix)).unwrap(),
-            b"signed-supervisor-v2"
-        );
-        assert_eq!(
-            fs::read_to_string(crate::install::prefix_plugin(&prefix).join("index.ts")).unwrap(),
-            "plugin-v2"
-        );
-        assert!(
-            lines.iter().any(|l| l.contains(
-                &crate::install::prefix_supervisor(&prefix)
-                    .display()
-                    .to_string()
-            )),
-            "{lines:?}"
-        );
+        let lines = run_in_prefix_with(&SetupOptions::default(), &ctx, &prefix, &release, (&r.components.0, &r.components.1)).unwrap();
+        assert_eq!(fs::read(crate::install::prefix_supervisor(&prefix)).unwrap(), b"signed-supervisor-v2");
+        assert_eq!(fs::read_to_string(crate::install::prefix_plugin(&prefix).join("index.ts")).unwrap(), "plugin-v2");
+        assert!(lines.iter().any(|l| l.contains(&crate::install::prefix_supervisor(&prefix).display().to_string())), "{lines:?}");
     }
 
     #[test]
@@ -2198,13 +1513,9 @@ mod tests {
 
         let (bytes, mut sha256) = release_tarball(r._dir.path(), b"tampered", "tampered");
         sha256[0] ^= 0xff;
-        let url =
-            "https://github.com/nearai/nearai-red-sandbox/releases/download/v0.1.5/rts.tar.gz";
+        let url = "https://github.com/nearai/nearai-red-sandbox/releases/download/v0.1.5/rts.tar.gz";
         r.fetch.inner.body(url, bytes);
-        let release = ReleaseArchive {
-            url: url.into(),
-            sha256,
-        };
+        let release = ReleaseArchive { url: url.into(), sha256 };
         let s = r.seams(host_ok, plain_ok, mvm_ok);
         let ctx = SetupContext {
             home: &r.home,
@@ -2217,14 +1528,7 @@ mod tests {
             mvm_plain: &s.plain,
             mvm: &s.mvm,
         };
-        let err = run_in_prefix_with(
-            &SetupOptions::default(),
-            &ctx,
-            &prefix,
-            &release,
-            (&r.components.0, &r.components.1),
-        )
-        .unwrap_err();
+        let err = run_in_prefix_with(&SetupOptions::default(), &ctx, &prefix, &release, (&r.components.0, &r.components.1)).unwrap_err();
         assert!(err.contains("sha256 mismatch"), "{err}");
         assert_eq!(fs::read(&old_sup).unwrap(), b"previous-supervisor-bytes");
         assert_eq!(fs::read_to_string(&old_plugin).unwrap(), "previous-plugin");
@@ -2235,8 +1539,7 @@ mod tests {
         let r = SetupRig::new();
         let prefix = r._dir.path().join("embedded-prefix");
         let release = ReleaseArchive {
-            url: "https://github.com/nearai/nearai-red-sandbox/releases/download/v0.1.5/rts.tar.gz"
-                .into(),
+            url: "https://github.com/nearai/nearai-red-sandbox/releases/download/v0.1.5/rts.tar.gz".into(),
             sha256: [0u8; 32],
         };
         let s = r.seams(host_ok, plain_ok, mvm_ok);
@@ -2251,21 +1554,8 @@ mod tests {
             mvm_plain: &s.plain,
             mvm: &s.mvm,
         };
-        let _ = run_in_prefix_with(
-            &SetupOptions {
-                check: true,
-                offline: false,
-            },
-            &ctx,
-            &prefix,
-            &release,
-            (&r.components.0, &r.components.1),
-        );
-        assert!(
-            r.fetches().is_empty(),
-            "check mode fetched {:?}",
-            r.fetches()
-        );
+        let _ = run_in_prefix_with(&SetupOptions { check: true, offline: false }, &ctx, &prefix, &release, (&r.components.0, &r.components.1));
+        assert!(r.fetches().is_empty(), "check mode fetched {:?}", r.fetches());
     }
 
     #[test]

@@ -413,10 +413,7 @@ impl Plan {
             1 => " · 1 name resolved".into(),
             n => format!(" · {n} names resolved"),
         };
-        format!(
-            "{}{names} · TCP only",
-            hosts(self.entries.len(), "validated")
-        )
+        format!("{}{names} · TCP only", hosts(self.entries.len(), "validated"))
     }
 
     /// The launch progress detail for the pinned-address check, or `None`
@@ -438,19 +435,12 @@ impl Plan {
 
     /// `pinned` is what mvm pinned for this plan's names (see
     /// [`read_pinned`]), recorded next to what `rts` resolved.
-    pub fn record(
-        &self,
-        probes: &[Probe],
-        pinned: &BTreeMap<String, BTreeSet<IpAddr>>,
-    ) -> serde_json::Value {
+    pub fn record(&self, probes: &[Probe], pinned: &BTreeMap<String, BTreeSet<IpAddr>>) -> serde_json::Value {
         fn ips_json<'a>(ips: impl Iterator<Item = &'a IpAddr>) -> serde_json::Value {
             serde_json::Value::Array(ips.map(|ip| ip.to_string().into()).collect())
         }
-        let resolved: serde_json::Map<String, serde_json::Value> = self
-            .resolved
-            .iter()
-            .map(|(name, ips)| (name.clone(), ips_json(ips.iter())))
-            .collect();
+        let resolved: serde_json::Map<String, serde_json::Value> =
+            self.resolved.iter().map(|(name, ips)| (name.clone(), ips_json(ips.iter()))).collect();
         let pinned: serde_json::Map<String, serde_json::Value> = pinned
             .iter()
             .filter(|(name, _)| self.resolved.contains_key(*name))
@@ -472,14 +462,7 @@ impl Plan {
 /// The proxy variables mvm v0.22.0 reads from its own environment
 /// (`network_endpoint_spawn.rs:871-875`). Allowed guest traffic would leave
 /// through any of them.
-pub const PROXY_VARS: [&str; 6] = [
-    "HTTPS_PROXY",
-    "https_proxy",
-    "HTTP_PROXY",
-    "http_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-];
+pub const PROXY_VARS: [&str; 6] = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"];
 
 /// The guest proxy mvm's network endpoint listens on inside the VM.
 const GUEST_PROXY: &str = "127.0.0.1:1080";
@@ -492,18 +475,9 @@ pub fn proxy_env() -> Vec<String> {
     let http = format!("http://{GUEST_PROXY}");
     let socks = format!("socks5h://{GUEST_PROXY}");
     let no_proxy = "localhost,127.0.0.1,::1";
-    let upper = [
-        ("HTTPS_PROXY", http.as_str()),
-        ("HTTP_PROXY", http.as_str()),
-        ("ALL_PROXY", socks.as_str()),
-        ("NO_PROXY", no_proxy),
-    ];
+    let upper = [("HTTPS_PROXY", http.as_str()), ("HTTP_PROXY", http.as_str()), ("ALL_PROXY", socks.as_str()), ("NO_PROXY", no_proxy)];
     let lower = upper.iter().map(|(k, v)| (k.to_lowercase(), *v));
-    upper
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .chain(lower.map(|(k, v)| format!("{k}={v}")))
-        .collect()
+    upper.iter().map(|(k, v)| format!("{k}={v}")).chain(lower.map(|(k, v)| format!("{k}={v}"))).collect()
 }
 
 /// Refuse an mvm host whose settings could grant guest egress outside
@@ -522,12 +496,7 @@ pub fn check_mvm_host(env: &[(String, String)], mvm_root: &std::path::Path) -> R
     let cfg = mvm_root.join("config").join("config.toml");
     match std::fs::symlink_metadata(&cfg) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => {
-            return Err(format!(
-                "cannot check mvm host config {}: {e}",
-                cfg.display()
-            ));
-        }
+        Err(e) => return Err(format!("cannot check mvm host config {}: {e}", cfg.display())),
         Ok(_) => {}
     }
     let text = std::fs::read_to_string(&cfg)
@@ -615,35 +584,19 @@ esac
 /// Probe `target` (`name:port`, `a.b.c.d:port` or `[v6]:port`) from the
 /// guest through the proxy on `127.0.0.1:1080`.
 pub fn probe_argv(target: &str) -> Vec<String> {
-    vec![
-        "sh".into(),
-        "-c".into(),
-        PROBE_SCRIPT.into(),
-        "sh".into(),
-        target.into(),
-    ]
+    vec!["sh".into(), "-c".into(), PROBE_SCRIPT.into(), "sh".into(), target.into()]
 }
 
 /// Probe that [`DENY_ALL_TARGET`] is unreachable both directly and through
 /// the guest proxy.
 pub fn deny_all_argv() -> Vec<String> {
-    vec![
-        "sh".into(),
-        "-c".into(),
-        DENY_ALL_SCRIPT.into(),
-        "sh".into(),
-        DENY_ALL_TARGET.into(),
-    ]
+    vec!["sh".into(), "-c".into(), DENY_ALL_SCRIPT.into(), "sh".into(), DENY_ALL_TARGET.into()]
 }
 
 /// `net=none` for no entries, else `net=N host(s)`: the count after
 /// expansion, as [`Plan::startup_line`] gives it.
 pub fn net_label(entries: usize) -> String {
-    if entries == 0 {
-        "net=none".into()
-    } else {
-        format!("net={}", hosts(entries, "").trim_end())
-    }
+    if entries == 0 { "net=none".into() } else { format!("net={}", hosts(entries, "").trim_end()) }
 }
 
 fn hosts(n: usize, then: &str) -> String {
@@ -697,17 +650,10 @@ pub fn run_probes(sb: &dyn crate::sandbox::Exec, plan: &Plan) -> Result<Vec<Prob
                 .collect::<String>()
                 .escape_debug()
                 .collect();
-            let shown = if shown.is_empty() {
-                "no output".to_string()
-            } else {
-                shown
-            };
+            let shown = if shown.is_empty() { "no output".to_string() } else { shown };
             return Err(fail(shown));
         }
-        probes.push(Probe {
-            target,
-            result: want.to_string(),
-        });
+        probes.push(Probe { target, result: want.to_string() });
     }
     Ok(probes)
 }
@@ -722,11 +668,7 @@ const AUDIT_PREFIXES: [&str; 4] = ["host.flow.", "dns.", "icmp.", "host.route."]
 /// `vm_name` exactly and `entry.event` starts with one of
 /// [`AUDIT_PREFIXES`]; unparseable lines are skipped. mvm's files are only
 /// ever opened for reading. `out` is created 0600 and truncated.
-pub fn extract_audit(
-    audit_dir: &std::path::Path,
-    vm_name: &str,
-    out: &std::path::Path,
-) -> Result<usize, String> {
+pub fn extract_audit(audit_dir: &std::path::Path, vm_name: &str, out: &std::path::Path) -> Result<usize, String> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -740,15 +682,12 @@ pub fn extract_audit(
         .open(out)
         .map_err(write_err)?;
     // `mode` applies only on creation; an existing file is narrowed too.
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(write_err)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(write_err)?;
     let mut w = io::BufWriter::new(file);
     let mut kept = 0;
     for_each_audit_line(&segments, &mut |line| {
         if audit_line_matches(line, vm_name) {
-            w.write_all(line)
-                .and_then(|()| w.write_all(b"\n"))
-                .map_err(write_err)?;
+            w.write_all(line).and_then(|()| w.write_all(b"\n")).map_err(write_err)?;
             kept += 1;
         }
         Ok(())
@@ -790,15 +729,11 @@ fn for_each_audit_line(
 ) -> Result<(), String> {
     use std::io::BufRead;
     for src in sources {
-        let mut r =
-            io::BufReader::new(std::fs::File::open(src).map_err(|e| audit_read_err(src, e))?);
+        let mut r = io::BufReader::new(std::fs::File::open(src).map_err(|e| audit_read_err(src, e))?);
         let mut buf = Vec::new();
         loop {
             buf.clear();
-            if r.read_until(b'\n', &mut buf)
-                .map_err(|e| audit_read_err(src, e))?
-                == 0
-            {
+            if r.read_until(b'\n', &mut buf).map_err(|e| audit_read_err(src, e))? == 0 {
                 break;
             }
             f(buf.strip_suffix(b"\n").unwrap_or(&buf))?;
@@ -815,10 +750,7 @@ fn for_each_audit_line(
 /// one name are merged. A line for this VM whose `resolved_ips` does not
 /// parse fails the read. Field names are from the research notes and are
 /// confirmed against a real run in Task 10.
-pub fn read_pinned(
-    audit_dir: &std::path::Path,
-    vm_name: &str,
-) -> Result<BTreeMap<String, BTreeSet<IpAddr>>, String> {
+pub fn read_pinned(audit_dir: &std::path::Path, vm_name: &str) -> Result<BTreeMap<String, BTreeSet<IpAddr>>, String> {
     let sources = audit_sources(audit_dir)?;
     let mut out: BTreeMap<String, BTreeSet<IpAddr>> = BTreeMap::new();
     for_each_audit_line(&sources, &mut |line| {
@@ -837,30 +769,15 @@ pub fn read_pinned(
         let Some(name) = name else { return Ok(()) };
         let name = name.trim_end_matches('.').to_ascii_lowercase();
         let raw: Vec<String> = match &labels["resolved_ips"] {
-            serde_json::Value::String(s) => s
-                .split(',')
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect(),
-            serde_json::Value::Array(a) => a
-                .iter()
-                .map(|x| {
-                    x.as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| x.to_string())
-                })
-                .collect(),
-            other => {
-                return Err(format!(
-                    "mvm audit entry for {name}: resolved_ips is not a list ({other})"
-                ));
-            }
+            serde_json::Value::String(s) => s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
+            serde_json::Value::Array(a) => a.iter().map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string())).collect(),
+            other => return Err(format!("mvm audit entry for {name}: resolved_ips is not a list ({other})")),
         };
         let set = out.entry(name.clone()).or_default();
         for ip in raw {
-            let parsed = ip.parse::<IpAddr>().map_err(|_| {
-                format!("mvm audit entry for {name}: pinned address {ip:?} is not an IP address")
-            })?;
+            let parsed = ip
+                .parse::<IpAddr>()
+                .map_err(|_| format!("mvm audit entry for {name}: pinned address {ip:?} is not an IP address"))?;
             set.insert(parsed);
         }
         Ok(())
@@ -871,11 +788,7 @@ pub fn read_pinned(
 /// The host half of a flow target: `name:port`, `a.b.c.d:port` or `[v6]:port`.
 fn target_host(target: &str) -> Option<String> {
     let (host, _port) = target.rsplit_once(':')?;
-    Some(
-        host.trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_string(),
-    )
+    Some(host.trim_start_matches('[').trim_end_matches(']').to_string())
 }
 
 /// Compare what mvm pinned (`pinned`, from [`read_pinned`]) with what `rts`
@@ -884,18 +797,11 @@ fn target_host(target: &str) -> Option<String> {
 /// every pinned IP must be one `rts` resolved for that name; mvm may pin
 /// fewer. IP-literal entries pin to themselves and pass. Names in `pinned`
 /// that the plan does not hold are ignored.
-pub fn check_pinned(
-    plan: &Plan,
-    pinned: &BTreeMap<String, BTreeSet<IpAddr>>,
-) -> Result<(), String> {
+pub fn check_pinned(plan: &Plan, pinned: &BTreeMap<String, BTreeSet<IpAddr>>) -> Result<(), String> {
     for (name, ours) in &plan.resolved {
         let theirs = match pinned.get(name) {
             Some(set) if !set.is_empty() => set,
-            _ => {
-                return Err(format!(
-                    "network-mismatch: mvm recorded no pinned address for {name}"
-                ));
-            }
+            _ => return Err(format!("network-mismatch: mvm recorded no pinned address for {name}")),
         };
         for ip in theirs {
             if let Some(range) = refused_range(*ip) {
@@ -919,9 +825,7 @@ fn audit_line_matches(line: &[u8], vm_name: &str) -> bool {
     };
     let entry = &v["entry"];
     entry["labels"]["vm_name"].as_str() == Some(vm_name)
-        && entry["event"]
-            .as_str()
-            .is_some_and(|ev| AUDIT_PREFIXES.iter().any(|p| ev.starts_with(p)))
+        && entry["event"].as_str().is_some_and(|ev| AUDIT_PREFIXES.iter().any(|p| ev.starts_with(p)))
 }
 
 /// `--allow-host` values for tests in other modules. IP literals need no
@@ -935,9 +839,7 @@ pub(crate) fn test_allow_hosts(entries: &[&str]) -> Vec<AllowHost> {
         }
     }
     let written: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
-    plan(&written, &Fixed)
-        .expect("test entries are valid")
-        .allow_hosts()
+    plan(&written, &Fixed).expect("test entries are valid").allow_hosts()
 }
 
 #[cfg(test)]
@@ -1134,70 +1036,28 @@ mod tests {
         assert_eq!(net_label(0), "net=none");
         assert_eq!(none.net_label(), "net=none");
         assert_eq!(none.allowlist_line(), "none · the guest has no network");
-        assert_eq!(
-            probes_line(
-                &none,
-                &[Probe {
-                    target: DENY_ALL_TARGET.into(),
-                    result: "unreachable".into()
-                }]
-            ),
-            "deny-all held · 1.1.1.1:443 unreachable"
-        );
+        assert_eq!(probes_line(&none, &[Probe { target: DENY_ALL_TARGET.into(), result: "unreachable".into() }]), "deny-all held · 1.1.1.1:443 unreachable");
         assert_eq!(none.pinned_line(), None);
 
         let one = plan(&s(&["198.51.100.7:8443"]), &r).unwrap();
         assert_eq!(one.net_label(), "net=1 host");
         assert_eq!(one.allowlist_line(), "1 host validated · TCP only");
         // An IP literal pins to itself: there is nothing for mvm to re-resolve.
-        assert_eq!(
-            one.pinned_line().as_deref(),
-            Some("IP entries only; nothing to re-resolve")
-        );
+        assert_eq!(one.pinned_line().as_deref(), Some("IP entries only; nothing to re-resolve"));
 
         let many = plan(
-            &s(&[
-                "packages",
-                "api.example-target.com",
-                "198.51.100.7:8443",
-                "192.168.1.20:8080",
-            ]),
+            &s(&["packages", "api.example-target.com", "198.51.100.7:8443", "192.168.1.20:8080"]),
             &with_packages(r),
         )
         .unwrap();
         // The same count as startup_line, which says "10 hosts allowed".
         assert!(many.startup_line().contains("10 hosts allowed"));
-        assert_eq!(
-            net_label(
-                expand(&s(&[
-                    "packages",
-                    "api.example-target.com",
-                    "198.51.100.7:8443",
-                    "192.168.1.20:8080"
-                ]))
-                .unwrap()
-                .len()
-            ),
-            "net=10 hosts"
-        );
+        assert_eq!(net_label(expand(&s(&["packages", "api.example-target.com", "198.51.100.7:8443", "192.168.1.20:8080"])).unwrap().len()), "net=10 hosts");
         assert_eq!(many.net_label(), "net=10 hosts");
-        assert_eq!(
-            many.allowlist_line(),
-            "10 hosts validated · 8 names resolved · TCP only"
-        );
-        let probes: Vec<Probe> = many
-            .entries()
-            .iter()
-            .map(|e| Probe {
-                target: e.display(),
-                result: "connected".into(),
-            })
-            .collect();
+        assert_eq!(many.allowlist_line(), "10 hosts validated · 8 names resolved · TCP only");
+        let probes: Vec<Probe> = many.entries().iter().map(|e| Probe { target: e.display(), result: "connected".into() }).collect();
         assert_eq!(probes_line(&many, &probes), "10 hosts reachable");
-        assert_eq!(
-            many.pinned_line().as_deref(),
-            Some("8 names pinned only to validated addresses")
-        );
+        assert_eq!(many.pinned_line().as_deref(), Some("8 names pinned only to validated addresses"));
     }
 
     #[test]
@@ -1327,15 +1187,7 @@ mod tests {
     fn proxy_env_is_the_guest_proxy_in_both_cases_upper_first() {
         let e = proxy_env();
         assert_eq!(e.len(), 8);
-        assert_eq!(
-            e[..4],
-            [
-                "HTTPS_PROXY=http://127.0.0.1:1080",
-                "HTTP_PROXY=http://127.0.0.1:1080",
-                "ALL_PROXY=socks5h://127.0.0.1:1080",
-                "NO_PROXY=localhost,127.0.0.1,::1"
-            ]
-        );
+        assert_eq!(e[..4], ["HTTPS_PROXY=http://127.0.0.1:1080", "HTTP_PROXY=http://127.0.0.1:1080", "ALL_PROXY=socks5h://127.0.0.1:1080", "NO_PROXY=localhost,127.0.0.1,::1"]);
         for (upper, lower) in e[..4].iter().zip(&e[4..]) {
             let (uk, uv) = upper.split_once('=').unwrap();
             let (lk, lv) = lower.split_once('=').unwrap();
@@ -1350,16 +1202,7 @@ mod tests {
             let e = check_mvm_host(&[(var.into(), String::new())], &root).unwrap_err();
             assert!(e.contains(var), "{e}");
         }
-        assert!(
-            check_mvm_host(
-                &[
-                    ("NO_PROXY".into(), "x".into()),
-                    ("HOME".into(), "/h".into())
-                ],
-                &root
-            )
-            .is_ok()
-        );
+        assert!(check_mvm_host(&[("NO_PROXY".into(), "x".into()), ("HOME".into(), "/h".into())], &root).is_ok());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1371,11 +1214,7 @@ mod tests {
         std::fs::write(&cfg, "dev_vm_cpus = 8\ndefault_cpus = 2\ntrusted_plan_signers = []\n# egress in a comment is fine\n[tenant]\nname = \"\"\n").unwrap();
         assert!(check_mvm_host(&[], &root).is_ok());
         std::fs::write(&cfg, "[default_grants.egress]\nallow = []\n").unwrap();
-        assert!(
-            check_mvm_host(&[], &root)
-                .unwrap_err()
-                .contains("config.toml")
-        );
+        assert!(check_mvm_host(&[], &root).unwrap_err().contains("config.toml"));
         std::fs::remove_file(&cfg).unwrap();
         std::fs::create_dir(&cfg).unwrap(); // exists, unreadable as a file
         assert!(check_mvm_host(&[], &root).is_err());
@@ -1438,16 +1277,10 @@ mod tests {
             if passes {
                 assert_eq!(
                     r.unwrap(),
-                    vec![Probe {
-                        target: DENY_ALL_TARGET.into(),
-                        result: "unreachable".into()
-                    }]
+                    vec![Probe { target: DENY_ALL_TARGET.into(), result: "unreachable".into() }]
                 );
             } else {
-                assert!(
-                    r.unwrap_err()
-                        .starts_with("network probe 1.1.1.1:443 failed: ")
-                );
+                assert!(r.unwrap_err().starts_with("network probe 1.1.1.1:443 failed: "));
             }
         }
     }
@@ -1478,10 +1311,7 @@ mod tests {
             }
         });
         let e = run_probes(&rec, &p).unwrap_err();
-        assert!(
-            e.contains("198.51.100.8:8443") && e.contains("refused"),
-            "{e}"
-        );
+        assert!(e.contains("198.51.100.8:8443") && e.contains("refused"), "{e}");
         let execs = rec.execs.lock().unwrap();
         assert_eq!(execs.len(), 2, "stops at the first failure");
         for ((argv, o), target) in execs.iter().zip(["198.51.100.7:443", "198.51.100.8:8443"]) {
@@ -1502,15 +1332,9 @@ mod tests {
         let rec = Recorder::new(|_, _| reply(0, b"RTS_PROBE connected\n", b""));
         let probes = run_probes(&rec, &p).unwrap();
         let targets: Vec<&str> = probes.iter().map(|p| p.target.as_str()).collect();
-        assert_eq!(
-            targets,
-            ["a.example:443", "198.51.100.7:8443", "[2001:db8::7]:443"]
-        );
+        assert_eq!(targets, ["a.example:443", "198.51.100.7:8443", "[2001:db8::7]:443"]);
         assert!(probes.iter().all(|p| p.result == "connected"));
-        assert_eq!(
-            rec.argvs().iter().map(|a| a[4].clone()).collect::<Vec<_>>(),
-            targets
-        );
+        assert_eq!(rec.argvs().iter().map(|a| a[4].clone()).collect::<Vec<_>>(), targets);
     }
 
     #[test]
@@ -1526,10 +1350,7 @@ mod tests {
     #[test]
     fn the_probe_script_reports_no_nc_when_nc_is_missing() {
         for argv in [probe_argv("a.example:443"), deny_all_argv()] {
-            assert_eq!(
-                run_script(&argv, "/nonexistent"),
-                (0, "RTS_PROBE no-nc\n".into())
-            );
+            assert_eq!(run_script(&argv, "/nonexistent"), (0, "RTS_PROBE no-nc\n".into()));
         }
     }
 
@@ -1537,24 +1358,15 @@ mod tests {
     fn the_probe_takes_the_first_line_without_waiting_for_the_tunnel_to_close() {
         // The proxy answers 200 and then holds the tunnel open, as a real
         // CONNECT does. The probe must not wait for nc to exit.
-        let d = fake_nc(
-            "probe-200",
-            "printf 'HTTP/1.1 200 Connection established\\r\\n\\r\\n'\nexec sleep 60",
-        );
+        let d = fake_nc("probe-200", "printf 'HTTP/1.1 200 Connection established\\r\\n\\r\\n'\nexec sleep 60");
         let path = format!("{}:/usr/bin:/bin", d.display());
-        assert_eq!(
-            run_script(&probe_argv("a.example:443"), &path),
-            (0, "RTS_PROBE connected\n".into())
-        );
+        assert_eq!(run_script(&probe_argv("a.example:443"), &path), (0, "RTS_PROBE connected\n".into()));
         std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn the_probe_reports_a_refusal_with_its_status_line() {
-        let d = fake_nc(
-            "probe-403",
-            "cat >/dev/null; printf 'HTTP/1.1 403 Forbidden\\r\\n\\r\\n'",
-        );
+        let d = fake_nc("probe-403", "cat >/dev/null; printf 'HTTP/1.1 403 Forbidden\\r\\n\\r\\n'");
         let path = format!("{}:/usr/bin:/bin", d.display());
         assert_eq!(
             run_script(&probe_argv("a.example:443"), &path),
@@ -1564,10 +1376,7 @@ mod tests {
         // Nothing answers at all.
         let d = fake_nc("probe-none", "exit 1");
         let path = format!("{}:/usr/bin:/bin", d.display());
-        assert_eq!(
-            run_script(&probe_argv("a.example:443"), &path),
-            (0, "RTS_PROBE refused \n".into())
-        );
+        assert_eq!(run_script(&probe_argv("a.example:443"), &path), (0, "RTS_PROBE refused \n".into()));
         std::fs::remove_dir_all(d).unwrap();
     }
 
@@ -1578,10 +1387,7 @@ mod tests {
             "[ \"$*\" = '-w 10 127.0.0.1 1080' ] || exit 1\nIFS= read -r l\n[ \"$l\" = \"$(printf 'CONNECT [2001:db8::7]:443 HTTP/1.1\\r')\" ] || exit 1\nprintf 'HTTP/1.0 200 OK\\r\\n'",
         );
         let path = format!("{}:/usr/bin:/bin", d.display());
-        assert_eq!(
-            run_script(&probe_argv("[2001:db8::7]:443"), &path),
-            (0, "RTS_PROBE connected\n".into())
-        );
+        assert_eq!(run_script(&probe_argv("[2001:db8::7]:443"), &path), (0, "RTS_PROBE connected\n".into()));
         std::fs::remove_dir_all(d).unwrap();
     }
 
@@ -1589,27 +1395,14 @@ mod tests {
     fn the_deny_all_script_passes_only_when_neither_path_connects() {
         // $4 is the port: 443 for the direct try, 1080 for the proxy.
         for (body, want) in [
-            (
-                "[ \"$4\" = 443 ] && exit 1\nprintf 'HTTP/1.1 403 Forbidden\\r\\n'",
-                "RTS_PROBE unreachable\n",
-            ),
+            ("[ \"$4\" = 443 ] && exit 1\nprintf 'HTTP/1.1 403 Forbidden\\r\\n'", "RTS_PROBE unreachable\n"),
             ("exit 1", "RTS_PROBE unreachable\n"),
-            (
-                "[ \"$4\" = 443 ] && exit 0\nprintf 'HTTP/1.1 403 Forbidden\\r\\n'",
-                "RTS_PROBE reachable-direct\n",
-            ),
-            (
-                "[ \"$4\" = 443 ] && exit 1\nprintf 'HTTP/1.1 200 OK\\r\\n'\nexec sleep 60",
-                "RTS_PROBE reachable-proxy\n",
-            ),
+            ("[ \"$4\" = 443 ] && exit 0\nprintf 'HTTP/1.1 403 Forbidden\\r\\n'", "RTS_PROBE reachable-direct\n"),
+            ("[ \"$4\" = 443 ] && exit 1\nprintf 'HTTP/1.1 200 OK\\r\\n'\nexec sleep 60", "RTS_PROBE reachable-proxy\n"),
         ] {
             let d = fake_nc("deny-all", body);
             let path = format!("{}:/usr/bin:/bin", d.display());
-            assert_eq!(
-                run_script(&deny_all_argv(), &path),
-                (0, want.into()),
-                "{body}"
-            );
+            assert_eq!(run_script(&deny_all_argv(), &path), (0, want.into()), "{body}");
             std::fs::remove_dir_all(d).unwrap();
         }
         assert_eq!(deny_all_argv()[4], DENY_ALL_TARGET);
@@ -1619,64 +1412,22 @@ mod tests {
     fn audit_entries_are_filtered_by_vm_name_and_event_across_a_rotated_segment() {
         use std::os::unix::fs::PermissionsExt;
         let d = crate::testutil::tempdir("audit");
-        let line = |vm: &str, ev: &str| {
-            format!(
-                r#"{{"entry":{{"event":"{ev}","labels":{{"vm_name":"{vm}","target":"x:443"}}}},"canonical":"Y2Fu","prev_hash":"cA","signature":"c2ln"}}"#
-            )
-        };
+        let line = |vm: &str, ev: &str| format!(r#"{{"entry":{{"event":"{ev}","labels":{{"vm_name":"{vm}","target":"x:443"}}}},"canonical":"Y2Fu","prev_hash":"cA","signature":"c2ln"}}"#);
         let me = "rts-0123456789ab";
-        std::fs::write(
-            d.join("local.seg-0001.jsonl"),
-            [
-                line(me, "host.flow.allowed"),
-                line("rts-ffffffffffff", "host.flow.denied"),
-                "not json".into(),
-            ]
-            .join("\n")
-                + "\n",
-        )
-        .unwrap();
-        std::fs::write(
-            d.join("local.jsonl"),
-            [
-                line(me, "dns.resolved"),
-                line(me, "plan.signed"),
-                line(&format!("{me}x"), "host.flow.denied"),
-                line(me, "host.route.decided"),
-                line(me, "icmp.refused"),
-            ]
-            .join("\n")
-                + "\n",
-        )
-        .unwrap();
+        std::fs::write(d.join("local.seg-0001.jsonl"), [line(me, "host.flow.allowed"), line("rts-ffffffffffff", "host.flow.denied"), "not json".into()].join("\n") + "\n").unwrap();
+        std::fs::write(d.join("local.jsonl"), [line(me, "dns.resolved"), line(me, "plan.signed"), line(&format!("{me}x"), "host.flow.denied"), line(me, "host.route.decided"), line(me, "icmp.refused")].join("\n") + "\n").unwrap();
         let out = d.join("network.jsonl");
         assert_eq!(extract_audit(&d, me, &out).unwrap(), 4);
         let text = std::fs::read_to_string(&out).unwrap();
-        assert_eq!(
-            text.lines().collect::<Vec<_>>(),
-            [
-                line(me, "host.flow.allowed"),
-                line(me, "dns.resolved"),
-                line(me, "host.route.decided"),
-                line(me, "icmp.refused")
-            ]
-        );
-        assert_eq!(
-            std::fs::metadata(&out).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        assert_eq!(text.lines().collect::<Vec<_>>(), [line(me, "host.flow.allowed"), line(me, "dns.resolved"), line(me, "host.route.decided"), line(me, "icmp.refused")]);
+        assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o600);
         assert!(extract_audit(&d.join("missing"), me, &out).is_err());
         std::fs::remove_dir_all(d).unwrap();
     }
 
     fn pins(v: &[(&str, &[&str])]) -> BTreeMap<String, BTreeSet<IpAddr>> {
         v.iter()
-            .map(|(n, ips)| {
-                (
-                    n.to_string(),
-                    ips.iter().map(|ip| ip.parse().unwrap()).collect(),
-                )
-            })
+            .map(|(n, ips)| (n.to_string(), ips.iter().map(|ip| ip.parse().unwrap()).collect()))
             .collect()
     }
 
@@ -1685,10 +1436,7 @@ mod tests {
             &s(&["a.example", "198.51.100.9:8443"]),
             &fake(&[(
                 "a.example",
-                Ok(vec![
-                    "198.51.100.1".parse().unwrap(),
-                    "2001:db8::1".parse().unwrap(),
-                ]),
+                Ok(vec!["198.51.100.1".parse().unwrap(), "2001:db8::1".parse().unwrap()]),
             )]),
         )
         .unwrap()
@@ -1697,11 +1445,7 @@ mod tests {
     #[test]
     fn identical_pinned_sets_pass() {
         let p = two_ip_plan();
-        check_pinned(
-            &p,
-            &pins(&[("a.example", &["198.51.100.1", "2001:db8::1"])]),
-        )
-        .unwrap();
+        check_pinned(&p, &pins(&[("a.example", &["198.51.100.1", "2001:db8::1"])])).unwrap();
     }
 
     #[test]
@@ -1713,11 +1457,7 @@ mod tests {
     #[test]
     fn a_pinned_ip_rts_did_not_validate_fails_naming_host_and_ip() {
         let p = two_ip_plan();
-        let e = check_pinned(
-            &p,
-            &pins(&[("a.example", &["198.51.100.1", "203.0.113.5"])]),
-        )
-        .unwrap_err();
+        let e = check_pinned(&p, &pins(&[("a.example", &["198.51.100.1", "203.0.113.5"])])).unwrap_err();
         assert!(e.starts_with("network-mismatch: "), "{e}");
         assert!(e.contains("a.example") && e.contains("203.0.113.5"), "{e}");
     }
@@ -1737,28 +1477,19 @@ mod tests {
             &s(&["mixed.example"]),
             &fake(&[(
                 "mixed.example",
-                Ok(vec![
-                    "198.51.100.1".parse().unwrap(),
-                    "127.0.0.1".parse().unwrap(),
-                ]),
+                Ok(vec!["198.51.100.1".parse().unwrap(), "127.0.0.1".parse().unwrap()]),
             )]),
         )
         .unwrap();
         let e = check_pinned(&p, &pins(&[("mixed.example", &["127.0.0.1"])])).unwrap_err();
-        assert!(
-            e.contains("mixed.example") && e.contains("127.0.0.1") && e.contains("loopback"),
-            "{e}"
-        );
+        assert!(e.contains("mixed.example") && e.contains("127.0.0.1") && e.contains("loopback"), "{e}");
     }
 
     #[test]
     fn a_name_with_no_pinning_entry_fails() {
         let p = two_ip_plan();
         let e = check_pinned(&p, &pins(&[])).unwrap_err();
-        assert!(
-            e.starts_with("network-mismatch: ") && e.contains("a.example"),
-            "{e}"
-        );
+        assert!(e.starts_with("network-mismatch: ") && e.contains("a.example"), "{e}");
         let e = check_pinned(&p, &pins(&[("a.example", &[])])).unwrap_err();
         assert!(e.contains("a.example"), "{e}");
     }
@@ -1793,10 +1524,7 @@ mod tests {
         std::fs::remove_dir_all(&d).unwrap();
         assert_eq!(
             got.unwrap(),
-            pins(&[
-                ("a.example", &["198.51.100.1", "2001:db8::1"]),
-                ("b.example", &["198.51.100.2"])
-            ])
+            pins(&[("a.example", &["198.51.100.1", "2001:db8::1"]), ("b.example", &["198.51.100.2"])])
         );
     }
 
@@ -1804,9 +1532,7 @@ mod tests {
     fn an_unparseable_pinned_ip_fails_the_read() {
         let d = audit_dir(
             "pinned-bad",
-            &[
-                r#"{"entry":{"event":"dns.resolved","labels":{"vm_name":"rts-a","qname":"a.example","resolved_ips":"198.51.100.1,banana"}}}"#,
-            ],
+            &[r#"{"entry":{"event":"dns.resolved","labels":{"vm_name":"rts-a","qname":"a.example","resolved_ips":"198.51.100.1,banana"}}}"#],
         );
         let got = read_pinned(&d, "rts-a");
         std::fs::remove_dir_all(&d).unwrap();
@@ -1818,9 +1544,7 @@ mod tests {
     fn pinned_ips_are_read_across_a_rotated_segment() {
         let d = audit_dir(
             "pinned-seg",
-            &[
-                r#"{"entry":{"event":"dns.resolved","labels":{"vm_name":"rts-a","qname":"a.example","resolved_ips":"198.51.100.1"}}}"#,
-            ],
+            &[r#"{"entry":{"event":"dns.resolved","labels":{"vm_name":"rts-a","qname":"a.example","resolved_ips":"198.51.100.1"}}}"#],
         );
         std::fs::write(
             d.join("local.seg-0001.jsonl"),
@@ -1830,10 +1554,7 @@ mod tests {
         let got = read_pinned(&d, "rts-a");
         let missing = read_pinned(&d.join("missing"), "rts-a");
         std::fs::remove_dir_all(&d).unwrap();
-        assert_eq!(
-            got.unwrap(),
-            pins(&[("a.example", &["198.51.100.1", "2001:db8::1"])])
-        );
+        assert_eq!(got.unwrap(), pins(&[("a.example", &["198.51.100.1", "2001:db8::1"])]));
         assert!(missing.is_err());
     }
 }
