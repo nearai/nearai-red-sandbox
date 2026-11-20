@@ -9,6 +9,21 @@
       "sha256": "ae66f844658a7aee331dcb9fb59bd40323d71d192d37719e022cc4af8389265b",
       "recorded": "2026-10-29",
       "source": "NEAR AI production cloud-api.near.ai: model_attestations[0] for deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated, info.app_name dstack-nvidia-0.5.11"
+    },
+    {
+      "sha256": "53cd435edbc129f848ed0ddce301f7f192446fe39683713a38537820bea7e1fb",
+      "recorded": "2026-11-20",
+      "source": "NEAR AI production cloud-api.near.ai: gateway_attestation, info.app_name dstack-0.5.12 (mr-config-only, verified by rts)"
+    },
+    {
+      "sha256": "e3902667a26282dd8b4015a901848c521b20243a155a457148f88acf48a45959",
+      "recorded": "2026-11-20",
+      "source": "NEAR AI production cloud-api.near.ai: model_attestations[0] for deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated, info.app_name dstack-nvidia-0.5.11 (mr-config-only, verified by rts)"
+    },
+    {
+      "sha256": "edabf8039210336d90fe966dfc4e48216551dfd8b05d54e96d3f3f0e0da850d4",
+      "recorded": "2026-11-20",
+      "source": "NEAR AI production cloud-api.near.ai: model_attestations[1] for deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated, info.app_name dstack-nvidia-0.5.11 (mr-config-only, verified by rts)"
     }
   ]
 }

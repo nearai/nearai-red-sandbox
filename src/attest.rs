@@ -27,7 +27,9 @@ use tdx::{PcsQuoteVerifier, QuoteVerifier, tcb_policy};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ComposePolicy {
-    /// The compose hash must be listed in `opencode/attestation-policy.json`.
+    /// The compose hash must be pinned in the environment's policy:
+    /// `opencode/attestation-policy.json` (production) or
+    /// `opencode/attestation-policy-staging.json` (staging).
     Pinned,
     /// Any compose that `mr_config_id` vouches for.
     MrConfigOnly,
@@ -55,8 +57,21 @@ pub struct Policy {
     pub compose_hashes: BTreeSet<[u8; 32]>,
 }
 
-/// Compiled in: changing the pinned list needs a rebuild.
+/// Production's pinned composes. Compiled in: changing the pinned list needs
+/// a rebuild.
 pub const POLICY_JSON: &str = include_str!("../opencode/attestation-policy.json");
+
+/// Staging's pinned composes, kept apart from production's so a build
+/// trusted in one environment is never trusted in the other.
+pub const POLICY_STAGING_JSON: &str = include_str!("../opencode/attestation-policy-staging.json");
+
+/// The compiled-in policy for `near`.
+pub fn policy_json(near: crate::inference::NearEnvironment) -> &'static str {
+    match near {
+        crate::inference::NearEnvironment::Production => POLICY_JSON,
+        crate::inference::NearEnvironment::Staging => POLICY_STAGING_JSON,
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -203,11 +218,14 @@ fn urandom_nonce() -> [u8; 32] {
 }
 
 impl Attestor {
-    /// BlockingHttp, SystemClock, PcsQuoteVerifier, NrasGpuVerifier, NEAR_BASE_URL, POLICY_JSON, /dev/urandom nonces.
+    /// BlockingHttp, SystemClock, PcsQuoteVerifier, NrasGpuVerifier, and
+    /// /dev/urandom nonces, with `near`'s API base and pinned policy (one
+    /// value, so the two cannot be mixed).
     ///
     /// `BlockingHttp` must not run on a Tokio runtime thread: call `attest`
     /// from a plain thread.
     pub fn real(
+        near: crate::inference::NearEnvironment,
         key: Option<HostSecret>,
         models: &[String],
         options: AttestOptions,
@@ -222,11 +240,11 @@ impl Attestor {
             }),
             http,
             clock,
-            base_url: crate::inference::NEAR_BASE_URL.into(),
+            base_url: near.base_url().into(),
             key,
             models: models.to_vec(),
             options,
-            policy: load_policy(POLICY_JSON)?,
+            policy: load_policy(policy_json(near))?,
             continuity: Continuity::default(),
             nonce: Arc::new(urandom_nonce),
         })
@@ -372,6 +390,7 @@ impl Attestor {
         // Every model entry passed too: the report is accepted whole.
         out.gateway_keys.extend(gateway_key);
         out.evidence.push(json!({
+            "base_url": self.base_url,
             "model": model,
             "nonce": nonce_hex,
             "report": raw,
@@ -1190,22 +1209,144 @@ mod tests {
         );
     }
 
-    /// The production compose hashes measured on 2026-10-29: the gateway
-    /// (dstack-0.5.12) and the abliterated DeepSeek model entry
-    /// (dstack-nvidia-0.5.11), each sha256(info.tcb_info.app_compose).
+    #[test]
+    fn each_environment_attests_against_its_own_base_and_policy() {
+        use crate::inference::NearEnvironment;
+        let models = vec!["m".to_string()];
+        for (near, json) in [
+            (NearEnvironment::Production, POLICY_JSON),
+            (NearEnvironment::Staging, POLICY_STAGING_JSON),
+        ] {
+            assert_eq!(policy_json(near), json);
+            let a = Attestor::real(near, None, &models, AttestOptions::default()).unwrap();
+            assert_eq!(a.base_url, near.base_url());
+            assert_eq!(a.policy, load_policy(json).unwrap());
+        }
+        assert_ne!(POLICY_JSON, POLICY_STAGING_JSON);
+    }
+
+    /// Every pin names the environment it was measured in, and no gateway
+    /// build is pinned in both: a staging gateway is never trusted for
+    /// production, nor the reverse. (Model builds may be shared.)
+    #[test]
+    fn no_gateway_build_is_pinned_in_both_environments() {
+        let entries = |json: &str| -> Vec<(String, String)> {
+            let v: Value = serde_json::from_str(json).unwrap();
+            v["composeHashes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| {
+                    (
+                        e["sha256"].as_str().unwrap().to_string(),
+                        e["source"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect()
+        };
+        let pinned = |json: &str| load_policy(json).unwrap().compose_hashes;
+        for (json, name, other) in [
+            (POLICY_JSON, "production", POLICY_STAGING_JSON),
+            (POLICY_STAGING_JSON, "staging", POLICY_JSON),
+        ] {
+            let mut gateways = 0;
+            for (hash, source) in entries(json) {
+                assert!(
+                    source.starts_with(&format!("NEAR AI {name} ")),
+                    "{hash} in the {name} policy names another source: {source}"
+                );
+                if source.contains("gateway_attestation") {
+                    gateways += 1;
+                    assert!(
+                        !pinned(other).contains(&report::hex32(&hash).unwrap()),
+                        "{name} gateway {hash} is pinned in the other environment too"
+                    );
+                }
+            }
+            assert!(gateways > 0, "the {name} policy pins no gateway");
+        }
+    }
+
+    #[test]
+    fn the_recorded_production_evidence_is_refused_under_the_staging_policy() {
+        let e = production_replay(
+            PRODUCTION_RECORDED_AT,
+            load_policy(POLICY_STAGING_JSON).unwrap(),
+            None,
+        )
+        .unwrap_err();
+        assert!(e.contains("not pinned"), "{e}");
+    }
+
+    /// The production compose hashes, each sha256(info.tcb_info.app_compose).
+    /// 2026-10-29: the gateway (dstack-0.5.12) and the abliterated DeepSeek
+    /// model entry (dstack-nvidia-0.5.11). 2026-11-20, verified by rts under
+    /// mr-config-only: the redeployed gateway (dstack-0.5.12) and both
+    /// model entries (dstack-nvidia-0.5.11, gpu04 and gpu02).
     #[test]
     fn the_committed_policy_pins_the_production_composes() {
         let policy = load_policy(POLICY_JSON).unwrap();
         for h in [
             "f571e5dafe8f96baf116a271b4be9cba228b447dd6ebe502bbda81ede7bcc7ce",
             "ae66f844658a7aee331dcb9fb59bd40323d71d192d37719e022cc4af8389265b",
+            "53cd435edbc129f848ed0ddce301f7f192446fe39683713a38537820bea7e1fb",
+            "e3902667a26282dd8b4015a901848c521b20243a155a457148f88acf48a45959",
+            "edabf8039210336d90fe966dfc4e48216551dfd8b05d54e96d3f3f0e0da850d4",
         ] {
             assert!(
                 policy.compose_hashes.contains(&report::hex32(h).unwrap()),
                 "{h} is not pinned"
             );
         }
-        assert_eq!(policy.compose_hashes.len(), 2);
+        assert_eq!(policy.compose_hashes.len(), 5);
+    }
+
+    /// The staging compose hashes measured on 2026-11-20 and verified by rts
+    /// under mr-config-only: the staging gateway (dstack-0.5.15) and the
+    /// same two model entries production serves.
+    #[test]
+    fn the_committed_staging_policy_pins_the_staging_composes() {
+        let policy = load_policy(POLICY_STAGING_JSON).unwrap();
+        for h in [
+            "10d29b736472383a011211c5c882d85d5dd53c8d4242d9d872c64a6097bdf441",
+            "e3902667a26282dd8b4015a901848c521b20243a155a457148f88acf48a45959",
+            "edabf8039210336d90fe966dfc4e48216551dfd8b05d54e96d3f3f0e0da850d4",
+        ] {
+            assert!(
+                policy.compose_hashes.contains(&report::hex32(h).unwrap()),
+                "{h} is not pinned"
+            );
+        }
+        assert_eq!(policy.compose_hashes.len(), 3);
+    }
+
+    const STAGING_RECORDED_AT: u64 = 1_795_182_609;
+
+    #[test]
+    fn the_recorded_staging_evidence_attests_only_under_the_staging_policy() {
+        let a = staging_replay(
+            STAGING_RECORDED_AT,
+            load_policy(POLICY_STAGING_JSON).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            a.evidence[0]["base_url"],
+            crate::inference::NEAR_STAGING_BASE_URL
+        );
+        let entries = a.evidence[0]["entries"].as_array().unwrap();
+        assert!(entries.iter().all(|e| e["tcb_status"] == "UpToDate"));
+        assert!(entries.iter().all(|e| e["compose_acceptance"] == "pinned"));
+        // The staging gateway's ed25519 key signs receipts.
+        assert_eq!(
+            a.gateway_keys,
+            BTreeSet::from([report::hex32(
+                "b883f3a4b5dd466b270be49609f5cda34ac5b86787d2af46742d48ec268fbfc2"
+            )
+            .unwrap()])
+        );
+        // The staging gateway is not a production build.
+        let e = staging_replay(STAGING_RECORDED_AT, load_policy(POLICY_JSON).unwrap()).unwrap_err();
+        assert!(e.contains("gateway") && e.contains("not pinned"), "{e}");
     }
 
     /// The production evidence recorded by tests/live_attest.rs on
@@ -1217,11 +1358,33 @@ mod tests {
         policy: Policy,
         key: Option<HostSecret>,
     ) -> Result<Attested, String> {
+        replay(
+            include_str!("../tests/fixtures/near-prod/live-run-2026-10-29.json"),
+            now,
+            policy,
+            key,
+        )
+    }
+
+    /// The staging evidence recorded by tests/live_attest.rs on 2026-11-20
+    /// (RTS_LIVE_NEAR_ENVIRONMENT=staging), replayed the same way.
+    fn staging_replay(now: u64, policy: Policy) -> Result<Attested, String> {
+        replay(
+            include_str!("../tests/fixtures/near-staging/live-run-2026-11-20.json"),
+            now,
+            policy,
+            None,
+        )
+    }
+
+    fn replay(
+        run: &str,
+        now: u64,
+        policy: Policy,
+        key: Option<HostSecret>,
+    ) -> Result<Attested, String> {
         use base64::Engine;
-        let run: Value = serde_json::from_str(include_str!(
-            "../tests/fixtures/near-prod/live-run-2026-10-29.json"
-        ))
-        .unwrap();
+        let run: Value = serde_json::from_str(run).unwrap();
         let http = FakeHttp::new();
         for e in run["exchanges"].as_array().unwrap() {
             let headers = e["headers"]
@@ -1314,6 +1477,7 @@ mod tests {
             )
             .unwrap()])
         );
+        assert_eq!(a.evidence[0]["base_url"], crate::inference::NEAR_BASE_URL);
         let entries = a.evidence[0]["entries"].as_array().unwrap();
         assert!(entries.iter().all(|e| e["tcb_status"] == "UpToDate"));
     }

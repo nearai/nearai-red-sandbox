@@ -1,0 +1,19 @@
+{
+  "composeHashes": [
+    {
+      "sha256": "10d29b736472383a011211c5c882d85d5dd53c8d4242d9d872c64a6097bdf441",
+      "recorded": "2026-11-20",
+      "source": "NEAR AI staging cloud-stg-api.near.ai: gateway_attestation, info.app_name dstack-0.5.15 (mr-config-only, verified by rts)"
+    },
+    {
+      "sha256": "e3902667a26282dd8b4015a901848c521b20243a155a457148f88acf48a45959",
+      "recorded": "2026-11-20",
+      "source": "NEAR AI staging cloud-stg-api.near.ai: model_attestations[0] for deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated, info.app_name dstack-nvidia-0.5.11 (mr-config-only, verified by rts)"
+    },
+    {
+      "sha256": "edabf8039210336d90fe966dfc4e48216551dfd8b05d54e96d3f3f0e0da850d4",
+      "recorded": "2026-11-20",
+      "source": "NEAR AI staging cloud-stg-api.near.ai: model_attestations[1] for deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated, info.app_name dstack-nvidia-0.5.11 (mr-config-only, verified by rts)"
+    }
+  ]
+}

@@ -7,8 +7,13 @@
 //! ```
 //!
 //! Environment (all optional):
-//! - `RTS_LIVE_NEAR_BASE_URL`: https base, default `inference::NEAR_BASE_URL`
-//!   (production, `https://cloud-api.near.ai/v1`).
+//! - `RTS_LIVE_NEAR_ENVIRONMENT`: `production` (default) or `staging`. Picks
+//!   the API base and the pinned policy together, as a launch does.
+//! - `RTS_LIVE_COMPOSE_POLICY`: `pinned` (default) or `mr-config-only`. Every
+//!   other check keeps its default.
+//! - `RTS_LIVE_RECORD_DIR`: write what verified as rts's own
+//!   `<dir>/live-<environment>/attestation.json`, the input of
+//!   `scripts/refresh-attestation-policy.py --environment <environment>`.
 //! - `RTS_LIVE_NEAR_MODELS`: comma-separated exact model IDs, default
 //!   `config::DEFAULT_MODELS`.
 //! - `RTS_LIVE_NEAR_API_KEY`: sent as the bearer on the report fetch when set.
@@ -31,9 +36,11 @@ use base64::engine::general_purpose::STANDARD;
 use ironwire_proxy::embed::HostSecret;
 use rts::attest::http::{BlockingHttp, Clock, Http, HttpResponse, SystemClock};
 use rts::attest::nras::NrasGpuVerifier;
+use rts::attest::record::AttestationRecord;
 use rts::attest::tdx::PcsQuoteVerifier;
-use rts::attest::{AttestOptions, Attested, Attestor, POLICY_JSON, load_policy};
+use rts::attest::{AttestOptions, Attested, Attestor, ComposePolicy, load_policy, policy_json};
 use rts::forwarder::pin::{PinSet, Rejected, native_roots, pinned_tls, spki_sha256};
+use rts::inference::NearEnvironment;
 use serde_json::{Value, json};
 
 /// Records every exchange that passes through it.
@@ -72,8 +79,35 @@ impl Http for Recording {
     }
 }
 
+fn environment() -> NearEnvironment {
+    match std::env::var("RTS_LIVE_NEAR_ENVIRONMENT").as_deref() {
+        Err(_) | Ok("production") => NearEnvironment::Production,
+        Ok("staging") => NearEnvironment::Staging,
+        Ok(other) => panic!("RTS_LIVE_NEAR_ENVIRONMENT {other:?}: production or staging"),
+    }
+}
+
+fn environment_name() -> &'static str {
+    match environment() {
+        NearEnvironment::Production => "production",
+        NearEnvironment::Staging => "staging",
+    }
+}
+
 fn base_url() -> String {
-    std::env::var("RTS_LIVE_NEAR_BASE_URL").unwrap_or_else(|_| rts::inference::NEAR_BASE_URL.into())
+    environment().base_url().into()
+}
+
+fn options() -> AttestOptions {
+    let compose_policy = match std::env::var("RTS_LIVE_COMPOSE_POLICY").as_deref() {
+        Err(_) | Ok("pinned") => ComposePolicy::Pinned,
+        Ok("mr-config-only") => ComposePolicy::MrConfigOnly,
+        Ok(other) => panic!("RTS_LIVE_COMPOSE_POLICY {other:?}: pinned or mr-config-only"),
+    };
+    AttestOptions {
+        compose_policy,
+        ..AttestOptions::default()
+    }
 }
 
 fn models() -> Vec<String> {
@@ -98,9 +132,9 @@ fn urandom_nonce() -> [u8; 32] {
     n
 }
 
-/// Attests every model with the real PCS and NRAS and the default options
-/// (TCB UpToDate, pinned compose). Returns what verified, the nonces used and
-/// the recorder.
+/// Attests every model with the real PCS and NRAS, the environment's base
+/// and policy, and `options()` (TCB UpToDate; pinned compose unless
+/// overridden). Returns what verified, the nonces used and the recorder.
 fn attest_live() -> (Result<Attested, String>, Vec<[u8; 32]>, Arc<Recording>) {
     let http = Arc::new(Recording {
         inner: BlockingHttp::new().unwrap(),
@@ -123,8 +157,8 @@ fn attest_live() -> (Result<Attested, String>, Vec<[u8; 32]>, Arc<Recording>) {
         base_url: base_url(),
         key,
         models: models(),
-        options: AttestOptions::default(),
-        policy: load_policy(POLICY_JSON).unwrap(),
+        options: options(),
+        policy: load_policy(policy_json(environment())).unwrap(),
         continuity: Default::default(),
         nonce: Arc::new(move || {
             let n = urandom_nonce();
@@ -188,9 +222,14 @@ fn handshake(
 
 #[test]
 #[ignore = "live: reaches NEAR AI, Intel PCS and NVIDIA NRAS"]
-fn production_attestation_verifies_for_every_model() {
+fn attestation_verifies_for_every_model() {
     let base = base_url();
-    println!("base {base}, models {:?}", models());
+    println!(
+        "{} base {base}, models {:?}, options {:?}",
+        environment_name(),
+        models(),
+        options()
+    );
     let (result, nonces, rec) = attest_live();
     let now = SystemClock.now_unix();
     save(&nonces, now, &rec);
@@ -216,6 +255,12 @@ fn production_attestation_verifies_for_every_model() {
     }
     let fps: Vec<String> = attested.fingerprints.iter().map(hex::encode).collect();
     println!("attested fingerprints {fps:?}");
+    if let Ok(dir) = std::env::var("RTS_LIVE_RECORD_DIR") {
+        let id = format!("live-{}", environment_name());
+        let record = AttestationRecord::create(dir.as_ref(), &id, &options()).unwrap();
+        record.verified(&attested).unwrap();
+        println!("recorded {}", record.path().display());
+    }
 
     // The live leaf's SPKI hash is attested, and the forwarder's pinned
     // client config completes a handshake with only the attested set.
