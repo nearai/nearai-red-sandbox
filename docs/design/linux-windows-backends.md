@@ -289,6 +289,11 @@ Still needs a real Linux KVM host, then a Windows 11 host:
   KVM; the release archive layout for Linux.
 - The session unit tests in `session.rs` assume HVF (supervisor probe in
   the call lists); on Linux they need the HVF flavor injected or gating.
+  So do `setup::tests::the_pinned_components_match_the_spec` (asserts the
+  macOS assets through `mvm()`/`opencode()`) and the zip fixtures, which
+  use `/usr/bin/ditto`.
+- Whether mvm-network-endpoint is a child of the attached `machine run` on
+  Firecracker, as `track_network` requires (it is on HVF).
 - A guest image digest for x86_64; the live invariants and the rest of
   `tests/contain` on a KVM host; trace-commons' Linux dependency.
 

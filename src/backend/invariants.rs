@@ -37,9 +37,13 @@ impl Rec {
     }
     fn answer(&self, argv: &[String]) -> io::Result<RunOutput> {
         self.calls.lock().unwrap().push(argv.join(" "));
-        let stdout = match argv.last().map(String::as_str) {
-            Some("--version") => "2.2.2\n",
-            Some(session::SUPERVISOR_PROBE) => session::SUPERVISOR_FIX_VERSION,
+        let uid = format!("{}\n", super::kvm::current_uid());
+        let stdout = match (argv.join(" ").as_str(), argv.last().map(String::as_str)) {
+            (_, Some("--version")) => "2.2.2\n",
+            (_, Some(session::SUPERVISOR_PROBE)) => session::SUPERVISOR_FIX_VERSION,
+            // The Firecracker VMM of `rig`'s fc.pid, running as this user.
+            ("readlink /proc/4244/exe", _) => "/usr/bin/firecracker\n",
+            ("ps -o uid= -p 4244", _) => &uid,
             _ => "",
         };
         Ok(RunOutput {
@@ -105,6 +109,9 @@ fn rig(flavor: Flavor) -> Rig {
         &dir.path().join("rt"),
     );
     // A file this user can open stands in for /dev/kvm.
+    let fc_pid = dir.path().join("vms").join(MACHINE).join("fc.pid");
+    std::fs::create_dir_all(fc_pid.parent().unwrap()).unwrap();
+    std::fs::write(&fc_pid, "4244\n").unwrap();
     let kvm = dir.path().join("kvm");
     std::fs::write(&kvm, "").unwrap();
     let backend = MvmBackend::for_session_flavor(flavor, &cfg, &deps, &paths)
@@ -248,6 +255,13 @@ fn an_unconfirmed_egress_path_or_vmm_refuses_the_session() {
         assert!(
             m.track_network().is_err(),
             "{flavor:?}: egress path accepted without an attached run"
+        );
+        let _ = std::fs::remove_file(
+            r._dir
+                .path()
+                .join("vms")
+                .join(MACHINE)
+                .join(flavor.pid_file()),
         );
         let e = m
             .monitor()

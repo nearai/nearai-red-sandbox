@@ -20,6 +20,8 @@ use rts::session::{
 };
 
 use crate::harness::{NETWORK_TEST_HOURS, mvm, tempdir};
+use rts::config::DEFAULT_IMAGE;
+use std::path::Path;
 
 /// A machine removed when dropped, so a failing test still cleans up.
 struct Guest(Box<dyn Machine>);
@@ -36,17 +38,41 @@ struct Rig {
     backend: Box<dyn Backend>,
     paths: SessionPaths,
     dir: PathBuf,
+    image: String,
+}
+
+/// mvmctl and the guest image. On HVF, the containment harness, which also
+/// probes the patched supervisor. On other flavors, which have no
+/// supervisor, `RTS_MVMCTL` (or where setup installs it) and `RTS_IMAGE`.
+fn prerequisites() -> (PathBuf, String) {
+    if Flavor::host() == Flavor::Hvf {
+        let h = mvm().expect("real-mvm prerequisites");
+        return (h.mvmctl.clone(), h.image.clone());
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mvmctl = std::env::var_os("RTS_MVMCTL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(&home).join(".local/mvm/v0.22.0/mvmctl"));
+    assert!(
+        mvmctl.is_file(),
+        "[contain] mvmctl not found at {} (set RTS_MVMCTL)",
+        mvmctl.display()
+    );
+    (
+        mvmctl,
+        std::env::var("RTS_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.into()),
+    )
 }
 
 /// This host's backend for a fresh session id, built as a session builds it.
 fn rig() -> Rig {
-    let h = mvm().expect("real-mvm prerequisites");
+    let (mvmctl, image) = prerequisites();
     let dir = tempdir("inv");
     let id = random_hex(6);
     let paths = session_paths(&id, &dir.join("sessions"), &dir.join("runtime"));
     prepare_session_dirs(&paths).unwrap();
     let defaults = Defaults {
-        mvmctl: h.mvmctl.clone(),
+        mvmctl,
         plugin_dir: dir.join("plugin"),
         opencode: "opencode".into(),
         sessions_dir: dir.join("sessions"),
@@ -60,15 +86,15 @@ fn rig() -> Rig {
         backend,
         paths,
         dir,
+        image,
     }
 }
 
 fn create(r: &Rig, egress: Option<Egress>) -> Guest {
-    let h = mvm().unwrap();
     let m = Guest(r.backend.machine(&r.paths.machine).unwrap());
     m.0.create(&CreateSpec {
         name: &r.paths.machine,
-        image: &h.image,
+        image: &r.image,
         memory_mib: 512,
         cpus: 1,
         egress,
@@ -171,8 +197,12 @@ fn invariant_no_host_files_except_the_in_copy_and_the_out_export() {
     let opts = ExecOptions::new(30_000, 4096);
     let given = m.0.exec(&sv(&["cat", "/in/given.txt"]), &opts).unwrap();
     assert_eq!(String::from_utf8_lossy(&given.stdout), "copied in\n");
-    let home = std::env::var("HOME").unwrap();
-    for host_path in [sentinel.to_str().unwrap(), &home, inputs.to_str().unwrap()] {
+    // Host-only paths: this test's private directory and what is in it.
+    for host_path in [
+        sentinel.to_str().unwrap(),
+        r.dir.to_str().unwrap(),
+        inputs.to_str().unwrap(),
+    ] {
         let seen = m.0.exec(&sv(&["test", "-e", host_path]), &opts).unwrap();
         assert_ne!(seen.exit_code, 0, "the guest sees host path {host_path}");
     }

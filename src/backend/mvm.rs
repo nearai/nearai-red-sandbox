@@ -60,6 +60,15 @@ impl Flavor {
         }
     }
 
+    /// How host processes are named: `ps -o comm=` on macOS; on Linux,
+    /// where comm is capped at 15 characters, `/proc/<pid>/exe`.
+    pub fn name_of(self) -> session::NameOf {
+        match self {
+            Self::Hvf => session::process_name,
+            Self::Firecracker => session::exe_name,
+        }
+    }
+
     /// The attached `machine run`'s children that carry guest egress. On
     /// Firecracker the VMM detaches from mvmctl, so only the endpoint.
     pub fn network_processes(self) -> &'static [&'static str] {
@@ -276,6 +285,28 @@ impl MvmMachine {
     }
 }
 
+impl MvmMachine {
+    /// Firecracker's VMM from its PID file, refused unless it runs as
+    /// this user and not as root.
+    fn unprivileged_vmm(&self) -> Result<session::Supervisor, String> {
+        let label = self.flavor.vmm_label();
+        let root =
+            session::mvm_root(&self.env).map_err(|e| format!("cannot monitor {label}: {e}"))?;
+        let pid_file = root
+            .join("vms")
+            .join(&self.sb.name)
+            .join(self.flavor.pid_file());
+        let vmm = session::Supervisor::discover_vmm(
+            &pid_file,
+            self.flavor.vmm(),
+            label,
+            self.flavor.name_of(),
+        )?;
+        kvm::check_vmm_uid(self.host.as_ref(), vmm.pid, kvm::current_uid())?;
+        Ok(vmm)
+    }
+}
+
 impl Exec for MvmMachine {
     fn exec(&self, argv: &[String], opts: &ExecOptions) -> SandboxResult<ExecResult> {
         self.sb.exec(argv, opts)
@@ -284,7 +315,12 @@ impl Exec for MvmMachine {
 
 impl Sandbox for MvmMachine {
     fn create(&self, spec: &CreateSpec) -> SandboxResult<()> {
-        self.sb.create(spec)
+        self.sb.create(spec)?;
+        // No root VM gets past create: before probes, /in or canaries.
+        if self.flavor == Flavor::Firecracker {
+            self.unprivileged_vmm()?;
+        }
+        Ok(())
     }
     fn copy_in(&self, host_dir: &Path, guest_dir: &str) -> SandboxResult<()> {
         self.sb.copy_in(host_dir, guest_dir)
@@ -307,6 +343,7 @@ impl Machine for MvmMachine {
             self.host.as_ref(),
             attach,
             self.flavor.network_processes(),
+            self.flavor.name_of(),
         )?;
         Ok(())
     }
@@ -323,18 +360,7 @@ impl Machine for MvmMachine {
     fn monitor(&self) -> Result<Box<dyn Monitor>, String> {
         let supervisor = match self.flavor {
             Flavor::Hvf => session::Supervisor::discover(&self.sb.name, &self.env)?,
-            Flavor::Firecracker => {
-                let label = self.flavor.vmm_label();
-                let root = session::mvm_root(&self.env)
-                    .map_err(|e| format!("cannot monitor {label}: {e}"))?;
-                let pid_file = root
-                    .join("vms")
-                    .join(&self.sb.name)
-                    .join(self.flavor.pid_file());
-                let vmm = session::Supervisor::discover_vmm(&pid_file, self.flavor.vmm(), label)?;
-                kvm::check_vmm_uid(self.host.as_ref(), vmm.pid, kvm::current_uid())?;
-                vmm
-            }
+            Flavor::Firecracker => self.unprivileged_vmm()?,
         };
         Ok(Box::new(MvmMonitor {
             supervisor,
@@ -346,7 +372,7 @@ impl Machine for MvmMachine {
         // Both run after export and removal, so neither can stop them.
         let names = self.flavor.network_processes();
         for &pid in self.network_pids.lock().unwrap().iter() {
-            if let Some(name) = session::process_name(self.host.as_ref(), pid)
+            if let Some(name) = (self.flavor.name_of())(self.host.as_ref(), pid)
                 .filter(|n| names.contains(&n.as_str()))
             {
                 log(&format!(
@@ -767,7 +793,9 @@ mod tests {
         let uid = Arc::new(Mutex::new(kvm::current_uid().to_string()));
         let reply_uid = uid.clone();
         let rec = Rec::new(move |a| match a.join(" ").as_str() {
-            "ps -o comm= -p 4244" => out(0, "/usr/bin/firecracker\n"),
+            // Linux shapes: comm is the bare, 15-character kernel name.
+            "ps -o comm= -p 4244" => out(0, "firecracker\n"),
+            "readlink /proc/4244/exe" => out(0, "/usr/bin/firecracker\n"),
             "ps -o uid= -p 4244" => out(0, &format!("{}\n", reply_uid.lock().unwrap())),
             "ps -o rss= -p 4244" => out(0, "2048\n"),
             _ => out(0, ""),
@@ -789,6 +817,93 @@ mod tests {
                 .err()
                 .unwrap()
                 .contains("cannot monitor Firecracker")
+        );
+    }
+
+    /// `pgrep` and the process tables of a Linux host: `ps -o comm=` is the
+    /// kernel comm, capped at 15 characters.
+    fn linux_tree(a: &[String]) -> RunOutput {
+        match a.join(" ").as_str() {
+            "pgrep -P 4242" => out(0, "4243\n4245\n"),
+            "ps -o comm= -p 4243" => out(0, "mvm-network-end\n"),
+            "readlink /proc/4243/exe" => out(0, "/opt/mvm/mvm-network-endpoint\n"),
+            "ps -o comm= -p 4245" => out(0, "bash\n"),
+            "readlink /proc/4245/exe" => out(0, "/usr/bin/bash\n"),
+            _ => out(1, ""),
+        }
+    }
+
+    #[test]
+    fn firecracker_finds_the_endpoint_by_its_executable_not_the_truncated_comm() {
+        let rec = Rec::new(linux_tree);
+        let names = Flavor::Firecracker.network_processes();
+        assert_eq!(
+            session::network_children_of(rec.as_ref(), 4242, names, Flavor::Firecracker.name_of())
+                .unwrap(),
+            vec![4243]
+        );
+        // The comm-based lookup the HVF flavor uses cannot see it on Linux.
+        assert!(
+            session::network_children_of(rec.as_ref(), 4242, names, Flavor::Hvf.name_of()).is_err()
+        );
+    }
+
+    #[test]
+    fn exe_names_drop_a_deleted_suffix_and_need_a_readable_link() {
+        let rec = Rec::new(|a| match a.join(" ").as_str() {
+            "readlink /proc/1/exe" => out(0, "/usr/bin/firecracker (deleted)\n"),
+            _ => out(1, ""),
+        });
+        assert_eq!(
+            session::exe_name(rec.as_ref(), 1).as_deref(),
+            Some("firecracker")
+        );
+        assert_eq!(session::exe_name(rec.as_ref(), 2), None);
+    }
+
+    #[test]
+    fn a_firecracker_machine_running_as_root_is_refused_at_create() {
+        let d = tempfile::tempdir().unwrap();
+        let pid_file = d.path().join("vms/rts-0123456789ab/fc.pid");
+        std::fs::create_dir_all(pid_file.parent().unwrap()).unwrap();
+        std::fs::write(&pid_file, "4244\n").unwrap();
+        let env = vec![(
+            "MVM_HOME".to_string(),
+            d.path().to_string_lossy().into_owned(),
+        )];
+        let rec = Rec::new(|a| match a.join(" ").as_str() {
+            "readlink /proc/4244/exe" => out(0, "/usr/bin/firecracker\n"),
+            "ps -o uid= -p 4244" => out(0, "0\n"),
+            _ => out(0, ""),
+        });
+        let m = fc_backend(&rec, env, Path::new("/dev/null"))
+            .machine("rts-0123456789ab")
+            .unwrap();
+        let image = "example.invalid/guest@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let e = m
+            .create(&CreateSpec {
+                name: "rts-0123456789ab",
+                image,
+                memory_mib: 512,
+                cpus: 1,
+                egress: None,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("runs as root"), "{e}");
+        let calls = rec.calls();
+        let start = calls
+            .iter()
+            .position(|c| c.starts_with("machine start"))
+            .expect("no start");
+        let uid = calls
+            .iter()
+            .position(|c| c == "ps -o uid= -p 4244")
+            .expect("uid never checked");
+        assert!(start < uid, "{calls:?}");
+        assert!(
+            !calls.iter().any(|c| c.starts_with("machine exec")),
+            "{calls:?}"
         );
     }
 }
