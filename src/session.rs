@@ -370,18 +370,11 @@ const OPENCODE_ENV: [&str; 11] = [
 
 /// The few system variables a Windows process needs to run at all (without
 /// SystemRoot, Winsock fails). No token or secret is among them. The
-/// profile folders (USERPROFILE, APPDATA, LOCALAPPDATA) are not passed:
+/// profile folders (USERPROFILE, APPDATA, LOCALAPPDATA) and TEMP/TMP are not passed:
 /// OpenCode takes its home from USERPROFILE there, so the launch sets them
 /// to the session, as HOME is.
-const OPENCODE_ENV_WINDOWS: [&str; 7] = [
-    "SystemRoot",
-    "windir",
-    "ComSpec",
-    "PATHEXT",
-    "TEMP",
-    "TMP",
-    "SystemDrive",
-];
+const OPENCODE_ENV_WINDOWS: [&str; 5] =
+    ["SystemRoot", "windir", "ComSpec", "PATHEXT", "SystemDrive"];
 
 /// Whether the host variable `name` passes to OpenCode. Only the lists above
 /// and the explicitly selected direct provider key pass; host credentials
@@ -405,12 +398,17 @@ pub fn opencode_launch_with_key(p: &SessionPaths, opencode: &str, base_env: impl
 }
 
 /// The session's Windows profile folders, which stand in for the operator's.
-fn windows_profile(p: &SessionPaths) -> [(&'static str, PathBuf); 3] {
+/// TEMP and TMP too: OpenCode's tmp follows them, and the host's %TEMP% is
+/// shared with other sessions and the operator's own OpenCode.
+fn windows_profile(p: &SessionPaths) -> [(&'static str, PathBuf); 5] {
     let app_data = p.home.join("AppData");
+    let tmp = p.runtime.join("tmp");
     [
         ("USERPROFILE", p.home.clone()),
         ("APPDATA", app_data.join("Roaming")),
         ("LOCALAPPDATA", app_data.join("Local")),
+        ("TEMP", tmp.clone()),
+        ("TMP", tmp),
     ]
 }
 
@@ -2015,8 +2013,6 @@ mod tests {
             "windir",
             "ComSpec",
             "PATHEXT",
-            "TEMP",
-            "TMP",
             "SystemDrive",
             "Path",
             "SYSTEMROOT",
@@ -2036,6 +2032,8 @@ mod tests {
             "USERPROFILE",
             "APPDATA",
             "LOCALAPPDATA",
+            "TEMP",
+            "TMP",
             "UserProfile",
             "HOMEDRIVE",
             "HOMEPATH",
@@ -2076,6 +2074,7 @@ mod tests {
             ("USERPROFILE", "C:/Users/op"),
             ("APPDATA", "C:/Users/op/AppData/Roaming"),
             ("LOCALAPPDATA", "C:/Users/op/AppData/Local"),
+            ("TEMP", "C:/Users/op/AppData/Local/Temp"),
             ("Path", "C:/Windows"),
         ];
         let l = opencode_launch_for(
@@ -2096,6 +2095,10 @@ mod tests {
         assert_eq!(get("APPDATA"), [p.home.join("AppData").join("Roaming")]);
         assert_eq!(get("LOCALAPPDATA"), [p.home.join("AppData").join("Local")]);
         assert_eq!(get("HOME"), std::slice::from_ref(&p.home));
+        // OpenCode's tmp follows TEMP: the session's, never the host's
+        // shared %TEMP% (checked with `opencode debug paths`).
+        assert_eq!(get("TEMP"), [p.runtime.join("tmp")]);
+        assert_eq!(get("TMP"), [p.runtime.join("tmp")]);
         assert_eq!(get("Path"), [PathBuf::from("C:/Windows")]);
         // Unix launches set no Windows profile variables.
         let u = opencode_launch_for(

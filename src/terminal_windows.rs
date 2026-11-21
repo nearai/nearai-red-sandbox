@@ -1140,6 +1140,30 @@ mod tests {
             text.contains(&config),
             "config is not the session's: {text}"
         );
+        // Every path OpenCode reports, tmp included, is under the session's
+        // runtime directory: none is the operator's or the host's shared one.
+        let tmp = p
+            .runtime
+            .join("tmp")
+            .join("opencode")
+            .to_string_lossy()
+            .into_owned();
+        assert!(text.contains(&tmp), "tmp is not the session's: {text}");
+        let runtime = p.runtime.to_string_lossy().into_owned();
+        for name in [
+            "home", "data", "cache", "config", "state", "tmp", "bin", "log", "repos", "db",
+        ] {
+            let at = text
+                .find(&format!("{name} "))
+                .unwrap_or_else(|| panic!("no {name} line: {text}"));
+            let rest = text[at + name.len()..].trim_start();
+            assert!(
+                rest.starts_with(&runtime),
+                "{name} is outside the session: {}",
+                &rest[..rest.len().min(120)]
+            );
+        }
+        eprintln!("opencode debug paths under rts's env: {text}");
 
         let mut rig = Rig::start(&command(&["--standalone"]));
         rig.pump_until(Duration::from_secs(10), |_| false);
