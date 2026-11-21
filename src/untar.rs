@@ -7,9 +7,10 @@
 //! `<dest>.partial` and is renamed into place only on success.
 
 use std::fmt;
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs;
+#[cfg(unix)]
+use std::fs::{DirBuilder, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,20 +172,20 @@ pub fn extract_tar(archive: &[u8], dest: &Path, limits: ExtractLimits) -> Result
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(io)?;
     }
-    DirBuilder::new().mode(0o755).create(&partial).map_err(io)?;
+    make_dir(&partial, false).map_err(io)?;
     let result = (|| {
         let (mut files, mut bytes) = (0u64, 0u64);
         for e in &entries {
             let target = e.segments.iter().fold(partial.clone(), |p, s| p.join(s));
             let fail = |err: std::io::Error| rej(&e.display, format!("cannot create: {}", err.kind()));
             match e.kind {
-                Kind::Dir => DirBuilder::new().recursive(true).mode(0o755).create(&target).map_err(fail)?,
+                Kind::Dir => make_dir(&target, true).map_err(fail)?,
                 Kind::File => {
                     if let Some(p) = target.parent() {
-                        DirBuilder::new().recursive(true).mode(0o755).create(p).map_err(fail)?;
+                        make_dir(p, true).map_err(fail)?;
                     }
                     // create_new is O_CREAT|O_EXCL: an existing path is never opened or followed.
-                    let mut f = OpenOptions::new().write(true).create_new(true).mode(0o644).open(&target).map_err(fail)?;
+                    let mut f = create_file(&target).map_err(fail)?;
                     f.write_all(&archive[e.data.clone()]).map_err(fail)?;
                     files += 1;
                     bytes += e.data.len() as u64;
@@ -198,6 +199,35 @@ pub fn extract_tar(archive: &[u8], dest: &Path, limits: ExtractLimits) -> Result
         let _ = fs::remove_dir_all(&partial);
     }
     result
+}
+
+/// A directory of the extracted tree: 0755 on Unix.
+#[cfg(unix)]
+fn make_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    DirBuilder::new().recursive(recursive).mode(0o755).create(path)
+}
+
+/// A new file of the extracted tree: 0644 on Unix, created with O_CREAT|O_EXCL
+/// so an existing path is never opened or followed.
+#[cfg(unix)]
+fn create_file(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new().write(true).create_new(true).mode(0o644).open(path)
+}
+
+// The archive checks above were written for Unix paths. Windows adds drive
+// and UNC prefixes, backslash separators, alternate data streams, reserved
+// device names, trailing dots and spaces, and case-insensitive collisions;
+// until those are refused (with tests), nothing is extracted on Windows.
+#[cfg(windows)]
+fn make_dir(_path: &Path, _recursive: bool) -> std::io::Result<()> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "extracting a guest archive is not supported on Windows yet"))
+}
+
+#[cfg(windows)]
+fn create_file(_path: &Path) -> std::io::Result<fs::File> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "extracting a guest archive is not supported on Windows yet"))
 }
 
 #[cfg(test)]

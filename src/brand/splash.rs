@@ -441,10 +441,12 @@ pub fn play(out: &mut dyn Write, keys: &mut dyn Keys, sp: &Splash, depth: Depth)
 /// Stdin in non-canonical, no-echo mode for the length of the splash. ISIG is
 /// off too, so Ctrl-C arrives as a byte rather than a signal: the splash ends
 /// cleanly without changing SIGINT handling for the steps after it.
+#[cfg(unix)]
 pub struct StdinKeys {
     original: Option<libc::termios>,
 }
 
+#[cfg(unix)]
 impl StdinKeys {
     pub fn new() -> Self {
         // SAFETY: termios is plain data filled by tcgetattr before use.
@@ -461,12 +463,14 @@ impl StdinKeys {
     }
 }
 
+#[cfg(unix)]
 impl Default for StdinKeys {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(unix)]
 impl Keys for StdinKeys {
     fn wait(&mut self, timeout: Duration) -> Option<bool> {
         let mut fds = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
@@ -487,6 +491,7 @@ impl Keys for StdinKeys {
     }
 }
 
+#[cfg(unix)]
 impl Drop for StdinKeys {
     fn drop(&mut self) {
         if let Some(t) = self.original {
@@ -501,9 +506,23 @@ impl Drop for StdinKeys {
 
 /// Show the splash on stdout when `wanted`; Err only when it was interrupted.
 pub fn show(wanted: bool, depth: Depth) -> Result<(), String> {
-    if !wanted {
+    // Windows: no splash yet (the console has no termios raw mode here).
+    if !wanted || !cfg!(unix) {
         return Ok(());
     }
+    #[cfg(unix)]
+    {
+        show_unix(depth)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = depth;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn show_unix(depth: Depth) -> Result<(), String> {
     let Some(sp) = super::window_size(1).and_then(|(c, r)| Splash::new(c, r)) else {
         return Ok(());
     };

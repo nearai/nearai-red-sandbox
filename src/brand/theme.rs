@@ -13,7 +13,6 @@ pub const THEME_FILE: &str = "branding/theme/nearai-red.json";
 /// Copy the shipped theme into the session's isolated opencode config dir.
 pub fn install(plugin_dir: &Path, config_dir: &Path) -> Result<PathBuf, String> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let source = plugin_dir.join(THEME_FILE);
     let data = fs::read(&source).map_err(|e| format!("theme file missing: {} ({e}); reinstall rts", source.display()))?;
     // opencode would fall back to its default theme without a word.
@@ -25,12 +24,7 @@ pub fn install(plugin_dir: &Path, config_dir: &Path) -> Result<PathBuf, String> 
     let dir = config_dir.join("themes");
     fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     let file = dir.join(format!("{THEME_NAME}.json"));
-    fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(&file)
+    crate::sys::fs::open_private(fs::OpenOptions::new().create(true).truncate(true).write(true), &file)
         .and_then(|mut f| f.write_all(&data))
         .map_err(|e| format!("writing {}: {e}", file.display()))?;
     Ok(file)
@@ -89,6 +83,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn install_copies_the_theme_privately_into_the_config_themes_dir() {
         use std::os::unix::fs::PermissionsExt;
         let (plugin, _) = shipped();

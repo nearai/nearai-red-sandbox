@@ -123,6 +123,13 @@ pub fn stdin_stdout_are_ttys() -> (bool, bool) {
 }
 
 /// The window size of a terminal file descriptor, as (cols, rows).
+#[cfg(windows)]
+pub fn window_size(_fd: i32) -> Option<(usize, usize)> {
+    None
+}
+
+/// The window size of a terminal file descriptor, as (cols, rows).
+#[cfg(unix)]
 pub fn window_size(fd: i32) -> Option<(usize, usize)> {
     let mut size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
     // SAFETY: TIOCGWINSZ writes one winsize into the struct we own.

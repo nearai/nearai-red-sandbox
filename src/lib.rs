@@ -21,6 +21,10 @@ pub mod setup;
 pub mod sandbox;
 pub mod sys;
 pub mod tools;
+#[cfg(unix)]
+pub mod terminal;
+#[cfg(windows)]
+#[path = "terminal_windows.rs"]
 pub mod terminal;
 pub mod untar;
 pub mod update;

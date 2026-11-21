@@ -5,7 +5,6 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -168,7 +167,7 @@ fn prepare_home(supplied: Option<PathBuf>) -> Result<OwnedHome, String> {
                 .prefix("rts-inference-")
                 .tempdir()
                 .map_err(|_| "inference: cannot create private runtime home")?;
-            fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700))
+            crate::sys::fs::restrict_dir(home.path())
                 .map_err(|_| "inference: cannot restrict runtime home")?;
             Ok(OwnedHome::Temp(home))
         }
@@ -185,15 +184,12 @@ fn prepare_home(supplied: Option<PathBuf>) -> Result<OwnedHome, String> {
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    fs::DirBuilder::new()
-                        .recursive(true)
-                        .mode(0o700)
-                        .create(&dir)
+                    crate::sys::fs::create_private_dir_all(&dir)
                         .map_err(|_| "inference: cannot create private runtime home")?;
                 }
                 Err(_) => return Err("inference: cannot inspect runtime home".into()),
             }
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            crate::sys::fs::restrict_dir(&dir)
                 .map_err(|_| "inference: cannot restrict runtime home")?;
             Ok(OwnedHome::Supplied(dir))
         }
@@ -218,12 +214,11 @@ pub fn start_with_endpoint(
     } = setup;
     let config = runtime_config(models, endpoint, capture)?;
     let home = prepare_home(supplied_home)?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(home.path().join("config.toml"))
-        .map_err(|_| "inference: cannot create runtime configuration")?;
+    let mut file = crate::sys::fs::open_private(
+        OpenOptions::new().write(true).create_new(true),
+        &home.path().join("config.toml"),
+    )
+    .map_err(|_| "inference: cannot create runtime configuration")?;
     file.write_all(config.as_bytes())
         .map_err(|_| "inference: cannot write runtime configuration")?;
     drop(file);
@@ -369,11 +364,13 @@ enabled = false
 }
 
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(unused_imports))]
 mod tests {
     use super::*;
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -583,6 +580,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn configured_models_are_available_without_discovery_and_home_is_private_and_ephemeral() {
         let models = vec![
             "z-ai/glm-5.3-flash".into(),
@@ -654,6 +652,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_supplied_home_survives_shutdown() {
         let dir = tempfile::tempdir().unwrap();
         let iw_home = dir.path().join("iw");

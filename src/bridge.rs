@@ -98,11 +98,11 @@ pub fn parse_request(raw: &[u8]) -> Result<Request, String> {
 /// from a genuine no-match result. Do not persist any token-bearing error.
 fn monitoring_failure(o: &BridgeOptions, message: &str) -> Outcome {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     StateDir(o.state_dir.clone()).mark("canary monitoring failed");
-    let marker = std::fs::OpenOptions::new()
-        .write(true).create_new(true).mode(0o600)
-        .open(o.state_dir.join("canary-monitoring-failed"));
+    let marker = crate::sys::fs::open_private(
+        std::fs::OpenOptions::new().write(true).create_new(true),
+        &o.state_dir.join("canary-monitoring-failed"),
+    );
     if let Ok(mut marker) = marker {
         let _ = marker.write_all(b"canary monitoring failed; observation coverage incomplete\n");
     }

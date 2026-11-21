@@ -1,14 +1,24 @@
 //! Session-owned synthetic canaries. Exact matches are observations, not access tracing.
 //! The registry stays on the host. Only guest decoys and a value-free manifest enter the VM.
+//!
+//! The host side relies on Unix primitives (O_NOFOLLOW, 0600 files owned by
+//! this user, flock, and openat-relative export scans). On Windows a registry
+//! cannot be created or loaded yet, so a session with canaries refuses there.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::ffi::{CStr, CString, OsString};
+#[cfg(unix)]
+use std::ffi::{CStr, CString};
+use std::ffi::OsString;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -88,6 +98,29 @@ fn random_hex(bytes: usize) -> Result<String, String> {
         .map_err(|_| "canaries: OS randomness failed")?;
     Ok(hex::encode(b))
 }
+#[cfg(not(unix))]
+const UNSUPPORTED: &str = "canaries are not supported on Windows yet";
+#[cfg(not(unix))]
+fn private_new(_path: &Path, _bytes: &[u8]) -> Result<(), String> {
+    Err(UNSUPPORTED.into())
+}
+#[cfg(not(unix))]
+fn private_file(_path: &Path, _append: bool) -> Result<File, String> {
+    Err(UNSUPPORTED.into())
+}
+#[cfg(not(unix))]
+fn lock(_f: &File, _exclusive: bool) -> Result<(), String> {
+    Err(UNSUPPORTED.into())
+}
+#[cfg(not(unix))]
+fn private_dir(_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, UNSUPPORTED))
+}
+#[cfg(unix)]
+fn private_dir(path: &Path) -> std::io::Result<()> {
+    DirBuilder::new().mode(0o700).create(path)
+}
+#[cfg(unix)]
 fn private_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut f = OpenOptions::new()
         .write(true)
@@ -99,6 +132,7 @@ fn private_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
     f.write_all(bytes)
         .map_err(|e| format!("canaries: writing private file: {e}"))
 }
+#[cfg(unix)]
 fn private_file(path: &Path, append: bool) -> Result<File, String> {
     let mut o = OpenOptions::new();
     o.read(!append)
@@ -122,7 +156,9 @@ fn private_file(path: &Path, append: bool) -> Result<File, String> {
     }
     Ok(f)
 }
-fn lock(f: &File, operation: libc::c_int) -> Result<(), String> {
+#[cfg(unix)]
+fn lock(f: &File, exclusive: bool) -> Result<(), String> {
+    let operation = if exclusive { libc::LOCK_EX } else { libc::LOCK_SH };
     loop {
         if unsafe { libc::flock(f.as_raw_fd(), operation) } == 0 {
             return Ok(());
@@ -140,15 +176,9 @@ impl Registry {
         if !dir.is_absolute() || !audit_file.is_absolute() {
             return Err("canaries: registry and audit paths must be absolute".into());
         }
-        DirBuilder::new()
-            .mode(0o700)
-            .create(dir)
-            .map_err(|e| format!("canaries: creating registry directory: {e}"))?;
+        private_dir(dir).map_err(|e| format!("canaries: creating registry directory: {e}"))?;
         let host = dir.join("host");
-        DirBuilder::new()
-            .mode(0o700)
-            .create(&host)
-            .map_err(|e| format!("canaries: creating host directory: {e}"))?;
+        private_dir(&host).map_err(|e| format!("canaries: creating host directory: {e}"))?;
         let guest_root = format!("/tmp/rts/canaries-{}", random_hex(16)?);
         let mut entries = vec![];
         for s in specs {
@@ -272,7 +302,7 @@ impl Registry {
             return Ok(());
         }
         let mut f = private_file(&self.stored.audit_file, true)?;
-        lock(&f, libc::LOCK_EX)?;
+        lock(&f, true)?;
         let mut bytes = vec![];
         for e in events {
             serde_json::to_writer(&mut bytes, e).map_err(|_| "canaries: serializing event")?;
@@ -314,6 +344,11 @@ impl Registry {
         self.append(&events)?;
         Ok(events.len())
     }
+    #[cfg(not(unix))]
+    pub fn scan_exports(&self, _root: &Path) -> Result<usize, String> {
+        Err(UNSUPPORTED.into())
+    }
+    #[cfg(unix)]
     pub fn scan_exports(&self, root: &Path) -> Result<usize, String> {
         let root_file = OpenOptions::new()
             .read(true)
@@ -326,6 +361,7 @@ impl Registry {
         };
         self.scan_dir(&root_file, Path::new(""), &mut budget)
     }
+    #[cfg(unix)]
     fn scan_dir(
         &self,
         dir: &File,
@@ -413,7 +449,7 @@ impl Registry {
     }
     pub fn summary(&self) -> Result<String, String> {
         let f = private_file(&self.stored.audit_file, false)?;
-        lock(&f, libc::LOCK_SH)?;
+        lock(&f, false)?;
         if f.metadata()
             .map_err(|_| "canaries: reading audit size")?
             .len()
@@ -446,6 +482,7 @@ struct ScanBudget {
 
 // Enumerate an already-open directory. All descendants are opened relative to
 // its descriptor with O_NOFOLLOW; a hostile path cannot redirect us to host files.
+#[cfg(unix)]
 fn directory_names(dir: &File) -> Result<Vec<OsString>, String> {
     let duplicate = unsafe { libc::dup(dir.as_raw_fd()) };
     if duplicate < 0 {
@@ -492,7 +529,7 @@ fn directory_names(dir: &File) -> Result<Vec<OsString>, String> {
     names.sort();
     Ok(names)
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::Value;

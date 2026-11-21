@@ -105,6 +105,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_symlinked_bin_rts_resolves_to_its_keg() {
         let dir = tempfile::tempdir().unwrap();
         let t = dir.path();

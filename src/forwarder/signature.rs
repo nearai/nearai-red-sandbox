@@ -9,7 +9,6 @@
 
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -369,11 +368,7 @@ pub struct InferenceLine {
 pub fn append_inference_line(path: &Path, line: &InferenceLine) -> std::io::Result<()> {
     let mut bytes = serde_json::to_vec(line)?;
     bytes.push(b'\n');
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut f = crate::sys::fs::open_private(std::fs::OpenOptions::new().append(true).create(true), path)?;
     // One write call per line.
     f.write_all(&bytes)
 }
@@ -738,6 +733,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn inference_lines_are_appended_to_a_private_file() {
         use std::os::unix::fs::PermissionsExt;
         let dir = crate::testutil::tempdir("inference-log");

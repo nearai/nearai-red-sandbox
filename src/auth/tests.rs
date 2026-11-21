@@ -611,7 +611,9 @@ fn sponsored_storage_is_versioned_redacted_and_replaced_by_personal_login() {
 }
 
 #[test]
+#[cfg(unix)]
 fn sponsored_key_file_bounds_newlines_permissions_and_symlinks() {
+    #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
     let directory = std::env::temp_dir().join(format!(
         "rts-sponsored-test-{}-{}",

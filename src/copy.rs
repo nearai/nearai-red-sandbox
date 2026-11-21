@@ -128,7 +128,7 @@ fn copy_out_inner(sb: &dyn Exec, guest_dir: &str, host_dir: &Path, limits: &Copy
     Ok(CopyOutResult::Exported { files: x.files, bytes: x.bytes })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     //! The copy scripts run by the host's sh and tar against temp directories
     //! standing in for the guest. GNU tar here, like busybox tar, writes GNU

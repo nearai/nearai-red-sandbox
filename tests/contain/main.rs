@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! End-to-end containment against real mvm (and real opencode 2.2.2 for
 //! the session tests). These create microVMs, so they are ignored by a
 //! plain `cargo test`. Run them with:

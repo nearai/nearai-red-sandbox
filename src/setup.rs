@@ -3,6 +3,10 @@
 //! it into place. Nothing unverified or partially unpacked is ever left at
 //! the target path. Then `run` signs and checks mvm, probes the supervisor,
 //! checks opencode and pulls the guest image.
+//!
+//! The install flow is macOS and Linux only for now; on Windows `run`
+//! refuses and only the download/verify helpers are used (by updates).
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -12,6 +16,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use url::Url;
 
+#[cfg(unix)]
 use crate::backend::mvm::Flavor;
 use crate::config::{Defaults, default_image};
 use crate::install::{MVM_VERSION, mvm_dir, opencode_dir};
@@ -254,8 +259,7 @@ pub fn install_component(c: &Component, target: &Path, f: &dyn Fetch, host: &dyn
     if parent.exists() {
         remove_stale_temp_dirs(parent).map_err(|e| format!("{label}: {e}"))?;
     } else {
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new().recursive(true).mode(0o700).create(parent).map_err(|e| format!("{label}: creating {}: {e}", parent.display()))?;
+        crate::sys::fs::create_private_dir_all(parent).map_err(|e| format!("{label}: creating {}: {e}", parent.display()))?;
     }
     let exists = || fs::symlink_metadata(target).is_ok();
     if exists() {
@@ -371,14 +375,9 @@ const RELEASE_MAX_BYTES: u64 = 128 << 20;
 const RELEASE_OWNED: [&str; 2] = ["libexec/nearai-red-sandbox", "share/nearai-red-sandbox/plugin"];
 
 fn swap_into_prefix(prefix: &Path, stage: &Path, rel: &str) -> Result<(), String> {
-    use std::os::unix::fs::DirBuilderExt;
     let dst = prefix.join(rel);
     if let Some(parent) = dst.parent() {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)
-            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        crate::sys::fs::create_private_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
     }
     if exists(&dst) {
         let backup = stage.join("old").join(rel);
@@ -397,16 +396,11 @@ fn install_release_components(
     f: &dyn Fetch,
     host: &dyn Host,
 ) -> Result<(), String> {
-    use std::os::unix::fs::DirBuilderExt;
     let label = "rts release";
     if prefix.exists() {
         remove_stale_temp_dirs(prefix).map_err(|e| format!("{label}: {e}"))?;
     } else {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(prefix)
-            .map_err(|e| format!("{label}: creating {}: {e}", prefix.display()))?;
+        crate::sys::fs::create_private_dir_all(prefix).map_err(|e| format!("{label}: creating {}: {e}", prefix.display()))?;
     }
     let tmp = tempfile::Builder::new()
         .prefix(TEMP_PREFIX)
@@ -613,13 +607,22 @@ impl Steps {
 
 /// `run` with the two components supplied, so tests serve fixtures.
 pub(crate) fn run_with(o: &SetupOptions, c: &SetupContext, components: (&Component, &Component)) -> Result<Vec<String>, String> {
-    run_steps(o, c, components, Flavor::host(), Path::new(crate::backend::kvm::KVM_DEVICE))
+    #[cfg(unix)]
+    {
+        run_steps(o, c, components, Flavor::host(), Path::new(crate::backend::kvm::KVM_DEVICE))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (o, c, components);
+        Err("rts setup is not supported on this OS yet".into())
+    }
 }
 
 /// The setup steps for `flavor`. HVF: mvm, `env sign`, doctor, the patched
 /// supervisor, OpenCode, the image. Firecracker: mvm, doctor, `kvm` (which
 /// must be readable and writable), OpenCode, `mvmctl bootstrap` (the signed
 /// guest runtime), the image; no supervisor, no code signatures.
+#[cfg(unix)]
 pub(crate) fn run_steps(o: &SetupOptions, c: &SetupContext, components: (&Component, &Component), flavor: Flavor, kvm: &Path) -> Result<Vec<String>, String> {
     if o.offline {
         if !o.check {
@@ -659,6 +662,7 @@ pub(crate) fn run_steps(o: &SetupOptions, c: &SetupContext, components: (&Compon
     steps.finish()
 }
 
+#[cfg(unix)]
 fn kvm_step(kvm: &Path) -> Result<Option<String>, String> {
     crate::backend::kvm::check_kvm(kvm)?;
     Ok(Some(format!("kvm {} (read-write)", kvm.display())))
@@ -667,6 +671,7 @@ fn kvm_step(kvm: &Path) -> Result<Option<String>, String> {
 /// `mvmctl bootstrap`: the guest runtime this mvmctl's release ships,
 /// fetched and checked against the release workflow's signature. Not run by
 /// `--check`, which cannot tell without running it.
+#[cfg(unix)]
 fn bootstrap_step(check: bool, c: &SetupContext) -> Result<Option<String>, String> {
     if check {
         return Ok(None);
@@ -747,6 +752,7 @@ fn image_step(check: bool, c: &SetupContext) -> Result<Option<String>, String> {
 /// `--check --offline`: the plugin's files, OpenCode, and on HVF both
 /// supervisor probes and the signatures of `rts` and the supervisor, on
 /// Firecracker `kvm`. No mvmctl, no network.
+#[cfg(unix)]
 fn offline_check(c: &SetupContext, flavor: Flavor, kvm: &Path) -> Result<Vec<String>, String> {
     let mut steps = Steps { check: true, lines: Vec::new(), failures: Vec::new() };
     let plugin = &c.defaults.plugin_dir;
@@ -831,7 +837,7 @@ impl Fetch for FakeFetch {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::mvm::RunOutput;

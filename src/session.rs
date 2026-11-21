@@ -236,8 +236,7 @@ fn write_tui_config_with_prompt(dir: &Path, plugin_dir: &Path, model_display: &s
 }
 
 fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(path)?.write_all(data)
+    crate::sys::fs::open_private(OpenOptions::new().create(true).truncate(true).write(true), path)?.write_all(data)
 }
 
 // --- session layout ---
@@ -305,9 +304,8 @@ pub fn session_paths(id: &str, sessions_dir: &Path, runtime: &Path) -> SessionPa
 }
 
 pub fn prepare_session_dirs(p: &SessionPaths) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
     for d in [&p.home, &p.xdg_config, &p.xdg_data, &p.xdg_cache, &p.xdg_state, &p.config_dir, &p.work, &p.state_dir, &p.session_dir] {
-        fs::DirBuilder::new().recursive(true).mode(0o700).create(d)?;
+        crate::sys::fs::create_private_dir_all(d)?;
     }
     fs::write(&p.empty_git_config, "")
 }
@@ -603,6 +601,7 @@ pub fn mvm_root(env: &[(String, String)]) -> Result<PathBuf, String> {
 
 /// The VMM process held to the host RSS ceiling: the HVF supervisor, or
 /// another flavor's VMM through [`Supervisor::discover_vmm`].
+#[cfg(unix)]
 pub(crate) struct Supervisor {
     pub(crate) pid: u32,
     pub(crate) pid_file: PathBuf,
@@ -614,6 +613,7 @@ pub(crate) struct Supervisor {
     pub(crate) name_of: NameOf,
 }
 
+#[cfg(unix)]
 impl Supervisor {
     pub(crate) fn discover(name: &str, env: &[(String, String)]) -> Result<Self, String> {
         let root = mvm_root(env).map_err(|e| format!("cannot monitor HVF supervisor: {e}"))?;
@@ -649,6 +649,7 @@ pub(crate) type NameOf = fn(&dyn Host, u32) -> Option<String>;
 /// The basename of `/proc/<pid>/exe` (Linux), without the kernel's
 /// ` (deleted)` suffix. Unlike `ps -o comm=`, which Linux caps at 15
 /// characters, it names `mvm-network-endpoint` in full.
+#[cfg(unix)]
 pub(crate) fn exe_name(host: &dyn Host, pid: u32) -> Option<String> {
     let link = host.run(&sv(&["readlink", &format!("/proc/{pid}/exe")]), Duration::from_secs(5)).ok()?;
     if link.code != Some(0) || link.killed {
@@ -845,6 +846,12 @@ fn finish_canaries(registry: &crate::canary::Registry, paths: &SessionPaths, exp
     failed
 }
 
+#[cfg(windows)]
+fn copy_tree_preserving_mode(_src: &Path, _dst: &Path) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "copying a tree with its permissions is not supported on Windows yet"))
+}
+
+#[cfg(unix)]
 fn copy_tree_preserving_mode(src: &Path, dst: &Path) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let meta = fs::symlink_metadata(src)?;
@@ -1022,6 +1029,7 @@ fn write_session_record(p: &SessionPaths, plan: &crate::network::Plan, probes: &
 }
 
 /// How long to wait for mvm's audit log to show a pin for every name.
+#[cfg(unix)]
 const PIN_WAIT: Duration = Duration::from_secs(10);
 
 /// Read this VM's pins from mvm's audit log in `audit_dir` until every name
@@ -1029,6 +1037,7 @@ const PIN_WAIT: Duration = Duration::from_secs(10);
 /// with no names reads nothing. A missing log counts as no pins yet, and
 /// ends the session if it is still missing at the deadline; an unreadable
 /// or malformed one ends it at once.
+#[cfg(unix)]
 pub(crate) fn wait_for_pins(plan: &crate::network::Plan, audit_dir: &Path, machine: &str, clock: &Clock) -> Result<Pinned, String> {
     let names = plan.pinning_names();
     if names.is_empty() {
@@ -1264,7 +1273,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, backend: &dyn Backend, operat
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::backend::mvm::MvmMachine;

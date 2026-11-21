@@ -7,7 +7,6 @@
 //! (`RTS_TARBALL_SHA256`), which `install.sh` checks next to `SHA256SUMS`.
 
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -130,18 +129,10 @@ pub fn run(o: &UpdateOptions, c: &UpdateContext) -> Result<Vec<String>, String> 
             got.sha256
         ));
     }
-    // Explicitly 0700: tempfile's directories otherwise follow the umask.
-    let stage = tempfile::Builder::new()
-        .prefix("rts-update-")
-        .permissions(std::fs::Permissions::from_mode(0o700))
-        .tempdir_in(c.temp_dir)
+    let stage = private_stage(c.temp_dir)
         .map_err(|e| format!("creating a private directory under {}: {e}", c.temp_dir.display()))?;
     let path = stage.path().join("install.sh");
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
+    crate::sys::fs::open_private(std::fs::OpenOptions::new().write(true).create_new(true), &path)
         .and_then(|mut f| f.write_all(&script))
         .map_err(|e| format!("writing {}: {e}", path.display()))?;
 
@@ -235,6 +226,19 @@ pub fn command(o: &UpdateOptions) -> Result<i32, String> {
         println!("{line}");
     }
     Ok(0)
+}
+
+/// A temp directory created 0700 (tempfile's otherwise follow the umask).
+#[cfg(unix)]
+fn private_stage(dir: &Path) -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::PermissionsExt;
+    tempfile::Builder::new().prefix("rts-update-").permissions(std::fs::Permissions::from_mode(0o700)).tempdir_in(dir)
+}
+
+/// install.sh updates are a macOS and Linux install path.
+#[cfg(windows)]
+fn private_stage(_dir: &Path) -> std::io::Result<tempfile::TempDir> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "install.sh updates are not supported on Windows"))
 }
 
 #[cfg(test)]
@@ -523,10 +527,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_stage_directory_and_script_are_private() {
         use std::os::unix::fs::PermissionsExt;
         struct Modes(Mutex<Option<(u32, u32)>>);
         impl Installer for Modes {
+            #[cfg(unix)]
             fn run(&self, script: &Path, _: &[(String, String)], _: &[&str]) -> Result<i32, String> {
                 let m = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
                 *self.0.lock().unwrap() = Some((m(script.parent().unwrap()), m(script)));
