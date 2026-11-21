@@ -315,7 +315,24 @@ fn setup_command(o: &setup::SetupOptions) -> Result<i32, String> {
     unsafe { GetProductInfo(10, 0, 0, 0, &mut product_type) };
     let hyperv = rts::backend::hyperv::hcs::available().err().map(|e| e.to_string());
     let fetch = setup::HttpsFetch::new()?;
-    for line in hv::run(o.check, &env, product_type, hyperv.as_deref(), &fetch, hv::GUEST_RELEASE)? {
+    let home = rts::install::home_in(&env, true)
+        .filter(|h| h.is_absolute())
+        .ok_or("rts setup needs USERPROFILE (or HOME) set to an absolute path")?;
+    let component = setup::opencode_windows();
+    let opencode = hv::OpenCode {
+        home: &home,
+        host: &rts::session::RealHost,
+        component: &component,
+    };
+    for line in hv::run(
+        o.check,
+        &env,
+        product_type,
+        hyperv.as_deref(),
+        &fetch,
+        hv::GUEST_RELEASE,
+        &opencode,
+    )? {
         println!("{line}");
     }
     Ok(0)

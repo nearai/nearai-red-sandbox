@@ -161,6 +161,8 @@ pub enum Unpack {
     /// A tar.gz whose entries sit at the top level.
     TarGz,
     Zip,
+    /// A zip unpacked by Windows' own tar.exe (bsdtar, in System32).
+    ZipWindows,
 }
 
 /// A host platform rts has pinned release assets for.
@@ -250,6 +252,32 @@ pub fn opencode_for(t: Target) -> Component {
     }
 }
 
+/// OpenCode's Windows release asset, by GitHub's asset digest: one file,
+/// opencode.exe (checked on rts-win-dev).
+pub fn opencode_windows() -> Component {
+    Component {
+        name: "opencode",
+        version: OPENCODE_VERSION,
+        url: format!(
+            "https://github.com/anomalyco/opencode/releases/download/v{OPENCODE_VERSION}/opencode-windows-x64.zip"
+        ),
+        sha256: "e604e66cc13128fe36db7c68c7b0ed31c10b2ce759dd3d702eae080dc140bed5".into(),
+        max_bytes: 256 << 20,
+        unpack: Unpack::ZipWindows,
+        binary: "opencode.exe",
+    }
+}
+
+/// System32's tar.exe, which reads zip archives.
+fn windows_tar() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    Path::new(&root)
+        .join("System32")
+        .join("tar.exe")
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Download, check the digest, unpack into `<parent>/.rts-setup-XXXX/unpacked`,
 /// check `binary`, rename to `target`.
 /// Errs when `target` exists: the caller decides to skip or refuse it.
@@ -289,6 +317,7 @@ pub fn install_component(c: &Component, target: &Path, f: &dyn Fetch, host: &dyn
         Unpack::TarGzStrip1 => vec!["/usr/bin/tar".into(), "-xzf".into(), dl, "-C".into(), un, "--strip-components".into(), "1".into()],
         Unpack::TarGz => vec!["/usr/bin/tar".into(), "-xzf".into(), dl, "-C".into(), un],
         Unpack::Zip => vec!["/usr/bin/ditto".into(), "-x".into(), "-k".into(), dl, un],
+        Unpack::ZipWindows => vec![windows_tar(), "-xf".into(), dl, "-C".into(), un],
     };
     let tool = argv[0].clone();
     let out = host.run(&argv, UNPACK_TIMEOUT).map_err(|e| format!("{label}: running {tool}: {e}; nothing was installed"))?;
@@ -712,23 +741,37 @@ fn supervisor_step(c: &SetupContext) -> Result<Option<String>, String> {
 }
 
 fn opencode_step(check: bool, c: &SetupContext, comp: &Component) -> Result<Option<String>, String> {
+    install_opencode(check, c.home, c.host, c.fetch, comp)
+}
+
+/// OpenCode in `opencode_dir(home)`: an existing copy must answer
+/// `--version` with the pinned version; with `check` a missing one is an
+/// error, otherwise it is downloaded, checked and installed. One summary
+/// line, "<name> <version> <path>".
+pub fn install_opencode(
+    check: bool,
+    home: &Path,
+    host: &dyn Host,
+    fetch: &dyn Fetch,
+    comp: &Component,
+) -> Result<Option<String>, String> {
     let label = format!("{} {}", comp.name, comp.version);
-    let dir = opencode_dir(c.home);
+    let dir = opencode_dir(home);
     let bin = dir.join(comp.binary);
     let bin_s = bin.to_string_lossy();
     let line = Some(format!("{label} {}", bin.display()));
     // check_opencode's own advice is "run rts setup", which would not help here.
     let reason = |e: String| e.trim_end_matches("; run rts setup").to_string();
     if exists(&dir) {
-        check_opencode(c.host, &bin_s)
+        check_opencode(host, &bin_s)
             .map_err(|e| format!("{label}: {} exists but is not opencode {OPENCODE_VERSION} ({}); remove it and re-run rts setup", dir.display(), reason(e)))?;
         return Ok(line);
     }
     if check {
         return Err(format!("{label}: not installed at {}; run rts setup", bin.display()));
     }
-    install_component(comp, &dir, c.fetch, c.host)?;
-    check_opencode(c.host, &bin_s)
+    install_component(comp, &dir, fetch, host)?;
+    check_opencode(host, &bin_s)
         .map_err(|e| format!("{label}: the copy just installed at {} does not verify ({}); remove it and re-run rts setup", dir.display(), reason(e)))?;
     Ok(line)
 }

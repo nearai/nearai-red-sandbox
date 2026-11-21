@@ -323,9 +323,8 @@ impl Defaults {
     /// From HOME (empty if unset), RTS_MVMCTL, the install prefix of the
     /// running binary, and the checkout it was built from.
     pub fn from_env() -> Self {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
+        let env: Vec<(String, String)> = std::env::vars().collect();
+        let home = crate::install::home_in(&env, cfg!(windows)).unwrap_or_default();
         let rts_mvmctl = std::env::var_os("RTS_MVMCTL").map(PathBuf::from);
         let prefix = crate::install::current_prefix();
         crate::install::defaults(&crate::install::Lookup {
@@ -343,7 +342,7 @@ impl Defaults {
             mvmctl: crate::install::mvm_dir(prefix).join("mvmctl"),
             plugin_dir: crate::install::prefix_plugin(prefix),
             opencode: crate::install::opencode_dir(prefix)
-                .join("opencode")
+                .join(crate::install::OPENCODE_BINARY)
                 .to_string_lossy()
                 .into_owned(),
             sessions_dir: sessions_dir.to_path_buf(),

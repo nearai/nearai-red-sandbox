@@ -1,6 +1,6 @@
 //! `rts setup` on Windows: install the pinned guest kernel and initramfs
 //! into the guest directory (`%LOCALAPPDATA%\nearai-red-sandbox\hyperv`,
-//! owner-only). Each file is fetched over setup's GitHub host allowlist,
+//! owner-only), then OpenCode's pinned Windows build. Each file is fetched over setup's GitHub host allowlist,
 //! checked against its pin, and renamed into place; a file already there
 //! with the right digest is left alone. HCS reads the files from that
 //! owner-only directory itself (checked live).
@@ -9,7 +9,8 @@ use std::io::Write;
 use std::path::Path;
 
 use super::backend::{INITRD_FILE, INITRD_SHA256, KERNEL_FILE, KERNEL_SHA256};
-use crate::setup::{Fetch, download};
+use crate::session::Host;
+use crate::setup::{Component, Fetch, download, install_opencode};
 
 /// Where the guest files are published: the hyperv-guest-v1 release, made
 /// by .github/workflows/hyperv-guest.yml from guest/hyperv on a signed tag
@@ -32,9 +33,18 @@ fn digest(p: &Path) -> Option<String> {
         .map(|b| hex::encode(Sha256::digest(b)))
 }
 
-/// `rts setup` on Windows. Refuses a host that cannot run the sandbox
-/// (Windows Home, or Hyper-V missing) before downloading anything. With
-/// `check`, only reports whether each guest file is in place.
+/// OpenCode's part of `rts setup` on Windows: the home it is installed
+/// under (`opencode_dir(home)`, as on Unix), what runs its `--version`, and
+/// the pinned release asset.
+pub struct OpenCode<'a> {
+    pub home: &'a Path,
+    pub host: &'a dyn Host,
+    pub component: &'a Component,
+}
+
+/// `rts setup` on Windows: the guest files, then OpenCode. Refuses a host
+/// that cannot run the sandbox (Windows Home, or Hyper-V missing) before
+/// downloading anything. With `check`, only reports what is in place.
 pub fn run(
     check: bool,
     env: &[(String, String)],
@@ -42,6 +52,30 @@ pub fn run(
     hyperv_problem: Option<&str>,
     f: &dyn Fetch,
     base: &str,
+    opencode: &OpenCode,
+) -> Result<Vec<String>, String> {
+    run_with(
+        check,
+        env,
+        product_type,
+        hyperv_problem,
+        f,
+        base,
+        &guest_files(),
+        opencode,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with(
+    check: bool,
+    env: &[(String, String)],
+    product_type: u32,
+    hyperv_problem: Option<&str>,
+    f: &dyn Fetch,
+    base: &str,
+    files: &[(&str, &str, u64)],
+    opencode: &OpenCode,
 ) -> Result<Vec<String>, String> {
     if let Some(why) = super::backend::edition_problem(product_type) {
         return Err(why.into());
@@ -51,25 +85,36 @@ pub fn run(
     }
     let dir = super::backend::guest_dir(env)
         .ok_or("cannot find the rts guest directory (LOCALAPPDATA is not set)")?;
+    let oc = |check| install_opencode(check, opencode.home, opencode.host, f, opencode.component);
     if !check {
-        return install(f, base, &dir, &guest_files());
+        let mut lines = install(f, base, &dir, files)?;
+        lines.extend(oc(false)?);
+        return Ok(lines);
     }
     let mut lines = vec![];
-    let mut missing = vec![];
-    for (name, pin, _) in guest_files() {
-        if digest(&dir.join(name)).as_deref() == Some(pin) {
-            lines.push(format!("{name}: ok"));
-        } else {
-            missing.push(name);
-        }
+    let mut failures = vec![];
+    let missing: Vec<&str> = files
+        .iter()
+        .filter(|(name, pin, _)| digest(&dir.join(name)).as_deref() != Some(*pin))
+        .map(|(name, _, _)| *name)
+        .collect();
+    for (name, _, _) in files.iter().filter(|(name, _, _)| !missing.contains(name)) {
+        lines.push(format!("{name}: ok"));
     }
-    if missing.is_empty() {
-        Ok(lines)
-    } else {
-        Err(format!(
+    if !missing.is_empty() {
+        failures.push(format!(
             "{} missing or not as pinned; run rts setup",
             missing.join(", ")
-        ))
+        ));
+    }
+    match oc(true) {
+        Ok(line) => lines.extend(line),
+        Err(e) => failures.push(e),
+    }
+    if failures.is_empty() {
+        Ok(lines)
+    } else {
+        Err(failures.join("\n"))
     }
 }
 
@@ -212,7 +257,19 @@ mod tests {
     fn setup_refuses_windows_home_and_a_host_without_hyper_v_before_downloading() {
         let f = FakeFetch::new();
         let env = vec![("RTS_HV_DIR".to_string(), "/nonexistent".to_string())];
-        let e = run(false, &env, 101, None, &f, BASE).unwrap_err();
+        let (home, host) = (
+            tempfile::tempdir().unwrap(),
+            WindowsHost {
+                calls: Default::default(),
+            },
+        );
+        let component = opencode_component(b"zip");
+        let oc = OpenCode {
+            home: home.path(),
+            host: &host,
+            component: &component,
+        };
+        let e = run(false, &env, 101, None, &f, BASE, &oc).unwrap_err();
         assert!(e.contains("Windows Home is not supported"), "{e}");
         let e = run(
             false,
@@ -221,6 +278,7 @@ mod tests {
             Some("Hyper-V is not available"),
             &f,
             BASE,
+            &oc,
         )
         .unwrap_err();
         assert!(e.contains("Hyper-V is not available"), "{e}");
@@ -235,12 +293,150 @@ mod tests {
             "RTS_HV_DIR".to_string(),
             d.path().to_string_lossy().into_owned(),
         )];
-        let e = run(true, &env, 0x30, None, &f, BASE).unwrap_err();
+        let (home, host) = (
+            tempfile::tempdir().unwrap(),
+            WindowsHost {
+                calls: Default::default(),
+            },
+        );
+        let component = opencode_component(b"zip");
+        let oc = OpenCode {
+            home: home.path(),
+            host: &host,
+            component: &component,
+        };
+        let e = run(true, &env, 0x30, None, &f, BASE, &oc).unwrap_err();
         assert!(
             e.contains(KERNEL_FILE) && e.contains("run rts setup"),
             "{e}"
         );
         assert!(f.calls().is_empty());
+    }
+
+    /// Answers `opencode --version` as 2.2.2 and plays tar.exe by writing
+    /// `opencode.exe` into the unpack directory (argv: tar -xf ZIP -C DIR).
+    struct WindowsHost {
+        calls: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl crate::session::Host for WindowsHost {
+        fn run(
+            &self,
+            argv: &[String],
+            _t: std::time::Duration,
+        ) -> std::io::Result<crate::mvm::RunOutput> {
+            self.calls.lock().unwrap().push(argv.to_vec());
+            let ok = |stdout: &str| crate::mvm::RunOutput {
+                code: Some(0),
+                stdout: stdout.into(),
+                stderr: vec![],
+                killed: false,
+            };
+            if argv[0].ends_with("tar.exe") {
+                assert_eq!(&argv[1..2], ["-xf"]);
+                assert_eq!(argv[3], "-C");
+                std::fs::write(Path::new(&argv[4]).join("opencode.exe"), b"exe").unwrap();
+                return Ok(ok(""));
+            }
+            assert_eq!(
+                argv.last().map(String::as_str),
+                Some("--version"),
+                "{argv:?}"
+            );
+            Ok(ok("2.2.2\n"))
+        }
+    }
+
+    fn opencode_component(zip: &[u8]) -> crate::setup::Component {
+        crate::setup::Component {
+            url: format!("{BASE}/opencode-windows-x64.zip"),
+            sha256: pin(zip),
+            ..crate::setup::opencode_windows()
+        }
+    }
+
+    #[test]
+    fn opencode_for_windows_is_the_pinned_release_asset() {
+        let c = crate::setup::opencode_windows();
+        assert_eq!(
+            c.url,
+            "https://github.com/anomalyco/opencode/releases/download/v2.2.2/opencode-windows-x64.zip"
+        );
+        assert_eq!(
+            c.sha256,
+            "e604e66cc13128fe36db7c68c7b0ed31c10b2ce759dd3d702eae080dc140bed5"
+        );
+        assert_eq!(
+            (c.binary, c.unpack),
+            ("opencode.exe", crate::setup::Unpack::ZipWindows)
+        );
+    }
+
+    #[test]
+    fn setup_installs_opencode_into_the_home_once_and_checks_its_version() {
+        let (home, guest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let env = vec![(
+            "RTS_HV_DIR".to_string(),
+            guest.path().to_string_lossy().into_owned(),
+        )];
+        let zip = b"zip bytes".to_vec();
+        let component = opencode_component(&zip);
+        let f = FakeFetch::new();
+        f.body(&component.url, zip);
+        let host = WindowsHost {
+            calls: Default::default(),
+        };
+        let oc = OpenCode {
+            home: home.path(),
+            host: &host,
+            component: &component,
+        };
+        let lines = run_with(false, &env, 0x30, None, &f, BASE, &[], &oc).unwrap();
+        let exe = crate::install::opencode_dir(home.path()).join("opencode.exe");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"exe");
+        assert!(
+            lines.contains(&format!("opencode 2.2.2 {}", exe.display())),
+            "{lines:?}"
+        );
+        assert_eq!(f.calls().len(), 1);
+        // A second run checks the installed copy and downloads nothing.
+        let again = run_with(false, &env, 0x30, None, &f, BASE, &[], &oc).unwrap();
+        assert_eq!(again, lines);
+        assert_eq!(f.calls().len(), 1);
+        assert!(
+            host.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| a[0].ends_with("tar.exe"))
+                .count()
+                == 1
+        );
+    }
+
+    #[test]
+    fn setup_check_reports_missing_opencode_and_guest_files_together_without_downloading() {
+        let (home, guest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let env = vec![(
+            "RTS_HV_DIR".to_string(),
+            guest.path().to_string_lossy().into_owned(),
+        )];
+        let component = opencode_component(b"zip");
+        let f = FakeFetch::new();
+        let host = WindowsHost {
+            calls: Default::default(),
+        };
+        let oc = OpenCode {
+            home: home.path(),
+            host: &host,
+            component: &component,
+        };
+        let e = run_with(true, &env, 0x30, None, &f, BASE, &guest_files(), &oc).unwrap_err();
+        assert!(
+            e.contains(KERNEL_FILE) && e.contains("opencode 2.2.2: not installed"),
+            "{e}"
+        );
+        assert!(f.calls().is_empty() && host.calls.lock().unwrap().is_empty());
     }
 
     #[test]

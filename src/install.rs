@@ -14,6 +14,13 @@ pub const MVM_VERSION: &str = "0.22.0";
 const SHARE: &str = "share/nearai-red-sandbox";
 const HOME_SHARE: &str = ".local/share/nearai-red-sandbox";
 
+/// `base` joined with each `/`-separated part of `rel`, so Windows paths
+/// use one separator throughout.
+fn under(base: &Path, rel: &str) -> PathBuf {
+    rel.split('/')
+        .fold(base.to_path_buf(), |p, part| p.join(part))
+}
+
 /// `<prefix>` when `exe`, canonicalized, sits in a directory named exactly `bin`.
 pub fn install_prefix(exe: &Path) -> Option<PathBuf> {
     let exe = std::fs::canonicalize(exe).ok()?;
@@ -30,35 +37,63 @@ pub fn current_prefix() -> Option<PathBuf> {
 }
 
 pub fn prefix_plugin(prefix: &Path) -> PathBuf {
-    prefix.join(SHARE).join("plugin")
+    under(prefix, SHARE).join("plugin")
 }
 
 pub fn prefix_supervisor(prefix: &Path) -> PathBuf {
-    prefix.join("libexec/nearai-red-sandbox/mvm-hvf-supervisor")
+    under(prefix, "libexec/nearai-red-sandbox/mvm-hvf-supervisor")
 }
 
 pub fn home_supervisor(home: &Path) -> PathBuf {
-    home.join(HOME_SHARE).join("mvm-hvf-supervisor")
+    under(home, HOME_SHARE).join("mvm-hvf-supervisor")
 }
 
 pub fn mvm_dir(home: &Path) -> PathBuf {
-    home.join(".local/mvm").join(format!("v{MVM_VERSION}"))
+    under(home, ".local/mvm").join(format!("v{MVM_VERSION}"))
+}
+
+/// OpenCode's executable inside `opencode_dir`.
+pub const OPENCODE_BINARY: &str = if cfg!(windows) {
+    "opencode.exe"
+} else {
+    "opencode"
+};
+
+/// The home rts installs under: HOME, else on Windows USERPROFILE (HOME is
+/// rarely set there). Empty values count as unset; names are matched
+/// case-insensitively on Windows.
+pub fn home_in(env: &[(String, String)], windows: bool) -> Option<PathBuf> {
+    let get = |key: &str| {
+        env.iter()
+            .find(|(k, v)| {
+                !v.is_empty()
+                    && if windows {
+                        k.eq_ignore_ascii_case(key)
+                    } else {
+                        k == key
+                    }
+            })
+            .map(|(_, v)| PathBuf::from(v))
+    };
+    get("HOME").or_else(|| if windows { get("USERPROFILE") } else { None })
 }
 
 pub fn opencode_dir(home: &Path) -> PathBuf {
-    home.join(HOME_SHARE).join("opencode").join(crate::session::OPENCODE_VERSION)
+    under(home, HOME_SHARE)
+        .join("opencode")
+        .join(crate::session::OPENCODE_VERSION)
 }
 
 /// Where an installed `rts` keeps sessions when the config names no
 /// `sessionsDir`: a release binary's compiled-in checkout path is the CI
 /// runner's, so it cannot be used.
 pub fn home_sessions(home: &Path) -> PathBuf {
-    home.join(HOME_SHARE).join("sessions")
+    under(home, HOME_SHARE).join("sessions")
 }
 
 /// The launch update check's cache (`ironwire_update::CheckedAt`).
 pub fn update_cache(home: &Path) -> PathBuf {
-    home.join(HOME_SHARE).join("update-check.json")
+    under(home, HOME_SHARE).join("update-check.json")
 }
 
 pub struct Lookup<'a> {
@@ -74,7 +109,7 @@ pub struct Lookup<'a> {
 pub fn defaults(l: &Lookup) -> Defaults {
     let installed_plugin = l.prefix.map(prefix_plugin).filter(|p| p.is_dir());
     let installed = installed_plugin.is_some();
-    let opencode = opencode_dir(l.home).join("opencode");
+    let opencode = opencode_dir(l.home).join(OPENCODE_BINARY);
     Defaults {
         mvmctl: l
             .rts_mvmctl
@@ -141,7 +176,9 @@ mod tests {
         assert_eq!(d.sessions_dir, home.join(".local/share/nearai-red-sandbox/sessions"));
         assert_eq!(d.mvmctl, home.join(".local/mvm/v0.22.0/mvmctl"));
         assert_eq!(d.opencode, "opencode");
-        let opencode = home.join(".local/share/nearai-red-sandbox/opencode/2.2.2/opencode");
+        let opencode = home
+            .join(".local/share/nearai-red-sandbox/opencode/2.2.2")
+            .join(OPENCODE_BINARY);
         touch(&opencode);
         let d2 = defaults(&lookup);
         assert_eq!(Path::new(&d2.opencode), opencode);
@@ -163,6 +200,46 @@ mod tests {
         assert_eq!(d.plugin_dir, PathBuf::from("/src/plugin"));
         assert_eq!(d.sessions_dir, PathBuf::from("/src/sessions"));
         assert_eq!(d.mvmctl, home.join(".local/mvm/v0.22.0/mvmctl"));
+    }
+
+    #[test]
+    fn windows_finds_home_in_userprofile_and_unix_only_in_home() {
+        let env = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let both = env(&[("HOME", "/h"), ("USERPROFILE", r"C:\Users\op")]);
+        assert_eq!(home_in(&both, false), Some(PathBuf::from("/h")));
+        assert_eq!(home_in(&both, true), Some(PathBuf::from("/h")));
+        let profile = env(&[("UserProfile", r"C:\Users\op")]);
+        assert_eq!(home_in(&profile, true), Some(PathBuf::from(r"C:\Users\op")));
+        assert_eq!(home_in(&profile, false), None);
+        assert_eq!(home_in(&env(&[("HOME", "")]), true), None);
+    }
+
+    #[test]
+    fn opencode_is_found_under_its_platform_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let opencode = opencode_dir(&home).join(OPENCODE_BINARY);
+        assert_eq!(
+            OPENCODE_BINARY,
+            if cfg!(windows) {
+                "opencode.exe"
+            } else {
+                "opencode"
+            }
+        );
+        touch(&opencode);
+        let d = defaults(&Lookup {
+            source: Path::new("/src"),
+            prefix: None,
+            home: &home,
+            rts_mvmctl: None,
+        });
+        assert_eq!(Path::new(&d.opencode), opencode);
     }
 
     #[test]
