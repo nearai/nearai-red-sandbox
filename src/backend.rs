@@ -16,6 +16,7 @@ use crate::session::{Clock, Deps, Host, SessionPaths};
 
 #[cfg(all(test, unix))]
 mod invariants;
+pub mod hyperv;
 #[cfg(unix)]
 pub mod kvm;
 #[cfg(unix)]
