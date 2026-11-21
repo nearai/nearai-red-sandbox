@@ -22,7 +22,8 @@ use rts::session::{SessionPaths, ancestor_config, opencode_launch, prepare_sessi
 use serde_json::{Value, json};
 
 use crate::harness::{
-    Guest, fake_ironwire, fresh_guest, limits, opencode, plugin_dir, rts_exe, rts_tool, tempdir,
+    Guest, fake_ironwire, fake_provider_calling_shell, fresh_guest, limits, opencode, plugin_dir,
+    rts_exe, rts_tool, tempdir,
 };
 #[cfg(unix)]
 use crate::harness::{bridge_options, mvm};
@@ -257,6 +258,73 @@ fn an_mcp_server_in_the_global_config_never_spawns() {
     assert!(ready_holds(&s.p, &nonce), "{err}");
     let debug: Value = serde_json::from_str(&fs::read_to_string(s.p.runtime.join("debug.json")).unwrap()).unwrap();
     assert_eq!(debug["mcp"], json!([]));
+}
+
+/// The path a model's tool call takes: the (fake) provider asks for
+/// `shell`, real OpenCode runs the plugin's tool, the plugin spawns
+/// `rts tool shell`, and the command runs in the guest, never on the host.
+#[test]
+#[ignore = "real VM and opencode"]
+fn a_model_tool_call_reaches_the_guest_through_opencode_and_rts_tool() {
+    let Some(oc) = opencode() else { return };
+    let m = fresh_guest();
+    let s = session();
+    let nonce = new_nonce();
+    let marker = random_hex(8);
+    let file = format!("/out/from-model-{marker}.txt");
+    let (url, chats) =
+        fake_provider_calling_shell(&provider().models[0], &format!("echo {marker} > {file}"));
+    let p = ProviderConfig {
+        base_url: url,
+        ..provider()
+    };
+    write_opencode_config(
+        &s.p.config_dir,
+        &plugin_dir(),
+        &options(&m, &s.p, &nonce),
+        &p,
+        false,
+    )
+    .unwrap();
+    let l = opencode_launch(&s.p, &oc, std::env::vars());
+    let mut cmd = Command::new(&oc);
+    let model = format!("{}/{}", p.id, p.models[0]);
+    cmd.args(["run", "--standalone", "--model", &model, "write the marker"])
+        .current_dir(&l.cwd)
+        .env_clear()
+        .envs(l.env.iter().map(|(k, v)| (k, v)));
+    let r = run_captured(cmd, Duration::from_secs(180)).unwrap();
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&r.stdout),
+        String::from_utf8_lossy(&r.stderr)
+    );
+    assert!(ready_holds(&s.p, &nonce), "{out}");
+    let audit =
+        fs::read_to_string(&s.p.audit_file).unwrap_or_else(|e| panic!("no audit log ({e}): {out}"));
+    let shell: Vec<Value> = audit
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["tool"] == "shell")
+        .collect();
+    assert_eq!(shell.len(), 1, "{audit}\n{out}");
+    assert_eq!(shell[0]["status"], "completed", "{audit}");
+    let got = m.exec(&sv(&["cat", &file]), &limits()).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&got.stdout).trim(),
+        marker,
+        "the command did not run in the guest: {out}"
+    );
+    assert!(
+        !Path::new(&file).exists(),
+        "LEAK: the model's command ran on the host"
+    );
+    let chats = chats.lock().unwrap();
+    assert!(
+        chats.len() >= 2 && chats.iter().any(|b| b.contains("\"role\":\"tool\"")),
+        "the tool's result never went back to the model: {} requests",
+        chats.len()
+    );
 }
 
 /// The leak check reruns this test with RTS_TEST_LEAK=shell and requires

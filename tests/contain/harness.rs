@@ -409,6 +409,100 @@ pub fn fake_ironwire_counted(model: &str) -> (String, Arc<AtomicUsize>) {
     (format!("http://127.0.0.1:{port}/openai/v1"), accepted)
 }
 
+/// A stand-in OpenAI-compatible provider that asks for one tool call: its
+/// first chat completion calls `shell` with `command`; once a request
+/// carries the tool's result it answers "done". It also answers /models.
+/// Returns the base URL and every chat request body it received.
+pub fn fake_provider_calling_shell(
+    model: &str,
+    command: &str,
+) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let models =
+        json!({ "object": "list", "data": [{ "id": model, "object": "model" }] }).to_string();
+    let args = json!({ "command": command, "description": "write the marker" }).to_string();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let log = seen.clone();
+    let model = model.to_string();
+    thread::spawn(move || {
+        for s in l.incoming().flatten() {
+            let mut s = s;
+            let (mut req, mut buf) = (vec![], [0u8; 8192]);
+            let head_end = loop {
+                if let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(i + 4);
+                }
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break None,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            };
+            let Some(head_end) = head_end else { continue };
+            let head = String::from_utf8_lossy(&req[..head_end]).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while req.len() < head_end + length {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let body = String::from_utf8_lossy(&req[head_end..]).into_owned();
+            let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+            if !path.ends_with("/chat/completions") {
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{models}",
+                    models.len()
+                );
+                continue;
+            }
+            log.lock().unwrap().push(body.clone());
+            let answered = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v["messages"].as_array().cloned())
+                .is_some_and(|m| m.iter().any(|m| m["role"] == "tool"));
+            let delta = if answered {
+                json!({ "role": "assistant", "content": "done" })
+            } else {
+                json!({ "role": "assistant", "tool_calls": [{ "index": 0, "id": "call_rts_1", "type": "function", "function": { "name": "shell", "arguments": args } }] })
+            };
+            let finish = if answered { "stop" } else { "tool_calls" };
+            let chunk = |delta: Value, finish: Value| json!({ "id": "chatcmpl-rts", "object": "chat.completion.chunk", "created": 0, "model": model, "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }] });
+            if body.contains("\"stream\":true") {
+                let events = format!(
+                    "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    chunk(delta, Value::Null),
+                    chunk(json!({}), json!(finish))
+                );
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{events}"
+                );
+            } else {
+                let mut message = delta;
+                if message.get("tool_calls").is_some() {
+                    message["tool_calls"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("index");
+                }
+                let reply = json!({ "id": "chatcmpl-rts", "object": "chat.completion", "created": 0, "model": model, "choices": [{ "index": 0, "message": message, "finish_reason": finish }] }).to_string();
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        }
+    });
+    (format!("http://127.0.0.1:{port}/openai/v1"), seen)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
