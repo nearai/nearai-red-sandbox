@@ -18,7 +18,7 @@ IMAGE=docker.io/library/debian@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643
 SNAPSHOT=20261104T000000Z
 SOURCE_DATE_EPOCH=1793750400 # 2026-11-04T00:00:00Z
 
-docker run --rm --network=host \
+docker run --rm --network=host --platform linux/amd64 \
   -e KERNEL_VERSION="$KERNEL_VERSION" -e KERNEL_SHA256="$KERNEL_SHA256" \
   -e SNAPSHOT="$SNAPSHOT" -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
   -v "$here:/recipe:ro" -v "$out:/out" "$IMAGE" bash /recipe/build-in-container.sh

@@ -24,16 +24,25 @@ What the build does:
   in `kernel.config`.
 - **Checks the result before building.** The build fails if any requested
   option was dropped. It also fails if any option that would give the
-  guest a device, a filesystem bridge or a module loader is on: PCI,
-  NETDEVICES, BLOCK, MODULES, NIC/storage/9p/CIFS/NFS/FUSE drivers, or the
-  virtio and loopback vsock transports.
+  guest a device, a network or a module loader is on: Hyper-V virtual PCI,
+  NETDEVICES, BLOCK, MODULES, IPv6 (its `sit0` tunnel is a second network
+  device), NIC/storage/9p/CIFS/NFS/FUSE drivers, or the virtio and
+  loopback vsock transports.
+- **Keeps ACPI and core PCI on.** x86 finds VMBus through ACPI, and
+  Hyper-V's DSDT has PCI configuration-space regions that fail to load
+  without PCI support, which leaves VMBus (and hvsocket) absent. No PCI
+  device driver is built.
+- **Runs as amd64 on any host.** `build.sh` passes `--platform linux/amd64`.
 
-Two runs on 2026-11-21 (with ACPI, which x86 VMBus discovery needs) (x86_64 Linux host, docker) gave identical bytes:
+Three builds on 2026-11-21 gave identical bytes: an arm64 Mac running
+docker under Rosetta through colima. This kernel booted under HCS on
+Windows (host build 26100). It probed VMBus, listed only `lo`, and
+served hvexec to the host.
 
 | file | sha256 |
 | --- | --- |
-| `vmlinuz` | `40272ed75e3af6ebc7618abd9c272ba352e049adfbcef05b86ee1b17ee1318f8` |
-| `kernel.config.full` | `577c45c5b5a44b5096526da50acf43780a929aae5a5c7a4ffdaab98e0c148b30` |
+| `vmlinuz` | `a331c0ab03687e36fea6ecca473c5fdb0351e76c0331f7be8fddd1cfe62b2d58` |
+| `kernel.config.full` | `666857cb71ddef61d95b33f07d14236d63aaa66e1d0888deb8464ca20ec30dad` |
 
 ## Agent (`agent/`)
 

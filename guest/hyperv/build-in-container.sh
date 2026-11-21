@@ -34,7 +34,7 @@ while IFS= read -r line; do
       grep -q "^${opt}=" .config && { echo "must be off: $opt" >&2; fail=1; } ;;
   esac
 done < /recipe/kernel.config
-for opt in CONFIG_MODULES CONFIG_PCI CONFIG_NETDEVICES CONFIG_ETHERNET CONFIG_WLAN CONFIG_USB \
+for opt in CONFIG_MODULES CONFIG_PCI_HYPERV CONFIG_PCI_HYPERV_INTERFACE CONFIG_IPV6 CONFIG_IPV6_SIT CONFIG_NETDEVICES CONFIG_ETHERNET CONFIG_WLAN CONFIG_USB \
            CONFIG_HYPERV_NET CONFIG_HYPERV_STORAGE CONFIG_VIRTIO_NET CONFIG_NET_9P CONFIG_9P_FS \
            CONFIG_CIFS CONFIG_NFS_FS CONFIG_FUSE_FS CONFIG_VSOCKETS_LOOPBACK CONFIG_VIRTIO_VSOCKETS; do
   grep -q "^${opt}=" .config && { echo "forbidden option on: $opt" >&2; fail=1; }
