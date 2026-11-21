@@ -11,7 +11,14 @@ use crate::sandbox::{Exec, ExecOptions, ExecResult, Result};
 pub fn run_wrapped_locally(cmd: &[String], timeout_sec: u64, cap: u64, workdir: Option<&str>) -> ParsedResult {
     let nonce = new_nonce();
     let argv = wrap_argv(cmd, &WrapOptions { nonce: &nonce, timeout_sec, max_output_bytes: cap, workdir }).unwrap();
-    let out = Command::new(&argv[0]).args(&argv[1..]).stdin(Stdio::null()).output().unwrap();
+    // As copy_in does for the host's own tar: no AppleDouble "._" files
+    // from macOS bsdtar standing in for the guest's tar.
+    let out = Command::new(&argv[0])
+        .args(&argv[1..])
+        .env("COPYFILE_DISABLE", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
     assert!(out.status.success());
     parse_result(&out.stdout, &out.stderr, &nonce).expect("trailer")
 }
