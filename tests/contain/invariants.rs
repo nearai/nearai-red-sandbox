@@ -20,7 +20,7 @@ use rts::session::{
 };
 
 use crate::harness::{NETWORK_TEST_HOURS, mvm, tempdir};
-use rts::config::DEFAULT_IMAGE;
+use rts::config::default_image;
 use std::path::Path;
 
 /// A machine removed when dropped, so a failing test still cleans up.
@@ -60,7 +60,7 @@ fn prerequisites() -> (PathBuf, String) {
     );
     (
         mvmctl,
-        std::env::var("RTS_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.into()),
+        std::env::var("RTS_IMAGE").unwrap_or_else(|_| default_image().into()),
     )
 }
 
