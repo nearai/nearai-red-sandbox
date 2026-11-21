@@ -8,11 +8,14 @@ pub mod doc;
 pub mod egress;
 pub mod exec;
 pub mod machine;
+pub mod mux;
 pub mod props;
 pub mod setup;
 #[cfg(windows)]
 pub mod hvsock;
 #[cfg(windows)]
 pub mod hcs;
+#[cfg(windows)]
+pub mod appcontainer;
 #[cfg(all(test, windows))]
 mod live;

@@ -489,3 +489,183 @@ fn a_killed_rts_process_takes_its_vm_down() {
     );
     let _ = std::fs::remove_file(out);
 }
+
+/// Probe half of the confinement tests: run confined by the parents below.
+/// Tries what the egress proxy must not be able to do and reports it.
+#[test]
+#[ignore = "run confined by the AppContainer tests"]
+fn confined_probe() {
+    let Ok(file) = std::env::var("RTS_HV_PROBE_FILE") else {
+        return;
+    };
+    let port: u16 = std::env::var("RTS_HV_PROBE_PORT").unwrap().parse().unwrap();
+    let read = match std::fs::read(&file) {
+        Ok(_) => "read=ok".to_string(),
+        Err(e) => format!("read=denied({:?})", e.kind()),
+    };
+    let connect = match std::net::TcpStream::connect_timeout(
+        &([127, 0, 0, 1], port).into(),
+        Duration::from_secs(3),
+    ) {
+        Ok(_) => "loopback=ok".to_string(),
+        Err(e) => format!("loopback=denied({:?})", e.kind()),
+    };
+    println!("[probe] {read} {connect}");
+}
+
+fn confined_probe_output(file: &std::path::Path, port: u16) -> String {
+    use std::io::Read;
+    // The child inherits this environment (CreateProcessW, no explicit block).
+    // SAFETY: these tests run with --test-threads=1.
+    unsafe {
+        std::env::set_var("RTS_HV_PROBE_FILE", file);
+        std::env::set_var("RTS_HV_PROBE_PORT", port.to_string());
+    }
+    // RTS_HV_PROBE_EXE: a minimal probe executable instead of this test
+    // binary (which loads the whole rts library).
+    let (exe, args): (std::path::PathBuf, Vec<&str>) = match std::env::var_os("RTS_HV_PROBE_EXE") {
+        Some(p) => (p.into(), vec![]),
+        None => (
+            std::env::current_exe().unwrap(),
+            vec![
+                "backend::hyperv::live::confined_probe",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ],
+        ),
+    };
+    let (proxy, stdin, mut stdout) = super::appcontainer::spawn(&exe, &args, false).unwrap();
+    drop(stdin);
+    let mut out = String::new();
+    let _ = stdout.read_to_string(&mut out);
+    std::thread::sleep(Duration::from_millis(200));
+    let code = proxy.exit_code();
+    drop(proxy);
+    match out.lines().find(|l| l.starts_with("[probe]")) {
+        Some(l) => l.to_string(),
+        None => format!(
+            "[probe] no probe line; exit {:?}; output {:?}",
+            code.map(|c| format!("0x{c:08X}")),
+            out.chars().take(400).collect::<String>()
+        ),
+    }
+}
+
+#[test]
+#[ignore = "starts an AppContainer process"]
+fn the_confined_proxy_cannot_read_the_user_profile_or_reach_host_loopback() {
+    let profile = std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap());
+    let secret = profile.join(format!("rts-probe-{}.txt", new_vm_id()));
+    std::fs::write(&secret, b"must not leak").unwrap();
+    assert!(
+        std::fs::read(&secret).is_ok(),
+        "control: rts itself can read it"
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
+        "control: unconfined loopback works"
+    );
+    let line = confined_probe_output(&secret, port);
+    let _ = std::fs::remove_file(&secret);
+    eprintln!("[hv-live] {line}");
+    assert!(
+        line.contains("read=denied"),
+        "the confined proxy read the user's profile: {line}"
+    );
+    assert!(
+        line.contains("loopback=denied"),
+        "the confined proxy reached host loopback: {line}"
+    );
+}
+
+/// Child half of the job-object test: start a confined proxy, report its
+/// pid, then wait to be killed.
+#[test]
+#[ignore = "run by a_killed_rts_takes_its_confined_proxy_down"]
+fn child_holds_a_confined_proxy() {
+    let Ok(out) = std::env::var("RTS_HV_PROXY_OUT") else {
+        return;
+    };
+    let exe = std::env::var_os("RTS_EGRESS_PROXY_EXE")
+        .expect("RTS_EGRESS_PROXY_EXE names rts-egress.exe");
+    let (proxy, _stdin, _stdout) =
+        super::appcontainer::spawn(std::path::Path::new(&exe), &[], false).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    // pid, then the exit code if the proxy has already ended.
+    std::fs::write(
+        &out,
+        format!(
+            "{} {:?}",
+            proxy.pid,
+            proxy.exit_code().map(|c| format!("0x{c:08X}"))
+        ),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_secs(600));
+}
+
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: plain process queries; the handle is closed below.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            // No such process, or one we may not open (which still exists).
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(h, &mut code) != 0;
+        CloseHandle(h);
+        ok && code == 259 // STILL_ACTIVE
+    }
+}
+
+#[test]
+#[ignore = "starts an AppContainer process"]
+fn a_killed_rts_takes_its_confined_proxy_down() {
+    let out = std::env::temp_dir().join(format!("rts-proxy-{}", new_vm_id()));
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "backend::hyperv::live::child_holds_a_confined_proxy",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("RTS_HV_PROXY_OUT", &out)
+        .spawn()
+        .unwrap();
+    let t0 = Instant::now();
+    while !out.exists() && t0.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let report = std::fs::read_to_string(&out).expect("the child never started its proxy");
+    let pid: u32 = report.split_whitespace().next().unwrap().parse().unwrap();
+    eprintln!("[hv-live] child reports proxy {report}");
+    assert!(
+        process_alive(pid),
+        "the proxy is running before the kill: {report}"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let t1 = Instant::now();
+    while process_alive(pid) {
+        assert!(
+            t1.elapsed() < Duration::from_secs(10),
+            "the proxy {pid} outlived rts"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!(
+        "[hv-live] the confined proxy {pid} was gone {} ms after rts was killed",
+        t1.elapsed().as_millis()
+    );
+    let _ = std::fs::remove_file(out);
+}

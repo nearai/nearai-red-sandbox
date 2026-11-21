@@ -26,7 +26,11 @@ fn imported_dlls(d: &[u8]) -> Vec<String> {
     let table: Vec<(usize, usize, usize)> = (0..sections)
         .map(|i| {
             let s = opt + opt_size + i * 40;
-            (u32_at(d, s + 12), u32_at(d, s + 8).max(u32_at(d, s + 16)), u32_at(d, s + 20))
+            (
+                u32_at(d, s + 12),
+                u32_at(d, s + 8).max(u32_at(d, s + 16)),
+                u32_at(d, s + 20),
+            )
         })
         .collect();
     let at = |rva: usize| {
@@ -51,6 +55,45 @@ fn imported_dlls(d: &[u8]) -> Vec<String> {
 fn computecore_dll_is_not_a_load_time_import_of_rts_exe() {
     let exe = std::fs::read(env!("CARGO_BIN_EXE_rts")).unwrap();
     let dlls = imported_dlls(&exe);
-    assert!(dlls.iter().any(|d| d == "kernel32.dll"), "the parser found no kernel32.dll: {dlls:?}");
-    assert!(!dlls.iter().any(|d| d == "computecore.dll"), "rts.exe imports computecore.dll: {dlls:?}");
+    assert!(
+        dlls.iter().any(|d| d == "kernel32.dll"),
+        "the parser found no kernel32.dll: {dlls:?}"
+    );
+    assert!(
+        !dlls.iter().any(|d| d == "computecore.dll"),
+        "rts.exe imports computecore.dll: {dlls:?}"
+    );
+}
+
+/// The confined egress proxy must load only what serving CONNECT needs.
+/// user32, shell32, COM and TLS DLLs need a window station or desktop to
+/// initialise, which an AppContainer process does not get, so the proxy
+/// would die at start (STATUS_DLL_INIT_FAILED). Built with
+/// `--profile egress`; CI passes the path in RTS_EGRESS_EXE.
+#[test]
+#[ignore = "needs RTS_EGRESS_EXE, an rts-egress.exe built with --profile egress"]
+fn rts_egress_exe_imports_no_ui_shell_com_or_tls_dlls() {
+    let path = std::env::var("RTS_EGRESS_EXE").expect("RTS_EGRESS_EXE");
+    let dlls = imported_dlls(&std::fs::read(path).unwrap());
+    assert!(
+        dlls.iter().any(|d| d == "kernel32.dll") && dlls.iter().any(|d| d == "ws2_32.dll"),
+        "{dlls:?}"
+    );
+    for forbidden in [
+        "user32.dll",
+        "gdi32.dll",
+        "shell32.dll",
+        "ole32.dll",
+        "oleaut32.dll",
+        "combase.dll",
+        "crypt32.dll",
+        "ncrypt.dll",
+        "secur32.dll",
+        "computecore.dll",
+    ] {
+        assert!(
+            !dlls.iter().any(|d| d == forbidden),
+            "rts-egress.exe imports {forbidden}: {dlls:?}"
+        );
+    }
 }

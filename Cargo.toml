@@ -14,6 +14,11 @@ path = "src/lib.rs"
 name = "rts"
 path = "src/main.rs"
 
+# The confined Windows egress proxy (see the file).
+[[bin]]
+name = "rts-egress"
+path = "src/bin/rts-egress.rs"
+
 [dependencies]
 base64 = "0.23.1"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -68,6 +73,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_HostComputeSystem",
@@ -81,3 +87,13 @@ windows-sys = { version = "=0.61.2", features = [
 
 [profile.release]
 panic = "abort"
+
+# rts-egress, the confined Windows egress proxy: built with this profile so
+# whole-program optimisation leaves only the code (and DLL imports) serving
+# CONNECT needs. Without it the binary links the rts library's TLS, shell
+# and COM imports, whose initialisation needs a desktop an AppContainer
+# process does not get. tests/windows_imports.rs checks the result.
+[profile.egress]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

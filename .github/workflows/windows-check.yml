@@ -39,3 +39,9 @@ jobs:
         run: cargo test --locked --target x86_64-pc-windows-msvc --lib --bins
       - name: rts.exe starts without Hyper-V (no computecore.dll import)
         run: cargo test --locked --target x86_64-pc-windows-msvc --test windows_imports
+      - name: rts-egress.exe imports nothing an AppContainer cannot load
+        shell: bash
+        run: |
+          cargo build --locked --target x86_64-pc-windows-msvc --profile egress --bin rts-egress
+          RTS_EGRESS_EXE=target/x86_64-pc-windows-msvc/egress/rts-egress.exe \
+            cargo test --locked --target x86_64-pc-windows-msvc --test windows_imports -- --ignored

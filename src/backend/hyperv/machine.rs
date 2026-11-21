@@ -11,7 +11,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 
 use super::doc::{EGRESS_PORT, EXEC_PORT, VmSpec, document, new_vm_id, service_id};
-use super::egress::{Audit, Policy, dial, serve_one};
+use super::egress::{Audit, Policy};
 use super::exec::{Connect, GuestExec};
 use super::props::{VmState, wait_ready};
 use crate::backend::{Machine, Monitor, Pinned};
@@ -49,6 +49,8 @@ pub trait VmHost: Send + Sync {
     type Listener: Accept;
     /// Listen for the guest's connections to `service` of VM `id` only.
     fn listen(&self, id: &str, service: &str) -> io::Result<Self::Listener>;
+    /// Start the egress proxy for `policy` in its own (confined) process.
+    fn spawn_proxy(&self, policy: &Policy) -> io::Result<ProxyChannel>;
     /// An existing compute system by id, or `None` if there is none.
     fn open(&self, id: &str) -> io::Result<Option<Arc<dyn VmHandle>>>;
     fn create(&self, id: &str, document: &str) -> io::Result<Arc<dyn VmHandle>>;
@@ -122,10 +124,18 @@ pub struct HyperVMachine<H: VmHost> {
 /// The running egress path of a machine with an allowlist.
 struct Egress {
     policy: Policy,
-    audit: Arc<Audit>,
     audit_path: PathBuf,
-    /// Set when the accept loop ends: the session must stop.
+    /// Set when the accept loop or the proxy ends: the session must stop.
     stopped: Arc<Mutex<Option<String>>>,
+    /// The confined proxy process; dropping it ends the process.
+    _proxy: Box<dyn Send>,
+}
+
+/// A started egress proxy: rts's ends of its channel, and what keeps it alive.
+pub struct ProxyChannel {
+    pub to_proxy: Box<dyn io::Write + Send>,
+    pub from_proxy: Box<dyn io::Read + Send>,
+    pub guard: Box<dyn Send>,
 }
 
 impl<H: VmHost> HyperVMachine<H> {
@@ -176,32 +186,32 @@ impl<H: VmHost> HyperVMachine<H> {
             .host
             .listen(id, &service_id(EGRESS_PORT))
             .map_err(|err| Error::Other(format!("cannot serve {}'s egress: {err}", self.name)))?;
+        // The proxy, not rts, reads CONNECT requests and dials out; rts only
+        // carries the guest's bytes to it and records its audit lines.
+        let proxy = self.host.spawn_proxy(&policy).map_err(|err| {
+            Error::Other(format!("cannot start {}'s egress proxy: {err}", self.name))
+        })?;
         let stopped = Arc::new(Mutex::new(None));
+        let mux =
+            super::mux::MuxParent::start(proxy.to_proxy, proxy.from_proxy, audit, stopped.clone());
         {
-            let (policy, audit, stopped) = (policy.clone(), audit.clone(), stopped.clone());
+            let stopped = stopped.clone();
             std::thread::spawn(move || {
                 loop {
-                    match listener.accept() {
-                        Ok(conn) => {
-                            let (policy, audit) = (policy.clone(), audit.clone());
-                            std::thread::spawn(move || {
-                                let _ = serve_one(conn, &policy, &audit, dial);
-                            });
-                        }
-                        Err(err) => {
-                            *stopped.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(format!("network-lost: the egress listener stopped: {err}"));
-                            return;
-                        }
+                    let attached = listener.accept().and_then(|conn| mux.attach(conn));
+                    if let Err(err) = attached {
+                        *stopped.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(format!("network-lost: the egress listener stopped: {err}"));
+                        return;
                     }
                 }
             });
         }
         *self.egress.lock().unwrap_or_else(|e| e.into_inner()) = Some(Egress {
             policy,
-            audit,
             audit_path: e.attach_log.to_path_buf(),
             stopped,
+            _proxy: proxy.guard,
         });
         Ok(())
     }
@@ -396,7 +406,6 @@ impl<H: VmHost> Machine for HyperVMachine<H> {
     fn finish(&self, network_audit: &Path, log: &dyn Fn(&str)) {
         let egress = self.egress.lock().unwrap_or_else(|e| e.into_inner());
         let Some(e) = egress.as_ref() else { return };
-        let _ = &e.audit;
         if let Err(err) = std::fs::copy(&e.audit_path, network_audit) {
             log(&format!(
                 "[rts] {}: cannot copy the egress audit: {err}",
@@ -495,6 +504,27 @@ impl VmHost for HcsHost {
     fn open(&self, id: &str) -> io::Result<Option<Arc<dyn VmHandle>>> {
         Ok(super::hcs::ComputeSystem::open(id)?.map(|c| Arc::new(c) as Arc<dyn VmHandle>))
     }
+    /// rts-egress.exe in an AppContainer inside a kill-on-close job (see
+    /// appcontainer.rs).
+    fn spawn_proxy(&self, policy: &Policy) -> io::Result<ProxyChannel> {
+        // rts-egress.exe beside rts.exe; RTS_EGRESS_PROXY_EXE names it
+        // elsewhere (the containment test harness).
+        let exe = match std::env::var_os("RTS_EGRESS_PROXY_EXE") {
+            Some(p) => std::path::PathBuf::from(p),
+            None => std::env::current_exe()?
+                .parent()
+                .ok_or_else(|| io::Error::other("rts.exe has no directory"))?
+                .join(super::appcontainer::EXECUTABLE),
+        };
+        let (proxy, mut to, from) =
+            super::appcontainer::spawn(&exe, &[], super::mux::needs_private_network(policy))?;
+        io::Write::write_all(&mut to, format!("{}\n", policy.to_json()).as_bytes())?;
+        Ok(ProxyChannel {
+            to_proxy: Box::new(to),
+            from_proxy: Box::new(from),
+            guard: Box::new(proxy),
+        })
+    }
     fn create(&self, id: &str, document: &str) -> io::Result<Arc<dyn VmHandle>> {
         Ok(Arc::new(super::hcs::ComputeSystem::create(id, document)?))
     }
@@ -579,6 +609,20 @@ mod tests {
     impl VmHost for Arc<FakeHost> {
         type Conn = LocalConn;
         type Listener = FakeListener;
+        /// The proxy's main loop on a thread, over socket pairs.
+        fn spawn_proxy(&self, policy: &Policy) -> io::Result<ProxyChannel> {
+            let (mut to, proxy_in) = UnixStream::pair()?;
+            let (proxy_out, from) = UnixStream::pair()?;
+            io::Write::write_all(&mut to, format!("{}\n", policy.to_json()).as_bytes())?;
+            std::thread::spawn(move || {
+                super::super::mux::proxy_main(proxy_in, Box::new(proxy_out))
+            });
+            Ok(ProxyChannel {
+                to_proxy: Box::new(to),
+                from_proxy: Box::new(from),
+                guard: Box::new(()),
+            })
+        }
         fn open(&self, id: &str) -> io::Result<Option<Arc<dyn VmHandle>>> {
             Ok(self
                 .opened
