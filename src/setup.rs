@@ -202,6 +202,12 @@ pub fn mvm() -> Component {
 pub fn mvm_for(t: Target) -> Component {
     let (triple, sha256) = match t {
         Target::MacosAarch64 => ("aarch64-apple-darwin", "1f2c80b253add28c3856080e3f3a10aa1163f1aef0a7d413ded15100bdcd0c69"),
+        // TODO(linux-mvm-pin): Linux x86_64 must move to the nearai/mvm fork
+        // release v0.28.0-rts.1 (mvmctl-x86_64-unknown-linux-gnu.tar.gz from
+        // https://github.com/nearai/mvm/releases, with MVM_VERSION 0.28.0-rts.1
+        // on this target) once that release exists and its sha256 is known.
+        // Until then this is upstream v0.22.0, whose Linux egress is broken
+        // (tinylabscom/mvm#3962).
         Target::LinuxX86_64 => ("x86_64-unknown-linux-gnu", "502e84ea3fa1ff04b0138fb6c3cb47b3a72c730d72c8f468df55e01d99c94d64"),
         Target::LinuxAarch64 => ("aarch64-unknown-linux-gnu", "dafb1d9ebb9480b26841c772bee6322015b727b8cc2bc67d82056631101122f9"),
     };
