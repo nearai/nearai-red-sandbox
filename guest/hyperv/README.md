@@ -59,16 +59,16 @@ served hvexec to the host.
 Build:
 
 ```sh
-cd guest/hyperv/agent
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
-  cargo build --release --target x86_64-unknown-linux-musl
+guest/hyperv/build-agent.sh <out-dir>     # needs docker
 ```
 
-It is a static-pie binary. Its only dependency is the libc rts already
-uses. The build verified here (rustc 1.100.0) has sha256
-`d3299687563be85c03e6548c0ff6413d80a9cad0925fcf112d39d8c07af65bee`.
-The agent build is not yet reproducible across toolchains; the release
-pipeline will pin the toolchain.
+It builds in a digest-pinned `rust:1.100.0-slim-trixie` image (amd64)
+from `agent/Cargo.lock`. It links with rust-lld and remaps the build
+paths, so two runs give identical bytes on any docker host. The result is
+a static-pie binary whose only dependency is the libc rts already uses.
+
+Two builds (an arm64 Mac under Rosetta) gave
+`0d376deb57a697258e3ed2c8c1dddfa56759185fb5c4e4d868b2ca93213f6855`.
 
 ## Initramfs
 
@@ -90,4 +90,19 @@ What the script does:
 Standard library only.
 
 With the agent above, two runs gave
-`1286b5648649d1126b9416d111e6f98946632861aa89f7f956c9bcb91e42635a`.
+`cdef2be2e9e687ebdd32b96717e687cb5b43723c142ddcf5a71b4d5b056b0a00`.
+
+## Release
+
+`.github/workflows/hyperv-guest.yml` runs on every pull request that
+touches the guest. It rebuilds `vmlinuz` and `initramfs.cpio.gz` from this
+directory, and `check-pins.sh` fails the run unless both match the pins in
+`src/backend/hyperv/backend.rs`. Those are the digests rts checks before
+every boot.
+
+The workflow publishes only on a `hyperv-guest-v*` tag that carries an SSH
+signature from a key in `allowed_signers`. It reads that file from the
+default branch (`main`), never from the tag. So until this directory,
+including `allowed_signers`, is on `main`, no tag can be verified and
+nothing is published. Publishing creates the release that `rts setup`
+downloads from.

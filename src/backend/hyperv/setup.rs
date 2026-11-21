@@ -11,9 +11,9 @@ use std::path::Path;
 use super::backend::{INITRD_FILE, INITRD_SHA256, KERNEL_FILE, KERNEL_SHA256};
 use crate::setup::{Fetch, download};
 
-/// Where the guest files are published.
-/// TODO(hyperv-guest-release): the release that publishes vmlinuz and
-/// initramfs.cpio.gz (built by guest/hyperv) is not decided yet.
+/// Where the guest files are published: the hyperv-guest-v1 release, made
+/// by .github/workflows/hyperv-guest.yml from guest/hyperv on a signed tag
+/// (owner decision). The pins, not the release, decide what is accepted.
 pub const GUEST_RELEASE: &str =
     "https://github.com/nearai/nearai-red-sandbox/releases/download/hyperv-guest-v1";
 

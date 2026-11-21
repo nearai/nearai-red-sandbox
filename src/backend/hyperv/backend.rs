@@ -16,7 +16,7 @@ use crate::backend::{Backend, HostCheck, Machine};
 /// sha256 of the guest kernel built by guest/hyperv/build.sh.
 pub const KERNEL_SHA256: &str = "a331c0ab03687e36fea6ecca473c5fdb0351e76c0331f7be8fddd1cfe62b2d58";
 /// sha256 of the guest initramfs built by guest/hyperv/build-initramfs.py.
-pub const INITRD_SHA256: &str = "1286b5648649d1126b9416d111e6f98946632861aa89f7f956c9bcb91e42635a";
+pub const INITRD_SHA256: &str = "cdef2be2e9e687ebdd32b96717e687cb5b43723c142ddcf5a71b4d5b056b0a00";
 
 pub const KERNEL_FILE: &str = "vmlinuz";
 pub const INITRD_FILE: &str = "initramfs.cpio.gz";
