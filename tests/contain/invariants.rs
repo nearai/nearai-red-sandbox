@@ -9,19 +9,34 @@
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(unix)]
 use rts::backend::mvm::{Flavor, MvmBackend};
 use rts::backend::{Backend, Machine};
+#[cfg(unix)]
 use rts::config::{Defaults, parse_config};
 use rts::network::{Probe, SystemResolver, probe_argv, run_probes};
 use rts::protocol::random_hex;
 use rts::sandbox::{CopyOutResult, CreateSpec, Egress, ExecOptions, sv};
-use rts::session::{
-    Deps, SessionPaths, initialize_guest_storage, prepare_session_dirs, session_paths,
-};
+#[cfg(unix)]
+use rts::session::Deps;
+use rts::session::{SessionPaths, initialize_guest_storage, prepare_session_dirs, session_paths};
 
+#[cfg(unix)]
 use crate::harness::{NETWORK_TEST_HOURS, mvm, tempdir};
+#[cfg(unix)]
 use rts::config::default_image;
+#[cfg(unix)]
 use std::path::Path;
+
+#[cfg(windows)]
+const NETWORK_TEST_HOURS: u32 = 1;
+
+#[cfg(windows)]
+fn tempdir(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("rts-{tag}-{}", random_hex(6)));
+    fs::create_dir_all(&d).unwrap();
+    d
+}
 
 /// A machine removed when dropped, so a failing test still cleans up.
 struct Guest(Box<dyn Machine>);
@@ -41,6 +56,7 @@ struct Rig {
     image: String,
 }
 
+#[cfg(unix)]
 /// mvmctl and the guest image. On HVF, the containment harness, which also
 /// probes the patched supervisor. On other flavors, which have no
 /// supervisor, `RTS_MVMCTL` (or where setup installs it) and `RTS_IMAGE`.
@@ -65,6 +81,7 @@ fn prerequisites() -> (PathBuf, String) {
 }
 
 /// This host's backend for a fresh session id, built as a session builds it.
+#[cfg(unix)]
 fn rig() -> Rig {
     let (mvmctl, image) = prerequisites();
     let dir = tempdir("inv");
@@ -87,6 +104,26 @@ fn rig() -> Rig {
         paths,
         dir,
         image,
+    }
+}
+
+/// The Hyper-V backend for a fresh session id, built as a session builds
+/// it: this user's guest image directory (`RTS_HV_DIR` or LOCALAPPDATA).
+#[cfg(windows)]
+fn rig() -> Rig {
+    let dir = tempdir("inv");
+    let id = random_hex(6);
+    let paths = session_paths(&id, &dir.join("sessions"), &dir.join("runtime"));
+    prepare_session_dirs(&paths).unwrap();
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let backend: Box<dyn Backend> =
+        Box::new(rts::backend::hyperv::backend::HyperVBackend::windows(&env).unwrap());
+    eprintln!("[contain] invariants on Hyper-V");
+    Rig {
+        backend,
+        paths,
+        dir,
+        image: String::new(),
     }
 }
 
@@ -115,7 +152,7 @@ fn last_line(m: &Guest, argv: &[String]) -> String {
 }
 
 #[test]
-#[ignore = "real mvm"]
+#[ignore = "boots a real VM"]
 fn invariant_no_allowlist_means_no_route_out() {
     let r = rig();
     let m = create(&r, None);
@@ -190,7 +227,7 @@ fn invariant_the_allowlist_is_exact_and_pinned() {
 }
 
 #[test]
-#[ignore = "real mvm"]
+#[ignore = "boots a real VM"]
 fn invariant_no_host_files_except_the_in_copy_and_the_out_export() {
     let r = rig();
     let token = random_hex(16);
@@ -236,12 +273,15 @@ fn invariant_no_host_files_except_the_in_copy_and_the_out_export() {
 }
 
 #[test]
-#[ignore = "real mvm"]
+#[ignore = "boots a real VM"]
 fn invariant_the_vmm_is_confirmed_and_held_to_the_rss_ceiling() {
     let r = rig();
     let m = create(&r, None);
     let monitor = m.0.monitor().expect("the VMM is confirmed");
     let rss = monitor.sample(u64::MAX).unwrap();
+    // On Windows this is the VM's configured (assigned) size, not measured
+    // usage; the description says which.
+    eprintln!("[contain] {} MiB: {}", rss, monitor.describe());
     assert!(rss > 0, "{}", monitor.describe());
     assert!(monitor.sample(0).unwrap_err().contains("ceiling"));
     drop(m);

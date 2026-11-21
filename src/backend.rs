@@ -23,7 +23,7 @@ pub mod kvm;
 pub mod mvm;
 
 /// The refusal on a host with no backend yet (Windows until Hyper-V lands).
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 const NO_BACKEND: &str = "rts has no sandbox backend on this OS yet (the Hyper-V backend is in progress)";
 
 /// IPs the egress path pinned for each allowlisted name.
@@ -84,7 +84,12 @@ pub fn for_preflight(
     {
         Ok(Box::new(mvm::MvmBackend::for_preflight(cfg, env, empty_git_config)?))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let _ = (cfg, empty_git_config);
+        Ok(Box::new(hyperv::backend::HyperVBackend::windows(env)?))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (cfg, env, empty_git_config);
         Err(NO_BACKEND.into())
@@ -101,7 +106,12 @@ pub fn for_session(
     {
         Ok(Box::new(mvm::MvmBackend::for_session(cfg, deps, paths)?))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let _ = (cfg, paths);
+        Ok(Box::new(hyperv::backend::HyperVBackend::windows(&deps.env)?))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (cfg, deps, paths);
         Err(NO_BACKEND.into())

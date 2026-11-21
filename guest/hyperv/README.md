@@ -66,7 +66,7 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
 
 It is a static-pie binary. Its only dependency is the libc rts already
 uses. The build verified here (rustc 1.100.0) has sha256
-`475d0ebd97a18856329eef916b788ff1fb8262aaa6f1923f2547cbc5821a3d04`.
+`d3299687563be85c03e6548c0ff6413d80a9cad0925fcf112d39d8c07af65bee`.
 The agent build is not yet reproducible across toolchains; the release
 pipeline will pin the toolchain.
 
@@ -90,4 +90,4 @@ What the script does:
 Standard library only.
 
 With the agent above, two runs gave
-`86be012012ab96c290f563d591440f691a4c8b59307e4cd6ba4e923fb22cdbfd`.
+`1286b5648649d1126b9416d111e6f98946632861aa89f7f956c9bcb91e42635a`.

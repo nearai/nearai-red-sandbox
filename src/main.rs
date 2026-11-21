@@ -305,7 +305,23 @@ fn parse_update(flags: &[&str]) -> Result<Action, String> {
 
 const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network] [--no-splash]\n                  [--cpus N] [--memory SIZE] [--prompt TEXT | --prompt-file PATH]\n       rts launch --prompt \"Review /in and save findings to /out/report.md\"\n       rts launch --prompt-file ./handoff.md       # submit a UTF-8 task file\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts launch --cpus 4 --memory 8G             # a bigger VM (default 2 vCPUs, 2048 MiB)\n       rts trial --key-file PATH   # import your individual sponsored allowance\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nThe guest has no network unless the session file's network.allow or --allow-host names entries\n(HOST, HOST:PORT, IP:PORT or [IPv6]:PORT, port 443 by default, or the preset packages);\n--no-network drops them all. TCP only, and every connection is logged. A session stops with\nsession-limit after limits.sessionHours (default 24), network-lost when the attached\nmvmctl machine run that keeps egress up exits, and network-mismatch when mvm pinned an address\nrts did not validate; /out is exported and the VM removed in every case.\n--cpus and --memory (MiB, or with an M or G suffix) override limits.cpus and limits.memoryMiB,\nup to this host's CPU count and RAM; the host RSS watchdog follows memory unless the session\nfile sets limits.hostRssCeilingMiB.\n--prompt or --prompt-file submits one initial task after the sandbox plugin is verified,\nthen leaves OpenCode interactive. Prompt files are relative to the invoking directory,\nmust be UTF-8 and at most 64 KiB; empty/whitespace-only or NUL-containing text is refused.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn setup_command(o: &setup::SetupOptions) -> Result<i32, String> {
+    use rts::backend::hyperv::setup as hv;
+    use windows_sys::Win32::System::SystemInformation::GetProductInfo;
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let mut product_type = 0u32;
+    // SAFETY: a plain query with a valid out-pointer.
+    unsafe { GetProductInfo(10, 0, 0, 0, &mut product_type) };
+    let hyperv = rts::backend::hyperv::hcs::available().err().map(|e| e.to_string());
+    let fetch = setup::HttpsFetch::new()?;
+    for line in hv::run(o.check, &env, product_type, hyperv.as_deref(), &fetch, hv::GUEST_RELEASE)? {
+        println!("{line}");
+    }
+    Ok(0)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn setup_command(_o: &setup::SetupOptions) -> Result<i32, String> {
     Err("rts setup is not supported on this OS yet".into())
 }

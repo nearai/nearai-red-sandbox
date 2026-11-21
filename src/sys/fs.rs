@@ -87,6 +87,13 @@ pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
     }
 }
 
+/// The current user's SID ("S-1-5-21-..."), which owner-only DACLs and
+/// the Hyper-V backend's hvsocket descriptors name.
+#[cfg(windows)]
+pub fn current_user_sid() -> io::Result<String> {
+    win::user_sid()
+}
+
 /// Narrow an existing directory to owner-only.
 pub fn restrict_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]

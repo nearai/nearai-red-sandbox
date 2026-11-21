@@ -374,6 +374,12 @@ impl Plan {
         &self.entries
     }
 
+    /// The addresses `name` resolved to when the plan was made: the only
+    /// ones a pinned egress path may connect to for it.
+    pub fn resolved_ips(&self, name: &str) -> &[IpAddr] {
+        self.resolved.get(name).map(Vec::as_slice).unwrap_or(&[])
+    }
+
     /// One value per entry, as mvm v0.22.0 parses them: it splits at the
     /// last `:` and keeps the host verbatim, so IPv6 goes unbracketed.
     pub fn allow_hosts(&self) -> Vec<AllowHost> {
