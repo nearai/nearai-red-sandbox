@@ -706,3 +706,17 @@ fn cloud_session_cancellation_uses_supplied_callback_before_network() {
         "NEAR AI sign-in interrupted"
     );
 }
+
+#[test]
+fn only_macos_and_linux_have_a_key_store_and_windows_says_why() {
+    assert_eq!(storage::store_refusal("macos"), None);
+    assert_eq!(storage::store_refusal("linux"), None);
+    let windows = storage::store_refusal("windows").unwrap();
+    assert!(windows.contains("not available on Windows"), "{windows}");
+    assert!(windows.contains("app"), "{windows}");
+    assert!(
+        !windows.contains("file"),
+        "no plaintext fallback is offered: {windows}"
+    );
+    assert!(storage::store_refusal("freebsd").is_some());
+}
