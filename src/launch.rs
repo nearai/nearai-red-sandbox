@@ -801,6 +801,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn unpatched_supervisor_is_rejected_before_credentials_or_browser_login() {
         struct StockSupervisor;
         impl session::Host for StockSupervisor {

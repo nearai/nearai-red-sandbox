@@ -344,6 +344,40 @@ mod win {
         })
     }
 
+    /// `sddl` as Windows prints it back (well-known accounts become
+    /// aliases such as `LA`), for comparing with `dacl_sddl`.
+    #[cfg(test)]
+    pub(super) fn canonical_sddl(sddl: &str) -> io::Result<String> {
+        use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+        let wide: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated; both allocations are freed below.
+        unsafe {
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let mut s: *mut u16 = std::ptr::null_mut();
+            let ok = ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                sd,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut s,
+                std::ptr::null_mut(),
+            );
+            LocalFree(sd);
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(take_local_wide(s))
+        }
+    }
+
     /// The DACL of `path` as SDDL, for tests.
     #[cfg(test)]
     pub(super) fn dacl_sddl(path: &Path) -> io::Result<String> {
@@ -450,8 +484,37 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn owner_only(inherit: bool) -> String {
-        win::owner_only_sddl(&win::user_sid().unwrap(), inherit)
+    /// (DACL flags, ACEs) of an SDDL string "D:<flags>(ace)(ace)...".
+    fn split(sddl: &str) -> (String, Vec<String>) {
+        let body = sddl
+            .strip_prefix("D:")
+            .unwrap_or_else(|| panic!("not a DACL: {sddl}"));
+        let at = body.find('(').unwrap_or(body.len());
+        let aces = body[at..]
+            .trim_matches(|c| c == '(' || c == ')')
+            .split(")(")
+            .map(str::to_string);
+        (
+            body[..at].to_string(),
+            aces.filter(|a| !a.is_empty()).collect(),
+        )
+    }
+
+    /// The single ACE `open_private` and friends set, as Windows prints it.
+    fn owner_ace(inherit: bool) -> String {
+        let want =
+            win::canonical_sddl(&win::owner_only_sddl(&win::user_sid().unwrap(), inherit)).unwrap();
+        let (_, aces) = split(&want);
+        assert_eq!(aces.len(), 1, "{want}");
+        aces[0].clone()
+    }
+
+    /// Protected (no inherited ACEs from above) with exactly the owner ACE.
+    fn assert_owner_only(path: &Path, inherit: bool) {
+        let got = win::dacl_sddl(path).unwrap();
+        let (flags, aces) = split(&got);
+        assert!(flags.contains('P'), "DACL not protected: {got}");
+        assert_eq!(aces, [owner_ace(inherit)], "{got}");
     }
 
     #[test]
@@ -462,7 +525,7 @@ mod tests {
             .unwrap()
             .write_all(b"secret")
             .unwrap();
-        assert_eq!(win::dacl_sddl(&p).unwrap(), owner_only(false));
+        assert_owner_only(&p, false);
         assert!(
             open_private(&p, Create::New).is_err(),
             "New refuses an existing file"
@@ -482,7 +545,7 @@ mod tests {
             .write_all(b"cd")
             .unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"abcd");
-        assert_eq!(win::dacl_sddl(&p).unwrap(), owner_only(false));
+        assert_owner_only(&p, false);
         open_private(&p, Create::Truncate)
             .unwrap()
             .write_all(b"x")
@@ -495,9 +558,14 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("f");
         std::fs::write(&p, "x").unwrap();
-        assert_ne!(win::dacl_sddl(&p).unwrap(), owner_only(false));
+        let (_, before) = split(&win::dacl_sddl(&p).unwrap());
+        assert_ne!(
+            before,
+            [owner_ace(false)],
+            "the temp dir already gives only the owner access"
+        );
         restrict_file(&std::fs::OpenOptions::new().write(true).open(&p).unwrap()).unwrap();
-        assert_eq!(win::dacl_sddl(&p).unwrap(), owner_only(false));
+        assert_owner_only(&p, false);
     }
 
     #[test]
@@ -506,24 +574,24 @@ mod tests {
         let p = d.path().join("a").join("b");
         create_private_dir_all(&p).unwrap();
         create_private_dir_all(&p).unwrap(); // an existing directory is fine, as on Unix
-        assert_eq!(
-            win::dacl_sddl(&d.path().join("a")).unwrap(),
-            owner_only(true)
-        );
-        assert_eq!(win::dacl_sddl(&p).unwrap(), owner_only(true));
+        assert_owner_only(&d.path().join("a"), true);
+        assert_owner_only(&p, true);
+
+        // A plain file inside inherits exactly the owner ACE, nothing else.
         let plain = p.join("plain");
         std::fs::write(&plain, "x").unwrap();
-        let inherited = win::dacl_sddl(&plain).unwrap();
-        assert!(inherited.contains(&win::user_sid().unwrap()), "{inherited}");
-        assert_eq!(
-            inherited.matches("(A;").count(),
-            1,
-            "only the owner ACE is inherited: {inherited}"
+        let got = win::dacl_sddl(&plain).unwrap();
+        let (_, aces) = split(&got);
+        let trustee = owner_ace(false).rsplit(';').next().unwrap().to_string();
+        assert_eq!(aces.len(), 1, "{got}");
+        assert!(
+            aces[0].starts_with("A;ID;FA;") && aces[0].ends_with(&trustee),
+            "{got}"
         );
 
         let open = d.path().join("open");
         std::fs::create_dir(&open).unwrap();
         restrict_dir(&open).unwrap();
-        assert_eq!(win::dacl_sddl(&open).unwrap(), owner_only(true));
+        assert_owner_only(&open, true);
     }
 }

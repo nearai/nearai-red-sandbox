@@ -245,6 +245,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn host_sh_workdir() {
         let r = run_wrapped_locally(&s(&["pwd"]), 10, 65536, Some("/tmp"));
         let actual = std::fs::canonicalize(String::from_utf8_lossy(&r.stdout).trim()).unwrap();

@@ -340,7 +340,17 @@ mod tests {
         assert_eq!(names, vec![std::ffi::OsString::from("sentinel")]);
     }
 
+    #[cfg(windows)]
     #[test]
+    fn extraction_refuses_on_windows_until_its_path_rules_land() {
+        let e = env();
+        let r = extract_tar(&tar(&[file("./a.txt", b"x")]), &e.dest, LIM);
+        assert!(format!("{r:?}").contains("not supported on Windows"), "{r:?}");
+        assert!(!e.dest.join("a.txt").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn dirs_and_files_extract_byte_exact() {
         let e = env();
         let bin: Vec<u8> = (0..3000u32).map(|i| (i * 7 % 251) as u8).collect();
@@ -351,6 +361,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn missing_parent_entries_and_prefix() {
         let e = env();
         let mut p = file("leaf.txt", b"p");
@@ -361,6 +372,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn empty_archive_is_empty_dir() {
         let e = env();
         assert_eq!(extract_tar(&tar(&[]), &e.dest, LIM).unwrap(), Extracted { files: 0, bytes: 0 });
@@ -368,6 +380,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn host_tar_round_trips() {
         let e = env();
         let src = e.root.join("src");

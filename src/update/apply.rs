@@ -242,6 +242,8 @@ fn private_stage(_dir: &Path) -> std::io::Result<tempfile::TempDir> {
 }
 
 #[cfg(test)]
+// Most of the rig serves the install.sh tests, which are Unix only.
+#[cfg_attr(not(unix), allow(dead_code))]
 mod tests {
     use super::*;
     use crate::mvm::RunOutput;
@@ -445,6 +447,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn not_newer_is_refused_unless_forced() {
         let mut r = Rig::new();
         r.current = "0.2.0".into();
@@ -500,6 +503,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_installer_gets_the_signed_tarball_digest_and_no_release_base() {
         let r = Rig::new();
         r.run(PLAIN).unwrap();
@@ -559,7 +563,17 @@ mod tests {
         assert_eq!(*modes.0.lock().unwrap(), Some((0o700, 0o600)));
     }
 
+    #[cfg(windows)]
     #[test]
+    fn install_sh_updates_refuse_on_windows() {
+        let r = Rig::new();
+        let e = r.run(PLAIN).unwrap_err();
+        assert!(e.contains("install.sh updates are not supported on Windows"), "{e}");
+        assert!(r.host_calls().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn a_failing_install_sh_is_reported() {
         let mut r = Rig::new();
         r.installer.code = 3;
@@ -570,6 +584,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_post_install_code_signature_is_required() {
         let mut r = Rig::new();
         r.run(PLAIN).unwrap();
@@ -598,6 +613,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_installed_version_must_match() {
         let mut r = Rig::new();
         r.host.version = "rts 0.1.9\n".into();
@@ -610,6 +626,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn success_names_both_versions() {
         let r = Rig::new();
         let lines = r.run(PLAIN).unwrap();
@@ -617,6 +634,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_version_being_installed_is_announced_first() {
         let announce = |r: &Rig, current: &str| format!("say: installing rts 0.2.0 over {current} to {}", r.prefix.display());
         let r = Rig::new();

@@ -467,7 +467,16 @@ mod tests {
             if entry.file_type().unwrap().is_dir() {
                 assert_artifacts_contain_no_key(&entry.path());
             } else {
-                let bytes = fs::read(entry.path()).unwrap();
+                let bytes = match fs::read(entry.path()) {
+                    // Windows: the running runtime holds this file
+                    // locked (ERROR_LOCK_VIOLATION). Unix reads every file.
+                    #[cfg(windows)]
+                    Err(e) if e.raw_os_error() == Some(33) => {
+                        eprintln!("skipping locked runtime file {}", entry.path().display());
+                        continue;
+                    }
+                    other => other.unwrap(),
+                };
                 assert!(
                     !bytes
                         .windows(DUMMY_KEY.len())

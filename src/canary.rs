@@ -792,3 +792,15 @@ mod tests {
         assert!(r.scan_exports(&t.path().join("out-link")).is_err());
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn a_registry_refuses_on_windows_rather_than_running_with_weaker_checks() {
+        let d = tempfile::tempdir().unwrap();
+        let e = Registry::create(&[], &d.path().join("reg"), &d.path().join("audit")).err().unwrap();
+        assert!(e.contains(UNSUPPORTED), "{e}");
+    }
+}

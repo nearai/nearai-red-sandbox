@@ -198,6 +198,7 @@ fn native_store_is_unavailable_to_automated_unit_tests() {
 }
 
 #[test]
+#[cfg(unix)]
 fn callback_timeout_and_cancellation_release_the_listener() {
     let callback = browser::Callback::bind().unwrap();
     let address = url::Url::parse(&callback.url()).unwrap();
@@ -257,6 +258,7 @@ fn callback_timeout_and_cancellation_release_the_listener() {
     );
 }
 
+#[cfg(unix)]
 fn client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .no_proxy()
@@ -265,6 +267,7 @@ fn client() -> reqwest::blocking::Client {
         .unwrap()
 }
 
+#[cfg(unix)]
 fn page_nonce(page: &str) -> String {
     page.split("body.set(\"state\", \"")
         .nth(1)
@@ -276,6 +279,7 @@ fn page_nonce(page: &str) -> String {
 }
 
 #[test]
+#[cfg(unix)]
 fn real_loopback_callback_ignores_spoofs_and_acknowledges_only_after_storage() {
     let callback = browser::Callback::bind().unwrap();
     let url = callback.url();

@@ -269,6 +269,7 @@ mod tests {
         assert!(error.contains("absolute"), "{error}");
     }
 
+    #[cfg(unix)]
     fn canary_fixture() -> (tempfile::TempDir, crate::canary::Registry, Request, String, String) {
         use crate::canary::{CanarySpec, Placement, Registry};
         let dir = tempfile::tempdir().unwrap();
@@ -290,6 +291,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn tool_output_matches_are_redacted_and_observed_without_raw_values() {
         let (dir, _registry, request, host, guest) = canary_fixture();
         // The shell tool combines guest stdout and stderr into returned text.
@@ -313,6 +315,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn tool_error_channels_are_redacted_and_keep_failure_status() {
         struct Failing(String);
         impl Exec for Failing {
@@ -330,6 +333,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn failed_canary_persistence_withholds_the_entire_tool_result() {
         let (dir, _registry, request, host, _) = canary_fixture();
         let audit = dir.path().join("canaries.jsonl");
@@ -351,6 +355,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn configured_monitor_does_not_change_unmatched_tool_output() {
         let (_dir, _registry, request, _, _) = canary_fixture();
         let rec = Recorder::new(|_, _| ok(b"ordinary output"));

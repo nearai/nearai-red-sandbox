@@ -142,9 +142,11 @@ pub fn guest_sha256(sb: &dyn Exec, path: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::testutil::{HostShell, Recorder, ok, reply, tempdir};
+    #[cfg(unix)]
     use sha2::{Digest, Sha256};
     use std::fs;
 
+    #[cfg(unix)]
     fn sha(b: &[u8]) -> String {
         Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
     }
@@ -187,6 +189,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn host_sh_random_write_round_trips() {
         let d = tempdir("files");
         let data = random(200 * 1024);
@@ -198,6 +201,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn host_sh_awkward_paths_round_trip() {
         let d = tempdir("files");
         let hs = HostShell::default();
@@ -231,6 +235,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn host_sh_truncation_listing_and_missing() {
         let d = tempdir("files");
         let hs = HostShell::default();
