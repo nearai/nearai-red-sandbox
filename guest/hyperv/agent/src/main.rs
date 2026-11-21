@@ -3,6 +3,8 @@
 //! The protocol is rts's `hvexec` module, included here as source.
 
 // The host-side half of the protocol (encode_argv, decode_exit) is unused here.
+// shutdown_stream is used only by the host client.
+#[allow(dead_code)]
 #[path = "../../../../src/hvexec/serve.rs"]
 mod serve;
 #[allow(dead_code)]

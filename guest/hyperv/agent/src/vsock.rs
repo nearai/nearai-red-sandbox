@@ -29,6 +29,10 @@ impl TryClone for VsockStream {
     fn try_clone_stream(&self) -> io::Result<Self> {
         Ok(VsockStream(self.0.try_clone()?))
     }
+    fn shutdown_stream(&self) -> io::Result<()> {
+        // SAFETY: shutdown on a socket descriptor this stream owns.
+        check(unsafe { libc::shutdown(self.0.as_raw_fd(), libc::SHUT_RDWR) }).map(|_| ())
+    }
 }
 
 fn check(r: libc::c_int) -> io::Result<libc::c_int> {

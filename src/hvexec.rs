@@ -18,19 +18,38 @@ pub struct Output {
     pub stderr: Vec<u8>,
 }
 
-/// Run `argv` in the guest over `conn`, feeding `stdin`. Refuses (and stops
-/// reading) once stdout and stderr together pass `max_output` bytes.
-pub fn run(
-    conn: &mut (impl Read + Write),
-    argv: &[String],
-    stdin: &[u8],
-    max_output: usize,
-) -> io::Result<Output> {
+/// Run `argv` in the guest over `conn`, feeding `stdin`. stdin is written
+/// from its own thread while output is read, so neither side can fill its
+/// buffers and stall. Refuses (and shuts the connection down) once stdout
+/// and stderr together pass `max_output` bytes.
+pub fn run<S>(conn: &mut S, argv: &[String], stdin: &[u8], max_output: usize) -> io::Result<Output>
+where
+    S: Read + Write + Send + serve::TryClone,
+{
     wire::write_frame(conn, REQUEST, &wire::encode_argv(argv)?)?;
-    for chunk in stdin.chunks(wire::MAX_FRAME) {
-        wire::write_frame(conn, STDIN, chunk)?;
-    }
-    wire::write_frame(conn, STDIN, &[])?;
+    let mut writer = conn.try_clone_stream()?;
+    std::thread::scope(|scope| {
+        let feeder = scope.spawn(move || -> io::Result<()> {
+            for chunk in stdin.chunks(wire::MAX_FRAME) {
+                wire::write_frame(&mut writer, STDIN, chunk)?;
+            }
+            wire::write_frame(&mut writer, STDIN, &[])
+        });
+        let result = read_output(conn, max_output);
+        if result.is_err() {
+            // Unblocks the feeder if the guest stopped reading stdin.
+            let _ = conn.shutdown_stream();
+        }
+        // A feeder error only matters if the guest never answered: a
+        // command may exit without reading all of its stdin.
+        let _fed = feeder
+            .join()
+            .map_err(|_| io::Error::other("stdin writer panicked"))?;
+        result
+    })
+}
+
+fn read_output(conn: &mut impl Read, max_output: usize) -> io::Result<Output> {
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
     loop {
         match wire::read_frame(conn)? {
@@ -175,6 +194,40 @@ mod tests {
                 100000
             )
             .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdin_larger_than_the_socket_buffers_echoes_back_without_deadlock() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut host, guest) = pair();
+            let input = vec![b'x'; 1 << 20];
+            let out = run(&mut host, &s(&["cat"]), &input, 4 << 20);
+            let _ = guest.join();
+            let _ = tx.send(out.map(|o| (o.code, o.stdout.len())));
+        });
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("hvexec::run deadlocked");
+        assert_eq!(got.unwrap(), (0, 1 << 20));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hitting_the_output_limit_stops_the_guest_command() {
+        let (mut host, guest) = pair();
+        assert!(run(&mut host, &s(&["yes"]), b"", 100_000).is_err());
+        drop(host);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(guest.join().is_ok());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the guest command kept running"),
+            "serve panicked"
         );
     }
 

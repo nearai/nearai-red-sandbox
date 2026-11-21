@@ -102,14 +102,19 @@ where
     wire::write_frame(&mut *writer.lock().unwrap(), EXIT, &wire::encode_exit(code))
 }
 
-/// A connection that can be split into a reader and a writer.
+/// A connection that can be split into a reader and a writer, and shut
+/// down from either half to unblock the other.
 pub trait TryClone: Sized {
     fn try_clone_stream(&self) -> io::Result<Self>;
+    fn shutdown_stream(&self) -> io::Result<()>;
 }
 
 #[cfg(unix)]
 impl TryClone for std::os::unix::net::UnixStream {
     fn try_clone_stream(&self) -> io::Result<Self> {
         self.try_clone()
+    }
+    fn shutdown_stream(&self) -> io::Result<()> {
+        self.shutdown(std::net::Shutdown::Both)
     }
 }
