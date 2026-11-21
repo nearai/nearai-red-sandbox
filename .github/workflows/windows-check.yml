@@ -65,20 +65,52 @@ jobs:
           python -c "import json,shutil; [shutil.copy(m['executable'], 'dist/' + m['target']['name'] + '-' + m['target']['kind'][0] + '.exe') for m in map(json.loads, open('build.jsonl')) if m.get('reason') == 'compiler-artifact' and m.get('profile', {}).get('test') and m.get('executable')]"
           cp target/x86_64-pc-windows-msvc/debug/rts.exe target/x86_64-pc-windows-msvc/egress/rts-egress.exe target/x86_64-pc-windows-msvc/egress/examples/egress_probe.exe dist/
           ls -la dist
-      # The release archive, packaged as release.yml packages it, must pass
-      # rts's own untar rules and install into a prefix.
-      - name: the Windows release archive installs into a prefix
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-test-binaries
+          path: dist/
+          retention-days: 3
+          if-no-files-found: error
+
+  # The Windows release archive exactly as release.yml's build-windows job
+  # builds and packages it (--release rts.exe, rts-egress.exe with the
+  # egress profile, scripts/package-windows.sh), on every pull request, so
+  # a break shows up before tag time: release publishing waits on it. Its
+  # own job, in parallel with msvc.
+  release-archive:
+    name: release archive (as release.yml builds it)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+      - name: build rts and rts-egress as release.yml does
+        shell: bash
+        run: |
+          cargo build --locked --release --target x86_64-pc-windows-msvc --bin rts
+          cargo build --locked --profile egress --target x86_64-pc-windows-msvc --bin rts-egress
+      - name: package, then install into a prefix through rts's untar
         shell: bash
         run: |
           scripts/package-windows.sh --version 0.0.0-ci \
-            --rts target/x86_64-pc-windows-msvc/debug/rts.exe \
+            --rts target/x86_64-pc-windows-msvc/release/rts.exe \
             --egress target/x86_64-pc-windows-msvc/egress/rts-egress.exe --out dist
           RTS_RELEASE_TAR="$PWD/dist/rts-0.0.0-ci-x86_64-pc-windows-msvc.tar" \
             cargo test --locked --target x86_64-pc-windows-msvc --lib -- --ignored --exact \
             backend::hyperv::setup::tests::a_built_release_archive_installs_into_a_prefix
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: windows-test-binaries
+          name: windows-release-archive
           path: dist/
           retention-days: 3
           if-no-files-found: error
