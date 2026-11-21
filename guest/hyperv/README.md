@@ -28,12 +28,12 @@ What the build does:
   NETDEVICES, BLOCK, MODULES, NIC/storage/9p/CIFS/NFS/FUSE drivers, or the
   virtio and loopback vsock transports.
 
-Two runs on 2026-11-21 (x86_64 Linux host, docker) gave identical bytes:
+Two runs on 2026-11-21 (with ACPI, which x86 VMBus discovery needs) (x86_64 Linux host, docker) gave identical bytes:
 
 | file | sha256 |
 | --- | --- |
-| `vmlinuz` | `725e2b3acf0f6db546606ea18693d7c46a352294f99b5f29f63ef236ceb96beb` |
-| `kernel.config.full` | `d53f7931e317865e5d9cb2ab8dcbc5f89b757bc6898bee0afc0b8fc2cc69059d` |
+| `vmlinuz` | `40272ed75e3af6ebc7618abd9c272ba352e049adfbcef05b86ee1b17ee1318f8` |
+| `kernel.config.full` | `577c45c5b5a44b5096526da50acf43780a929aae5a5c7a4ffdaab98e0c148b30` |
 
 ## Agent (`agent/`)
 
@@ -57,7 +57,7 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
 
 It is a static-pie binary. Its only dependency is the libc rts already
 uses. The build verified here (rustc 1.100.0) has sha256
-`86ac03973d010be74ca32cc1de756c598d109cff8b5ef9fabe9f5e55a174a738`.
+`475d0ebd97a18856329eef916b788ff1fb8262aaa6f1923f2547cbc5821a3d04`.
 The agent build is not yet reproducible across toolchains; the release
 pipeline will pin the toolchain.
 
@@ -81,4 +81,4 @@ What the script does:
 Standard library only.
 
 With the agent above, two runs gave
-`05ac28c3073512912e3460545f1fcdd83fdcbb3ca098e9138f34bb1de28c2884`.
+`86be012012ab96c290f563d591440f691a4c8b59307e4cd6ba4e923fb22cdbfd`.
