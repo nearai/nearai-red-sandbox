@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 
 use super::egress::{Audit, Policy, serve_one};
@@ -156,10 +156,30 @@ impl Write for AuditFrames {
 /// The confined proxy's main loop: serve every connection rts opens,
 /// until rts closes `input`.
 pub fn run_proxy<D>(
+    input: impl Read,
+    output: Box<dyn Write + Send>,
+    policy: Policy,
+    dial: D,
+) -> io::Result<()>
+where
+    D: Fn(&std::net::SocketAddr) -> io::Result<std::net::TcpStream> + Clone + Send + 'static,
+{
+    run_proxy_with(input, output, policy, dial, STALL_LIMIT)
+}
+
+/// Frames a connection may have queued (about 1 MiB) before the proxy
+/// stops reading for it.
+const QUEUE_FRAMES: usize = 16;
+/// How long one connection may keep its queue full (its upstream not
+/// reading) before the proxy closes that connection instead of buffering.
+const STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn run_proxy_with<D>(
     mut input: impl Read,
     output: Box<dyn Write + Send>,
     policy: Policy,
     dial: D,
+    stall_limit: std::time::Duration,
 ) -> io::Result<()>
 where
     D: Fn(&std::net::SocketAddr) -> io::Result<std::net::TcpStream> + Clone + Send + 'static,
@@ -170,11 +190,11 @@ where
         line: vec![],
     })));
     let policy = Arc::new(policy);
-    let mut conns: HashMap<u32, Sender<Vec<u8>>> = HashMap::new();
+    let mut conns: HashMap<u32, SyncSender<Vec<u8>>> = HashMap::new();
     while let Some((kind, id, payload)) = read_frame(&mut input)? {
         match kind {
             OPEN => {
-                let (tx, rx) = channel();
+                let (tx, rx) = sync_channel(QUEUE_FRAMES);
                 conns.insert(id, tx);
                 let conn = VConn {
                     id,
@@ -192,8 +212,26 @@ where
                 });
             }
             DATA => {
-                if let Some(tx) = conns.get(&id) {
-                    let _ = tx.send(payload);
+                // Bounded: a full queue waits for its reader, up to the stall
+                // limit, then that one connection is closed. Memory stays
+                // bounded and a stuck upstream cannot freeze the rest for long.
+                let Some(tx) = conns.get(&id) else { continue };
+                let started = std::time::Instant::now();
+                let mut item = payload;
+                let stalled = loop {
+                    match tx.try_send(item) {
+                        Ok(()) => break false,
+                        Err(TrySendError::Disconnected(_)) => break false,
+                        Err(TrySendError::Full(back)) if started.elapsed() < stall_limit => {
+                            item = back;
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(TrySendError::Full(_)) => break true,
+                    }
+                };
+                if stalled {
+                    conns.remove(&id);
+                    let _ = send(&out, CLOSE, id, &[]);
                 }
             }
             CLOSE => {
@@ -522,6 +560,72 @@ mod tests {
             log.lines().filter(|l| l.contains("\"refused\"")).count(),
             2,
             "{log}"
+        );
+    }
+
+    #[test]
+    fn an_upstream_that_stops_reading_gets_its_connection_closed_not_buffered() {
+        // An upstream that accepts and never reads.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream = l.local_addr().unwrap();
+        let held = std::thread::spawn(move || l.accept().map(|(s, _)| s));
+        let plan = crate::network::plan(
+            &["198.51.100.7:443".to_string()],
+            &crate::network::SystemResolver,
+        )
+        .unwrap();
+        let policy = Policy::from_plan(&plan);
+        let (parent_to, proxy_in) = UnixStream::pair().unwrap();
+        let (proxy_out, parent_from) = UnixStream::pair().unwrap();
+        let stall = std::time::Duration::from_millis(300);
+        std::thread::spawn(move || {
+            run_proxy_with(
+                proxy_in,
+                Box::new(proxy_out),
+                policy,
+                move |_| TcpStream::connect(upstream),
+                stall,
+            )
+        });
+        let d = tempfile::tempdir().unwrap();
+        let stopped = Arc::new(Mutex::new(None));
+        let mux = MuxParent::start(
+            Box::new(parent_to),
+            parent_from,
+            Arc::new(Audit::new(&d.path().join("a"))),
+            stopped.clone(),
+        );
+        let mut g = guest(&mux);
+        g.write_all(b"CONNECT 198.51.100.7:443 HTTP/1.1\r\n\r\n")
+            .unwrap();
+        let mut r = BufReader::new(g.try_clone().unwrap());
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap();
+        assert!(line.starts_with("HTTP/1.1 200"), "{line}");
+        let _upstream_conn = held.join().unwrap().unwrap();
+        // Far more than the queue and the kernel buffers hold.
+        let mut w = g.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let chunk = vec![0u8; 64 * 1024];
+            for _ in 0..2048 {
+                if w.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        // The proxy closes the connection: the guest reads to EOF.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut rest = vec![];
+            let _ = r.read_to_end(&mut rest);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the stalled connection was never closed");
+        assert_eq!(
+            *stopped.lock().unwrap(),
+            None,
+            "only that connection ends, not the proxy"
         );
     }
 
