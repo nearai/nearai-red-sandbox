@@ -128,7 +128,10 @@ pub fn stdin_stdout_are_ttys() -> (bool, bool) {
 /// A console input handle has no screen buffer, so 0 reads stdout's.
 #[cfg(windows)]
 pub fn window_size(fd: i32) -> Option<(usize, usize)> {
-    use windows_sys::Win32::System::Console::{GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, STD_ERROR_HANDLE,
+        STD_OUTPUT_HANDLE,
+    };
     let which = match fd {
         0 | 1 => STD_OUTPUT_HANDLE,
         2 => STD_ERROR_HANDLE,
@@ -138,7 +141,10 @@ pub fn window_size(fd: i32) -> Option<(usize, usize)> {
     unsafe {
         let handle = GetStdHandle(which);
         let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
-        if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE || GetConsoleScreenBufferInfo(handle, &mut info) == 0 {
+        if handle.is_null()
+            || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+            || GetConsoleScreenBufferInfo(handle, &mut info) == 0
+        {
             return None;
         }
         window_cols_rows(&info.srWindow)
@@ -199,9 +205,22 @@ mod window_size_tests {
 
     #[test]
     fn the_visible_window_not_the_buffer_gives_cols_and_rows() {
-        let r = SMALL_RECT { Left: 0, Top: 9000, Right: 119, Bottom: 9029 };
+        let r = SMALL_RECT {
+            Left: 0,
+            Top: 9000,
+            Right: 119,
+            Bottom: 9029,
+        };
         assert_eq!(super::window_cols_rows(&r), Some((120, 30)));
-        assert_eq!(super::window_cols_rows(&SMALL_RECT { Left: 5, Top: 5, Right: 4, Bottom: 5 }), None);
+        assert_eq!(
+            super::window_cols_rows(&SMALL_RECT {
+                Left: 5,
+                Top: 5,
+                Right: 4,
+                Bottom: 5
+            }),
+            None
+        );
     }
 
     #[test]

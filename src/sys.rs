@@ -44,7 +44,9 @@ extern "C" fn on_signal(sig: i32) {
 /// are SIGINT; closing the console, logoff and shutdown are SIGTERM.
 #[cfg(windows)]
 fn ctrl_signal(event: u32) -> Option<i32> {
-    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT};
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
     match event {
         CTRL_C_EVENT | CTRL_BREAK_EVENT => Some(SIGINT),
         CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => Some(SIGTERM),
@@ -59,10 +61,31 @@ fn ctrl_signal(event: u32) -> Option<i32> {
 #[cfg(windows)]
 const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_millis(4500);
 
+/// Set once the console is closing (close, logoff or shutdown); never cleared.
+static CLOSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether Windows is closing this console: teardown then has only seconds,
+/// so it skips its grace periods. Always false on Unix.
+pub fn closing() -> bool {
+    CLOSING.load(Ordering::SeqCst)
+}
+
+/// Record a console control event on the flags; the signal it stands for.
+#[cfg(windows)]
+fn record_ctrl(event: u32) -> Option<i32> {
+    let sig = ctrl_signal(event)?;
+    if sig == SIGTERM {
+        CLOSING.store(true, Ordering::SeqCst);
+    }
+    LAST_SIGNAL.store(sig, Ordering::SeqCst);
+    Some(sig)
+}
+
 #[cfg(windows)]
 unsafe extern "system" fn on_ctrl(event: u32) -> windows_sys::core::BOOL {
-    let Some(sig) = ctrl_signal(event) else { return 0 };
-    LAST_SIGNAL.store(sig, Ordering::SeqCst);
+    let Some(sig) = record_ctrl(event) else {
+        return 0;
+    };
     if sig == SIGTERM {
         std::thread::sleep(CLOSE_GRACE);
     }
@@ -159,7 +182,9 @@ mod memory_tests {
 #[cfg(all(test, windows))]
 mod ctrl_tests {
     use super::*;
-    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT};
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
 
     #[test]
     fn console_events_map_to_the_signals_the_session_polls() {
@@ -173,11 +198,31 @@ mod ctrl_tests {
 
     #[test]
     fn the_handler_is_registered_and_ctrl_break_sets_the_flag_instead_of_ending_the_process() {
-        assert!(catch_termination_signals(), "SetConsoleCtrlHandler must succeed");
+        assert!(
+            catch_termination_signals(),
+            "SetConsoleCtrlHandler must succeed"
+        );
         let _ = take_signal();
         // SAFETY: called as Windows would call it, with an event code.
-        assert_ne!(unsafe { on_ctrl(CTRL_BREAK_EVENT) }, 0, "handled, so the default handler does not end the process");
+        assert_ne!(
+            unsafe { on_ctrl(CTRL_BREAK_EVENT) },
+            0,
+            "handled, so the default handler does not end the process"
+        );
         assert_eq!(take_signal(), Some(SIGINT));
-        assert_eq!(unsafe { on_ctrl(42) }, 0, "an unknown event is left to the next handler");
+        assert_eq!(
+            unsafe { on_ctrl(42) },
+            0,
+            "an unknown event is left to the next handler"
+        );
+        // One test: these share the process-wide flags.
+        assert_eq!(record_ctrl(CTRL_C_EVENT), Some(SIGINT));
+        assert!(!closing(), "Ctrl-C is not a console close");
+        assert_eq!(record_ctrl(CTRL_CLOSE_EVENT), Some(SIGTERM));
+        assert_eq!(take_signal(), Some(SIGTERM));
+        assert!(
+            closing(),
+            "teardown must know Windows allows only seconds, even after the signal is taken"
+        );
     }
 }

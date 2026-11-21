@@ -6,7 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,7 +19,7 @@ use crate::protocol::{new_nonce, random_hex};
 use crate::backend::{Backend, HostCheck, Machine};
 use crate::sandbox::{CopyOutResult, CreateSpec, Exec, ExecOptions, sv};
 use crate::sys;
-use crate::terminal::Terminal;
+use crate::terminal::{Child, Terminal};
 use crate::brand::progress::Live as Shown;
 
 pub const OPENCODE_VERSION: &str = "2.2.2";
@@ -354,14 +354,34 @@ pub fn opencode_launch(p: &SessionPaths, opencode: &str, base_env: impl IntoIter
 }
 
 /// Terminal and runtime essentials that pass to OpenCode on every OS.
-const OPENCODE_ENV: [&str; 11] = ["PATH", "TERM", "COLORTERM", "LANG", "TMPDIR", "USER", "LOGNAME", "SHELL", "DISPLAY", "WAYLAND_DISPLAY", "NO_COLOR"];
+const OPENCODE_ENV: [&str; 11] = [
+    "PATH",
+    "TERM",
+    "COLORTERM",
+    "LANG",
+    "TMPDIR",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "NO_COLOR",
+];
 
 /// The few system variables a Windows process needs to run at all (without
 /// SystemRoot, Winsock fails). No token or secret is among them. The
 /// profile folders (USERPROFILE, APPDATA, LOCALAPPDATA) are not passed:
 /// OpenCode takes its home from USERPROFILE there, so the launch sets them
 /// to the session, as HOME is.
-const OPENCODE_ENV_WINDOWS: [&str; 7] = ["SystemRoot", "windir", "ComSpec", "PATHEXT", "TEMP", "TMP", "SystemDrive"];
+const OPENCODE_ENV_WINDOWS: [&str; 7] = [
+    "SystemRoot",
+    "windir",
+    "ComSpec",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "SystemDrive",
+];
 
 /// Whether the host variable `name` passes to OpenCode. Only the lists above
 /// and the explicitly selected direct provider key pass; host credentials
@@ -371,7 +391,10 @@ fn opencode_env_passes(name: &str, windows: bool, direct_key: Option<&str>) -> b
         return true;
     }
     if windows {
-        let listed = OPENCODE_ENV.iter().chain(&OPENCODE_ENV_WINDOWS).any(|k| k.eq_ignore_ascii_case(name));
+        let listed = OPENCODE_ENV
+            .iter()
+            .chain(&OPENCODE_ENV_WINDOWS)
+            .any(|k| k.eq_ignore_ascii_case(name));
         return listed || name.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("LC_"));
     }
     OPENCODE_ENV.contains(&name) || name.starts_with("LC_")
@@ -384,11 +407,24 @@ pub fn opencode_launch_with_key(p: &SessionPaths, opencode: &str, base_env: impl
 /// The session's Windows profile folders, which stand in for the operator's.
 fn windows_profile(p: &SessionPaths) -> [(&'static str, PathBuf); 3] {
     let app_data = p.home.join("AppData");
-    [("USERPROFILE", p.home.clone()), ("APPDATA", app_data.join("Roaming")), ("LOCALAPPDATA", app_data.join("Local"))]
+    [
+        ("USERPROFILE", p.home.clone()),
+        ("APPDATA", app_data.join("Roaming")),
+        ("LOCALAPPDATA", app_data.join("Local")),
+    ]
 }
 
-fn opencode_launch_for(p: &SessionPaths, opencode: &str, base_env: impl IntoIterator<Item = (String, String)>, direct_key: Option<&str>, windows: bool) -> Launch {
-    let mut env: Vec<(String, String)> = base_env.into_iter().filter(|(k, _)| opencode_env_passes(k, windows, direct_key)).collect();
+fn opencode_launch_for(
+    p: &SessionPaths,
+    opencode: &str,
+    base_env: impl IntoIterator<Item = (String, String)>,
+    direct_key: Option<&str>,
+    windows: bool,
+) -> Launch {
+    let mut env: Vec<(String, String)> = base_env
+        .into_iter()
+        .filter(|(k, _)| opencode_env_passes(k, windows, direct_key))
+        .collect();
     for (k, v) in [
         ("HOME", &p.home),
         ("XDG_CONFIG_HOME", &p.xdg_config),
@@ -399,7 +435,11 @@ fn opencode_launch_for(p: &SessionPaths, opencode: &str, base_env: impl IntoIter
         env.push((k.into(), v.to_string_lossy().into_owned()));
     }
     if windows {
-        env.extend(windows_profile(p).into_iter().map(|(k, v)| (k.into(), v.to_string_lossy().into_owned())));
+        env.extend(
+            windows_profile(p)
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.to_string_lossy().into_owned())),
+        );
     }
     Launch { argv: sv(&[opencode, "--standalone"]), env, cwd: p.work.clone() }
 }
@@ -959,15 +999,13 @@ impl Live<'_> {
         crate::brand::progress::teardown();
         self.log.log(&format!("teardown: {why}"));
         if let Some(mut c) = self.child.take() {
-            // Terminal::spawn gives OpenCode its own session and process group.
-            // Stop descendants too, even if the group leader already exited.
-            sys::send_signal(-(c.id() as i32), sys::SIGTERM);
-            let end = Instant::now() + Duration::from_secs(10);
-            while c.try_wait().ok().flatten().is_none() && Instant::now() < end {
-                thread::sleep(Duration::from_millis(100));
-            }
-            sys::send_signal(-(c.id() as i32), sys::SIGKILL);
-            let _ = c.wait();
+            // A closing Windows console allows only seconds: no grace then.
+            let grace = if sys::closing() {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(10)
+            };
+            crate::terminal::stop_tree(&mut c, grace);
             self.log.log("teardown: opencode stopped");
         }
         keep_opencode_data(self.paths, self.log);
@@ -1339,12 +1377,33 @@ mod windows_launch_tests {
     #[test]
     fn opencode_on_windows_gets_the_system_variables_and_no_host_token() {
         let p = super::session_paths("0123456789ab", Path::new(r"C:\s"), Path::new(r"C:\r"));
-        let env = [("Path", r"C:\Windows"), ("SystemRoot", r"C:\Windows"), ("USERPROFILE", r"C:\Users\op"), ("GITHUB_TOKEN", "ghp_x"), ("NEARAI_API_KEY", "k")];
-        let l = super::opencode_launch(&p, "opencode.exe", env.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let env = [
+            ("Path", r"C:\Windows"),
+            ("SystemRoot", r"C:\Windows"),
+            ("USERPROFILE", r"C:\Users\op"),
+            ("GITHUB_TOKEN", "ghp_x"),
+            ("NEARAI_API_KEY", "k"),
+        ];
+        let l = super::opencode_launch(
+            &p,
+            "opencode.exe",
+            env.iter().map(|(k, v)| (k.to_string(), v.to_string())),
+        );
         let names: Vec<&str> = l.env.iter().map(|(k, _)| k.as_str()).collect();
-        assert!(names.contains(&"Path") && names.contains(&"SystemRoot"), "{names:?}");
-        assert!(!names.contains(&"GITHUB_TOKEN") && !names.contains(&"NEARAI_API_KEY"), "{names:?}");
-        let profile: Vec<&str> = l.env.iter().filter(|(k, _)| k == "USERPROFILE").map(|(_, v)| v.as_str()).collect();
+        assert!(
+            names.contains(&"Path") && names.contains(&"SystemRoot"),
+            "{names:?}"
+        );
+        assert!(
+            !names.contains(&"GITHUB_TOKEN") && !names.contains(&"NEARAI_API_KEY"),
+            "{names:?}"
+        );
+        let profile: Vec<&str> = l
+            .env
+            .iter()
+            .filter(|(k, _)| k == "USERPROFILE")
+            .map(|(_, v)| v.as_str())
+            .collect();
         assert_eq!(profile, [p.home.to_str().unwrap()]);
     }
 }
@@ -1365,7 +1424,10 @@ mod copy_tree_tests {
         let dst = base.join("dst");
         super::copy_tree_preserving_mode(&src, &dst).unwrap();
         assert_eq!(fs::read(dst.join("auth.json")).unwrap(), b"{}");
-        assert_eq!(fs::read(dst.join("storage/session/ses_1.json")).unwrap(), b"one");
+        assert_eq!(
+            fs::read(dst.join("storage/session/ses_1.json")).unwrap(),
+            b"one"
+        );
         assert!(dst.join("empty").is_dir());
         fs::remove_dir_all(&base).unwrap();
     }
@@ -1948,35 +2010,106 @@ mod tests {
 
     #[test]
     fn on_windows_opencode_gets_only_the_minimal_system_variables_matched_case_insensitively() {
-        for name in ["SystemRoot", "windir", "ComSpec", "PATHEXT", "TEMP", "TMP", "SystemDrive", "Path", "SYSTEMROOT"] {
-            assert!(opencode_env_passes(name, true, None), "{name} must reach OpenCode on Windows");
-            assert!(!opencode_env_passes(name, false, None), "{name} is Windows-only");
+        for name in [
+            "SystemRoot",
+            "windir",
+            "ComSpec",
+            "PATHEXT",
+            "TEMP",
+            "TMP",
+            "SystemDrive",
+            "Path",
+            "SYSTEMROOT",
+        ] {
+            assert!(
+                opencode_env_passes(name, true, None),
+                "{name} must reach OpenCode on Windows"
+            );
+            assert!(
+                !opencode_env_passes(name, false, None),
+                "{name} is Windows-only"
+            );
         }
         // The operator's profile folders never pass: OpenCode takes its home
         // from USERPROFILE on Windows, so the launch sets them to the session.
-        for name in ["USERPROFILE", "APPDATA", "LOCALAPPDATA", "UserProfile", "HOMEDRIVE", "HOMEPATH", "USERDOMAIN", "COMPUTERNAME", "ProgramData", "OneDrive", "GITHUB_TOKEN", "NEARAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK", "OPENCODE_CONFIG", "PSModulePath"] {
-            assert!(!opencode_env_passes(name, true, None), "{name} must not reach OpenCode on Windows");
+        for name in [
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "UserProfile",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "USERDOMAIN",
+            "COMPUTERNAME",
+            "ProgramData",
+            "OneDrive",
+            "GITHUB_TOKEN",
+            "NEARAI_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "SSH_AUTH_SOCK",
+            "OPENCODE_CONFIG",
+            "PSModulePath",
+        ] {
+            assert!(
+                !opencode_env_passes(name, true, None),
+                "{name} must not reach OpenCode on Windows"
+            );
         }
         // The direct provider key still passes, by its exact name.
-        assert!(opencode_env_passes("NEARAI_API_KEY", true, Some("NEARAI_API_KEY")));
+        assert!(opencode_env_passes(
+            "NEARAI_API_KEY",
+            true,
+            Some("NEARAI_API_KEY")
+        ));
         // Unix keeps its exact-case list: no Windows names, no case folding.
-        assert!(opencode_env_passes("PATH", false, None) && !opencode_env_passes("SystemRoot", false, None) && !opencode_env_passes("path", false, None));
+        assert!(
+            opencode_env_passes("PATH", false, None)
+                && !opencode_env_passes("SystemRoot", false, None)
+                && !opencode_env_passes("path", false, None)
+        );
     }
 
     #[test]
     fn on_windows_opencode_home_and_app_data_are_the_session_not_the_operator_profile() {
         let p = session_paths("0123456789ab", Path::new("/s"), Path::new("/tmp/rts-x"));
-        let env = [("USERPROFILE", "C:/Users/op"), ("APPDATA", "C:/Users/op/AppData/Roaming"), ("LOCALAPPDATA", "C:/Users/op/AppData/Local"), ("Path", "C:/Windows")];
-        let l = opencode_launch_for(&p, "opencode.exe", env.iter().map(|(k, v)| (k.to_string(), v.to_string())), None, true);
-        let get = |k: &str| l.env.iter().filter(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| PathBuf::from(v)).collect::<Vec<_>>();
+        let env = [
+            ("USERPROFILE", "C:/Users/op"),
+            ("APPDATA", "C:/Users/op/AppData/Roaming"),
+            ("LOCALAPPDATA", "C:/Users/op/AppData/Local"),
+            ("Path", "C:/Windows"),
+        ];
+        let l = opencode_launch_for(
+            &p,
+            "opencode.exe",
+            env.iter().map(|(k, v)| (k.to_string(), v.to_string())),
+            None,
+            true,
+        );
+        let get = |k: &str| {
+            l.env
+                .iter()
+                .filter(|(n, _)| n.eq_ignore_ascii_case(k))
+                .map(|(_, v)| PathBuf::from(v))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(get("USERPROFILE"), std::slice::from_ref(&p.home));
         assert_eq!(get("APPDATA"), [p.home.join("AppData").join("Roaming")]);
         assert_eq!(get("LOCALAPPDATA"), [p.home.join("AppData").join("Local")]);
         assert_eq!(get("HOME"), std::slice::from_ref(&p.home));
         assert_eq!(get("Path"), [PathBuf::from("C:/Windows")]);
         // Unix launches set no Windows profile variables.
-        let u = opencode_launch_for(&p, "opencode", env.iter().map(|(k, v)| (k.to_string(), v.to_string())), None, false);
-        assert!(u.env.iter().all(|(k, _)| !["USERPROFILE", "APPDATA", "LOCALAPPDATA"].contains(&k.as_str())));
+        let u = opencode_launch_for(
+            &p,
+            "opencode",
+            env.iter().map(|(k, v)| (k.to_string(), v.to_string())),
+            None,
+            false,
+        );
+        assert!(
+            u.env
+                .iter()
+                .all(|(k, _)| !["USERPROFILE", "APPDATA", "LOCALAPPDATA"].contains(&k.as_str()))
+        );
     }
 
     fn healthy(argv: &[String]) -> RunOutput {
