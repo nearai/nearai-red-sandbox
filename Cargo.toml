@@ -60,5 +60,23 @@ apple-native-keyring-store = { version = "=1.0.2", features = ["keychain"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus-secret-service-keyring-store = { version = "=1.0.1", default-features = false, features = ["rt-tokio-crypto-rust"] }
 
+# Hyper-V backend (HCS, hvsocket, job objects, owner-only DACLs). Windows
+# only; the feature list is the owner-approved set, no umbrella features.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_HostComputeSystem",
+    "Win32_System_Hypervisor",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
 [profile.release]
 panic = "abort"

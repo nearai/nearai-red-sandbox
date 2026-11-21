@@ -11,7 +11,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use rts::{attest, auth, bridge, config, launch, session, setup};
+use rts::{attest, auth, bridge, config, launch, setup};
+#[cfg(unix)]
+use rts::session;
 
 /// `--allow-host` entries in the order given, and `--no-network`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -39,14 +41,13 @@ const MAX_PROMPT_BYTES: usize = 64 * 1024;
 impl PromptSource {
     fn read(&self) -> Result<String, String> {
         use std::io::Read;
-        use std::os::unix::fs::OpenOptionsExt;
         let text = match self {
             Self::Text(text) => text.clone(),
             Self::File(path) => {
                 // Nonblocking open makes a mistaken FIFO path fail rather than
                 // hanging before we can verify the opened object is a file.
-                let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK)
-                    .open(path).map_err(|e| format!("cannot read prompt file {}: {e}", path.display()))?;
+                let file = rts::sys::fs::open_read_nonblocking(path)
+                    .map_err(|e| format!("cannot read prompt file {}: {e}", path.display()))?;
                 if !file.metadata().map_err(|e| format!("cannot inspect prompt file {}: {e}", path.display()))?.is_file() {
                     return Err(format!("prompt file {} must be a regular file", path.display()));
                 }
@@ -304,6 +305,12 @@ fn parse_update(flags: &[&str]) -> Result<Action, String> {
 
 const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network] [--no-splash]\n                  [--cpus N] [--memory SIZE] [--prompt TEXT | --prompt-file PATH]\n       rts launch --prompt \"Review /in and save findings to /out/report.md\"\n       rts launch --prompt-file ./handoff.md       # submit a UTF-8 task file\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts launch --cpus 4 --memory 8G             # a bigger VM (default 2 vCPUs, 2048 MiB)\n       rts trial --key-file PATH   # import your individual sponsored allowance\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nThe guest has no network unless the session file's network.allow or --allow-host names entries\n(HOST, HOST:PORT, IP:PORT or [IPv6]:PORT, port 443 by default, or the preset packages);\n--no-network drops them all. TCP only, and every connection is logged. A session stops with\nsession-limit after limits.sessionHours (default 24), network-lost when the attached\nmvmctl machine run that keeps egress up exits, and network-mismatch when mvm pinned an address\nrts did not validate; /out is exported and the VM removed in every case.\n--cpus and --memory (MiB, or with an M or G suffix) override limits.cpus and limits.memoryMiB,\nup to this host's CPU count and RAM; the host RSS watchdog follows memory unless the session\nfile sets limits.hostRssCeilingMiB.\n--prompt or --prompt-file submits one initial task after the sandbox plugin is verified,\nthen leaves OpenCode interactive. Prompt files are relative to the invoking directory,\nmust be UTF-8 and at most 64 KiB; empty/whitespace-only or NUL-containing text is refused.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
 
+#[cfg(not(unix))]
+fn setup_command(_o: &setup::SetupOptions) -> Result<i32, String> {
+    Err("rts setup is not supported on this OS yet".into())
+}
+
+#[cfg(unix)]
 fn setup_command(o: &setup::SetupOptions) -> Result<i32, String> {
     let env: Vec<(String, String)> = std::env::vars().collect();
     let home = env
@@ -479,6 +486,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn invalid_prompt_content_and_paths_fail_before_launch() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("prompt");

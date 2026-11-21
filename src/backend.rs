@@ -14,10 +14,16 @@ use crate::network::Plan;
 use crate::sandbox::Sandbox;
 use crate::session::{Clock, Deps, Host, SessionPaths};
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod invariants;
+#[cfg(unix)]
 pub mod kvm;
+#[cfg(unix)]
 pub mod mvm;
+
+/// The refusal on a host with no backend yet (Windows until Hyper-V lands).
+#[cfg(not(unix))]
+const NO_BACKEND: &str = "rts has no sandbox backend on this OS yet (the Hyper-V backend is in progress)";
 
 /// IPs the egress path pinned for each allowlisted name.
 pub type Pinned = std::collections::BTreeMap<String, std::collections::BTreeSet<std::net::IpAddr>>;
@@ -73,11 +79,15 @@ pub fn for_preflight(
     env: &[(String, String)],
     empty_git_config: std::path::PathBuf,
 ) -> Result<Box<dyn Backend>, String> {
-    Ok(Box::new(mvm::MvmBackend::for_preflight(
-        cfg,
-        env,
-        empty_git_config,
-    )?))
+    #[cfg(unix)]
+    {
+        Ok(Box::new(mvm::MvmBackend::for_preflight(cfg, env, empty_git_config)?))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (cfg, env, empty_git_config);
+        Err(NO_BACKEND.into())
+    }
 }
 
 /// The backend for this host's OS.
@@ -86,5 +96,13 @@ pub fn for_session(
     deps: &Deps,
     paths: &SessionPaths,
 ) -> Result<Box<dyn Backend>, String> {
-    Ok(Box::new(mvm::MvmBackend::for_session(cfg, deps, paths)?))
+    #[cfg(unix)]
+    {
+        Ok(Box::new(mvm::MvmBackend::for_session(cfg, deps, paths)?))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (cfg, deps, paths);
+        Err(NO_BACKEND.into())
+    }
 }

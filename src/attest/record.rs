@@ -2,9 +2,8 @@
 //! status, rewritten atomically (temp file in the same directory, then
 //! rename) on every change.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -55,12 +54,9 @@ impl AttestationRecord {
             ));
         }
         let dir = sessions_dir.join(session_id);
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)
+        crate::sys::fs::create_private_dir_all(&dir)
             .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+        crate::sys::fs::restrict_dir(&dir)
             .map_err(|e| format!("cannot restrict {}: {e}", dir.display()))?;
         let overrides = serde_json::to_value(options)
             .map_err(|e| format!("attestation record: overrides: {e}"))?;
@@ -141,11 +137,7 @@ impl AttestationRecord {
             crate::protocol::random_hex(6)
         ));
         let written = (|| {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)?;
+            let mut f = crate::sys::fs::open_private(&tmp, crate::sys::fs::Create::New)?;
             f.write_all(&bytes)?;
             f.sync_all()?;
             fs::rename(&tmp, &self.path)
@@ -159,10 +151,12 @@ impl AttestationRecord {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(unused_imports, dead_code))]
 mod tests {
     use super::*;
     use crate::attest::{AttestOptions, Attested, ComposePolicy};
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     const DUMMY_KEY: &str = "rts-dummy-key-never-send-to-a-provider";
@@ -185,6 +179,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_record_is_private_atomic_and_keeps_history() {
         let d = crate::testutil::tempdir("record");
         let sessions = d.join("sessions");

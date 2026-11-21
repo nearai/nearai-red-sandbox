@@ -670,19 +670,13 @@ const AUDIT_PREFIXES: [&str; 4] = ["host.flow.", "dns.", "icmp.", "host.route."]
 /// ever opened for reading. `out` is created 0600 and truncated.
 pub fn extract_audit(audit_dir: &std::path::Path, vm_name: &str, out: &std::path::Path) -> Result<usize, String> {
     use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let segments = audit_sources(audit_dir)?;
     let write_err = |e: io::Error| format!("writing {}: {e}", out.display());
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(out)
-        .map_err(write_err)?;
-    // `mode` applies only on creation; an existing file is narrowed too.
-    file.set_permissions(std::fs::Permissions::from_mode(0o600)).map_err(write_err)?;
+    let file = crate::sys::fs::open_private(out, crate::sys::fs::Create::Truncate)
+    .map_err(write_err)?;
+    // The owner-only mode applies only on creation; an existing file is narrowed too.
+    crate::sys::fs::restrict_file(&file).map_err(write_err)?;
     let mut w = io::BufWriter::new(file);
     let mut kept = 0;
     for_each_audit_line(&segments, &mut |line| {
@@ -830,7 +824,7 @@ fn audit_line_matches(line: &[u8], vm_name: &str) -> bool {
 
 /// `--allow-host` values for tests in other modules. IP literals need no
 /// lookup; a name resolves to a fixed public test address.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn test_allow_hosts(entries: &[&str]) -> Vec<AllowHost> {
     struct Fixed;
     impl Resolver for Fixed {
@@ -1236,6 +1230,7 @@ mod tests {
     }
 
     /// A directory holding only a fake `nc` with this body.
+    #[cfg(unix)]
     fn fake_nc(tag: &str, body: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let d = crate::testutil::tempdir(tag);
@@ -1355,6 +1350,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_probe_takes_the_first_line_without_waiting_for_the_tunnel_to_close() {
         // The proxy answers 200 and then holds the tunnel open, as a real
         // CONNECT does. The probe must not wait for nc to exit.
@@ -1365,6 +1361,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_probe_reports_a_refusal_with_its_status_line() {
         let d = fake_nc("probe-403", "cat >/dev/null; printf 'HTTP/1.1 403 Forbidden\\r\\n\\r\\n'");
         let path = format!("{}:/usr/bin:/bin", d.display());
@@ -1381,6 +1378,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_probe_sends_a_connect_for_its_target_to_the_guest_proxy() {
         let d = fake_nc(
             "probe-req",
@@ -1392,6 +1390,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_deny_all_script_passes_only_when_neither_path_connects() {
         // $4 is the port: 443 for the direct try, 1080 for the proxy.
         for (body, want) in [
@@ -1409,6 +1408,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn audit_entries_are_filtered_by_vm_name_and_event_across_a_rotated_segment() {
         use std::os::unix::fs::PermissionsExt;
         let d = crate::testutil::tempdir("audit");

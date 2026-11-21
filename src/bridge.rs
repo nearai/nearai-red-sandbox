@@ -98,11 +98,11 @@ pub fn parse_request(raw: &[u8]) -> Result<Request, String> {
 /// from a genuine no-match result. Do not persist any token-bearing error.
 fn monitoring_failure(o: &BridgeOptions, message: &str) -> Outcome {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     StateDir(o.state_dir.clone()).mark("canary monitoring failed");
-    let marker = std::fs::OpenOptions::new()
-        .write(true).create_new(true).mode(0o600)
-        .open(o.state_dir.join("canary-monitoring-failed"));
+    let marker = crate::sys::fs::open_private(
+        &o.state_dir.join("canary-monitoring-failed"),
+        crate::sys::fs::Create::New,
+    );
     if let Ok(mut marker) = marker {
         let _ = marker.write_all(b"canary monitoring failed; observation coverage incomplete\n");
     }
@@ -269,6 +269,7 @@ mod tests {
         assert!(error.contains("absolute"), "{error}");
     }
 
+    #[cfg(unix)]
     fn canary_fixture() -> (tempfile::TempDir, crate::canary::Registry, Request, String, String) {
         use crate::canary::{CanarySpec, Placement, Registry};
         let dir = tempfile::tempdir().unwrap();
@@ -290,6 +291,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn tool_output_matches_are_redacted_and_observed_without_raw_values() {
         let (dir, _registry, request, host, guest) = canary_fixture();
         // The shell tool combines guest stdout and stderr into returned text.
@@ -313,6 +315,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn tool_error_channels_are_redacted_and_keep_failure_status() {
         struct Failing(String);
         impl Exec for Failing {
@@ -330,6 +333,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn failed_canary_persistence_withholds_the_entire_tool_result() {
         let (dir, _registry, request, host, _) = canary_fixture();
         let audit = dir.path().join("canaries.jsonl");
@@ -351,6 +355,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn configured_monitor_does_not_change_unmatched_tool_output() {
         let (_dir, _registry, request, _, _) = canary_fixture();
         let rec = Recorder::new(|_, _| ok(b"ordinary output"));

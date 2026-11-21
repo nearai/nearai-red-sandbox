@@ -88,18 +88,13 @@ impl LaunchSpec {
 
 /// A private temp directory holding an empty Git config for mvmctl.
 pub fn private_git_config(prefix: &str) -> Result<(tempfile::TempDir, PathBuf), String> {
-    use std::os::unix::fs::OpenOptionsExt;
     let temp = tempfile::Builder::new()
         .prefix(prefix)
         .tempdir()
         .map_err(|_| "Cannot create a private temp directory")?;
     let empty_git_config = temp.path().join("empty.gitconfig");
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&empty_git_config)
-        .map_err(|_| "Cannot create an empty Git configuration")?;
+    crate::sys::fs::open_private(&empty_git_config, crate::sys::fs::Create::New)
+    .map_err(|_| "Cannot create an empty Git configuration")?;
     Ok((temp, empty_git_config))
 }
 
@@ -776,6 +771,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_verified_record_that_cannot_be_written_names_the_record() {
         use std::os::unix::fs::PermissionsExt;
         let (_d, record) = verified_record();
@@ -805,6 +801,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn unpatched_supervisor_is_rejected_before_credentials_or_browser_login() {
         struct StockSupervisor;
         impl session::Host for StockSupervisor {

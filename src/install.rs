@@ -105,6 +105,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_symlinked_bin_rts_resolves_to_its_keg() {
         let dir = tempfile::tempdir().unwrap();
         let t = dir.path();
@@ -143,7 +144,7 @@ mod tests {
         let opencode = home.join(".local/share/nearai-red-sandbox/opencode/2.2.2/opencode");
         touch(&opencode);
         let d2 = defaults(&lookup);
-        assert_eq!(d2.opencode, opencode.to_str().unwrap());
+        assert_eq!(Path::new(&d2.opencode), opencode);
     }
 
     #[test]

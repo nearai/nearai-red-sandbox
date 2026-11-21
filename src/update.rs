@@ -5,7 +5,6 @@ pub mod apply;
 pub mod manifest;
 
 use std::io::Write;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -184,7 +183,7 @@ fn human(d: Duration) -> String {
 /// umask's mode, and install.sh requires 0700 there.
 fn save(path: &Path, checked: &CheckedAt) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        crate::sys::fs::create_private_dir_all(parent)?;
     }
     save_cache(path, checked)
 }
@@ -228,7 +227,7 @@ pub fn append_log(log_file: &Path, lines: &[String]) {
         return;
     }
     if let Some(parent) = log_file.parent()
-        && std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent).is_err()
+        && crate::sys::fs::create_private_dir_all(parent).is_err()
     {
         return;
     }
@@ -318,6 +317,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn channels_follow_the_layout() {
         let t = tempfile::tempdir().unwrap();
         let t = t.path();
@@ -364,6 +364,7 @@ mod tests {
         use chrono::{DateTime, Utc};
         use ed25519_dalek::{Signer, SigningKey};
         use ironwire_update::{CheckedAt, UpdateStatus, load_cache, save_cache};
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         use std::sync::Arc;
         use std::time::{Duration, Instant};
@@ -597,6 +598,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(unix)]
         fn the_cache_directory_is_private() {
             let t = tempfile::tempdir().unwrap();
             let ch = release();
@@ -624,6 +626,7 @@ mod tests {
         }
 
         #[test]
+        #[cfg(unix)]
         fn the_log_goes_to_launcher_log() {
             let t = tempfile::tempdir().unwrap();
             let file = t.path().join("s/abc/launcher.log");
