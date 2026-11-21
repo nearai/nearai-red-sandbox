@@ -5,6 +5,9 @@
 //! checksums, and archives over the size or entry caps. The whole archive
 //! is validated before anything is written; extraction goes to
 //! `<dest>.partial` and is renamed into place only on success.
+//! On Windows it also refuses names Windows would read differently
+//! (separators, drive and stream markers, trailing dots and spaces,
+//! device names) and paths that differ only in case.
 
 use std::fmt;
 use std::fs;
@@ -99,6 +102,48 @@ fn normalize(raw: &str, entry: &str) -> Result<Vec<String>, TarRejected> {
     Ok(segs)
 }
 
+/// Why `seg` cannot be extracted as written on Windows, if it cannot:
+/// characters Windows treats as separators, drive or stream markers, or
+/// wildcards; trailing dots and spaces (Win32 strips them, so the name
+/// would alias another); and reserved device names, with or without an
+/// extension.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_name_problem(seg: &str) -> Option<&'static str> {
+    if seg.chars().any(|c| matches!(c, '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || (c as u32) < 0x20) {
+        return Some("character not allowed in a Windows file name");
+    }
+    if seg.ends_with('.') || seg.ends_with(' ') {
+        return Some("Windows file name ends with a dot or space");
+    }
+    let stem = seg.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.chars().count() == 4
+            && stem.chars().last().is_some_and(|c| c.is_ascii_digit() || matches!(c, '\u{b9}' | '\u{b2}' | '\u{b3}')));
+    if device {
+        return Some("reserved Windows device name");
+    }
+    None
+}
+
+/// Refuses two entries whose paths differ only in case: on Windows they
+/// are the same file. Directories may repeat (they are one directory).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_collisions(entries: &[Planned]) -> Result<(), TarRejected> {
+    let mut seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for e in entries {
+        let key = e.segments.join("/").to_lowercase();
+        let is_dir = matches!(e.kind, Kind::Dir);
+        if let Some(&was_dir) = seen.get(&key)
+            && !(was_dir && is_dir)
+        {
+            return Err(rej(&e.display, "names differ only in case (one file on Windows)"));
+        }
+        seen.insert(key, is_dir);
+    }
+    Ok(())
+}
+
 fn plan(archive: &[u8], limits: ExtractLimits) -> Result<Vec<Planned>, TarRejected> {
     let mut out = Vec::new();
     let mut total: u64 = 0;
@@ -135,6 +180,10 @@ fn plan(archive: &[u8], limits: ExtractLimits) -> Result<Vec<Planned>, TarReject
             return Err(rej(&entry, format!("entry cap of {} exceeded", limits.max_entries)));
         }
         let segments = normalize(&entry, &entry)?;
+        #[cfg(windows)]
+        if let Some(why) = segments.iter().find_map(|seg| windows_name_problem(seg)) {
+            return Err(rej(&entry, why));
+        }
         match kind {
             Kind::File if segments.is_empty() => return Err(rej(&entry, "empty path for a file")),
             Kind::Dir if size != 0 => return Err(rej(&entry, "directory with data")),
@@ -166,6 +215,8 @@ pub fn extract_tar(archive: &[u8], dest: &Path, limits: ExtractLimits) -> Result
         return Err(rej(dest.display().to_string(), "destination exists"));
     }
     let entries = plan(archive, limits)?;
+    #[cfg(windows)]
+    windows_collisions(&entries)?;
     let partial = partial_of(dest);
     let io = |e: std::io::Error| rej(dest.display().to_string(), format!("cannot create destination: {e}"));
     let _ = fs::remove_dir_all(&partial);
@@ -216,18 +267,18 @@ fn create_file(path: &Path) -> std::io::Result<fs::File> {
     OpenOptions::new().write(true).create_new(true).mode(0o644).open(path)
 }
 
-// The archive checks above were written for Unix paths. Windows adds drive
-// and UNC prefixes, backslash separators, alternate data streams, reserved
-// device names, trailing dots and spaces, and case-insensitive collisions;
-// until those are refused (with tests), nothing is extracted on Windows.
+/// A directory of the extracted tree on Windows: it inherits the
+/// destination's ACL. Names were checked by `windows_name_problem`.
 #[cfg(windows)]
-fn make_dir(_path: &Path, _recursive: bool) -> std::io::Result<()> {
-    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "extracting a guest archive is not supported on Windows yet"))
+fn make_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
+    fs::DirBuilder::new().recursive(recursive).create(path)
 }
 
+/// A new file of the extracted tree on Windows, CREATE_NEW: an existing
+/// path (including one that differs only in case) is never opened.
 #[cfg(windows)]
-fn create_file(_path: &Path) -> std::io::Result<fs::File> {
-    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "extracting a guest archive is not supported on Windows yet"))
+fn create_file(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 #[cfg(test)]
@@ -340,17 +391,42 @@ mod tests {
         assert_eq!(names, vec![std::ffi::OsString::from("sentinel")]);
     }
 
+    #[test]
+    fn windows_name_rules_refuse_separators_streams_devices_and_aliases() {
+        for bad in [
+            "a\\b", "..\\x", "c:", "C:x", "f.txt:stream", "a*", "a?", "a\"", "a<", "a>", "a|", "a\u{1}b",
+            "x.", "x ", "x. .", "CON", "con", "Con.txt", "NUL.tar.gz", "aux", "PRN", "COM1", "com9.log", "LPT1",
+            "lpt0", "COM\u{b9}", "LPT\u{b3}.x", "CONIN$", "conout$", "CON .txt",
+        ] {
+            assert!(windows_name_problem(bad).is_some(), "{bad:?} accepted");
+        }
+        for good in ["a", "report.md", "CONSOLE", "com10", "LPTX", "nul_file", ".hidden", "a.b.c", "ünïcode", "x y"] {
+            assert_eq!(windows_name_problem(good), None, "{good:?} refused");
+        }
+    }
+
     #[cfg(windows)]
     #[test]
-    fn extraction_refuses_on_windows_until_its_path_rules_land() {
-        let e = env();
-        let r = extract_tar(&tar(&[file("./a.txt", b"x")]), &e.dest, LIM);
-        assert!(format!("{r:?}").contains("not supported on Windows"), "{r:?}");
-        assert!(!e.dest.join("a.txt").exists());
+    fn windows_hostile_names_are_refused_before_anything_is_written() {
+        refused(&tar(&[file("./a\\..\\..\\evil", b"x")]), "character not allowed", LIM);
+        refused(&tar(&[file("./out.txt:hidden", b"x")]), "character not allowed", LIM);
+        refused(&tar(&[file("./CON.txt", b"x")]), "reserved Windows device name", LIM);
+        refused(&tar(&[file("./report. ", b"x")]), "dot or space", LIM);
+        refused(&tar(&[file("./a.txt", b"x"), file("./A.TXT", b"y")]), "differ only in case", LIM);
     }
 
     #[test]
-    #[cfg(unix)]
+    fn names_that_differ_only_in_case_collide_on_windows() {
+        let plan = |names: &[&str]| -> Result<(), TarRejected> {
+            let entries: Vec<_> = names.iter().map(|n| file(n, b"x")).collect();
+            windows_collisions(&super::plan(&tar(&entries), LIM)?)
+        };
+        assert!(plan(&["./a/b.txt", "./A/B.TXT"]).is_err());
+        assert!(plan(&["./dir/x", "./Dir/y"]).is_ok(), "the same directory, spelled two ways, is one directory");
+        assert!(plan(&["./a/b.txt", "./a/c.txt"]).is_ok());
+    }
+
+    #[test]
     fn dirs_and_files_extract_byte_exact() {
         let e = env();
         let bin: Vec<u8> = (0..3000u32).map(|i| (i * 7 % 251) as u8).collect();
@@ -361,7 +437,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn missing_parent_entries_and_prefix() {
         let e = env();
         let mut p = file("leaf.txt", b"p");
@@ -372,7 +447,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn empty_archive_is_empty_dir() {
         let e = env();
         assert_eq!(extract_tar(&tar(&[]), &e.dest, LIM).unwrap(), Extracted { files: 0, bytes: 0 });
