@@ -27,9 +27,29 @@ pub enum Flavor {
     Firecracker,
 }
 
+#[cfg(test)]
+thread_local! {
+    static UNIT_TEST_FLAVOR: std::cell::Cell<Flavor> = const { std::cell::Cell::new(Flavor::Hvf) };
+}
+
 impl Flavor {
-    /// Firecracker on Linux, HVF everywhere else.
+    /// The flavor sessions on this host use: [`Flavor::native`]. In this
+    /// crate's unit tests it is HVF on every OS, because their fake mvmctl
+    /// and host replies are HVF-shaped; the Firecracker flavor is tested
+    /// directly (`for_session_flavor`, `backend::invariants`).
     pub fn host() -> Self {
+        #[cfg(test)]
+        {
+            UNIT_TEST_FLAVOR.with(|f| f.get())
+        }
+        #[cfg(not(test))]
+        {
+            Self::native()
+        }
+    }
+
+    /// Firecracker on Linux, HVF everywhere else.
+    pub fn native() -> Self {
         if cfg!(target_os = "linux") {
             Self::Firecracker
         } else {
@@ -677,9 +697,10 @@ mod tests {
     }
 
     #[test]
-    fn this_host_gets_its_flavor() {
+    fn this_host_gets_its_flavor_and_unit_tests_get_hvf() {
+        assert_eq!(Flavor::host(), Flavor::Hvf);
         assert_eq!(
-            Flavor::host(),
+            Flavor::native(),
             if cfg!(target_os = "linux") {
                 Flavor::Firecracker
             } else {
