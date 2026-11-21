@@ -45,3 +45,29 @@ jobs:
           cargo build --locked --target x86_64-pc-windows-msvc --profile egress --bin rts-egress
           RTS_EGRESS_EXE=target/x86_64-pc-windows-msvc/egress/rts-egress.exe \
             cargo test --locked --target x86_64-pc-windows-msvc --test windows_imports -- --ignored
+      - name: the confined egress proxy (AppContainer and job object, no VM)
+        shell: bash
+        run: |
+          cargo build --locked --target x86_64-pc-windows-msvc --profile egress --bin rts-egress --example egress_probe
+          export RTS_EGRESS_PROXY_EXE="$PWD/target/x86_64-pc-windows-msvc/egress/rts-egress.exe"
+          export RTS_HV_PROBE_EXE="$PWD/target/x86_64-pc-windows-msvc/egress/examples/egress_probe.exe"
+          cargo test --locked --target x86_64-pc-windows-msvc --lib -- --ignored --exact --test-threads=1 \
+            backend::hyperv::live::the_confined_proxy_cannot_read_the_user_profile_or_reach_host_loopback \
+            backend::hyperv::live::a_killed_rts_takes_its_confined_proxy_down
+      # The runner has no nested Hyper-V, so the VM suites run elsewhere
+      # (a Hyper-V host) from these msvc builds.
+      - name: collect test binaries for a Hyper-V host
+        shell: bash
+        run: |
+          cargo build --locked --target x86_64-pc-windows-msvc --bin rts
+          cargo test --locked --target x86_64-pc-windows-msvc --lib --test contain --no-run --message-format=json > build.jsonl
+          mkdir dist
+          python -c "import json,shutil; [shutil.copy(m['executable'], 'dist/' + m['target']['name'] + '-' + m['target']['kind'][0] + '.exe') for m in map(json.loads, open('build.jsonl')) if m.get('reason') == 'compiler-artifact' and m.get('profile', {}).get('test') and m.get('executable')]"
+          cp target/x86_64-pc-windows-msvc/debug/rts.exe target/x86_64-pc-windows-msvc/egress/rts-egress.exe target/x86_64-pc-windows-msvc/egress/examples/egress_probe.exe dist/
+          ls -la dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-test-binaries
+          path: dist/
+          retention-days: 3
+          if-no-files-found: error
