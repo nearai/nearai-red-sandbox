@@ -6,8 +6,7 @@
 //! the time limit in the guest, caps output there, and reports the real
 //! status and full output sizes in a nonce-tagged trailer on stderr.
 
-use std::fs::File;
-use std::io::Read;
+use ring::rand::{SecureRandom, SystemRandom};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedResult {
@@ -20,12 +19,13 @@ pub struct ParsedResult {
     pub truncated: bool,
 }
 
-/// Random lowercase hex from the OS.
+/// Random lowercase hex from the OS CSPRNG (getrandom on Linux, the
+/// system generator on macOS and Windows).
 pub fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .expect("reading /dev/urandom");
+    SystemRandom::new()
+        .fill(&mut buf)
+        .expect("the OS random number generator failed");
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
