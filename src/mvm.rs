@@ -131,7 +131,7 @@ impl Runner for SpawnRunner {
     /// 0600 log, and its own process group so the operator's Ctrl-C never
     /// reaches it.
     fn attach(&self, argv: &[String], log: &Path) -> io::Result<Box<dyn Attached>> {
-        let file = crate::sys::fs::open_private(OpenOptions::new().create(true).append(true), log)?;
+        let file = crate::sys::fs::open_private(log, crate::sys::fs::Create::Append)?;
         // The owner-only mode above applies only to a new file.
         crate::sys::fs::restrict_file(&file)?;
         let mut cmd = self.command(argv);

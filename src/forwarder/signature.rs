@@ -368,7 +368,7 @@ pub struct InferenceLine {
 pub fn append_inference_line(path: &Path, line: &InferenceLine) -> std::io::Result<()> {
     let mut bytes = serde_json::to_vec(line)?;
     bytes.push(b'\n');
-    let mut f = crate::sys::fs::open_private(std::fs::OpenOptions::new().append(true).create(true), path)?;
+    let mut f = crate::sys::fs::open_private(path, crate::sys::fs::Create::Append)?;
     // One write call per line.
     f.write_all(&bytes)
 }

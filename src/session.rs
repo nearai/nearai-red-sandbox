@@ -236,7 +236,7 @@ fn write_tui_config_with_prompt(dir: &Path, plugin_dir: &Path, model_display: &s
 }
 
 fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
-    crate::sys::fs::open_private(OpenOptions::new().create(true).truncate(true).write(true), path)?.write_all(data)
+    crate::sys::fs::open_private(path, crate::sys::fs::Create::Truncate)?.write_all(data)
 }
 
 // --- session layout ---

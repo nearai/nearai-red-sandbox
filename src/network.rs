@@ -673,10 +673,7 @@ pub fn extract_audit(audit_dir: &std::path::Path, vm_name: &str, out: &std::path
 
     let segments = audit_sources(audit_dir)?;
     let write_err = |e: io::Error| format!("writing {}: {e}", out.display());
-    let file = crate::sys::fs::open_private(
-        std::fs::OpenOptions::new().write(true).create(true).truncate(true),
-        out,
-    )
+    let file = crate::sys::fs::open_private(out, crate::sys::fs::Create::Truncate)
     .map_err(write_err)?;
     // The owner-only mode applies only on creation; an existing file is narrowed too.
     crate::sys::fs::restrict_file(&file).map_err(write_err)?;

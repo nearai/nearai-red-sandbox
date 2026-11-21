@@ -2,7 +2,7 @@
 //! status, rewritten atomically (temp file in the same directory, then
 //! rename) on every change.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -137,7 +137,7 @@ impl AttestationRecord {
             crate::protocol::random_hex(6)
         ));
         let written = (|| {
-            let mut f = crate::sys::fs::open_private(OpenOptions::new().write(true).create_new(true), &tmp)?;
+            let mut f = crate::sys::fs::open_private(&tmp, crate::sys::fs::Create::New)?;
             f.write_all(&bytes)?;
             f.sync_all()?;
             fs::rename(&tmp, &self.path)

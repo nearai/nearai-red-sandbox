@@ -3,7 +3,7 @@
 //! The worker owns its runtime home through shutdown. The host credential is
 //! handed directly to IronWire; configuration contains only routing policy.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -214,10 +214,7 @@ pub fn start_with_endpoint(
     } = setup;
     let config = runtime_config(models, endpoint, capture)?;
     let home = prepare_home(supplied_home)?;
-    let mut file = crate::sys::fs::open_private(
-        OpenOptions::new().write(true).create_new(true),
-        &home.path().join("config.toml"),
-    )
+    let mut file = crate::sys::fs::open_private(&home.path().join("config.toml"), crate::sys::fs::Create::New)
     .map_err(|_| "inference: cannot create runtime configuration")?;
     file.write_all(config.as_bytes())
         .map_err(|_| "inference: cannot write runtime configuration")?;

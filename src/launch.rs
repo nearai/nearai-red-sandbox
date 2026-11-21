@@ -93,10 +93,7 @@ pub fn private_git_config(prefix: &str) -> Result<(tempfile::TempDir, PathBuf), 
         .tempdir()
         .map_err(|_| "Cannot create a private temp directory")?;
     let empty_git_config = temp.path().join("empty.gitconfig");
-    crate::sys::fs::open_private(
-        std::fs::OpenOptions::new().write(true).create_new(true),
-        &empty_git_config,
-    )
+    crate::sys::fs::open_private(&empty_git_config, crate::sys::fs::Create::New)
     .map_err(|_| "Cannot create an empty Git configuration")?;
     Ok((temp, empty_git_config))
 }

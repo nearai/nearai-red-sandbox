@@ -24,7 +24,7 @@ pub fn install(plugin_dir: &Path, config_dir: &Path) -> Result<PathBuf, String> 
     let dir = config_dir.join("themes");
     fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     let file = dir.join(format!("{THEME_NAME}.json"));
-    crate::sys::fs::open_private(fs::OpenOptions::new().create(true).truncate(true).write(true), &file)
+    crate::sys::fs::open_private(&file, crate::sys::fs::Create::Truncate)
         .and_then(|mut f| f.write_all(&data))
         .map_err(|e| format!("writing {}: {e}", file.display()))?;
     Ok(file)

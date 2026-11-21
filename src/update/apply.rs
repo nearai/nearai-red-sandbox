@@ -132,7 +132,7 @@ pub fn run(o: &UpdateOptions, c: &UpdateContext) -> Result<Vec<String>, String> 
     let stage = private_stage(c.temp_dir)
         .map_err(|e| format!("creating a private directory under {}: {e}", c.temp_dir.display()))?;
     let path = stage.path().join("install.sh");
-    crate::sys::fs::open_private(std::fs::OpenOptions::new().write(true).create_new(true), &path)
+    crate::sys::fs::open_private(&path, crate::sys::fs::Create::New)
         .and_then(|mut f| f.write_all(&script))
         .map_err(|e| format!("writing {}: {e}", path.display()))?;
 

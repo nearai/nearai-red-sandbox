@@ -100,8 +100,8 @@ fn monitoring_failure(o: &BridgeOptions, message: &str) -> Outcome {
     use std::io::Write;
     StateDir(o.state_dir.clone()).mark("canary monitoring failed");
     let marker = crate::sys::fs::open_private(
-        std::fs::OpenOptions::new().write(true).create_new(true),
         &o.state_dir.join("canary-monitoring-failed"),
+        crate::sys::fs::Create::New,
     );
     if let Ok(mut marker) = marker {
         let _ = marker.write_all(b"canary monitoring failed; observation coverage incomplete\n");
