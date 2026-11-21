@@ -1,26 +1,208 @@
-//! Shared setup for the real-mvm suite. Explicitly requested real-VM tests
-//! fail when the patched supervisor or mvmctl prerequisites are unavailable.
+//! Shared setup for the real-VM suite: mvm on macOS and Linux, Hyper-V on
+//! Windows. Explicitly requested real-VM tests fail when the backend's
+//! prerequisites are unavailable (on HVF the patched supervisor and mvmctl).
 //! Requested OpenCode tests fail when opencode 2.2.2 is unavailable on PATH
 //! (or at RTS_OPENCODE); missing prerequisites never count as validation.
+//!
+//! On Windows the test binary usually runs away from its checkout, so
+//! RTS_EXE names the rts.exe to run and RTS_PLUGIN_DIR the plugin.
 
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+#[cfg(unix)]
 use rts::config::default_image;
+#[cfg(unix)]
 use rts::mvm::{MvmSandbox, Runner, SpawnRunner};
-use rts::protocol::random_hex;
+#[cfg(unix)]
 use rts::network::{Plan, SystemResolver};
-use rts::sandbox::{CreateSpec, Egress, ExecOptions, Sandbox};
-use rts::session::{Host, RealHost, OPENCODE_VERSION, SUPERVISOR_FIX_VERSION, initialize_guest_storage, mvm_environment, supervisor_path};
+use rts::protocol::random_hex;
+#[cfg(unix)]
+use rts::sandbox::Egress;
+use rts::sandbox::{CreateSpec, ExecOptions, Sandbox};
+use rts::session::{Host, OPENCODE_VERSION, RealHost, initialize_guest_storage};
+#[cfg(unix)]
+use rts::session::{SUPERVISOR_FIX_VERSION, mvm_environment, supervisor_path};
 use serde_json::{Value, json};
 
+/// The rts binary the tests run: RTS_EXE, else the one Cargo built.
+pub fn rts_exe() -> PathBuf {
+    std::env::var_os("RTS_EXE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_rts")))
+}
+
+/// The sandbox plugin: RTS_PLUGIN_DIR, else the checkout's.
+pub fn plugin_dir() -> PathBuf {
+    std::env::var_os("RTS_PLUGIN_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin"))
+}
+
+/// A fresh machine on this host's backend, removed when dropped (so a
+/// failing test still cleans up). On Unix it is the mvm machine
+/// [`fresh_machine`] makes; on Windows a Hyper-V VM made through
+/// `rts::backend`, as a session makes it.
+pub struct Guest {
+    #[cfg(unix)]
+    m: Machine,
+    #[cfg(windows)]
+    m: Box<dyn rts::backend::Machine>,
+    #[cfg(windows)]
+    _backend: Box<dyn rts::backend::Backend>,
+    #[cfg(windows)]
+    dir: PathBuf,
+    pub name: String,
+}
+
+impl std::ops::Deref for Guest {
+    type Target = dyn Sandbox;
+    fn deref(&self) -> &(dyn Sandbox + 'static) {
+        #[cfg(unix)]
+        {
+            &self.m.0
+        }
+        #[cfg(windows)]
+        {
+            self.m.as_ref()
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Guest {
+    fn drop(&mut self) {
+        if let Err(e) = self.m.remove() {
+            eprintln!("[contain] removing {} failed: {e}", self.name);
+        }
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A fresh guest with /in and /out initialised.
+#[cfg(unix)]
+pub fn fresh_guest() -> Guest {
+    let h = mvm().expect("real-mvm prerequisites");
+    let m = fresh_machine(h);
+    let name = m.0.name.clone();
+    Guest { m, name }
+}
+
+/// A fresh guest with /in and /out initialised.
+#[cfg(windows)]
+pub fn fresh_guest() -> Guest {
+    let dir = tempdir("guest");
+    let paths =
+        rts::session::session_paths(&random_hex(6), &dir.join("sessions"), &dir.join("runtime"));
+    rts::session::prepare_session_dirs(&paths).unwrap();
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let backend: Box<dyn rts::backend::Backend> = Box::new(
+        rts::backend::hyperv::backend::HyperVBackend::windows(&env)
+            .unwrap_or_else(|e| panic!("[contain] Hyper-V prerequisites failed: {e}")),
+    );
+    let m = backend.machine(&paths.machine).unwrap();
+    let name = paths.machine.clone();
+    let g = Guest {
+        m,
+        _backend: backend,
+        dir,
+        name,
+    };
+    g.m.create(&CreateSpec {
+        name: &g.name,
+        image: "",
+        memory_mib: 512,
+        cpus: 1,
+        egress: None,
+    })
+    .expect("machine create");
+    initialize_guest_storage(&*g).expect("guest input/output storage");
+    g
+}
+
+impl Guest {
+    /// The bridge options `rts tool` needs for this guest, as the launcher
+    /// writes them.
+    pub fn bridge(&self, state_dir: &Path) -> Value {
+        #[cfg(unix)]
+        {
+            bridge_options(
+                mvm().expect("real-mvm prerequisites"),
+                &self.name,
+                state_dir,
+            )
+        }
+        #[cfg(windows)]
+        {
+            // Exactly what the launcher writes (plugin_options, then the VM
+            // id), for this guest and the caller's state directory.
+            let defaults = rts::config::Defaults {
+                mvmctl: PathBuf::new(),
+                plugin_dir: plugin_dir(),
+                opencode: String::new(),
+                sessions_dir: self.dir.join("sessions"),
+            };
+            let cfg = rts::config::parse_config("{}", &self.dir, &defaults).unwrap();
+            let paths = rts::session::session_paths(
+                &self.name[4..],
+                &self.dir.join("sessions"),
+                &self.dir.join("runtime"),
+            );
+            let home = std::env::var("USERPROFILE").unwrap_or_default();
+            let mut o = rts::session::plugin_options(
+                &paths,
+                &cfg,
+                &[rts_exe().to_string_lossy().into_owned(), "tool".into()],
+                &rts::protocol::new_nonce(),
+                &home,
+            );
+            rts::session::with_tool_target(&mut o, self.m.tool_target());
+            o["bridge"]["stateDir"] = json!(state_dir);
+            o["bridge"].take()
+        }
+    }
+
+    /// Stop the VM behind the session's back, as a crash or an operator
+    /// would: `machine stop` on mvm, an HCS terminate on Hyper-V.
+    pub fn stop_out_from_under(&self) {
+        #[cfg(unix)]
+        {
+            let h = mvm().expect("real-mvm prerequisites");
+            let stopped = h
+                .run
+                .run(
+                    &rts::sandbox::sv(&["machine", "stop", &self.name, "--yes"]),
+                    Duration::from_secs(120),
+                )
+                .unwrap();
+            assert_eq!(
+                stopped.code,
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&stopped.stderr)
+            );
+        }
+        #[cfg(windows)]
+        {
+            let id = self.m.tool_target().expect("a Hyper-V VM id");
+            let vm = rts::backend::hyperv::hcs::ComputeSystem::open(&id)
+                .unwrap()
+                .expect("the VM is running");
+            vm.terminate().unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
 pub struct Harness {
     pub mvmctl: PathBuf,
     pub image: String,
@@ -32,6 +214,7 @@ pub fn limits() -> ExecOptions {
     ExecOptions::new(120_000, 65_536)
 }
 
+#[cfg(unix)]
 fn patched_runner(mvmctl: PathBuf, empty_git_config: PathBuf, env: &[(String, String)], host: &dyn Host) -> Result<SpawnRunner, String> {
     let supervisor = supervisor_path(env, None)?;
     let executable = supervisor.to_str().ok_or("patched supervisor path is not valid UTF-8")?;
@@ -46,6 +229,7 @@ fn patched_runner(mvmctl: PathBuf, empty_git_config: PathBuf, env: &[(String, St
     Ok(SpawnRunner { mvmctl, empty_git_config, extra_env: mvm_environment(env, &supervisor), remove_env: Vec::new() })
 }
 
+#[cfg(unix)]
 fn probe() -> Result<Harness, String> {
     let env: Vec<(String, String)> = std::env::vars().collect();
     let home = env.iter().find(|(key, _)| key == "HOME").map(|(_, value)| value.as_str()).unwrap_or_default();
@@ -69,6 +253,7 @@ fn probe() -> Result<Harness, String> {
 
 /// Ignored tests run only by explicit request, so missing prerequisites must fail
 /// the test rather than report a successful skip. Keep Option for existing callers.
+#[cfg(unix)]
 pub fn mvm() -> Option<&'static Harness> {
     static H: OnceLock<Result<Harness, String>> = OnceLock::new();
     match H.get_or_init(probe) {
@@ -96,8 +281,10 @@ fn checked_opencode(oc: String, host: &dyn Host) -> Option<String> {
 }
 
 /// A machine removed when dropped, so a failing test still cleans up.
+#[cfg(unix)]
 pub struct Machine(pub MvmSandbox);
 
+#[cfg(unix)]
 impl Drop for Machine {
     fn drop(&mut self) {
         if let Err(e) = self.0.remove() {
@@ -106,6 +293,7 @@ impl Drop for Machine {
     }
 }
 
+#[cfg(unix)]
 impl std::ops::Deref for Machine {
     type Target = MvmSandbox;
     fn deref(&self) -> &MvmSandbox {
@@ -113,6 +301,7 @@ impl std::ops::Deref for Machine {
     }
 }
 
+#[cfg(unix)]
 pub fn fresh_machine(h: &Harness) -> Machine {
     let name = format!("rts-{}", random_hex(6));
     let m = Machine(MvmSandbox::new(&name, Box::new(h.run.clone())).unwrap());
@@ -124,12 +313,14 @@ pub fn fresh_machine(h: &Harness) -> Machine {
 /// The session limit a containment network machine is created with. One
 /// hour is the shortest mvm `--ttl` rts asks for, so a machine left behind
 /// by an aborted run stops on its own soon after.
+#[cfg(unix)]
 pub const NETWORK_TEST_HOURS: u32 = 1;
 
 /// A machine with egress to `allow`, created the way a session creates
 /// one: the entries go through `network::plan` with the host's resolver,
 /// `machine create` gets one `--allow-host` per entry, and the supervised
 /// `machine run` writes to `mvm-attach.log` in the returned temp dir.
+#[cfg(unix)]
 pub fn fresh_network_machine(h: &Harness, allow: &[&str]) -> (Machine, Plan, PathBuf) {
     let written: Vec<String> = allow.iter().map(|a| a.to_string()).collect();
     let plan = rts::network::plan(&written, &SystemResolver).expect("allowlist resolves and validates");
@@ -150,12 +341,14 @@ pub fn tempdir(tag: &str) -> PathBuf {
 }
 
 /// The options `rts tool` needs for a machine, as the launcher writes them.
+#[cfg(unix)]
 pub fn bridge_options(h: &Harness, machine: &str, state_dir: &Path) -> Value {
     bridge_options_with(h, machine, state_dir, false)
 }
 
 /// As [`bridge_options`], with `"proxy": true` for a network session, as
 /// the launcher writes it only when the session has an allowlist.
+#[cfg(unix)]
 pub fn bridge_options_with(h: &Harness, machine: &str, state_dir: &Path, proxy: bool) -> Value {
     let mut o = json!({
         "machine": machine,
@@ -174,7 +367,7 @@ pub fn bridge_options_with(h: &Harness, machine: &str, state_dir: &Path, proxy: 
 
 /// One call through the built `rts tool` binary: exactly what the plugin shim spawns.
 pub fn rts_tool(options: &Value, tool: &str, input: Value) -> (i32, String, String) {
-    let mut p = Command::new(env!("CARGO_BIN_EXE_rts"))
+    let mut p = Command::new(rts_exe())
         .args(["tool", tool])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -216,7 +409,7 @@ pub fn fake_ironwire_counted(model: &str) -> (String, Arc<AtomicUsize>) {
     (format!("http://127.0.0.1:{port}/openai/v1"), accepted)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
