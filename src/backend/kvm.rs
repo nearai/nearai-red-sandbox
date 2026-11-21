@@ -159,6 +159,19 @@ mod tests {
         }
     }
 
+    /// Run the just-written shim. On Linux, exec of a file fails with
+    /// ETXTBSY while another test thread's fork still holds a write fd to
+    /// it (until that child execs), so retry briefly.
+    fn run_shim(sudo: &Path, args: &[&str]) -> std::process::Output {
+        for _ in 0..50 {
+            match Command::new(sudo).args(args).output() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => std::thread::sleep(Duration::from_millis(20)),
+                r => return r.unwrap(),
+            }
+        }
+        panic!("{} stayed busy", sudo.display());
+    }
+
     fn shim(d: &Path) -> PathBuf {
         install_sudo_shim(&d.join("bin")).unwrap().join("sudo")
     }
@@ -184,7 +197,7 @@ mod tests {
             &["-n", "id", "-u"],
             &["-n", "-E", "--", "id", "-u"],
         ] {
-            let o = Command::new(&sudo).args(args).output().unwrap();
+            let o = run_shim(&sudo, args);
             assert!(
                 o.status.success(),
                 "{args:?}: {}",
@@ -209,7 +222,7 @@ mod tests {
             &["-i"],
             &[],
         ] {
-            let o = Command::new(&sudo).args(args).output().unwrap();
+            let o = run_shim(&sudo, args);
             assert_eq!(o.status.code(), Some(1), "{args:?}");
             assert!(o.stdout.is_empty(), "{args:?} ran something");
         }
