@@ -1,8 +1,9 @@
 //! Host-OS calls std does not expose. On Unix: sending a signal other than
 //! SIGKILL, catching SIGINT/SIGTERM, physical memory, and process groups;
 //! libc is already linked by std on macOS and Linux, so this needs no crate.
-//! On Windows these are not implemented yet: each fails closed (no signal
-//! sent, no memory figure, so a launch refuses) rather than pretending.
+//! On Windows, physical memory and console control events are read through
+//! windows-sys; signals are not sent (job objects end process trees there),
+//! so `send_signal` and `signal_group` fail closed.
 
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -39,21 +40,55 @@ extern "C" fn on_signal(sig: i32) {
     LAST_SIGNAL.store(sig, Ordering::SeqCst);
 }
 
-/// Route SIGINT and SIGTERM to a flag the launcher polls, instead of
-/// letting them kill the launcher before teardown runs. Windows: not yet
-/// (a console control handler); Ctrl-C ends the launcher there.
+/// The signal a console control event stands for: Ctrl-C and Ctrl-Break
+/// are SIGINT; closing the console, logoff and shutdown are SIGTERM.
 #[cfg(windows)]
-pub fn catch_termination_signals() {}
+fn ctrl_signal(event: u32) -> Option<i32> {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT};
+    match event {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT => Some(SIGINT),
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => Some(SIGTERM),
+        _ => None,
+    }
+}
+
+/// How long the close, logoff and shutdown events hold the console handler.
+/// Windows ends the process when the handler returns (or after about five
+/// seconds), so it waits here while the launcher tears down; the launcher
+/// exiting first ends the process, and this thread with it.
+#[cfg(windows)]
+const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_millis(4500);
+
+#[cfg(windows)]
+unsafe extern "system" fn on_ctrl(event: u32) -> windows_sys::core::BOOL {
+    let Some(sig) = ctrl_signal(event) else { return 0 };
+    LAST_SIGNAL.store(sig, Ordering::SeqCst);
+    if sig == SIGTERM {
+        std::thread::sleep(CLOSE_GRACE);
+    }
+    1
+}
+
+/// Route Ctrl-C, Ctrl-Break and console close, logoff and shutdown to the
+/// flag the launcher polls, instead of letting them end the launcher before
+/// teardown runs. In ConPTY raw mode Ctrl-C reaches OpenCode as a keystroke,
+/// not as an event. Returns whether the handler was installed.
+#[cfg(windows)]
+pub fn catch_termination_signals() -> bool {
+    // SAFETY: the handler only stores to an atomic and sleeps.
+    unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(on_ctrl), 1) != 0 }
+}
 
 /// Route SIGINT and SIGTERM to a flag the launcher polls, instead of
-/// letting them kill the launcher before teardown runs.
+/// letting them kill the launcher before teardown runs. Returns true.
 #[cfg(unix)]
-pub fn catch_termination_signals() {
+pub fn catch_termination_signals() -> bool {
     // SAFETY: the handler only performs an atomic store.
     unsafe {
         signal(SIGINT, on_signal as *const () as usize);
         signal(SIGTERM, on_signal as *const () as usize);
     }
+    true
 }
 
 /// The last SIGINT/SIGTERM received, if any, cleared on read.
@@ -64,10 +99,18 @@ pub fn take_signal() -> Option<i32> {
     }
 }
 
-/// Physical memory in MiB. Windows: not yet, so a launch refuses there.
+/// Physical memory in MiB, from GlobalMemoryStatusEx.
 #[cfg(windows)]
 pub fn host_memory_mib() -> Option<u64> {
-    None
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: MEMORYSTATUSEX is plain data; dwLength is set as the API requires.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: the pointer is to a struct we own, sized in dwLength.
+    if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 || status.ullTotalPhys == 0 {
+        return None;
+    }
+    Some(status.ullTotalPhys / (1024 * 1024))
 }
 
 /// Run `cmd` as the leader of its own process group (Unix), so a timeout
@@ -103,12 +146,38 @@ pub fn host_memory_mib() -> Option<u64> {
     Some((pages as u64).checked_mul(page as u64)? / (1024 * 1024))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod memory_tests {
     #[test]
     fn host_memory_is_read_in_mib() {
-        let mib = super::host_memory_mib().expect("sysconf reports physical memory");
+        let mib = super::host_memory_mib().expect("the OS reports physical memory");
         // Any machine that runs this has between 512 MiB and 64 TiB.
         assert!((512..64 * 1024 * 1024).contains(&mib), "{mib}");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod ctrl_tests {
+    use super::*;
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT};
+
+    #[test]
+    fn console_events_map_to_the_signals_the_session_polls() {
+        assert_eq!(ctrl_signal(CTRL_C_EVENT), Some(SIGINT));
+        assert_eq!(ctrl_signal(CTRL_BREAK_EVENT), Some(SIGINT));
+        for close in [CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT] {
+            assert_eq!(ctrl_signal(close), Some(SIGTERM));
+        }
+        assert_eq!(ctrl_signal(42), None);
+    }
+
+    #[test]
+    fn the_handler_is_registered_and_ctrl_break_sets_the_flag_instead_of_ending_the_process() {
+        assert!(catch_termination_signals(), "SetConsoleCtrlHandler must succeed");
+        let _ = take_signal();
+        // SAFETY: called as Windows would call it, with an event code.
+        assert_ne!(unsafe { on_ctrl(CTRL_BREAK_EVENT) }, 0, "handled, so the default handler does not end the process");
+        assert_eq!(take_signal(), Some(SIGINT));
+        assert_eq!(unsafe { on_ctrl(42) }, 0, "an unknown event is left to the next handler");
     }
 }

@@ -348,13 +348,30 @@ pub fn opencode_launch(p: &SessionPaths, opencode: &str, base_env: impl IntoIter
     opencode_launch_with_key(p, opencode, base_env, None)
 }
 
+/// Terminal and runtime essentials that pass to OpenCode on every OS.
+const OPENCODE_ENV: [&str; 11] = ["PATH", "TERM", "COLORTERM", "LANG", "TMPDIR", "USER", "LOGNAME", "SHELL", "DISPLAY", "WAYLAND_DISPLAY", "NO_COLOR"];
+
+/// The few system variables a Windows process needs to run at all (without
+/// SystemRoot, Winsock fails). No token or secret is among them.
+const OPENCODE_ENV_WINDOWS: [&str; 10] = ["SystemRoot", "windir", "ComSpec", "PATHEXT", "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "SystemDrive"];
+
+/// Whether the host variable `name` passes to OpenCode. Only the lists above
+/// and the explicitly selected direct provider key pass; host credentials
+/// stay on the host. Windows names are case-insensitive (std reports `Path`).
+fn opencode_env_passes(name: &str, windows: bool, direct_key: Option<&str>) -> bool {
+    if direct_key == Some(name) {
+        return true;
+    }
+    if windows {
+        let listed = OPENCODE_ENV.iter().chain(&OPENCODE_ENV_WINDOWS).any(|k| k.eq_ignore_ascii_case(name));
+        return listed || name.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("LC_"));
+    }
+    OPENCODE_ENV.contains(&name) || name.starts_with("LC_")
+}
+
 pub fn opencode_launch_with_key(p: &SessionPaths, opencode: &str, base_env: impl IntoIterator<Item = (String, String)>, direct_key: Option<&str>) -> Launch {
-    let mut env: Vec<(String, String)> = base_env
-        .into_iter()
-        // Only terminal/runtime essentials and the explicitly selected direct
-        // provider key pass to OpenCode. Host credentials stay on the host.
-        .filter(|(k, _)| matches!(k.as_str(), "PATH" | "TERM" | "COLORTERM" | "LANG" | "TMPDIR" | "USER" | "LOGNAME" | "SHELL" | "DISPLAY" | "WAYLAND_DISPLAY" | "NO_COLOR") || k.starts_with("LC_") || direct_key == Some(k.as_str()))
-        .collect();
+    let mut env: Vec<(String, String)> =
+        base_env.into_iter().filter(|(k, _)| opencode_env_passes(k, cfg!(windows), direct_key)).collect();
     for (k, v) in [
         ("HOME", &p.home),
         ("XDG_CONFIG_HOME", &p.xdg_config),
@@ -846,9 +863,22 @@ fn finish_canaries(registry: &crate::canary::Registry, paths: &SessionPaths, exp
     failed
 }
 
+/// Windows has no mode bits: directories are created owner-only (as every
+/// session directory is) and files inherit that DACL. Links and other
+/// non-regular entries are skipped, as on Unix.
 #[cfg(windows)]
-fn copy_tree_preserving_mode(_src: &Path, _dst: &Path) -> io::Result<()> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "copying a tree with its permissions is not supported on Windows yet"))
+fn copy_tree_preserving_mode(src: &Path, dst: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(src)?;
+    if meta.is_dir() {
+        crate::sys::fs::create_private_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            copy_tree_preserving_mode(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else if meta.is_file() {
+        fs::copy(src, dst)?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1279,6 +1309,43 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, backend: &dyn Backend, operat
             monitor.sample(cfg.limits.host_rss_ceiling_mib)?;
         }
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_launch_tests {
+    use std::path::Path;
+
+    #[test]
+    fn opencode_on_windows_gets_the_system_variables_and_no_host_token() {
+        let p = super::session_paths("0123456789ab", Path::new(r"C:\s"), Path::new(r"C:\r"));
+        let env = [("Path", r"C:\Windows"), ("SystemRoot", r"C:\Windows"), ("GITHUB_TOKEN", "ghp_x"), ("NEARAI_API_KEY", "k")];
+        let l = super::opencode_launch(&p, "opencode.exe", env.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let names: Vec<&str> = l.env.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(names.contains(&"Path") && names.contains(&"SystemRoot"), "{names:?}");
+        assert!(!names.contains(&"GITHUB_TOKEN") && !names.contains(&"NEARAI_API_KEY"), "{names:?}");
+    }
+}
+
+#[cfg(test)]
+mod copy_tree_tests {
+    use std::fs;
+
+    #[test]
+    fn kept_opencode_data_is_copied_as_a_whole_tree() {
+        let base = std::env::temp_dir().join(format!("rts-copy-tree-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        fs::create_dir_all(src.join("storage/session")).unwrap();
+        fs::write(src.join("auth.json"), b"{}").unwrap();
+        fs::write(src.join("storage/session/ses_1.json"), b"one").unwrap();
+        fs::create_dir_all(src.join("empty")).unwrap();
+        let dst = base.join("dst");
+        super::copy_tree_preserving_mode(&src, &dst).unwrap();
+        assert_eq!(fs::read(dst.join("auth.json")).unwrap(), b"{}");
+        assert_eq!(fs::read(dst.join("storage/session/ses_1.json")).unwrap(), b"one");
+        assert!(dst.join("empty").is_dir());
+        fs::remove_dir_all(&base).unwrap();
     }
 }
 
@@ -1855,6 +1922,21 @@ mod tests {
         assert_eq!(get("PATH"), ["/bin"]);
         assert_eq!(p.machine, "rts-0123456789ab");
         assert_eq!(p.audit_file, PathBuf::from("/s/0123456789ab/tools.jsonl"));
+    }
+
+    #[test]
+    fn on_windows_opencode_gets_only_the_minimal_system_variables_matched_case_insensitively() {
+        for name in ["SystemRoot", "windir", "ComSpec", "PATHEXT", "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "SystemDrive", "Path", "SYSTEMROOT"] {
+            assert!(opencode_env_passes(name, true, None), "{name} must reach OpenCode on Windows");
+            assert!(!opencode_env_passes(name, false, None), "{name} is Windows-only");
+        }
+        for name in ["USERDOMAIN", "COMPUTERNAME", "ProgramData", "OneDrive", "GITHUB_TOKEN", "NEARAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "SSH_AUTH_SOCK", "OPENCODE_CONFIG", "PSModulePath", "HOMEPATH"] {
+            assert!(!opencode_env_passes(name, true, None), "{name} must not reach OpenCode on Windows");
+        }
+        // The direct provider key still passes, by its exact name.
+        assert!(opencode_env_passes("NEARAI_API_KEY", true, Some("NEARAI_API_KEY")));
+        // Unix keeps its exact-case list: no Windows names, no case folding.
+        assert!(opencode_env_passes("PATH", false, None) && !opencode_env_passes("SystemRoot", false, None) && !opencode_env_passes("path", false, None));
     }
 
     fn healthy(argv: &[String]) -> RunOutput {
