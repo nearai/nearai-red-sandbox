@@ -12,6 +12,7 @@ mod copy;
 mod exec;
 mod files;
 mod harness;
+mod invariants;
 mod leak;
 mod network;
 mod session;

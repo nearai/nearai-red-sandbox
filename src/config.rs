@@ -10,7 +10,18 @@ use serde::Deserialize;
 
 use crate::mvm::is_image_ref;
 
+/// The arm64 guest image (Apple-silicon macOS, arm64 Linux).
 pub const DEFAULT_IMAGE: &str = "us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images/guest@sha256:56406743ca98389029c795a9cd55f0d1f55e569d57226c10e6c4f6f340cf9ac1";
+/// The amd64 guest image: the other member of the multi-arch index
+/// `guest@sha256:28197decf607aabcf0e6c64fb03aa364d59ad9b8be533ef0957f6c82c7e1acdd`,
+/// built reproducibly from `guest/Dockerfile`.
+pub const DEFAULT_IMAGE_AMD64: &str = "us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images/guest@sha256:6b72caa2757b31d48d93cb439fc78ae7495cf1acc93feda9a3196e8ad130b882";
+
+/// The guest image for this host's architecture. A manifest digest, not the
+/// index, so mvm never chooses a platform.
+pub fn default_image() -> &'static str {
+    if cfg!(target_arch = "x86_64") { DEFAULT_IMAGE_AMD64 } else { DEFAULT_IMAGE }
+}
 pub const IRONWIRE_PROVIDER_ID: &str = "ironwire";
 /// The provider rts itself configures after attestation (src/inference.rs).
 pub const EMBEDDED_PROVIDER_ID: &str = "nearai-red-embedded";
@@ -439,7 +450,7 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
             "config: provider.apiKeyEnv is required for a provider that is not on loopback".into(),
         );
     }
-    let image = raw.image.unwrap_or_else(|| DEFAULT_IMAGE.into());
+    let image = raw.image.unwrap_or_else(|| default_image().into());
     if !is_image_ref(&image) {
         return Err(
             "config: image must be a digest-pinned reference (name@sha256:<64 hex>)".into(),
@@ -734,7 +745,7 @@ mod tests {
             c.provider.loopback(),
             Some(("127.0.0.1".into(), 8463, "/openai/v1".into()))
         );
-        assert_eq!(c.image, DEFAULT_IMAGE);
+        assert_eq!(c.image, default_image());
         assert_eq!(c.limits, Limits::default());
         assert_eq!(c.sessions_dir, PathBuf::from("/repo/sessions"));
         assert_eq!(c.plugin_dir, PathBuf::from("/repo/plugin"));
@@ -877,4 +888,16 @@ mod tests {
         l.resize(None, Some(8192)).unwrap();
         assert_eq!(l.host_rss_ceiling_mib, 8192 + RSS_HEADROOM_MIB);
     }
+
+    #[test]
+    fn the_default_guest_image_is_this_hosts_architecture() {
+        // macOS (and any arm64 host) keeps the arm64 image it has always pinned.
+        assert_eq!(DEFAULT_IMAGE, "us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images/guest@sha256:56406743ca98389029c795a9cd55f0d1f55e569d57226c10e6c4f6f340cf9ac1");
+        // The amd64 member of the same image's multi-arch index (sha256:28197dec...).
+        assert_eq!(DEFAULT_IMAGE_AMD64, "us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images/guest@sha256:6b72caa2757b31d48d93cb439fc78ae7495cf1acc93feda9a3196e8ad130b882");
+        assert!(is_image_ref(DEFAULT_IMAGE_AMD64));
+        let want = if cfg!(target_arch = "x86_64") { DEFAULT_IMAGE_AMD64 } else { DEFAULT_IMAGE };
+        assert_eq!(default_image(), want);
+    }
+
 }

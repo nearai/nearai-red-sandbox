@@ -1,0 +1,13 @@
+#!/bin/busybox sh
+# Spike initrd: no NIC drivers loaded on purpose; hvsocket only.
+/bin/busybox mkdir -p /proc /sys /dev /tmp
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox mount -t devtmpfs devtmpfs /dev
+/bin/busybox --install -s /bin
+echo "rts-spike: init on $(uname -r)"
+insmod /lib/vsock.ko && insmod /lib/hv_sock.ko && echo "rts-spike: hv_sock loaded"
+echo "rts-spike: net interfaces: $(ls /sys/class/net)"
+/bin/hvexec 5000
+echo "rts-spike: hvexec exited $?"
+poweroff -f

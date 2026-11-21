@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use rts::config::DEFAULT_IMAGE;
+use rts::config::default_image;
 use rts::mvm::{MvmSandbox, Runner, SpawnRunner};
 use rts::protocol::random_hex;
 use rts::network::{Plan, SystemResolver};
@@ -63,7 +63,7 @@ fn probe() -> Result<Harness, String> {
     if r.code != Some(0) {
         return Err(format!("mvmctl doctor failed: {}", String::from_utf8_lossy(&r.stderr).trim()));
     }
-    let image = std::env::var("RTS_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.into());
+    let image = std::env::var("RTS_IMAGE").unwrap_or_else(|_| default_image().into());
     Ok(Harness { mvmctl, image, run, empty_git_config })
 }
 

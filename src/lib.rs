@@ -1,5 +1,6 @@
 pub mod canary;
 pub mod attest;
+pub mod backend;
 pub mod brand;
 pub mod bridge;
 pub mod auth;
