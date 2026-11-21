@@ -65,6 +65,17 @@ jobs:
           python -c "import json,shutil; [shutil.copy(m['executable'], 'dist/' + m['target']['name'] + '-' + m['target']['kind'][0] + '.exe') for m in map(json.loads, open('build.jsonl')) if m.get('reason') == 'compiler-artifact' and m.get('profile', {}).get('test') and m.get('executable')]"
           cp target/x86_64-pc-windows-msvc/debug/rts.exe target/x86_64-pc-windows-msvc/egress/rts-egress.exe target/x86_64-pc-windows-msvc/egress/examples/egress_probe.exe dist/
           ls -la dist
+      # The release archive, packaged as release.yml packages it, must pass
+      # rts's own untar rules and install into a prefix.
+      - name: the Windows release archive installs into a prefix
+        shell: bash
+        run: |
+          scripts/package-windows.sh --version 0.0.0-ci \
+            --rts target/x86_64-pc-windows-msvc/debug/rts.exe \
+            --egress target/x86_64-pc-windows-msvc/egress/rts-egress.exe --out dist
+          RTS_RELEASE_TAR="$PWD/dist/rts-0.0.0-ci-x86_64-pc-windows-msvc.tar" \
+            cargo test --locked --target x86_64-pc-windows-msvc --lib -- --ignored --exact \
+            backend::hyperv::setup::tests::a_built_release_archive_installs_into_a_prefix
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-test-binaries

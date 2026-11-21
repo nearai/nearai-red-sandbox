@@ -106,7 +106,7 @@ pub fn fresh_guest() -> Guest {
     rts::session::prepare_session_dirs(&paths).unwrap();
     let env: Vec<(String, String)> = std::env::vars().collect();
     let backend: Box<dyn rts::backend::Backend> = Box::new(
-        rts::backend::hyperv::backend::HyperVBackend::windows(&env)
+        rts::backend::hyperv::backend::HyperVBackend::windows(&env, &Default::default())
             .unwrap_or_else(|e| panic!("[contain] Hyper-V prerequisites failed: {e}")),
     );
     let m = backend.machine(&paths.machine).unwrap();
@@ -150,6 +150,7 @@ impl Guest {
                 plugin_dir: plugin_dir(),
                 opencode: String::new(),
                 sessions_dir: self.dir.join("sessions"),
+                hyperv: Default::default(),
             };
             let cfg = rts::config::parse_config("{}", &self.dir, &defaults).unwrap();
             let paths = rts::session::session_paths(

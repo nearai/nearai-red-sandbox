@@ -20,3 +20,6 @@ pub mod hcs;
 pub mod appcontainer;
 #[cfg(all(test, windows))]
 mod live;
+
+/// The egress proxy's file name.
+pub const EGRESS_EXE: &str = "rts-egress.exe";

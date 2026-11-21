@@ -28,7 +28,7 @@ pub const MAX_REDIRECTS: usize = 5;
 
 const CHUNK: usize = 64 * 1024;
 const UNPACK_TIMEOUT: Duration = Duration::from_secs(600);
-const TEMP_PREFIX: &str = ".rts-setup-";
+pub(crate) const TEMP_PREFIX: &str = ".rts-setup-";
 
 /// `url` parsed, when it is `https`, its host is exactly one of
 /// `ALLOWED_HOSTS` (not a suffix match), it names no port other than 443 and
@@ -340,7 +340,7 @@ pub fn install_component(c: &Component, target: &Path, f: &dyn Fetch, host: &dyn
 
 /// Remove `.rts-setup-*` directories (never files or symlinks) a killed run
 /// left in `parent`.
-fn remove_stale_temp_dirs(parent: &Path) -> Result<(), String> {
+pub(crate) fn remove_stale_temp_dirs(parent: &Path) -> Result<(), String> {
     let entries = fs::read_dir(parent).map_err(|e| format!("reading {}: {e}", parent.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("reading {}: {e}", parent.display()))?;
@@ -403,7 +403,7 @@ pub struct ReleaseArchive {
 const RELEASE_MAX_BYTES: u64 = 128 << 20;
 const RELEASE_OWNED: [&str; 2] = ["libexec/nearai-red-sandbox", "share/nearai-red-sandbox/plugin"];
 
-fn swap_into_prefix(prefix: &Path, stage: &Path, rel: &str) -> Result<(), String> {
+pub(crate) fn swap_into_prefix(prefix: &Path, stage: &Path, rel: &str) -> Result<(), String> {
     let dst = prefix.join(rel);
     if let Some(parent) = dst.parent() {
         crate::sys::fs::create_private_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
@@ -520,13 +520,24 @@ fn install_release_components(
 /// Download and verify `release`, extract the signed supervisor and plugin
 /// into `prefix`, then install or check mvm, OpenCode and the guest image
 /// under `prefix`.
+///
+/// On Windows: the release archive's egress proxy and plugin, the pinned
+/// Hyper-V guest files and OpenCode, into an owner-only `prefix`
+/// (`backend::hyperv::setup::run_in_prefix`; the mvm runners are unused).
 pub fn run_in_prefix(
     o: &SetupOptions,
     c: &SetupContext,
     prefix: &Path,
     release: &ReleaseArchive,
 ) -> Result<Vec<String>, String> {
-    run_in_prefix_with(o, c, prefix, release, (&mvm(), &opencode()))
+    #[cfg(windows)]
+    {
+        crate::backend::hyperv::setup::run_in_prefix(o.check, prefix, release, c.fetch, c.host)
+    }
+    #[cfg(not(windows))]
+    {
+        run_in_prefix_with(o, c, prefix, release, (&mvm(), &opencode()))
+    }
 }
 
 pub(crate) fn run_in_prefix_with(
@@ -1401,6 +1412,7 @@ mod tests {
                 plugin_dir: plugin,
                 opencode: "opencode".into(),
                 sessions_dir: home.join("sessions"),
+                hyperv: Default::default(),
             };
             let log: Log = Arc::default();
             SetupRig {

@@ -173,6 +173,19 @@ pub struct OperatorConfig {
     pub update_check: bool,
     /// Synthetic canaries managed by the launcher; disabled when empty.
     pub canaries: Vec<crate::canary::CanarySpec>,
+    /// Where the Hyper-V backend's own files are (from `Defaults` only:
+    /// a session config cannot move them).
+    pub hyperv: HyperVPaths,
+}
+
+/// The Hyper-V backend's files, when not in their default places.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HyperVPaths {
+    /// rts-egress.exe; `None`: beside the running rts.exe.
+    pub egress_exe: Option<PathBuf>,
+    /// The guest kernel and initramfs; `None`: `RTS_HV_DIR`, else
+    /// `%LOCALAPPDATA%\nearai-red-sandbox\hyperv`.
+    pub guest_dir: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Default)]
@@ -317,6 +330,7 @@ pub struct Defaults {
     pub plugin_dir: PathBuf,
     pub opencode: String,
     pub sessions_dir: PathBuf,
+    pub hyperv: HyperVPaths,
 }
 
 impl Defaults {
@@ -346,6 +360,10 @@ impl Defaults {
                 .to_string_lossy()
                 .into_owned(),
             sessions_dir: sessions_dir.to_path_buf(),
+            hyperv: HyperVPaths {
+                egress_exe: Some(crate::install::prefix_egress(prefix)),
+                guest_dir: Some(crate::install::prefix_hyperv(prefix)),
+            },
         }
     }
 }
@@ -505,6 +523,7 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
         network,
         update_check: raw.update_check.unwrap_or(true),
         canaries: raw.canaries,
+        hyperv: d.hyperv.clone(),
     })
 }
 
@@ -519,12 +538,48 @@ pub fn load_config(file: &Path, d: &Defaults) -> Result<OperatorConfig, String> 
 mod tests {
     use super::*;
 
+    #[test]
+    fn for_prefix_puts_the_hyperv_files_under_the_prefix_and_a_config_cannot_move_them() {
+        let prefix = Path::new("/p");
+        let d = Defaults::for_prefix(prefix, Path::new("/s"));
+        assert_eq!(
+            d.hyperv.egress_exe,
+            Some(
+                prefix
+                    .join("libexec")
+                    .join("nearai-red-sandbox")
+                    .join("rts-egress.exe")
+            )
+        );
+        assert_eq!(
+            d.hyperv.guest_dir,
+            Some(
+                prefix
+                    .join("share")
+                    .join("nearai-red-sandbox")
+                    .join("hyperv")
+            )
+        );
+        let cfg = parse_config("{}", Path::new("/cfg"), &d).unwrap();
+        assert_eq!(cfg.hyperv, d.hyperv);
+        // Not a session config key: deny_unknown_fields refuses it.
+        assert!(
+            parse_config(
+                r#"{ "hyperv": { "egressExe": "/evil.exe" } }"#,
+                Path::new("/cfg"),
+                &d
+            )
+            .is_err()
+        );
+    }
+
     fn d() -> Defaults {
         Defaults {
             mvmctl: "/home/op/.local/mvm/v0.22.0/mvmctl".into(),
             plugin_dir: "/repo/plugin".into(),
             opencode: "opencode".into(),
             sessions_dir: "/repo/sessions".into(),
+            hyperv: Default::default(),
         }
     }
 
@@ -654,6 +709,7 @@ mod tests {
             sessions_dir: "/p/sessions".into(),
             opencode: "/p/opencode".into(),
             mvmctl: "/p/mvmctl".into(),
+            hyperv: Default::default(),
         };
         let c = parse_config(
             r#"{ "pluginDir": "pl", "sessionsDir": "s", "opencode": "/oc", "mvmctl": "/m", "provider": { "models": ["m"] } }"#,

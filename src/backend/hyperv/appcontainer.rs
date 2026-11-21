@@ -57,7 +57,7 @@ pub const PROFILE: &str = "nearai.rts.egress";
 /// The proxy's memory cap.
 pub const MEMORY_LIMIT: usize = 256 << 20;
 /// The proxy executable, installed next to rts.exe.
-pub const EXECUTABLE: &str = "rts-egress.exe";
+pub const EXECUTABLE: &str = super::EGRESS_EXE;
 
 /// SE_GROUP_ENABLED (winnt.h); windows-sys puts it in a feature rts does not use.
 const SE_GROUP_ENABLED: u32 = 0x4;
@@ -137,7 +137,59 @@ fn profile_sid() -> io::Result<Sid> {
     Ok(Sid(sid, true))
 }
 
-/// Let the AppContainer read and run `exe` (and nothing else rts owns).
+const ALL_APPLICATION_PACKAGES: &str = "S-1-15-2-1";
+
+/// Whether `exe` is inside a WindowsApps directory (an installed MSIX
+/// package), checked on the canonical path, any case.
+pub(crate) fn under_windows_apps(exe: &Path) -> bool {
+    let p = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    p.components()
+        .any(|c| c.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+}
+
+fn sid_string(sid: &Sid) -> io::Result<String> {
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    let mut s: *mut u16 = std::ptr::null_mut();
+    // SAFETY: a valid SID; the string is LocalAlloc'd and freed below.
+    unsafe {
+        if ConvertSidToStringSidW(sid.0, &mut s) == 0 {
+            return Err(last_err("ConvertSidToStringSidW"));
+        }
+        let n = (0..).take_while(|&i| *s.add(i) != 0).count();
+        let out = String::from_utf16_lossy(std::slice::from_raw_parts(s, n));
+        LocalFree(s.cast());
+        Ok(out)
+    }
+}
+
+/// Let the AppContainer read and run `exe`: nothing when an entry already
+/// grants it (the profile's, or ALL APPLICATION PACKAGES), else one
+/// read-and-execute entry for the profile. Never under WindowsApps, whose
+/// permissions belong to the package: refused with a clear error instead.
+fn ensure_execute(exe: &Path, sid: &Sid) -> io::Result<()> {
+    if under_windows_apps(exe) {
+        return ensure_execute_refusal(exe);
+    }
+    let profile = sid_string(sid)?;
+    if let Some(aces) = crate::sys::fs::dacl(exe)?
+        && crate::sys::fs::grants_read_execute(&aces, &[&profile, ALL_APPLICATION_PACKAGES])
+    {
+        return Ok(());
+    }
+    grant_execute(exe, sid)
+}
+
+fn ensure_execute_refusal<T>(exe: &Path) -> io::Result<T> {
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "{} is inside an installed app package (WindowsApps); rts never changes permissions there, so the egress proxy must be installed outside it (rts setup)",
+            exe.display()
+        ),
+    ))
+}
+
+/// Add one read-and-execute entry for the AppContainer to `exe`.
 fn grant_execute(exe: &Path, sid: &Sid) -> io::Result<()> {
     let name: Vec<u16> = {
         use std::os::windows::ffi::OsStrExt;
@@ -260,8 +312,12 @@ impl Drop for Proxy {
 /// Start `exe args...` confined (rts runs rts-egress.exe); returns
 /// the process and rts's ends of its stdin (write) and stdout (read).
 pub fn spawn(exe: &Path, args: &[&str], private_network: bool) -> io::Result<(Proxy, File, File)> {
+    if under_windows_apps(exe) {
+        // Before anything is created or changed.
+        return ensure_execute_refusal(exe);
+    }
     let container = profile_sid()?;
-    grant_execute(exe, &container).map_err(|e| {
+    ensure_execute(exe, &container).map_err(|e| {
         io::Error::new(
             e.kind(),
             format!("granting the proxy access to {}: {e}", exe.display()),
@@ -413,5 +469,70 @@ pub fn spawn(exe: &Path, args: &[&str], private_network: bool) -> io::Result<(Pr
             close(rts_out);
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_path_inside_windows_apps_is_recognised_in_any_case() {
+        for p in [
+            r"C:\Program Files\WindowsApps\Iqlusion.TraceCommons_1.0.14.0_x64__x\rts-egress.exe",
+            r"C:\program files\windowsapps\pkg\rts-egress.exe",
+        ] {
+            assert!(under_windows_apps(Path::new(p)), "{p}");
+        }
+        assert!(!under_windows_apps(Path::new(
+            r"C:\Users\u\AppData\Roaming\WindowsAppsData\rts-egress.exe"
+        )));
+        assert!(!under_windows_apps(Path::new(
+            r"C:\Users\u\AppData\Local\rts\rts-egress.exe"
+        )));
+    }
+
+    #[test]
+    fn the_proxy_is_never_granted_access_inside_windows_apps() {
+        let e = spawn(
+            Path::new(r"C:\Program Files\WindowsApps\pkg\rts-egress.exe"),
+            &[],
+            false,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{e}");
+        assert!(e.to_string().contains("WindowsApps"), "{e}");
+    }
+
+    /// Creates (or reuses) the egress profile; no process is started.
+    #[test]
+    #[ignore = "creates the AppContainer profile"]
+    fn access_is_granted_once_and_an_existing_grant_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("rts-grant-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("probe.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        let sid = profile_sid().unwrap();
+        let profile = sid_string(&sid).unwrap();
+        let count = || {
+            crate::sys::fs::dacl(&exe)
+                .unwrap()
+                .unwrap()
+                .iter()
+                .filter(|a| a.sid == profile)
+                .count()
+        };
+        assert_eq!(count(), 0);
+        ensure_execute(&exe, &sid).unwrap();
+        assert_eq!(count(), 1);
+        let before = crate::sys::fs::dacl(&exe).unwrap();
+        ensure_execute(&exe, &sid).unwrap();
+        assert_eq!(
+            crate::sys::fs::dacl(&exe).unwrap(),
+            before,
+            "a second call must not change the DACL"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

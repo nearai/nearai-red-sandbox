@@ -44,6 +44,16 @@ pub fn prefix_supervisor(prefix: &Path) -> PathBuf {
     under(prefix, "libexec/nearai-red-sandbox/mvm-hvf-supervisor")
 }
 
+/// rts-egress.exe, the Windows egress proxy, in an install prefix.
+pub fn prefix_egress(prefix: &Path) -> PathBuf {
+    under(prefix, "libexec/nearai-red-sandbox").join("rts-egress.exe")
+}
+
+/// The Hyper-V guest kernel and initramfs in an embedder's prefix.
+pub fn prefix_hyperv(prefix: &Path) -> PathBuf {
+    under(prefix, SHARE).join("hyperv")
+}
+
 pub fn home_supervisor(home: &Path) -> PathBuf {
     under(home, HOME_SHARE).join("mvm-hvf-supervisor")
 }
@@ -110,7 +120,12 @@ pub fn defaults(l: &Lookup) -> Defaults {
     let installed_plugin = l.prefix.map(prefix_plugin).filter(|p| p.is_dir());
     let installed = installed_plugin.is_some();
     let opencode = opencode_dir(l.home).join(OPENCODE_BINARY);
+    let hyperv = crate::config::HyperVPaths {
+        egress_exe: l.prefix.filter(|_| installed).map(prefix_egress),
+        guest_dir: None,
+    };
     Defaults {
+        hyperv,
         mvmctl: l
             .rts_mvmctl
             .map(Path::to_path_buf)
@@ -176,6 +191,13 @@ mod tests {
         assert_eq!(d.sessions_dir, home.join(".local/share/nearai-red-sandbox/sessions"));
         assert_eq!(d.mvmctl, home.join(".local/mvm/v0.22.0/mvmctl"));
         assert_eq!(d.opencode, "opencode");
+        // An installed rts finds its egress proxy in the prefix's libexec;
+        // the guest files stay where setup puts them for this user.
+        assert_eq!(
+            d.hyperv.egress_exe,
+            Some(prefix.join("libexec/nearai-red-sandbox/rts-egress.exe"))
+        );
+        assert_eq!(d.hyperv.guest_dir, None);
         let opencode = home
             .join(".local/share/nearai-red-sandbox/opencode/2.2.2")
             .join(OPENCODE_BINARY);
@@ -200,6 +222,8 @@ mod tests {
         assert_eq!(d.plugin_dir, PathBuf::from("/src/plugin"));
         assert_eq!(d.sessions_dir, PathBuf::from("/src/sessions"));
         assert_eq!(d.mvmctl, home.join(".local/mvm/v0.22.0/mvmctl"));
+        // A source build runs the proxy from beside rts.exe.
+        assert_eq!(d.hyperv, crate::config::HyperVPaths::default());
     }
 
     #[test]

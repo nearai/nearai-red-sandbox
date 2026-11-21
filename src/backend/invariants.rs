@@ -86,6 +86,7 @@ fn rig(flavor: Flavor) -> Rig {
             plugin_dir: "/p".into(),
             opencode: "opencode".into(),
             sessions_dir: "/s".into(),
+            hyperv: Default::default(),
         },
     )
     .unwrap();

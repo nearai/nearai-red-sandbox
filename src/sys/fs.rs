@@ -107,6 +107,92 @@ pub fn restrict_dir(path: &Path) -> io::Result<()> {
     }
 }
 
+/// One access-control entry of a Windows DACL, as the checks below read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ace {
+    pub allow: bool,
+    pub deny: bool,
+    /// Applies only to children, not to the object itself.
+    pub inherit_only: bool,
+    pub mask: u32,
+    /// The trustee as an SDDL string ("S-1-5-18").
+    pub sid: String,
+}
+
+const SYSTEM_SID: &str = "S-1-5-18";
+const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+const CREATOR_OWNER_SID: &str = "S-1-3-0";
+const OWNER_RIGHTS_SID: &str = "S-1-3-4";
+
+/// Why a directory with these DACL entries is wider than its owner's, or
+/// None. Allowed: the user, SYSTEM and Administrators (a profile's own
+/// inherited entries), and CREATOR OWNER or OWNER RIGHTS only as inherit-only
+/// templates. A missing DACL grants everyone everything. Deny entries only
+/// narrow access.
+pub fn owner_only_problem(dacl: Option<&[Ace]>, user_sid: &str) -> Option<String> {
+    let Some(aces) = dacl else {
+        return Some("it has no DACL, so everyone has full access".into());
+    };
+    aces.iter().filter(|a| a.allow).find_map(|a| {
+        let fine = a.sid == user_sid
+            || a.sid == SYSTEM_SID
+            || a.sid == ADMINISTRATORS_SID
+            || (a.inherit_only && (a.sid == CREATOR_OWNER_SID || a.sid == OWNER_RIGHTS_SID));
+        (!fine).then(|| format!("it grants access to {}", a.sid))
+    })
+}
+
+/// Whether a live (not inherit-only) allow entry for one of `sids` grants
+/// read and execute (FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, or GENERIC_ALL).
+pub fn grants_read_execute(dacl: &[Ace], sids: &[&str]) -> bool {
+    const READ_EXECUTE: u32 = 0x0012_00A9;
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    dacl.iter().any(|a| {
+        a.allow
+            && !a.inherit_only
+            && sids.contains(&a.sid.as_str())
+            && (a.mask & READ_EXECUTE == READ_EXECUTE || a.mask & GENERIC_ALL != 0)
+    })
+}
+
+/// Make `path` (a directory) private to this user except that each of
+/// `readers` (SIDs, such as "S-1-5-18") may read and traverse it: a
+/// protected DACL its files and subdirectories inherit.
+#[cfg(windows)]
+pub fn restrict_dir_with_readers(path: &Path, readers: &[&str]) -> io::Result<()> {
+    win::restrict_dir_with_readers(path, readers)
+}
+
+/// Drop `path`'s own DACL entries and protection, so it has exactly what
+/// its directory passes down.
+#[cfg(windows)]
+pub fn inherit_from_parent(path: &Path) -> io::Result<()> {
+    win::inherit_from_parent(path)
+}
+
+/// The DACL of `path` (None when it has none).
+#[cfg(windows)]
+pub fn dacl(path: &Path) -> io::Result<Option<Vec<Ace>>> {
+    win::dacl(path)
+}
+
+/// Refuse a directory whose DACL is wider than its owner's
+/// ([`owner_only_problem`]).
+#[cfg(windows)]
+pub fn check_owner_only_dir(path: &Path) -> Result<(), String> {
+    let aces = dacl(path)
+        .map_err(|e| format!("cannot read the permissions of {}: {e}", path.display()))?;
+    let user =
+        current_user_sid().map_err(|e| format!("cannot read the current user's SID: {e}"))?;
+    match owner_only_problem(aces.as_deref(), &user) {
+        None => Ok(()),
+        Some(why) => Err(format!(
+            "{} is not private to this user: {why}",
+            path.display()
+        )),
+    }
+}
+
 #[cfg(windows)]
 mod win {
     use std::fs::File;
@@ -192,6 +278,73 @@ mod win {
         }
     }
 
+    /// The DACL of `path`, entry by entry.
+    pub(super) fn dacl(path: &Path) -> io::Result<Option<Vec<super::Ace>>> {
+        use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
+        use windows_sys::Win32::Security::{ACCESS_ALLOWED_ACE, GetAce, INHERIT_ONLY_ACE, PSID};
+        const ALLOWED: u8 = 0; // ACCESS_ALLOWED_ACE_TYPE
+        const DENIED: u8 = 1; // ACCESS_DENIED_ACE_TYPE
+        let name = wide(path)?;
+        let mut acl: *mut ACL = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: out-pointers are ours; `sd` is freed by Descriptor's drop.
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut acl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        set_dacl(rc)?;
+        let _sd = Descriptor(sd);
+        if acl.is_null() {
+            return Ok(None);
+        }
+        let mut out = vec![];
+        // SAFETY: `acl` points into `sd`, alive for this loop; each ACE is
+        // read only as far as its header says.
+        unsafe {
+            for i in 0..u32::from((*acl).AceCount) {
+                let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+                if GetAce(acl, i, &mut ace) == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let a = &*(ace as *const ACCESS_ALLOWED_ACE);
+                let kind = a.Header.AceType;
+                if kind != ALLOWED && kind != DENIED {
+                    // Object or callback entries: kept as neither, so an
+                    // unknown allow can never count as owner-only.
+                    out.push(super::Ace {
+                        allow: true,
+                        deny: false,
+                        inherit_only: false,
+                        mask: a.Mask,
+                        sid: format!("(ACE type {kind})"),
+                    });
+                    continue;
+                }
+                let sid_ptr = std::ptr::addr_of!(a.SidStart) as PSID;
+                let mut s: *mut u16 = std::ptr::null_mut();
+                if ConvertSidToStringSidW(sid_ptr, &mut s) == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                out.push(super::Ace {
+                    allow: kind == ALLOWED,
+                    deny: kind == DENIED,
+                    inherit_only: u32::from(a.Header.AceFlags) & INHERIT_ONLY_ACE != 0,
+                    mask: a.Mask,
+                    sid: take_local_wide(s),
+                });
+            }
+        }
+        Ok(Some(out))
+    }
+
     /// The owner-only SDDL: a protected DACL with one full-access ACE for
     /// the current user, inherited by children when `inherit`.
     pub(super) fn owner_only_sddl(sid: &str, inherit: bool) -> String {
@@ -203,10 +356,11 @@ mod win {
 
     impl Descriptor {
         fn owner_only(inherit: bool) -> io::Result<Self> {
-            let sddl: Vec<u16> = owner_only_sddl(&user_sid()?, inherit)
-                .encode_utf16()
-                .chain([0])
-                .collect();
+            Self::from_sddl(&owner_only_sddl(&user_sid()?, inherit))
+        }
+
+        fn from_sddl(sddl: &str) -> io::Result<Self> {
+            let sddl: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
             let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
             // SAFETY: `sddl` is NUL-terminated; the descriptor is freed in Drop.
             let ok = unsafe {
@@ -334,6 +488,47 @@ mod win {
         Ok(())
     }
 
+    pub(super) fn restrict_dir_with_readers(path: &Path, readers: &[&str]) -> io::Result<()> {
+        let mut sddl = owner_only_sddl(&user_sid()?, true);
+        for sid in readers {
+            // FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, inherited.
+            sddl.push_str(&format!("(A;OICI;0x1200a9;;;{sid})"));
+        }
+        let sd = Descriptor::from_sddl(&sddl)?;
+        let name = wide(path)?;
+        // SAFETY: `name` is NUL-terminated; the ACL lives in `sd`.
+        set_dacl(unsafe {
+            SetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                sd.dacl()?,
+                std::ptr::null(),
+            )
+        })
+    }
+
+    pub(super) fn inherit_from_parent(path: &Path) -> io::Result<()> {
+        use windows_sys::Win32::Security::UNPROTECTED_DACL_SECURITY_INFORMATION;
+        // An empty, unprotected DACL: the system adds the inherited entries.
+        let sd = Descriptor::from_sddl("D:")?;
+        let name = wide(path)?;
+        // SAFETY: `name` is NUL-terminated; the ACL lives in `sd`.
+        set_dacl(unsafe {
+            SetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                sd.dacl()?,
+                std::ptr::null(),
+            )
+        })
+    }
+
     pub(super) fn restrict_dir(path: &Path) -> io::Result<()> {
         let sd = Descriptor::owner_only(true)?;
         let name = wide(path)?;
@@ -423,6 +618,88 @@ mod win {
     }
 }
 
+#[cfg(test)]
+mod acl_rule_tests {
+    use super::{Ace, grants_read_execute, owner_only_problem};
+
+    const USER: &str = "S-1-5-21-1-2-3-1001";
+    const RX: u32 = 0x0012_00A9; // FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+
+    fn allow(sid: &str, mask: u32) -> Ace {
+        Ace {
+            allow: true,
+            deny: false,
+            inherit_only: false,
+            mask,
+            sid: sid.into(),
+        }
+    }
+
+    #[test]
+    fn owner_only_allows_the_user_system_and_administrators_and_nothing_else() {
+        let ok = [
+            allow(USER, 0x1F01FF),
+            allow("S-1-5-18", 0x1F01FF),
+            allow("S-1-5-32-544", 0x1F01FF),
+        ];
+        assert_eq!(owner_only_problem(Some(&ok), USER), None);
+        let creator = Ace {
+            inherit_only: true,
+            ..allow("S-1-3-0", 0x1000_0000)
+        };
+        assert_eq!(
+            owner_only_problem(Some(&[allow(USER, 0x1F01FF), creator]), USER),
+            None
+        );
+        for wider in [
+            "S-1-5-32-545",
+            "S-1-1-0",
+            "S-1-5-11",
+            "S-1-15-2-1",
+            "S-1-5-21-1-2-3-1002",
+        ] {
+            let e =
+                owner_only_problem(Some(&[allow(USER, 0x1F01FF), allow(wider, RX)]), USER).unwrap();
+            assert!(e.contains(wider), "{e}");
+        }
+        // CREATOR OWNER that applies to the directory itself, and no DACL at all.
+        assert!(owner_only_problem(Some(&[allow("S-1-3-0", 0x1F01FF)]), USER).is_some());
+        assert!(owner_only_problem(None, USER).unwrap().contains("no DACL"));
+        // A deny entry narrows access; it is never a reason to refuse.
+        let deny = Ace {
+            allow: false,
+            deny: true,
+            ..allow("S-1-1-0", 0x1F01FF)
+        };
+        assert_eq!(
+            owner_only_problem(Some(&[allow(USER, 0x1F01FF), deny]), USER),
+            None
+        );
+    }
+
+    #[test]
+    fn read_execute_is_granted_only_by_a_live_allow_entry_for_a_listed_sid() {
+        let ac = "S-1-15-2-9";
+        assert!(grants_read_execute(&[allow(ac, RX)], &[ac]));
+        assert!(grants_read_execute(
+            &[allow("S-1-15-2-1", 0x1F01FF)],
+            &[ac, "S-1-15-2-1"]
+        ));
+        assert!(
+            !grants_read_execute(&[allow(ac, 0x0012_0089)], &[ac]),
+            "read without execute"
+        );
+        assert!(!grants_read_execute(
+            &[Ace {
+                inherit_only: true,
+                ..allow(ac, RX)
+            }],
+            &[ac]
+        ));
+        assert!(!grants_read_execute(&[allow("S-1-5-32-545", RX)], &[ac]));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -489,6 +766,33 @@ mod tests {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_private_directory_passes_the_owner_only_check_and_a_users_grant_fails_it() {
+        let base = std::env::temp_dir().join(format!("rts-owner-only-{}", std::process::id()));
+        let private = base.join("private");
+        super::create_private_dir_all(&private).unwrap();
+        super::check_owner_only_dir(&private).unwrap();
+        // A plain directory in the user's profile inherits user, SYSTEM and
+        // Administrators: still this user's.
+        let plain = base.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        super::check_owner_only_dir(&plain).unwrap();
+        let granted = std::process::Command::new("icacls")
+            .arg(&plain)
+            .arg("/grant")
+            .arg("*S-1-5-32-545:(RX)")
+            .output()
+            .unwrap();
+        assert!(
+            granted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&granted.stdout)
+        );
+        let e = super::check_owner_only_dir(&plain).unwrap_err();
+        assert!(e.contains("S-1-5-32-545"), "{e}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
     use std::io::Write;
 
     /// (DACL flags, ACEs) of an SDDL string "D:<flags>(ace)(ace)...".

@@ -248,7 +248,7 @@ fn a_machine_copies_in_and_out_has_no_route_out_and_is_monitored() {
         pipe_prefix: r"\\.\pipe\rts-live-".into(),
         vm_ids: std::env::temp_dir().join("rts-live-vms"),
     };
-    let m = HyperVMachine::new("rts-live00000001", HcsHost, image);
+    let m = HyperVMachine::new("rts-live00000001", HcsHost::default(), image);
     let t0 = Instant::now();
     m.create(&CreateSpec {
         name: "rts-live00000001",
@@ -392,7 +392,7 @@ fn child_holds_a_vm_until_killed() {
         return;
     };
     let env: Vec<(String, String)> = std::env::vars().collect();
-    let backend = super::backend::HyperVBackend::windows(&env).unwrap();
+    let backend = super::backend::HyperVBackend::windows(&env, &Default::default()).unwrap();
     let m = backend.machine("rts-killtest0001").unwrap();
     m.create(&CreateSpec {
         name: "rts-killtest0001",
@@ -439,7 +439,7 @@ fn a_killed_rts_process_takes_its_vm_down() {
         .trim()
         .to_string();
     assert!(super::doc::parse_guid(&id).is_some(), "{id:?}");
-    let host = HcsHost;
+    let host = HcsHost::default();
     let before = host.open(&id).unwrap().expect("the child's VM exists");
     assert_eq!(before.state().unwrap(), VmState::Running);
     drop(before);
@@ -477,7 +477,7 @@ fn a_killed_rts_process_takes_its_vm_down() {
     );
     // The id the child recorded is stale now: the sweep drops it quietly.
     let env: Vec<(String, String)> = std::env::vars().collect();
-    let backend = super::backend::HyperVBackend::windows(&env).unwrap();
+    let backend = super::backend::HyperVBackend::windows(&env, &Default::default()).unwrap();
     let mut lines = vec![];
     backend.sweep(&mut |l| lines.push(l.to_string())).unwrap();
     assert!(lines.iter().all(|l| !l.contains(&id)), "{lines:?}");
@@ -680,7 +680,7 @@ fn rts_tool_reaches_the_session_vm_over_hvsocket_and_stops_after_teardown() {
     use std::io::Write;
     let rts = std::env::var("RTS_EXE").expect("RTS_EXE names the rts.exe under test");
     let env: Vec<(String, String)> = std::env::vars().collect();
-    let backend = super::backend::HyperVBackend::windows(&env).unwrap();
+    let backend = super::backend::HyperVBackend::windows(&env, &Default::default()).unwrap();
     let m = backend.machine("rts-0123456789ab").unwrap();
     m.create(&CreateSpec {
         name: "rts-0123456789ab",
@@ -743,4 +743,102 @@ fn rts_tool_reaches_the_session_vm_over_hvsocket_and_stops_after_teardown() {
     assert_ne!(code, Some(0));
     assert!(!stdout.contains("must-not-run"));
     m.remove().unwrap();
+}
+
+/// The Gateway app's layout end to end: a really built Windows release
+/// archive (RTS_RELEASE_TAR, read only here) installed into a fresh
+/// owner-only prefix through a file-backed fetch, then an allowlisted
+/// machine on a backend from `Defaults::for_prefix`, whose confined proxy
+/// must run from that prefix.
+#[test]
+#[ignore = "boots a Hyper-V VM; needs RTS_RELEASE_TAR"]
+fn a_prefix_install_runs_the_confined_proxy_from_the_prefix() {
+    use crate::backend::Backend;
+    use crate::sandbox::{CreateSpec, Egress};
+    use sha2::{Digest, Sha256};
+    let archive =
+        std::fs::read(std::env::var("RTS_RELEASE_TAR").expect("RTS_RELEASE_TAR")).unwrap();
+    let base = std::env::temp_dir().join(format!("rts-prefix-live-{}", new_vm_id()));
+    let prefix = base.join("runtime");
+    crate::sys::fs::create_private_dir_all(&prefix).unwrap();
+    crate::sys::fs::check_owner_only_dir(&prefix).unwrap();
+    let url = "https://github.com/nearai/nearai-red-sandbox/releases/download/t/rts.tar";
+    let fetch = crate::setup::FakeFetch::new();
+    fetch.body(url, archive.clone());
+    let release = crate::setup::ReleaseArchive {
+        url: url.into(),
+        sha256: Sha256::digest(&archive).into(),
+    };
+    let private = |d: &std::path::Path| crate::sys::fs::check_owner_only_dir(d);
+    let p = super::setup::Prefix {
+        dir: &prefix,
+        release: &release,
+        private: &private,
+    };
+    eprintln!(
+        "[hv-live] {}",
+        super::setup::install_release(&p, &fetch).unwrap()
+    );
+    eprintln!("[hv-live] {}", super::setup::verify_release(&p).unwrap());
+
+    // The pinned guest files, copied from this user's own setup.
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let defaults = crate::config::Defaults::for_prefix(&prefix, &base.join("sessions"));
+    let guest = defaults.hyperv.guest_dir.clone().unwrap();
+    super::setup::guest_dir_create(&guest).unwrap();
+    let installed = super::backend::guest_dir(&env).unwrap();
+    for f in [super::backend::KERNEL_FILE, super::backend::INITRD_FILE] {
+        std::fs::copy(installed.join(f), guest.join(f)).unwrap();
+    }
+    let proxy = defaults.hyperv.egress_exe.clone().unwrap();
+    assert!(proxy.starts_with(&prefix), "{}", proxy.display());
+    let aces = |p: &std::path::Path| crate::sys::fs::dacl(p).unwrap().unwrap();
+    let before = aces(&proxy).len();
+
+    let backend = super::backend::HyperVBackend::windows(&env, &defaults.hyperv).unwrap();
+    let plan =
+        crate::network::plan(&["pypi.org".to_string()], &crate::network::SystemResolver).unwrap();
+    let hosts = plan.allow_hosts();
+    let m = backend.machine("rts-0123456789ab").unwrap();
+    m.create(&CreateSpec {
+        name: "rts-0123456789ab",
+        image: "unused",
+        memory_mib: 512,
+        cpus: 1,
+        egress: Some(Egress {
+            allow_hosts: &hosts,
+            attach_log: &base.join("attach.log"),
+            session_hours: 1,
+        }),
+    })
+    .unwrap();
+    crate::session::initialize_guest_storage(m.as_ref()).unwrap();
+    m.track_network().unwrap();
+    let probes = crate::network::run_probes(m.as_ref(), &plan).unwrap();
+    eprintln!("[hv-live] probes through the prefix's proxy: {probes:?}");
+    let refused = m
+        .exec(
+            &crate::network::probe_argv("example.com:443"),
+            &ExecOptions::new(30_000, 4096),
+        )
+        .unwrap();
+    m.remove().unwrap();
+    assert_eq!(
+        probes.iter().map(|p| p.result.as_str()).collect::<Vec<_>>(),
+        ["connected"]
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stdout).contains("RTS_PROBE refused"),
+        "{}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    // The AppContainer's one entry went on the prefix's copy: it ran.
+    assert_eq!(
+        aces(&proxy).len(),
+        before + 1,
+        "the proxy in the prefix was not the one started"
+    );
+    // The grant changed permissions, not bytes: --check still passes.
+    super::setup::verify_release(&p).unwrap();
+    let _ = std::fs::remove_dir_all(&base);
 }

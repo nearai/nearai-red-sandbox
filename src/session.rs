@@ -1452,7 +1452,18 @@ mod tests {
 
     #[test]
     fn plugin_options_carry_the_exact_model_allowlist() {
-        let mut cfg = parse_config("{}", Path::new("/cfg"), &Defaults { mvmctl: "/m".into(), plugin_dir: "/r/plugin".into(), opencode: "opencode".into(), sessions_dir: "/r/sessions".into() }).unwrap();
+        let mut cfg = parse_config(
+            "{}",
+            Path::new("/cfg"),
+            &Defaults {
+                mvmctl: "/m".into(),
+                plugin_dir: "/r/plugin".into(),
+                opencode: "opencode".into(),
+                sessions_dir: "/r/sessions".into(),
+                hyperv: Default::default(),
+            },
+        )
+        .unwrap();
         cfg.provider.models = vec!["m-one".into(), "m-two".into()];
         let p = session_paths("0123456789ab", Path::new("/s"), Path::new("/rt"));
         let cmd = sv(&["/x/rts", "tool"]);
@@ -1468,7 +1479,18 @@ mod tests {
 
     #[test]
     fn plugin_options_carry_the_configured_tool_command() {
-        let cfg = parse_config("{}", Path::new("/cfg"), &Defaults { mvmctl: "/m".into(), plugin_dir: "/r/plugin".into(), opencode: "opencode".into(), sessions_dir: "/r/sessions".into() }).unwrap();
+        let cfg = parse_config(
+            "{}",
+            Path::new("/cfg"),
+            &Defaults {
+                mvmctl: "/m".into(),
+                plugin_dir: "/r/plugin".into(),
+                opencode: "opencode".into(),
+                sessions_dir: "/r/sessions".into(),
+                hyperv: Default::default(),
+            },
+        )
+        .unwrap();
         let p = session_paths("0123456789ab", Path::new("/s"), Path::new("/rt"));
         let cmd = sv(&["/x/gateway", "red-team", "tool"]);
         let o = plugin_options(&p, &cfg, &cmd, &"ab".repeat(12), "/home/op");
@@ -2491,7 +2513,18 @@ mod tests {
 
 
     fn session_cfg(sessions: &Path, plugin: &Path, provider: ProviderConfig) -> OperatorConfig {
-        let mut c = parse_config(r#"{ "provider": { "models": ["z-ai/glm-5.3-flash"] } }"#, Path::new("/"), &Defaults { mvmctl: "/x/mvmctl".into(), plugin_dir: "/repo/plugin".into(), opencode: "opencode".into(), sessions_dir: "/repo/sessions".into() }).unwrap();
+        let mut c = parse_config(
+            r#"{ "provider": { "models": ["z-ai/glm-5.3-flash"] } }"#,
+            Path::new("/"),
+            &Defaults {
+                mvmctl: "/x/mvmctl".into(),
+                plugin_dir: "/repo/plugin".into(),
+                opencode: "opencode".into(),
+                sessions_dir: "/repo/sessions".into(),
+                hyperv: Default::default(),
+            },
+        )
+        .unwrap();
         c.sessions_dir = sessions.into();
         c.plugin_dir = plugin.into();
         c.provider = provider;

@@ -91,8 +91,11 @@ pub fn for_preflight(
     }
     #[cfg(windows)]
     {
-        let _ = (cfg, empty_git_config);
-        Ok(Box::new(hyperv::backend::HyperVBackend::windows(env)?))
+        let _ = empty_git_config;
+        Ok(Box::new(hyperv::backend::HyperVBackend::windows(
+            env,
+            &cfg.hyperv,
+        )?))
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -113,8 +116,11 @@ pub fn for_session(
     }
     #[cfg(windows)]
     {
-        let _ = (cfg, paths);
-        Ok(Box::new(hyperv::backend::HyperVBackend::windows(&deps.env)?))
+        let _ = paths;
+        Ok(Box::new(hyperv::backend::HyperVBackend::windows(
+            &deps.env,
+            &cfg.hyperv,
+        )?))
     }
     #[cfg(not(any(unix, windows)))]
     {

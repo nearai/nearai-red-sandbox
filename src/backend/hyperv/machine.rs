@@ -471,8 +471,11 @@ impl Monitor for HvMonitor {
 
 /// The real host: HCS for compute systems, AF_HYPERV for services.
 #[cfg(windows)]
-#[derive(Clone, Copy)]
-pub struct HcsHost;
+#[derive(Clone, Default)]
+pub struct HcsHost {
+    /// rts-egress.exe; `None`: beside the running rts.exe.
+    pub egress_exe: Option<std::path::PathBuf>,
+}
 
 #[cfg(windows)]
 impl VmHandle for super::hcs::ComputeSystem {
@@ -511,10 +514,10 @@ impl VmHost for HcsHost {
     /// rts-egress.exe in an AppContainer inside a kill-on-close job (see
     /// appcontainer.rs).
     fn spawn_proxy(&self, policy: &Policy) -> io::Result<ProxyChannel> {
-        // rts-egress.exe beside rts.exe; RTS_EGRESS_PROXY_EXE names it
-        // elsewhere (the containment test harness).
-        let exe = match std::env::var_os("RTS_EGRESS_PROXY_EXE") {
-            Some(p) => std::path::PathBuf::from(p),
+        // The configured rts-egress.exe (an install prefix), else the one
+        // beside rts.exe. Never chosen by the environment.
+        let exe = match &self.egress_exe {
+            Some(p) => p.clone(),
             None => std::env::current_exe()?
                 .parent()
                 .ok_or_else(|| io::Error::other("rts.exe has no directory"))?

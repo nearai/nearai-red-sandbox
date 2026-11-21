@@ -93,6 +93,7 @@ fn rig() -> Rig {
         plugin_dir: dir.join("plugin"),
         opencode: "opencode".into(),
         sessions_dir: dir.join("sessions"),
+        hyperv: Default::default(),
     };
     let cfg = parse_config("{}", &dir, &defaults).unwrap();
     let deps = Deps::real(id, None).unwrap();
@@ -116,8 +117,9 @@ fn rig() -> Rig {
     let paths = session_paths(&id, &dir.join("sessions"), &dir.join("runtime"));
     prepare_session_dirs(&paths).unwrap();
     let env: Vec<(String, String)> = std::env::vars().collect();
-    let backend: Box<dyn Backend> =
-        Box::new(rts::backend::hyperv::backend::HyperVBackend::windows(&env).unwrap());
+    let backend: Box<dyn Backend> = Box::new(
+        rts::backend::hyperv::backend::HyperVBackend::windows(&env, &Default::default()).unwrap(),
+    );
     eprintln!("[contain] invariants on Hyper-V");
     Rig {
         backend,

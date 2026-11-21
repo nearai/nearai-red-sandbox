@@ -543,6 +543,7 @@ mod tests {
                 plugin_dir: "/repo/plugin".into(),
                 opencode: "opencode".into(),
                 sessions_dir: "/repo/sessions".into(),
+                hyperv: Default::default(),
             },
         )
         .unwrap()

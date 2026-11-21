@@ -158,20 +158,32 @@ pub fn guest_dir(env: &[(String, String)]) -> Option<PathBuf> {
     })
 }
 
+/// The guest directory: the configured one (an embedder's prefix), else
+/// [`guest_dir`].
+pub fn guest_dir_for(configured: &Option<PathBuf>, env: &[(String, String)]) -> Option<PathBuf> {
+    configured.clone().or_else(|| guest_dir(env))
+}
+
 #[cfg(windows)]
 impl HyperVBackend<super::machine::HcsHost> {
-    /// This host's backend: its edition, its user, its installed guest image.
-    pub fn windows(env: &[(String, String)]) -> Result<Self, String> {
+    /// This host's backend: its edition, its user, its installed guest image,
+    /// with the Hyper-V files where `paths` says.
+    pub fn windows(
+        env: &[(String, String)],
+        paths: &crate::config::HyperVPaths,
+    ) -> Result<Self, String> {
         use windows_sys::Win32::System::SystemInformation::GetProductInfo;
         let mut product_type = 0u32;
         // SAFETY: a plain query with a valid out-pointer.
         unsafe { GetProductInfo(10, 0, 0, 0, &mut product_type) };
-        let dir = guest_dir(env)
+        let dir = guest_dir_for(&paths.guest_dir, env)
             .ok_or("cannot find the rts guest directory (LOCALAPPDATA is not set)")?;
         let sid = crate::sys::fs::current_user_sid()
             .map_err(|e| format!("cannot read the current user's SID: {e}"))?;
         Ok(Self::new(
-            super::machine::HcsHost,
+            super::machine::HcsHost {
+                egress_exe: paths.egress_exe.clone(),
+            },
             Self::image_in(&dir, &sid),
             product_type,
             super::hcs::available().err().map(|e| e.to_string()),
@@ -215,6 +227,16 @@ mod tests {
             Some(Path::new("/l").join("nearai-red-sandbox").join("hyperv"))
         );
         assert_eq!(guest_dir(&env(&[])), None);
+        // A configured directory (an embedder's prefix) wins over both.
+        let configured = Some(PathBuf::from("/prefix/hyperv"));
+        assert_eq!(
+            guest_dir_for(&configured, &env(&[("RTS_HV_DIR", "/x")])),
+            configured
+        );
+        assert_eq!(
+            guest_dir_for(&None, &env(&[("RTS_HV_DIR", "/x")])),
+            Some(PathBuf::from("/x"))
+        );
     }
 
     #[test]
