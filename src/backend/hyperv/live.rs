@@ -669,3 +669,78 @@ fn a_killed_rts_takes_its_confined_proxy_down() {
     );
     let _ = std::fs::remove_file(out);
 }
+
+/// rts tool as opencode runs it: a separate rts.exe process per call,
+/// reaching the session's VM by id over hvsocket.
+#[test]
+#[ignore = "boots a Hyper-V VM; needs RTS_EXE"]
+fn rts_tool_reaches_the_session_vm_over_hvsocket_and_stops_after_teardown() {
+    use crate::backend::Backend;
+    use crate::sandbox::CreateSpec;
+    use std::io::Write;
+    let rts = std::env::var("RTS_EXE").expect("RTS_EXE names the rts.exe under test");
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let backend = super::backend::HyperVBackend::windows(&env).unwrap();
+    let m = backend.machine("rts-0123456789ab").unwrap();
+    m.create(&CreateSpec {
+        name: "rts-0123456789ab",
+        image: "unused",
+        memory_mib: 512,
+        cpus: 1,
+        egress: None,
+    })
+    .unwrap();
+    crate::session::initialize_guest_storage(m.as_ref()).unwrap();
+    let vm = m
+        .tool_target()
+        .expect("a Hyper-V machine has a tool target");
+    let state = tempfile::tempdir().unwrap();
+    let request = |command: &str| {
+        serde_json::json!({
+            "options": {
+                "machine": "rts-0123456789ab", "mvmctl": "unused", "emptyGitConfig": "unused",
+                "stateDir": state.path(), "timeoutMs": 30_000, "maxOutputBytes": 65_536, "hypervVmId": vm,
+            },
+            "input": { "command": command },
+        })
+        .to_string()
+    };
+    let run = |command: &str| {
+        let mut p = std::process::Command::new(&rts)
+            .args(["tool", "shell"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        p.stdin
+            .take()
+            .unwrap()
+            .write_all(request(command).as_bytes())
+            .unwrap();
+        let out = p.wait_with_output().unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, stdout, stderr) = run("echo from-tool; id -u; ls /sys/class/net");
+    eprintln!("[hv-live] rts tool: exit {code:?} stdout {stdout:?} stderr {stderr:?}");
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        stdout.contains("from-tool") && stdout.contains("1000") && stdout.contains("lo"),
+        "{stdout}"
+    );
+    // Teardown quiesces the state dir; later tool processes must stop.
+    drop(
+        crate::mvm::StateDir(state.path().to_path_buf())
+            .quiesce(Duration::from_secs(10))
+            .unwrap(),
+    );
+    let (code, stdout, stderr) = run("echo must-not-run");
+    eprintln!("[hv-live] after teardown: exit {code:?} stdout {stdout:?} stderr {stderr:?}");
+    assert_ne!(code, Some(0));
+    assert!(!stdout.contains("must-not-run"));
+    m.remove().unwrap();
+}

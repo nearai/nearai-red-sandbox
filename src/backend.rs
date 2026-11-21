@@ -64,6 +64,11 @@ pub trait Machine: Sandbox {
     /// After `remove`: kill egress-path residue and copy this machine's
     /// egress audit to `network_audit`. Never fails; it logs.
     fn finish(&self, network_audit: &Path, log: &dyn Fn(&str));
+    /// What a separate `rts tool` process needs to reach this machine
+    /// beyond its name: the Hyper-V VM id. `None` for mvm machines.
+    fn tool_target(&self) -> Option<String> {
+        None
+    }
 }
 
 pub trait Monitor {

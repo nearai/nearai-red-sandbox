@@ -284,7 +284,7 @@ impl StateDir {
         }
     }
 
-    fn lock(&self) -> io::Result<File> {
+    pub(crate) fn lock(&self) -> io::Result<File> {
         fs::create_dir_all(&self.0)?;
         let f = OpenOptions::new().create(true).truncate(false).write(true).open(self.0.join("exec.lock"))?;
         f.lock()?;

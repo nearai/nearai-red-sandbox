@@ -11,6 +11,7 @@ pub mod machine;
 pub mod mux;
 pub mod props;
 pub mod setup;
+pub mod tool;
 #[cfg(windows)]
 pub mod hvsock;
 #[cfg(windows)]

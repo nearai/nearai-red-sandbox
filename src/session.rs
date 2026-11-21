@@ -1095,6 +1095,14 @@ pub fn plugin_options(p: &SessionPaths, cfg: &OperatorConfig, tool_command: &[St
     })
 }
 
+/// Tell `rts tool` how to reach a machine it cannot find by name alone
+/// (a Hyper-V VM, by id).
+pub fn with_tool_target(plugin_options: &mut Value, target: Option<String>) {
+    if let Some(id) = target {
+        plugin_options["bridge"]["hypervVmId"] = json!(id);
+    }
+}
+
 fn session_body(cfg: &OperatorConfig, deps: &Deps, backend: &dyn Backend, operator_home: &str, live: &mut Live, initial_prompt: Option<&str>) -> Result<i32, String> {
     let p = live.paths;
     let leak_seam_set = deps.env.iter().any(|(k, _)| k == "RTS_TEST_LEAK");
@@ -1185,6 +1193,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, backend: &dyn Backend, operat
 
     let nonce = new_nonce();
     let mut plugin_options = plugin_options(p, cfg, &deps.tool_command, &nonce, operator_home);
+    with_tool_target(&mut plugin_options, live.sb.tool_target());
     if let Some(registry) = &live.canaries {
         plugin_options["canaryManifest"] = json!(registry.manifest_path());
     }
@@ -1499,6 +1508,15 @@ mod tests {
         fn resolve(&self, _: &str) -> io::Result<Vec<std::net::IpAddr>> {
             Err(io::Error::other("nodename nor servname provided"))
         }
+    }
+
+    #[test]
+    fn only_a_machine_with_a_tool_target_adds_it_to_the_bridge_options() {
+        let mut o = json!({"bridge": {"machine": "rts-0123456789ab"}});
+        with_tool_target(&mut o, None);
+        assert_eq!(o, json!({"bridge": {"machine": "rts-0123456789ab"}}));
+        with_tool_target(&mut o, Some("5191fbb2-f3b9-4de2-9de9-39de5b0ad75c".into()));
+        assert_eq!(o["bridge"]["hypervVmId"], "5191fbb2-f3b9-4de2-9de9-39de5b0ad75c");
     }
 
     #[test]

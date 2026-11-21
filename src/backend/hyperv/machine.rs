@@ -392,6 +392,10 @@ impl<H: VmHost> Machine for HyperVMachine<H> {
         Ok(e.policy.pins())
     }
 
+    fn tool_target(&self) -> Option<String> {
+        self.vm_id.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     fn monitor(&self) -> std::result::Result<Box<dyn Monitor>, String> {
         let (vm, configured) = self
             .handle()
