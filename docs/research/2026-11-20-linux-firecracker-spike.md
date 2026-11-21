@@ -26,7 +26,7 @@ NOPASSWD sudo. That makes this a real test of the shim: without it, mvm's
 | Guest egress on v0.28.0-rc.11 | Not established. rc.11 has no GitHub release or assets, only a tag. A release-channel build (mirroring `release.yml`) refuses to boot without the published `mvm-guest-bins-v0.28.0-rc.11` runtime: a locally built archive placed beside mvmctl still fails with `guest runtime io: No such file or directory`. A contributor build (`cargo build --release --bin mvmctl`, then `MVM_RUNTIME_OVERLAY_ACQUIRE_MODE=build mvmctl bootstrap`, 18 min) boots an x86_64 guest as uid 1000. With an allowlist, though, `machine run` stops at `the egress endpoint refused the gate probe: the endpoint reply is not a gate-probe response: missing field 'results'`, with both the glibc and the musl endpoint from the same commit. Whether that is the contributor build or rc.11 itself needs mvm's maintainers or a published rc. |
 | rc.11 differences that matter to rts | It downloads Firecracker into `<MVM_HOME>/cache/firecracker/v1.17.0/` and starts it with no `sudo` calls at all; `bootstrap` still runs `sudo mkdir -p /var/lib/mvm/tenants`. It runs a standby pool: a detached `mvmctl pool refill` and idle Firecracker VMs under `<MVM_HOME>/fc-idle/` that outlive `machine rm`. rts's teardown, sweep and RSS accounting assume one VMM per session, so this needs a design decision before rts moves to 0.28 (disable the pool, or account for it). |
 | Guest image | The pinned `DEFAULT_IMAGE` is arm64-only (config `architecture: arm64`), and so is the alpine base digest in `guest/Dockerfile` (a per-platform manifest, not an index; no current alpine tag's index contains it). x86_64 needs a multi-arch guest image built from an alpine index digest. |
-| Pulling from Artifact Registry | mvm v0.22.0's OCI client follows only 307/308 blob redirects (`mvm-fs/src/oci/registry.rs`, `is_preserving_redirect`). `us-west1-docker.pkg.dev` answers blob GETs with 302, so `mvmctl image pull` of `DEFAULT_IMAGE` fails on a host without the image cached. This affects `rts setup`'s image step on any fresh install, macOS too (not re-checked on macOS here). |
+| Pulling from Artifact Registry | mvm v0.22.0's OCI client follows only 307/308 blob redirects (`mvm-fs/src/oci/registry.rs`, `is_preserving_redirect`). `us-west1-docker.pkg.dev` answers blob GETs with 302, and `mvmctl image pull` of `DEFAULT_IMAGE` failed on this Linux host with `failed with 302 Found`. This was observed on Linux only. A macOS Red Team setup on 1.0.12 succeeded and pulled the image successfully (2026-11-20), so this does not claim a macOS failure. Upstream fix proposed: tinylabscom/mvm#5841. |
 
 ## Live invariants on Firecracker (`tests/contain/invariants.rs`)
 
@@ -162,8 +162,8 @@ cargo run --locked -p mvmctl -- dev guest-bins --out dist
 2. `rts setup` on Linux: install a pinned, checksum-verified Firecracker
    into the rts prefix and put it on mvmctl's PATH (or rely on 0.28's own
    download); check `/dev/kvm`; skip the HVF supervisor and codesign steps.
-3. Make sure `/usr/sbin` stays on mvmctl's PATH (`mkfs.ext4`, which bootstrap needs).
-4. Image pulls from Artifact Registry fail on mvm v0.22.0 (302). Pre-pull
+3. Make sure `/usr/sbin` stays on mvmctl's PATH (`mkfs.ext4`, which bootstrap needs). Upstream fix proposed: tinylabscom/mvm#5842.
+4. Image pulls from Artifact Registry failed on this Linux host with mvm v0.22.0 (302; macOS setup was not affected). Pre-pull
    during setup through another client, serve the image from a registry
    that redirects with 307, or wait for an mvm release that follows 302.
 5. Move to mvm 0.28 only once a published release passes this spike's
