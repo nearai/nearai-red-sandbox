@@ -130,16 +130,18 @@ fn windows_name_problem(seg: &str) -> Option<&'static str> {
 /// are the same file. Directories may repeat (they are one directory).
 #[cfg_attr(not(windows), allow(dead_code))]
 fn windows_collisions(entries: &[Planned]) -> Result<(), TarRejected> {
-    let mut seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashMap<String, (bool, String)> = std::collections::HashMap::new();
     for e in entries {
-        let key = e.segments.join("/").to_lowercase();
+        let path = e.segments.join("/");
+        let key = path.to_lowercase();
         let is_dir = matches!(e.kind, Kind::Dir);
-        if let Some(&was_dir) = seen.get(&key)
-            && !(was_dir && is_dir)
+        if let Some((was_dir, first)) = seen.get(&key)
+            && !(*was_dir && is_dir)
         {
-            return Err(rej(&e.display, "names differ only in case (one file on Windows)"));
+            let why = if *first == path { "duplicate path" } else { "names differ only in case (one file on Windows)" };
+            return Err(rej(&e.display, why));
         }
-        seen.insert(key, is_dir);
+        seen.insert(key, (is_dir, path));
     }
     Ok(())
 }
@@ -523,7 +525,9 @@ mod tests {
 
     #[test]
     fn duplicates_are_refused_not_overwritten() {
-        refused(&tar(&[file("a", b"1"), file("./a", b"2")]), "cannot create", LIM);
+        // Windows refuses the duplicate while planning, before any file exists.
+        let reason = if cfg!(windows) { "duplicate path" } else { "cannot create" };
+        refused(&tar(&[file("a", b"1"), file("./a", b"2")]), reason, LIM);
     }
 
     #[test]
