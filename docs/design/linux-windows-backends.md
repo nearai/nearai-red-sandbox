@@ -153,31 +153,200 @@ does better confined. Why not B: it reimplements mvm. Keep `linux/rts_linux.py`
 as the documented dev-only prototype; do not ship a degraded "bubblewrap mode"
 that sessions silently fall back to.
 
-## 5. Windows options
+## 5. Windows: a native Hyper-V backend
 
-| | W1. WSL2 distro + nested KVM + mvm Firecracker | W2. Native Hyper-V (HCS API) | W3. WSL2 utility VM as the boundary (no nested VM) |
+Owner decision (2026-11-21): Windows runs a native Hyper-V backend in rts.
+There is no WSL2 and no mvm on Windows. The WSL2 spike's result is kept in
+section 5.9 for the record.
+
+### 5.1 API choice
+
+| | HCS (`computecore.dll`, compute system JSON) | Hyper-V WMI / PowerShell (`Msvm_*`, `New-VM`) | hcsshim (Go) |
 |---|---|---|---|
-| Boundary | Firecracker VM inside the WSL2 VM | Hyper-V partition per session | WSL2's single shared utility VM + namespaces |
-| Reuse | the whole Linux backend, unchanged, inside a dedicated distro | guest image + kernel; needs a new host endpoint, agent transport over hvsocket, lifecycle | Linux backend option C, with extra holes |
-| Requirements | Windows 11 (nested virtualization in WSL2), "Virtual Machine Platform" feature (one admin step), works on Home; CPU nested-virt support | Hyper-V / HCS availability on the target editions must be verified (Home is unclear); admin to enable | WSL2 only |
-| Egress enforcement | same mvm vsock endpoint | must be built (hvsocket endpoint) | WSL2 NAT or mirrored networking gives the distro full network; would need the C-style netns |
-| Host FS exposure | distro must disable `automount` and `interop` (`/etc/wsl.conf`) so the distro cannot reach `C:\` or run Windows binaries; the guest is one VM boundary further in | none by default | `/mnt/c` and interop are inside the same kernel as the hostile code |
-| mvm status | `install/windows.md` says WSL2 is unsupported for workloads; but `mvm-core/src/platform/platform.rs:46` makes `has_kvm()` true on WSL2 when `/dev/kvm` exists. Contradictory; needs a spike | upstream mvm#428 (WHP) closed as not planned | n/a |
+| Direct kernel boot (`LinuxKernelDirect`: kernel + initrd + cmdline) | yes, used by WSL2 and LCOW | no: Gen1/Gen2 boot from firmware and a disk | yes (it wraps HCS) |
+| Per-VM hvsocket service table and security descriptors | yes, in the VM document | registry only | yes |
+| Ephemeral, unnamed systems that die with their last handle | yes (`ShouldTerminateOnLastHandleClosed`) | no: registered VMs persist in Hyper-V Manager | yes |
+| From Rust | a few `extern "system"` calls (`windows-sys` has them, feature `Win32_System_HostComputeSystem`) | COM/WMI or spawning PowerShell | a Go runtime or a sidecar |
+| Spike result | boots our guest in about 0.75 s, no NIC, hvsocket exec works, also as a non-admin member of Hyper-V Administrators | not tried | not tried |
 
-**Recommendation: W1 first, W2 as the long-term native path; reject W3.**
-W1 makes Windows "Linux in a box": the Windows app installs a dedicated
-`nearai-rts` WSL distro containing the Linux rts build, mvm and OpenCode, and
-launches sessions with `wsl.exe -d nearai-rts -- rts launch ...`. The rts crate
-never has to compile for Windows; the Windows side is a thin launcher in
-trace-commons. Main trade-off: it needs Windows 11 with nested virtualization
-and depends on mvm accepting WSL2 as a Firecracker host. Hosts without nested
-virtualization are refused, not degraded.
+**Choice: HCS.** It is what WSL2 itself uses, it boots a kernel and initrd
+directly, it scopes hvsocket access per VM, and its systems are ephemeral.
+WMI would leave persistent VMs behind and needs a disk image and firmware boot.
+hcsshim would bring in a Go runtime.
 
-Open items specific to W1: `/in` and `/out` crossing the Windows/WSL boundary
-with automount off (stream tar over `wsl.exe` stdio rather than `/mnt/c`);
-credential storage (no secret-service in WSL; keep the key in Windows
-Credential Manager and pass it on stdin, or a 0600 file store inside the
-distro); terminal rendering of the OpenCode TUI through `wsl.exe`.
+### 5.2 Guest boot
+
+- **Kernel:** a pinned Linux kernel with `CONFIG_HYPERV=y` (VMBus),
+  `CONFIG_HYPERV_VSOCKETS` and `CONFIG_VSOCKETS`, no network drivers loaded, and
+  `console=ttyS0` for a COM-port log. The spike used Ubuntu's
+  `linux-image-7.0.0-1020-azure` (vmlinuz sha256 `eda095ff…`), with `vsock.ko` and
+  `hv_sock.ko` loaded from the initrd. For production, either pin that package
+  by its Ubuntu archive digest, or build a kernel with those options built in (`=y`)
+  and every NIC driver off, so there is nothing to load. mvm's Firecracker
+  kernel has no VMBus drivers, so it can't be reused.
+- **Root filesystem:** derived from the pinned amd64 guest image
+  `guest@sha256:6b72caa2…`. rts setup pulls it by digest with rts's own OCI
+  client (checking every blob digest), flattens the layers into a read-only
+  ext4 or erofs image (or, for a first version, a cpio initrd), and records the
+  image's sha256 beside it. A small rts-owned init in the initrd verifies that
+  digest before mounting it, as mvm checks its dm-verity roothash. `/tmp` is a
+  per-VM tmpfs, as on mvm, so `/in` and `/out` stay the same links into `/tmp/rts`.
+- **Guest agent:** an rts-owned static binary (`rts-guest`, built from this
+  repo for `x86_64-unknown-linux-musl`). It serves the exec protocol rts
+  already speaks (`protocol::wrap_argv` / `parse_result`: exit code, capped
+  output, timeouts) over hvsocket. The spike's `hvexec.c` is the minimal
+  version.
+
+### 5.3 Host <-> guest channel
+
+- hvsocket. Host side: `AF_HYPERV` (34) / `HV_PROTOCOL_RAW`, bound to
+  `{VmId, ServiceId}`. Guest side: `AF_VSOCK` to CID 2 with the `hv_sock`
+  transport. A vsock port maps to the service GUID
+  `{port:08x}-facb-11e6-bd58-64006a7986d3`.
+- Each compute system's document lists its services in
+  `HvSocketConfig.ServiceTable`, with bind and connect security descriptors
+  that admit only the session's user (the spike used SYSTEM, Administrators
+  and Hyper-V Administrators).
+- The host listener binds that VM's id, never the wildcard. The host must
+  also register the service once under
+  `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\{guid}`.
+  That needs admin, so the installer does it.
+- `rts tool` reaches the session's channel through a per-session named pipe or
+  the hvsocket itself, plus the existing state-dir lock and the "unavailable"
+  marker (`MvmSandbox` semantics: one exec at a time, poisoned on a host-side
+  kill).
+
+### 5.4 Egress
+
+The same shape as mvm's design:
+- The VM document has no `NetworkAdapters`; the spike's guest sees only `lo`.
+- The guest's loopback SOCKS/HTTP proxy (`127.0.0.1:1080`) and DNS stub forward
+  over a second hvsocket service to a host-side endpoint in rts.
+- That endpoint applies the allowlist, pins resolved IPs, writes a
+  `network.jsonl` audit, and refuses everything else.
+
+rts already has the allowlist planning, probes and pin checks, which are
+platform-neutral. What's new is:
+- the endpoint itself. Port mvm's FlowMux endpoint, or write a minimal
+  CONNECT-only proxy, since rts's probes and `proxy_env` only use HTTP CONNECT;
+- a confinement story for it on Windows: an AppContainer or a restricted-token
+  child process, in place of Landlock/seccomp.
+
+With no NIC, the guest has no route except this endpoint, which the deny-all
+probe and the "no network device" invariant check.
+
+### 5.5 /in copy-in and /out export
+
+The existing tar streams (`copy::copy_in_via` / `copy_out_via`) run over the
+exec channel, with the same `untar.rs` hostile-archive rejection on the host.
+There is no shared folder (no Plan 9, no VSMB), so the guest sees no host
+path.
+
+### 5.6 Process limits
+
+- The VM's memory and vCPU count are set in its compute system document.
+- The worker process (`vmwp.exe`) is created by the Hyper-V service, not by
+  rts, so it can't be put in an rts job object. Instead, rts samples the
+  compute system's memory (`HcsGetComputeSystemProperties`, statistics) for
+  the RSS ceiling.
+- The rts-owned host processes (the egress endpoint, `rts tool`) run in a job
+  object with memory and process-count limits and kill-on-close, so nothing
+  outlives the session.
+- Teardown: `HcsTerminateComputeSystem`, then close the handle. With
+  `ShouldTerminateOnLastHandleClosed`, a crashed rts also takes the VM down.
+
+### 5.7 Privileges
+
+- **One-time admin steps at install:**
+  - enable `Microsoft-Hyper-V-All` (reboot);
+  - add the user to `Hyper-V Administrators`;
+  - register the hvsocket service GUIDs.
+- **Every session runs unelevated.** The spike created, booted and talked to a
+  compute system as `rtsuser`, which is only in Hyper-V Administrators and
+  Users, at Medium integrity.
+- **Windows editions:** Hyper-V needs Windows 11 Pro, Enterprise or Education,
+  so **Windows Home is not supported** (it has no Hyper-V role).
+- **Azure VMs:** nested virtualization is needed (D4s_v4 works).
+
+### 5.8 Making the rts crate compile for `x86_64-pc-windows-msvc`
+
+23 files use `std::os::unix` or `libc`. By kind:
+
+- **File modes and private files**: `fs::PermissionsExt`/`OpenOptionsExt`, in
+  `attest/record.rs`, `auth/*`, `brand/theme.rs`, `bridge.rs`,
+  `forwarder/signature.rs`, `inference.rs`, `launch.rs`, `network.rs`,
+  `setup.rs`, `untar.rs`, `update*.rs`, `mvm.rs`, `session.rs`. A small
+  `sys::private_file` / `sys::private_dir` helper: 0600/0700 on Unix, an
+  owner-only DACL on Windows.
+- **Symlinks** (`copy.rs`, `install.rs`, `session.rs`, `update.rs`): the guest
+  side is Linux either way. Host-side uses get a Windows path (junction or
+  copy) or are cfg'd to Unix where they only serve the mvm backend.
+- **Terminal and splash** (`terminal.rs`, `brand.rs`, `brand/splash.rs`: pty,
+  termios, ioctl, poll): a Windows implementation on ConPTY
+  (`CreatePseudoConsole`) behind the same `Terminal` API.
+- **Signals and process groups** (`sys.rs`, `session.rs`): Ctrl-C/close
+  handlers plus job objects on Windows.
+- **Canary directory scans** (`canary.rs`: `openat`/`fdopendir` race-free
+  walks): a Windows walk with handle-relative opens (`NtCreateFile` with
+  `RootDirectory`), or a narrower check.
+- **FIFOs** (`main.rs` `mkfifo`): a named pipe.
+- **The mvm backend and the KVM helpers** (`mvm.rs`, `backend/mvm.rs`,
+  `backend/kvm.rs`): `#[cfg(unix)]` only. Windows builds just the Hyper-V
+  backend.
+
+The platform-neutral core (attestation, forwarder, IronWire, config,
+allowlist planning, protocol, untar checks) needs no change beyond the file
+helpers. Keychain storage: Windows Credential Manager through the existing
+`keyring-core` store family, which may be a new store crate to propose.
+
+### 5.9 Record: the WSL2 spike (not pursued)
+
+- WSL 3.0.5 with `nestedVirtualization=true` exposes `/dev/kvm` in a WSL2
+  distro.
+- mvm v0.22.0's doctor accepts WSL2 and picks Firecracker, and machines boot.
+  But `machine exec` fails ("no host-side console transport"), because mvm
+  treats only native Linux as a Firecracker runner. Upstream main does the
+  same.
+- A one-line mvm change would fix that. It was dropped by owner decision and
+  kept as a patch for reference.
+- rts unit tests pass in WSL2 (564 passed, 0 failed).
+
+### 5.10 How the shared invariant tests prove each property on Hyper-V
+
+`tests/contain/invariants.rs` drives a `Backend`. A `HyperVBackend`
+implements the same `Machine`, so the same four tests run on Windows:
+
+| Invariant | Test on Hyper-V |
+|---|---|
+| No route out without an allowlist | deny-all probe; `ip -o link` shows only `lo` (the spike's guest already does: `/sys/class/net` = `lo`) |
+| Allowlist exact and pinned | probes through the hvsocket endpoint; pins from its audit log |
+| No host files except /in and /out | the host-path checks plus `/in` copy and `/out` export over the exec channel (no shared folders in the VM document) |
+| VMM confirmed, RSS ceiling | `Monitor` reads the compute system's memory statistics |
+
+`src/backend/invariants.rs` gets a Hyper-V fake: a recording HCS seam,
+checking that the VM document has no `NetworkAdapters` and no shares, and that
+its hvsocket table lists only the session's services, bound to the VM id.
+
+### 5.11 Phased plan for Windows
+
+1. **Spike** (done 2026-11-21): HCS `LinuxKernelDirect` boot with no NIC,
+   exec over hvsocket, also as a non-admin Hyper-V Administrators member. See
+   `docs/research/2026-11-21-hyperv-hcs-spike.md`.
+2. **Crate compiles for x86_64-pc-windows-msvc**: the file, terminal, signal
+   and FIFO helpers in 5.8 behind `sys`; the mvm backend `cfg(unix)`. CI:
+   `cargo check --target x86_64-pc-windows-msvc`. Needs the `windows-sys`
+   proposal approved.
+3. **Guest artifacts**: kernel pin, `rts-guest` agent (musl static), and the
+   rootfs derived from `guest@sha256:6b72caa2…`, with digest checks. Built and
+   checksummed in CI.
+4. **`HyperVBackend` without egress**: create, exec, copy, remove, monitor
+   (HCS through `windows-sys`), plus fake-seam unit tests. Live invariants 1, 3
+   and 4 on rts-win-dev.
+5. **hvsocket egress endpoint**: CONNECT proxy, allowlist, pins, audit,
+   confinement (AppContainer or restricted token). Live invariant 2.
+6. **Windows setup and installer**: feature check, Hyper-V Administrators,
+   hvsocket service registration, pulling the guest artifacts, and Credential
+   Manager for keys. Then trace-commons' Windows app.
 
 ## 6. Invariants every backend must hold, and how each proves it
 
