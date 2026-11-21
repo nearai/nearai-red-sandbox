@@ -125,12 +125,12 @@ pub fn stdin_stdout_are_ttys() -> (bool, bool) {
 /// The window size of the console behind a standard descriptor (0, 1 or 2),
 /// as (cols, rows): the visible window, not the scrollback buffer. None when
 /// that handle is not a console (a pipe, a file, or no console at all).
+/// A console input handle has no screen buffer, so 0 reads stdout's.
 #[cfg(windows)]
 pub fn window_size(fd: i32) -> Option<(usize, usize)> {
-    use windows_sys::Win32::System::Console::{GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    use windows_sys::Win32::System::Console::{GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
     let which = match fd {
-        0 => STD_INPUT_HANDLE,
-        1 => STD_OUTPUT_HANDLE,
+        0 | 1 => STD_OUTPUT_HANDLE,
         2 => STD_ERROR_HANDLE,
         _ => return None,
     };
