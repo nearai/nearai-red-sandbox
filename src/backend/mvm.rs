@@ -210,7 +210,10 @@ impl MvmBackend {
         })
     }
 
-    fn mvmctl_environment(
+    /// mvmctl's extra environment for `flavor`: on HVF the patched
+    /// supervisor, on Firecracker the non-elevating `sudo` (installed in
+    /// `shim_dir`) and no standby pool.
+    pub fn mvmctl_environment(
         flavor: Flavor,
         env: &[(String, String)],
         supervisor: Option<&Path>,

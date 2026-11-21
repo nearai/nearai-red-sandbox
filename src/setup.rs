@@ -12,7 +12,8 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::config::{DEFAULT_IMAGE, Defaults};
+use crate::backend::mvm::Flavor;
+use crate::config::{Defaults, default_image};
 use crate::install::{MVM_VERSION, mvm_dir, opencode_dir};
 use crate::mvm::{RunOutput, Runner, SpawnRunner, tail};
 use crate::session::{Host, OPENCODE_VERSION, SUPERVISOR_FIX_VERSION, check_opencode, check_supervisor_contract, check_supervisor_marker};
@@ -349,6 +350,8 @@ const SIGN_TIMEOUT: Duration = Duration::from_secs(120);
 const DOCTOR_TIMEOUT: Duration = Duration::from_secs(60);
 const INSPECT_TIMEOUT: Duration = Duration::from_secs(60);
 const PULL_TIMEOUT: Duration = Duration::from_secs(1800);
+/// `mvmctl bootstrap` fetches and checks the guest runtime, kernel and rootfs.
+const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(1800);
 const CODESIGN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A pinned, signed `rts` release archive supplied by an embedder.
@@ -604,16 +607,24 @@ impl Steps {
 
 /// `run` with the two components supplied, so tests serve fixtures.
 pub(crate) fn run_with(o: &SetupOptions, c: &SetupContext, components: (&Component, &Component)) -> Result<Vec<String>, String> {
+    run_steps(o, c, components, Flavor::host(), Path::new(crate::backend::kvm::KVM_DEVICE))
+}
+
+/// The setup steps for `flavor`. HVF: mvm, `env sign`, doctor, the patched
+/// supervisor, OpenCode, the image. Firecracker: mvm, doctor, `kvm` (which
+/// must be readable and writable), OpenCode, `mvmctl bootstrap` (the signed
+/// guest runtime), the image; no supervisor, no code signatures.
+pub(crate) fn run_steps(o: &SetupOptions, c: &SetupContext, components: (&Component, &Component), flavor: Flavor, kvm: &Path) -> Result<Vec<String>, String> {
     if o.offline {
         if !o.check {
             return Err("--offline requires --check".into());
         }
-        return offline_check(c);
+        return offline_check(c, flavor, kvm);
     }
     let (mvm_c, opencode_c) = components;
     let mut steps = Steps { check: o.check, lines: Vec::new(), failures: Vec::new() };
     let mvm_ok = steps.record(mvm_step(o.check, c, mvm_c))?;
-    if !o.check {
+    if !o.check && flavor == Flavor::Hvf {
         steps.record(
             succeeded(c.mvm_plain.run(&sv(&["env", "sign"]), SIGN_TIMEOUT), "mvmctl env sign", SIGN_TIMEOUT)
                 .map(|_| None)
@@ -628,12 +639,35 @@ pub(crate) fn run_with(o: &SetupOptions, c: &SetupContext, components: (&Compone
                 .map_err(|e| format!("mvm {MVM_VERSION}: {e}; fix the problems it reports and re-run rts setup")),
         )?;
     }
-    steps.record(supervisor_step(c))?;
+    let kvm_ok = match flavor {
+        Flavor::Hvf => steps.record(supervisor_step(c))?,
+        Flavor::Firecracker => steps.record(kvm_step(kvm))?,
+    };
     steps.record(opencode_step(o.check, c, opencode_c))?;
+    if mvm_ok && flavor == Flavor::Firecracker && kvm_ok {
+        steps.record(bootstrap_step(o.check, c))?;
+    }
     if mvm_ok {
         steps.record(image_step(o.check, c))?;
     }
     steps.finish()
+}
+
+fn kvm_step(kvm: &Path) -> Result<Option<String>, String> {
+    crate::backend::kvm::check_kvm(kvm)?;
+    Ok(Some(format!("kvm {} (read-write)", kvm.display())))
+}
+
+/// `mvmctl bootstrap`: the guest runtime this mvmctl's release ships,
+/// fetched and checked against the release workflow's signature. Not run by
+/// `--check`, which cannot tell without running it.
+fn bootstrap_step(check: bool, c: &SetupContext) -> Result<Option<String>, String> {
+    if check {
+        return Ok(None);
+    }
+    succeeded(c.mvm.run(&sv(&["bootstrap"]), BOOTSTRAP_TIMEOUT), "mvmctl bootstrap", BOOTSTRAP_TIMEOUT)
+        .map_err(|e| format!("mvm {MVM_VERSION}: {e}; fix the problems it reports and re-run rts setup"))?;
+    Ok(Some(format!("mvm {MVM_VERSION} guest runtime (mvmctl bootstrap)")))
 }
 
 fn mvm_step(check: bool, c: &SetupContext, comp: &Component) -> Result<Option<String>, String> {
@@ -689,23 +723,25 @@ fn opencode_step(check: bool, c: &SetupContext, comp: &Component) -> Result<Opti
 }
 
 fn image_step(check: bool, c: &SetupContext) -> Result<Option<String>, String> {
-    let line = Some(format!("guest-image {DEFAULT_IMAGE} (mvm image cache)"));
-    let inspect = c.mvm.run(&sv(&["image", "inspect", DEFAULT_IMAGE]), INSPECT_TIMEOUT);
+    let image = default_image();
+    let line = Some(format!("guest-image {image} (mvm image cache)"));
+    let inspect = c.mvm.run(&sv(&["image", "inspect", image]), INSPECT_TIMEOUT);
     if matches!(&inspect, Ok(r) if !r.killed && r.code == Some(0)) {
         return Ok(line);
     }
     if check {
         let why = succeeded(inspect, "mvmctl image inspect", INSPECT_TIMEOUT).err().unwrap_or_default();
-        return Err(format!("guest image {DEFAULT_IMAGE}: not in mvm's image cache ({why}); run rts setup"));
+        return Err(format!("guest image {image}: not in mvm's image cache ({why}); run rts setup"));
     }
-    succeeded(c.mvm.run(&sv(&["image", "pull", DEFAULT_IMAGE]), PULL_TIMEOUT), "mvmctl image pull", PULL_TIMEOUT)
-        .map_err(|e| format!("guest image {DEFAULT_IMAGE}: {e}; check the network and re-run rts setup"))?;
+    succeeded(c.mvm.run(&sv(&["image", "pull", image]), PULL_TIMEOUT), "mvmctl image pull", PULL_TIMEOUT)
+        .map_err(|e| format!("guest image {image}: {e}; check the network and re-run rts setup"))?;
     Ok(line)
 }
 
-/// `--check --offline`: the plugin's files, both supervisor probes, and the
-/// signatures of `rts` and the supervisor. No mvmctl, no network.
-fn offline_check(c: &SetupContext) -> Result<Vec<String>, String> {
+/// `--check --offline`: the plugin's files, OpenCode, and on HVF both
+/// supervisor probes and the signatures of `rts` and the supervisor, on
+/// Firecracker `kvm`. No mvmctl, no network.
+fn offline_check(c: &SetupContext, flavor: Flavor, kvm: &Path) -> Result<Vec<String>, String> {
     let mut steps = Steps { check: true, lines: Vec::new(), failures: Vec::new() };
     let plugin = &c.defaults.plugin_dir;
     let missing: Vec<String> = ["package.json", "index.ts", "branding/tui.tsx", "branding/footer.ts", "branding/startup.ts", crate::brand::theme::THEME_FILE]
@@ -728,6 +764,10 @@ fn offline_check(c: &SetupContext) -> Result<Vec<String>, String> {
     } else {
         Err(format!("opencode {OPENCODE_VERSION}: not installed at {oc_s}; run rts setup"))
     })?;
+    if flavor == Flavor::Firecracker {
+        steps.record(kvm_step(kvm))?;
+        return steps.finish();
+    }
     steps.record(supervisor_step(c))?;
     for (name, path, fix) in [("rts", c.rts, "reinstall rts"), ("supervisor", c.supervisor, "reinstall rts, or rebuild it with scripts/build-patched-mvm-supervisor.sh")] {
         let p = path.to_string_lossy();
@@ -812,6 +852,19 @@ mod tests {
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
         let out = dir.join("fixture.tar.gz");
         run(Command::new("/usr/bin/tar").arg("-czf").arg(&out).arg("-C").arg(&src).arg("top"));
+        fs::read(out).unwrap()
+    }
+
+    /// A tar.gz holding one top-level entry, `opencode`, as OpenCode's Linux
+    /// release does, built with the real tar.
+    fn flat(dir: &Path) -> Vec<u8> {
+        let src = dir.join("src-flat");
+        fs::create_dir_all(&src).unwrap();
+        let bin = src.join("opencode");
+        fs::write(&bin, "#!/bin/sh\necho fixture\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let out = dir.join("flat.tar.gz");
+        run(Command::new("/usr/bin/tar").arg("-czf").arg(&out).arg("-C").arg(&src).arg("opencode"));
         fs::read(out).unwrap()
     }
 
@@ -1111,16 +1164,6 @@ mod tests {
 
     #[test]
     fn a_flat_tarball_installs_its_top_level_binary() {
-        fn flat(dir: &Path) -> Vec<u8> {
-            let src = dir.join("src-flat");
-            fs::create_dir_all(&src).unwrap();
-            let bin = src.join("opencode");
-            fs::write(&bin, "#!/bin/sh\necho fixture\n").unwrap();
-            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-            let out = dir.join("flat.tar.gz");
-            run(Command::new("/usr/bin/tar").arg("-czf").arg(&out).arg("-C").arg(&src).arg("opencode"));
-            fs::read(out).unwrap()
-        }
         let r = rig_with(flat, "opencode", Unpack::TarGz, "opencode");
         install_component(&r.c, &r.target, &r.fetch, &RealHost).unwrap();
         assert!(r.target.join("opencode").is_file());
@@ -1129,7 +1172,8 @@ mod tests {
 
     // --- rts setup: checks, order and modes ---
 
-    use crate::config::{DEFAULT_IMAGE, Defaults};
+    use crate::backend::mvm::Flavor;
+    use crate::config::{Defaults, default_image};
     use crate::install::{mvm_dir, opencode_dir};
     use crate::mvm::Runner;
     use crate::session::{SUPERVISOR_CONTRACT_PROBE, SUPERVISOR_PROBE};
@@ -1230,6 +1274,32 @@ mod tests {
         if a.get(1).map(String::as_str) == Some("inspect") { Ok(out(0, "", "")) } else { mvm_ok(a) }
     }
 
+    /// `mvmctl --version` for this build's pinned mvm.
+    fn plain_pinned(a: &[String]) -> io::Result<RunOutput> {
+        Ok(match a.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+            ["--version"] => out(0, &format!("mvmctl {MVM_VERSION}\n"), ""),
+            _ => panic!("unexpected mvm_plain call {a:?}"),
+        })
+    }
+
+    /// The Firecracker flavor's mvmctl: doctor and bootstrap pass, the image
+    /// is not cached, a pull succeeds.
+    fn mvm_fc_ok(a: &[String]) -> io::Result<RunOutput> {
+        Ok(match a.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+            ["bootstrap"] => out(0, "", ""),
+            _ => return mvm_ok(a),
+        })
+    }
+
+    /// OpenCode's `--version`, and the real tar; nothing else.
+    fn host_linux_ok(a: &[String]) -> io::Result<RunOutput> {
+        match a[0].as_str() {
+            "/usr/bin/tar" => RealHost.run(a, Duration::from_secs(600)),
+            _ if a.last().map(String::as_str) == Some("--version") => Ok(out(0, "2.2.2\n", "")),
+            _ => panic!("unexpected host call {a:?}"),
+        }
+    }
+
     struct SetupRig {
         _dir: tempfile::TempDir,
         home: PathBuf,
@@ -1301,6 +1371,33 @@ mod tests {
             Seams { host: Recorder::new("host", &self.log, host), plain: Recorder::new("plain", &self.log, plain), mvm: Recorder::new("mvm", &self.log, mvm) }
         }
 
+        /// The Linux rig: OpenCode ships as a flat tar.gz, so no ditto.
+        fn new_linux() -> Self {
+            let mut r = Self::new();
+            let fixtures = r._dir.path().join("fixtures-linux");
+            fs::create_dir_all(&fixtures).unwrap();
+            let tgz = flat(&fixtures);
+            let oc_c = Component { url: "https://github.com/fixture/opencode-linux.tar.gz".into(), sha256: sha256_hex(&tgz), unpack: Unpack::TarGz, ..r.components.1.clone() };
+            r.fetch.inner.body(&oc_c.url, tgz);
+            r.components.1 = oc_c;
+            r
+        }
+
+        fn run_firecracker(&self, o: SetupOptions, s: &Seams, kvm: &Path) -> Result<Vec<String>, String> {
+            let ctx = SetupContext {
+                home: &self.home,
+                defaults: &self.defaults,
+                explicit_mvmctl: self.explicit_mvmctl,
+                supervisor: &self.supervisor,
+                rts: &self.rts,
+                fetch: &self.fetch,
+                host: &s.host,
+                mvm_plain: &s.plain,
+                mvm: &s.mvm,
+            };
+            run_steps(&o, &ctx, (&self.components.0, &self.components.1), Flavor::Firecracker, kvm)
+        }
+
         fn run(&self, o: SetupOptions, s: &Seams) -> Result<Vec<String>, String> {
             let ctx = SetupContext {
                 home: &self.home,
@@ -1333,6 +1430,72 @@ mod tests {
         calls.iter().any(|a| a.iter().any(|w| w == word))
     }
 
+    /// A file this user can open, standing in for /dev/kvm.
+    fn fake_kvm(r: &SetupRig) -> PathBuf {
+        let kvm = r._dir.path().join("kvm");
+        fs::write(&kvm, "").unwrap();
+        kvm
+    }
+
+    #[test]
+    fn a_firecracker_setup_checks_kvm_bootstraps_and_pulls_with_no_supervisor() {
+        let r = SetupRig::new_linux();
+        let kvm = fake_kvm(&r);
+        let s = r.seams(host_linux_ok, plain_pinned, mvm_fc_ok);
+        let lines = r.run_firecracker(SetupOptions::default(), &s, &kvm).unwrap();
+        let oc = r.opencode().display().to_string();
+        assert_eq!(
+            r.log(),
+            [
+                format!("fetch {}", r.components.0.url),
+                "host /usr/bin/tar".into(),
+                "plain --version".into(),
+                "mvm doctor --workflow bundle-run".into(),
+                format!("fetch {}", r.components.1.url),
+                "host /usr/bin/tar".into(),
+                format!("host {oc} --version"),
+                "mvm bootstrap".into(),
+                format!("mvm image inspect {}", default_image()),
+                format!("mvm image pull {}", default_image()),
+            ]
+        );
+        assert_eq!(lines.len(), 5, "{lines:?}"); // mvm, kvm, opencode, guest runtime, image
+        assert!(lines[1].contains(&kvm.display().to_string()), "{lines:?}");
+        assert!(lines[3].contains("guest runtime"), "{lines:?}");
+        assert!(lines[4].contains(default_image()), "{lines:?}");
+    }
+
+    #[test]
+    fn a_firecracker_setup_without_kvm_fails_with_the_fix_and_check_reports_it() {
+        let r = SetupRig::new_linux();
+        let missing = r._dir.path().join("no-kvm");
+        let s = r.seams(host_linux_ok, plain_pinned, mvm_fc_ok);
+        let e = r.run_firecracker(SetupOptions::default(), &s, &missing).unwrap_err();
+        assert!(e.contains("usermod -aG kvm"), "{e}");
+        assert!(!r.log().iter().any(|l| l == "mvm bootstrap"), "bootstrapped without KVM: {:?}", r.log());
+        let s = r.seams(host_linux_ok, plain_pinned, mvm_fc_ok);
+        let e = r.run_firecracker(SetupOptions { check: true, offline: false }, &s, &missing).unwrap_err();
+        assert!(e.contains("usermod -aG kvm"), "{e}");
+    }
+
+    #[test]
+    fn a_firecracker_offline_check_needs_kvm_and_no_supervisor_or_codesign() {
+        let r = SetupRig::new_linux();
+        let kvm = fake_kvm(&r);
+        let offline = SetupOptions { check: true, offline: true };
+        let oc = opencode_dir(&r.home).join("opencode");
+        fs::create_dir_all(oc.parent().unwrap()).unwrap();
+        fs::write(&oc, b"").unwrap();
+        let s = r.seams(host_linux_ok, plain_pinned, mvm_fc_ok);
+        let lines = r.run_firecracker(offline, &s, &kvm).unwrap();
+        assert!(s.mvm.calls().is_empty() && s.plain.calls().is_empty() && r.fetches().is_empty());
+        let programs: Vec<String> = s.host.calls().iter().map(|a| a[0].clone()).collect();
+        assert_eq!(programs, [oc.display().to_string()]);
+        assert!(lines.iter().any(|l| l.contains(&kvm.display().to_string())), "{lines:?}");
+        let s = r.seams(host_linux_ok, plain_pinned, mvm_fc_ok);
+        assert!(r.run_firecracker(offline, &s, &r._dir.path().join("no-kvm")).unwrap_err().contains("usermod -aG kvm"));
+    }
+
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "macOS setup flow: zip fixtures need /usr/bin/ditto; Linux setup is not built yet")]
     fn a_fresh_setup_installs_signs_checks_and_pulls_in_order() {
@@ -1354,8 +1517,8 @@ mod tests {
                 format!("fetch {}", r.components.1.url),
                 "host /usr/bin/ditto".into(),
                 format!("host {oc} --version"),
-                format!("mvm image inspect {DEFAULT_IMAGE}"),
-                format!("mvm image pull {DEFAULT_IMAGE}"),
+                format!("mvm image inspect {}", default_image()),
+                format!("mvm image pull {}", default_image()),
             ]
         );
         assert!(!has_word(&s.mvm.calls(), "sign"), "env sign went to the supervisor-pinned runner");
@@ -1363,7 +1526,7 @@ mod tests {
         assert!(lines[0].contains("mvm 0.22.0") && lines[0].contains(".local/mvm/v0.22.0"), "{lines:?}");
         assert!(lines[1].contains("rts-vsock-drain-v1") && lines[1].contains(&sup), "{lines:?}");
         assert!(lines[2].contains("opencode 2.2.2") && lines[2].contains(&oc), "{lines:?}");
-        assert!(lines[3].contains(DEFAULT_IMAGE), "{lines:?}");
+        assert!(lines[3].contains(default_image()), "{lines:?}");
         assert!(mvm_dir(&r.home).join("mvmctl").is_file() && r.opencode().is_file());
     }
 
@@ -1496,7 +1659,7 @@ mod tests {
         let check = SetupOptions { check: true, offline: false };
         let s = r.seams(host_ok, plain_ok, mvm_ok);
         let e = r.run(check, &s).unwrap_err();
-        assert!(e.contains(DEFAULT_IMAGE) && e.contains("run rts setup") && e.lines().count() == 1, "{e}");
+        assert!(e.contains(default_image()) && e.contains("run rts setup") && e.lines().count() == 1, "{e}");
         assert!(!has_word(&s.mvm.calls(), "pull") && !has_word(&s.plain.calls(), "sign"));
 
         let s = r.seams(host_ok, plain_ok, mvm_cached);

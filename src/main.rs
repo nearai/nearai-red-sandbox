@@ -319,10 +319,12 @@ fn setup_command(o: &setup::SetupOptions) -> Result<i32, String> {
     let (_temp, empty_git_config) = launch::private_git_config("rts-setup-")?;
     let fetch = setup::HttpsFetch::new()?;
     let mvm_plain = setup::plain_mvm_runner(&defaults.mvmctl, &empty_git_config, &env);
+    let flavor = rts::backend::mvm::Flavor::host();
+    let shim_dir = empty_git_config.parent().map(|p| p.join("sudo-shim")).ok_or("the setup Git configuration has no parent directory")?;
     let mvm = rts::mvm::SpawnRunner {
         mvmctl: defaults.mvmctl.clone(),
         empty_git_config,
-        extra_env: session::mvm_environment(&env, &supervisor),
+        extra_env: rts::backend::mvm::MvmBackend::mvmctl_environment(flavor, &env, Some(&supervisor), &shim_dir)?,
         remove_env: Vec::new(),
     };
     let lines = setup::run(
