@@ -529,19 +529,26 @@ const PROBE_ERROR_CHARS: usize = 200;
 /// Shared start of both probe scripts. With no `nc` it prints `no-nc`
 /// before any other command runs. `first_line TARGET` sends an HTTP CONNECT
 /// for TARGET to the guest proxy and sets `line` to the first response
-/// line, without its CR. It reads through a FIFO and then kills `nc`,
-/// because a CONNECT that succeeds leaves the tunnel open and `nc` would
-/// otherwise outlive the exec. It returns non-zero only if it could not set
-/// up, so a setup failure never reads as "no answer".
+/// line, without its CR. `nc` writes to a regular file, polled until it
+/// holds a full line or `nc` exits (at most about 11 s), and is then
+/// killed, because a CONNECT that succeeds leaves the tunnel open and `nc`
+/// would otherwise outlive the exec. No FIFO: mvm's exec sandbox denies
+/// mknod. It returns non-zero only if it could not set up, so a setup
+/// failure never reads as "no answer".
 macro_rules! probe_prelude {
     () => {
         r#"command -v nc >/dev/null 2>&1 || { echo 'RTS_PROBE no-nc'; exit 0; }
 first_line() {
   line=
   d=$(mktemp -d /tmp/rts-probe.XXXXXX) || return 1
-  printf 'CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n' "$1" "$1" >"$d/req" && mkfifo "$d/out" || { rm -rf "$d"; return 1; }
+  printf 'CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n' "$1" "$1" >"$d/req" && : >"$d/out" || { rm -rf "$d"; return 1; }
   nc -w 10 127.0.0.1 1080 <"$d/req" >"$d/out" 2>/dev/null &
   p=$!
+  i=0
+  while [ "$(wc -l <"$d/out")" -eq 0 ] && kill -0 "$p" 2>/dev/null && [ "$i" -lt 110 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
   IFS= read -r line <"$d/out"
   kill "$p" 2>/dev/null
   wait "$p" 2>/dev/null
@@ -1355,6 +1362,22 @@ mod tests {
         // The proxy answers 200 and then holds the tunnel open, as a real
         // CONNECT does. The probe must not wait for nc to exit.
         let d = fake_nc("probe-200", "printf 'HTTP/1.1 200 Connection established\\r\\n\\r\\n'\nexec sleep 60");
+        let path = format!("{}:/usr/bin:/bin", d.display());
+        assert_eq!(run_script(&probe_argv("a.example:443"), &path), (0, "RTS_PROBE connected\n".into()));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_probe_needs_no_fifo() {
+        // mvm's exec sandbox (seccomp) denies mknod, so mkfifo fails in the
+        // guest; the probe must still read the proxy's answer.
+        let d = fake_nc("probe-nofifo", "printf 'HTTP/1.1 200 Connection established\\r\\n\\r\\n'\nexec sleep 60");
+        std::fs::write(d.join("mkfifo"), "#!/bin/sh\necho 'mkfifo: Operation not permitted' >&2\nexit 1\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(d.join("mkfifo"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let path = format!("{}:/usr/bin:/bin", d.display());
         assert_eq!(run_script(&probe_argv("a.example:443"), &path), (0, "RTS_PROBE connected\n".into()));
         std::fs::remove_dir_all(d).unwrap();

@@ -127,22 +127,29 @@ fn invariant_no_allowlist_means_no_route_out() {
             result: "unreachable".into()
         }]
     );
+    // The kernel's own device list: no socket needed (mvm's exec sandbox
+    // denies AF_NETLINK, so `ip link` cannot list anything there).
     let links =
-        m.0.exec(&sv(&["ip", "-o", "link"]), &ExecOptions::new(30_000, 4096))
-            .unwrap();
+        m.0.exec(
+            &sv(&["ls", "/sys/class/net"]),
+            &ExecOptions::new(30_000, 4096),
+        )
+        .unwrap();
+    assert_eq!(
+        links.exit_code,
+        0,
+        "cannot list network devices: {}",
+        String::from_utf8_lossy(&links.stderr)
+    );
     let text = String::from_utf8_lossy(&links.stdout);
-    let names: Vec<&str> = text
-        .lines()
-        .filter_map(|l| l.split(':').nth(1))
-        .map(str::trim)
-        .collect();
+    let names: Vec<&str> = text.split_whitespace().collect();
     assert_eq!(names, ["lo"], "the guest has a network device");
     drop(m);
     fs::remove_dir_all(&r.dir).unwrap();
 }
 
 #[test]
-#[ignore = "real mvm"]
+#[ignore = "boots a real VM"]
 fn invariant_the_allowlist_is_exact_and_pinned() {
     let r = rig();
     let plan = rts::network::plan(&["pypi.org".to_string()], &SystemResolver).unwrap();
