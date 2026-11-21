@@ -83,7 +83,7 @@ pub fn install_sudo_shim(dir: &Path) -> Result<PathBuf, String> {
 }
 
 /// mvmctl's environment on Firecracker: HOME and MVM_HOME from the
-/// operator, and PATH with `shim_dir` first.
+/// operator, PATH with `shim_dir` first, and no standby pool.
 pub fn firecracker_environment(
     env: &[(String, String)],
     shim_dir: &Path,
@@ -100,6 +100,11 @@ pub fn firecracker_environment(
         .filter(|v| !v.is_empty())
         .unwrap_or("/usr/local/bin:/usr/bin:/bin");
     result.insert("PATH".into(), format!("{}:{inherited}", shim_dir.display()));
+    // mvm 0.28 keeps a standby pool by default: a detached `pool refill` and
+    // idle Firecracker processes that outlive `machine rm`. A sandbox session
+    // must leave nothing running, so turn both off.
+    result.insert("MVM_RESIDENCY".into(), "cold".into());
+    result.insert("MVM_FC_IDLE_POOL".into(), "0".into());
     result
 }
 
@@ -165,7 +170,9 @@ mod tests {
     fn run_shim(sudo: &Path, args: &[&str]) -> std::process::Output {
         for _ in 0..50 {
             match Command::new(sudo).args(args).output() {
-                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
                 r => return r.unwrap(),
             }
         }
@@ -245,7 +252,12 @@ mod tests {
             ("SECRET".into(), "x".into()),
         ];
         let e = firecracker_environment(&env, Path::new("/rt/bin"));
-        assert_eq!(e.len(), 3, "{e:?}");
+        assert_eq!(e.len(), 5, "{e:?}");
+        // No standby pool, refill or idle VMM may outlive a session.
+        assert_eq!(
+            (e["MVM_RESIDENCY"].as_str(), e["MVM_FC_IDLE_POOL"].as_str()),
+            ("cold", "0")
+        );
         assert_eq!(e["PATH"], "/rt/bin:/usr/bin:/bin");
         assert_eq!((e["HOME"].as_str(), e["MVM_HOME"].as_str()), ("/h", "/m"));
         let bare = firecracker_environment(&[], Path::new("/rt/bin"));
