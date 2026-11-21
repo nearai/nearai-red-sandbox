@@ -11,6 +11,7 @@ pub mod forwarder;
 pub mod copy;
 pub mod files;
 pub mod glob;
+pub mod hvexec;
 pub mod install;
 pub mod launch;
 pub mod mvm;
