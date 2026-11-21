@@ -3,7 +3,8 @@
 //! each connection here unread; this side reads the HTTP CONNECT, allows
 //! only the session's allowlist, connects only to the addresses the
 //! allowlist resolved to when the session's plan was made (pinned by
-//! construction, never re-resolved), refuses private and metadata ranges,
+//! construction, never re-resolved), refuses rts's refused ranges
+//! (loopback, link-local, cloud metadata; listed LAN targets are allowed)
 //! and writes one audit line per connection. Pure std over generic streams,
 //! so every rule is tested on any OS.
 
@@ -24,7 +25,8 @@ const MAX_HEAD: usize = 8 * 1024;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What the allowlist permits: each `name:port` with its pinned
-/// addresses, and each literal `ip:port`.
+/// addresses, and each literal `ip:port`. Serializes to JSON for handing
+/// to the confined proxy process.
 #[derive(Debug, Clone, Default)]
 pub struct Policy {
     names: BTreeMap<(String, u16), Vec<IpAddr>>,
@@ -51,6 +53,45 @@ impl Policy {
             }
         }
         p
+    }
+
+    pub fn to_json(&self) -> String {
+        let names: Vec<_> = self
+            .names
+            .iter()
+            .map(|((n, p), ips)| serde_json::json!([n, p, ips]))
+            .collect();
+        let ips: Vec<_> = self
+            .ips
+            .iter()
+            .map(|(ip, p)| serde_json::json!([ip, p]))
+            .collect();
+        serde_json::json!({"names": names, "ips": ips}).to_string()
+    }
+
+    pub fn from_json(s: &str) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            names: Vec<(String, u16, Vec<IpAddr>)>,
+            ips: Vec<(IpAddr, u16)>,
+        }
+        let w: Wire = serde_json::from_str(s).map_err(|e| format!("egress policy: {e}"))?;
+        let mut p = Policy::default();
+        for (n, port, ips) in w.names {
+            // Refused ranges never enter a policy, whoever wrote it.
+            p.names.insert(
+                (n.to_ascii_lowercase(), port),
+                ips.into_iter()
+                    .filter(|ip| refused_range(*ip).is_none())
+                    .collect(),
+            );
+        }
+        for (ip, port) in w.ips {
+            if refused_range(ip).is_none() {
+                p.ips.insert((ip, port));
+            }
+        }
+        Ok(p)
     }
 
     /// Every allowlisted name and the addresses the proxy may dial for it.
@@ -109,14 +150,30 @@ fn split_target(t: &str) -> Option<(&str, u16)> {
 
 /// The audit log (network.jsonl) and the addresses used, per name.
 pub struct Audit {
-    path: PathBuf,
+    sink: Mutex<Sink>,
     pinned: Mutex<Pinned>,
 }
 
+/// Where audit lines go: appended to an owner-only file (rts), or written
+/// to a stream (the confined proxy's stdout, which rts reads).
+enum Sink {
+    File(PathBuf),
+    Stream(Box<dyn Write + Send>),
+}
+
 impl Audit {
+    /// Append to the owner-only file at `path`.
     pub fn new(path: &Path) -> Self {
         Self {
-            path: path.to_path_buf(),
+            sink: Mutex::new(Sink::File(path.to_path_buf())),
+            pinned: Mutex::new(Pinned::new()),
+        }
+    }
+
+    /// Write each line to `out`.
+    pub fn to_stream(out: Box<dyn Write + Send>) -> Self {
+        Self {
+            sink: Mutex::new(Sink::Stream(out)),
             pinned: Mutex::new(Pinned::new()),
         }
     }
@@ -136,9 +193,24 @@ impl Audit {
             "ip": ip.map(|i| i.to_string()),
             "reason": reason,
         });
-        if let Ok(mut f) = crate::sys::fs::open_private(&self.path, crate::sys::fs::Create::Append)
-        {
-            let _ = writeln!(f, "{line}");
+        self.write_line(&line.to_string());
+    }
+
+    /// Append one already-formed audit line (rts relaying the proxy's).
+    pub fn write_line(&self, line: &str) {
+        let mut sink = self.sink.lock().unwrap_or_else(|e| e.into_inner());
+        match &mut *sink {
+            Sink::File(path) => {
+                if let Ok(mut f) =
+                    crate::sys::fs::open_private(path, crate::sys::fs::Create::Append)
+                {
+                    let _ = writeln!(f, "{line}");
+                }
+            }
+            Sink::Stream(out) => {
+                let _ = writeln!(out, "{line}");
+                let _ = out.flush();
+            }
         }
     }
 }
@@ -303,7 +375,54 @@ mod tests {
     }
 
     #[test]
-    fn private_metadata_and_malformed_targets_are_refused() {
+    fn a_policy_round_trips_through_json_and_refused_ranges_never_enter() {
+        let p = policy(
+            &["a.example", "198.51.100.7:8443"],
+            vec![("a.example", vec![ip("203.0.113.5")])],
+        );
+        let q = Policy::from_json(&p.to_json()).unwrap();
+        assert_eq!(
+            q.decide("a.example:443").unwrap(),
+            p.decide("a.example:443").unwrap()
+        );
+        assert_eq!(
+            q.decide("198.51.100.7:8443").unwrap(),
+            p.decide("198.51.100.7:8443").unwrap()
+        );
+        let forged = r#"{"names":[["a.example",443,["169.254.169.254","203.0.113.5"]]],"ips":[["127.0.0.1",443]]}"#;
+        let f = Policy::from_json(forged).unwrap();
+        assert_eq!(
+            f.decide("a.example:443").unwrap().1,
+            [SocketAddr::new(ip("203.0.113.5"), 443)]
+        );
+        assert!(
+            f.decide("127.0.0.1:443").is_err(),
+            "loopback never enters a policy"
+        );
+        assert!(Policy::from_json("not json").is_err());
+    }
+
+    #[test]
+    fn audit_lines_can_go_to_a_stream() {
+        let (mut r, w) = UnixStream::pair().unwrap();
+        let audit = Audit::to_stream(Box::new(w));
+        audit.record(
+            "a.example:443",
+            "refused",
+            None,
+            Some("not on the allowlist"),
+        );
+        let mut line = String::new();
+        BufReader::new(&mut r).read_line(&mut line).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            (v["target"].as_str(), v["result"].as_str()),
+            (Some("a.example:443"), Some("refused"))
+        );
+    }
+
+    #[test]
+    fn off_list_refused_range_and_malformed_targets_are_refused() {
         let p = policy(&["a.example"], vec![("a.example", vec![ip("203.0.113.5")])]);
         for bad in [
             "169.254.169.254:80",
