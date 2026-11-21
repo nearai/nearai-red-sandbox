@@ -37,3 +37,5 @@ jobs:
         run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets
       - name: unit tests
         run: cargo test --locked --target x86_64-pc-windows-msvc --lib --bins
+      - name: rts.exe starts without Hyper-V (no computecore.dll import)
+        run: cargo test --locked --target x86_64-pc-windows-msvc --test windows_imports
