@@ -65,6 +65,36 @@ fn computecore_dll_is_not_a_load_time_import_of_rts_exe() {
     );
 }
 
+/// The Visual C++ runtime DLLs, which a stock Windows install lacks unless
+/// the Visual C++ Redistributable was installed.
+const VC_RUNTIME: [&str; 5] = [
+    "vcruntime140.dll",
+    "vcruntime140_1.dll",
+    "msvcp140.dll",
+    "ucrtbase.dll",
+    "ucrtbased.dll",
+];
+
+/// Whether `dll` is a Visual C++ runtime DLL or a universal CRT API set.
+fn needs_vc_runtime(dll: &str) -> bool {
+    VC_RUNTIME.contains(&dll) || dll.starts_with("vcruntime") || dll.starts_with("api-ms-win-crt-")
+}
+
+/// rts.exe must start on a stock Windows install: release builds link the C
+/// runtime statically (-C target-feature=+crt-static, set by the Windows CI
+/// and release jobs), so it imports no Visual C++ runtime DLL. Without it
+/// rts.exe exits with STATUS_DLL_NOT_FOUND (checked on rts-win-dev).
+#[cfg(target_env = "msvc")]
+#[test]
+fn rts_exe_needs_no_visual_cpp_runtime() {
+    let dlls = imported_dlls(&std::fs::read(env!("CARGO_BIN_EXE_rts")).unwrap());
+    let runtime: Vec<&String> = dlls.iter().filter(|d| needs_vc_runtime(d)).collect();
+    assert!(
+        runtime.is_empty(),
+        "rts.exe needs the Visual C++ runtime (build with +crt-static): {runtime:?}"
+    );
+}
+
 /// The confined egress proxy must load only what serving CONNECT needs.
 /// user32, shell32, COM and TLS DLLs need a window station or desktop to
 /// initialise, which an AppContainer process does not get, so the proxy
@@ -94,6 +124,13 @@ fn rts_egress_exe_imports_no_ui_shell_com_or_tls_dlls() {
         assert!(
             !dlls.iter().any(|d| d == forbidden),
             "rts-egress.exe imports {forbidden}: {dlls:?}"
+        );
+    }
+    if cfg!(target_env = "msvc") {
+        let runtime: Vec<&String> = dlls.iter().filter(|d| needs_vc_runtime(d)).collect();
+        assert!(
+            runtime.is_empty(),
+            "rts-egress.exe needs the Visual C++ runtime (build with +crt-static): {runtime:?}"
         );
     }
 }
