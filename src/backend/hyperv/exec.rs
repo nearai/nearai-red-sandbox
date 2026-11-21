@@ -73,6 +73,15 @@ impl<C: Connect> Exec for GuestExec<C> {
             },
         )
         .map_err(Error::Other)?;
+        // A request must fit one frame. Refusing it here, before anything is
+        // sent, is an ordinary error: the machine is fine.
+        let size: usize = wrapped.iter().map(|a| a.len() + 4).sum::<usize>() + 4;
+        if crate::hvexec::wire::encode_argv(&wrapped).is_err() {
+            return Err(Error::Other(format!(
+                "command too large for the guest channel ({size} bytes; at most {} per command)",
+                crate::hvexec::wire::MAX_FRAME
+            )));
+        }
         let deadline = Duration::from_secs(timeout_sec) + self.backstop;
         let mut conn = match self.connect.connect(deadline) {
             Ok(c) => c,
@@ -287,6 +296,27 @@ mod tests {
             took >= Duration::from_millis(1500) && took < Duration::from_secs(4),
             "{took:?}"
         );
+    }
+
+    #[test]
+    fn an_oversized_command_is_an_ordinary_error_and_the_machine_stays_usable() {
+        let g = GuestExec::new(Local, Duration::from_secs(30));
+        let big = "x".repeat(100 * 1024);
+        let e = g
+            .exec(&s(&["echo", &big]), &ExecOptions::new(5_000, 1 << 20))
+            .unwrap_err();
+        assert!(
+            matches!(&e, Error::Other(m) if m.contains("too large")),
+            "{e}"
+        );
+        assert!(g.dead_reason().is_none());
+        let r = g
+            .exec(
+                &s(&["echo", "still here"]),
+                &ExecOptions::new(5_000, 1 << 20),
+            )
+            .unwrap();
+        assert_eq!(r.stdout, b"still here\n");
     }
 
     #[test]
