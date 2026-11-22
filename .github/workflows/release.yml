@@ -1,4 +1,6 @@
-# Build, sign, notarize and publish an rts release for aarch64-apple-darwin.
+# Build, sign, notarize and publish an rts release for aarch64-apple-darwin,
+# with the Windows and Linux archives for embedders (build-windows,
+# build-linux).
 #
 # A pushed tag v<X.Y.Z> (equal to Cargo.toml's version) publishes the GitHub
 # release and pushes a formula bump to nearai/homebrew-tap's main branch.
@@ -399,9 +401,71 @@ jobs:
           path: ${{ runner.temp }}/dist-windows/
           if-no-files-found: error
 
+  # The Linux archive (rts and the plugin; no supervisor: Firecracker needs
+  # none), packaged by the script linux-check exercises on every pull
+  # request. An embedder pins its sha256 and installs it with
+  # rts::setup::run_in_prefix. No update key is compiled in (rts update
+  # serves macOS only); SHA256SUMS and a build-provenance attestation cover
+  # it. Built on ubuntu-22.04, so it needs glibc 2.35 or later (Debian 12
+  # has 2.36); the Package step refuses a binary that needs newer.
+  build-linux:
+    name: build and package for Linux
+    needs: release-config
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: "-D warnings"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+      - name: Version
+        id: version
+        run: |
+          set -euo pipefail
+          V="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_NAME" != "v$V" ]; then
+            echo "refusing to release: tag is $GITHUB_REF_NAME, Cargo.toml version is $V (expected tag v$V)" >&2
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      - name: Build rts
+        run: cargo build --locked --release --bin rts
+      - name: Package
+        env:
+          V: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          scripts/package-linux.sh --version "$V" --rts target/release/rts --out "$RUNNER_TEMP/dist-linux"
+          archive="$RUNNER_TEMP/dist-linux/rts-$V-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir "$RUNNER_TEMP/smoke"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/smoke"
+          [ "$("$RUNNER_TEMP/smoke/bin/rts" --version)" = "rts $V" ] || { echo "refusing: packaged rts --version is not rts $V" >&2; exit 1; }
+          floor="$(objdump -T "$RUNNER_TEMP/smoke/bin/rts" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          echo "glibc floor: $floor"
+          [ "$(printf '%s\n' GLIBC_2.35 "$floor" | sort -V | tail -1)" = GLIBC_2.35 ] || { echo "refusing: rts needs $floor, newer than glibc 2.35" >&2; exit 1; }
+          RTS_RELEASE_TAR_GZ="$archive" \
+            cargo test --locked --lib -- --ignored --exact \
+            setup::tests::a_built_release_tar_gz_installs_into_a_prefix
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/dist-linux/rts-${{ steps.version.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-linux
+          path: ${{ runner.temp }}/dist-linux/
+          if-no-files-found: error
+
   publish:
     name: publish the release and the formula
-    needs: [build, build-windows]
+    needs: [build, build-windows, build-linux]
     # The push event too, not only a tag ref: a dispatch can name a tag ref.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
@@ -434,6 +498,13 @@ jobs:
           (cd "$RUNNER_TEMP/dist-windows" && sha256sum -c "$win.sha256")
           cp "$RUNNER_TEMP/dist-windows/$win" .
           grep -qF "  $win" SHA256SUMS || cat "$RUNNER_TEMP/dist-windows/$win.sha256" >> SHA256SUMS
+          # The Linux archive, the same way (only the tarball goes into
+          # dist/: gh release create uploads every file there).
+          linux="rts-$V-x86_64-unknown-linux-gnu.tar.gz"
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name dist-linux --dir "$RUNNER_TEMP/dist-linux"
+          (cd "$RUNNER_TEMP/dist-linux" && sha256sum -c "$linux.sha256")
+          cp "$RUNNER_TEMP/dist-linux/$linux" .
+          grep -qF "  $linux" SHA256SUMS || cat "$RUNNER_TEMP/dist-linux/$linux.sha256" >> SHA256SUMS
           sha256sum -c SHA256SUMS
 
       # A re-run of this job after the release was created but the tap step
@@ -478,6 +549,11 @@ jobs:
           Gateway app, which pin its sha256 from SHA256SUMS. It is not
           Authenticode-signed; verify it with SHA256SUMS and
           gh attestation verify.
+
+          rts-$V-x86_64-unknown-linux-gnu.tar.gz is the Linux build (rts
+          and the plugin; Firecracker needs no supervisor) for embedders,
+          which pin its sha256 from SHA256SUMS. It needs glibc 2.35 or later.
+          Verify it with SHA256SUMS and gh attestation verify.
 
           Installed with curl? rts update installs later releases; it accepts
           only a release whose latest.json is signed with the update key in

@@ -378,6 +378,13 @@ runner for W1.
   (`sudo usermod -aG kvm $USER`, re-login) instead of running it. No
   `NOPASSWD` sudo, ever. trace-commons' GTK app runs the same `run_in_prefix`
   and shows that message. Secret storage: the existing secret-service store.
+  The pinned release archive for embedders is
+  `rts-<v>-x86_64-unknown-linux-gnu.tar.gz` (`scripts/package-linux.sh`):
+  `bin/rts` and the plugin, no supervisor; `run_in_prefix` installs only the
+  plugin from it. As on macOS, the embedder's mvmctl runners (setup and
+  launch) must set `HOME=<prefix>` and `MVM_HOME=<prefix>/mvm`, or mvmctl's
+  guest runtime, image cache and VM state land under the operator's
+  `~/.mvm` instead of the prefix.
 - **Windows (W1)**: the trace-commons Windows app checks Windows 11 + "Virtual
   Machine Platform" + nested virtualization, asks the user once to enable the
   feature (admin, reboot), imports the `nearai-rts` distro from a signed

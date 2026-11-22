@@ -401,7 +401,20 @@ pub struct ReleaseArchive {
 }
 
 const RELEASE_MAX_BYTES: u64 = 128 << 20;
-const RELEASE_OWNED: [&str; 2] = ["libexec/nearai-red-sandbox", "share/nearai-red-sandbox/plugin"];
+const RELEASE_LIBEXEC: &str = "libexec/nearai-red-sandbox";
+const RELEASE_PLUGIN: &str = "share/nearai-red-sandbox/plugin";
+const RELEASE_SUPERVISOR: &str = "libexec/nearai-red-sandbox/mvm-hvf-supervisor";
+
+/// What `run_in_prefix` unpacks from a release archive and swaps into the
+/// prefix. HVF (macOS): the signed supervisor's libexec and the plugin.
+/// Firecracker (Linux): the plugin only; there is no supervisor.
+#[cfg(unix)]
+pub(crate) fn release_owned(flavor: Flavor) -> &'static [&'static str] {
+    match flavor {
+        Flavor::Hvf => &[RELEASE_LIBEXEC, RELEASE_PLUGIN],
+        Flavor::Firecracker => &[RELEASE_PLUGIN],
+    }
+}
 
 pub(crate) fn swap_into_prefix(prefix: &Path, stage: &Path, rel: &str) -> Result<(), String> {
     let dst = prefix.join(rel);
@@ -419,13 +432,16 @@ pub(crate) fn swap_into_prefix(prefix: &Path, stage: &Path, rel: &str) -> Result
     fs::rename(&src, &dst).map_err(|e| format!("moving {} into {}: {e}", src.display(), dst.display()))
 }
 
+#[cfg(unix)]
 fn install_release_components(
     prefix: &Path,
     release: &ReleaseArchive,
     f: &dyn Fetch,
     host: &dyn Host,
+    flavor: Flavor,
 ) -> Result<(), String> {
     let label = "rts release";
+    let owned = release_owned(flavor);
     if prefix.exists() {
         remove_stale_temp_dirs(prefix).map_err(|e| format!("{label}: {e}"))?;
     } else {
@@ -458,16 +474,15 @@ fn install_release_components(
 
     fs::create_dir(&unpacked)
         .map_err(|e| format!("{label}: creating {}: {e}", unpacked.display()))?;
-    let argv: Vec<String> = vec![
+    let mut argv: Vec<String> = vec![
         "/usr/bin/tar".into(),
         "-xzf".into(),
         download_path.to_string_lossy().into_owned(),
         "-C".into(),
         unpacked.to_string_lossy().into_owned(),
         "--".into(),
-        RELEASE_OWNED[0].into(),
-        RELEASE_OWNED[1].into(),
     ];
+    argv.extend(owned.iter().map(|rel| rel.to_string()));
     let out = host
         .run(&argv, UNPACK_TIMEOUT)
         .map_err(|e| format!("{label}: running /usr/bin/tar: {e}; nothing was installed"))?;
@@ -484,14 +499,14 @@ fn install_release_components(
         ));
     }
 
-    let sup = unpacked.join("libexec/nearai-red-sandbox/mvm-hvf-supervisor");
-    if !fs::symlink_metadata(&sup).map(|m| m.is_file()).unwrap_or(false) {
+    let sup = unpacked.join(RELEASE_SUPERVISOR);
+    if flavor == Flavor::Hvf && !fs::symlink_metadata(&sup).map(|m| m.is_file()).unwrap_or(false) {
         return Err(format!(
-            "{label}: {} does not contain a regular file libexec/nearai-red-sandbox/mvm-hvf-supervisor; nothing was installed",
+            "{label}: {} does not contain a regular file {RELEASE_SUPERVISOR}; nothing was installed",
             release.url
         ));
     }
-    let plugin = unpacked.join("share/nearai-red-sandbox/plugin");
+    let plugin = unpacked.join(RELEASE_PLUGIN);
     if !fs::symlink_metadata(&plugin).map(|m| m.is_dir()).unwrap_or(false) {
         return Err(format!(
             "{label}: {} does not contain share/nearai-red-sandbox/plugin; nothing was installed",
@@ -500,7 +515,7 @@ fn install_release_components(
     }
 
     let mut swapped: Vec<&str> = Vec::new();
-    for &rel in &RELEASE_OWNED {
+    for &rel in owned {
         if let Err(e) = swap_into_prefix(prefix, tmp.path(), rel) {
             for &prev in swapped.iter().rev() {
                 let dst = prefix.join(prev);
@@ -517,9 +532,21 @@ fn install_release_components(
     Ok(())
 }
 
-/// Download and verify `release`, extract the signed supervisor and plugin
-/// into `prefix`, then install or check mvm, OpenCode and the guest image
-/// under `prefix`.
+/// Download and verify `release`, extract its parts into `prefix`, then
+/// install or check mvm, OpenCode and the guest image under `prefix`.
+///
+/// On macOS the archive must hold the signed `mvm-hvf-supervisor` (in
+/// `libexec/nearai-red-sandbox`) and the plugin; on Linux only the plugin is
+/// installed from it and it holds no supervisor
+/// (`rts-<version>-x86_64-unknown-linux-gnu.tar.gz`).
+///
+/// MVM_HOME: on macOS and on Linux, the runners in `c` (`mvm_plain` and
+/// `mvm`), and the ones the embedder later launches sessions with, must
+/// run mvmctl with `HOME=<prefix>` and `MVM_HOME=<prefix>/mvm`. mvmctl's
+/// root is MVM_HOME, else `HOME/.mvm`; its image cache, VM state and (Linux)
+/// the guest runtime `mvmctl bootstrap` installs live there, so a runner
+/// without them puts those outside the prefix, where a launch with a
+/// different environment does not find them.
 ///
 /// On Windows: the release archive's egress proxy and plugin, the pinned
 /// Hyper-V guest files and OpenCode, into an owner-only `prefix`
@@ -540,6 +567,7 @@ pub fn run_in_prefix(
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn run_in_prefix_with(
     o: &SetupOptions,
     c: &SetupContext,
@@ -547,8 +575,35 @@ pub(crate) fn run_in_prefix_with(
     release: &ReleaseArchive,
     components: (&Component, &Component),
 ) -> Result<Vec<String>, String> {
+    prefix_setup(o, c, prefix, release, Flavor::host(), |ctx| run_with(o, ctx, components))
+}
+
+/// `run_in_prefix_with` for an explicit `flavor` and KVM device, so each
+/// platform's prefix install is tested on every host.
+#[cfg(all(test, unix))]
+fn run_in_prefix_flavor(
+    o: &SetupOptions,
+    c: &SetupContext,
+    prefix: &Path,
+    release: &ReleaseArchive,
+    components: (&Component, &Component),
+    flavor: Flavor,
+    kvm: &Path,
+) -> Result<Vec<String>, String> {
+    prefix_setup(o, c, prefix, release, flavor, |ctx| run_steps(o, ctx, components, flavor, kvm))
+}
+
+#[cfg(unix)]
+fn prefix_setup(
+    o: &SetupOptions,
+    c: &SetupContext,
+    prefix: &Path,
+    release: &ReleaseArchive,
+    flavor: Flavor,
+    steps: impl FnOnce(&SetupContext) -> Result<Vec<String>, String>,
+) -> Result<Vec<String>, String> {
     if !o.check {
-        install_release_components(prefix, release, c.fetch, c.host)?;
+        install_release_components(prefix, release, c.fetch, c.host, flavor)?;
     }
     let prefix_defaults = Defaults::for_prefix(prefix, &c.defaults.sessions_dir);
     let prefix_sup = crate::install::prefix_supervisor(prefix);
@@ -563,7 +618,7 @@ pub(crate) fn run_in_prefix_with(
         mvm_plain: c.mvm_plain,
         mvm: c.mvm,
     };
-    run_with(o, &prefix_ctx, components)
+    steps(&prefix_ctx)
 }
 
 /// Ok: one summary line per component ("<name> <version> <path>"). Err:
@@ -1389,7 +1444,10 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let fixtures = dir.path().join("fixtures");
             fs::create_dir_all(&fixtures).unwrap();
-            let (tgz, zipped) = (tarball(&fixtures, "mvmctl"), zip(&fixtures));
+            // The OpenCode zip needs /usr/bin/ditto (macOS); the Linux rig
+            // (`new_linux`) replaces that component, so elsewhere it is a stub.
+            let zipped = if Path::new("/usr/bin/ditto").exists() { zip(&fixtures) } else { b"no ditto on this host".to_vec() };
+            let tgz = tarball(&fixtures, "mvmctl");
             let fetch = FakeFetch::new();
             let mvm_c = Component { url: "https://github.com/fixture/mvm.tar.gz".into(), sha256: sha256_hex(&tgz), max_bytes: 1 << 20, ..mvm() };
             let oc_c = Component { url: "https://github.com/fixture/opencode.zip".into(), sha256: sha256_hex(&zipped), max_bytes: 1 << 20, ..opencode() };
@@ -1900,6 +1958,135 @@ mod tests {
         };
         let _ = run_in_prefix_with(&SetupOptions { check: true, offline: false }, &ctx, &prefix, &release, (&r.components.0, &r.components.1));
         assert!(r.fetches().is_empty(), "check mode fetched {:?}", r.fetches());
+    }
+
+    /// A release archive holding `files` (path, contents), tarred by their
+    /// top-level names, as the packaging scripts do (never `./`).
+    fn archive_of(work: &Path, files: &[(&str, &[u8])]) -> (Vec<u8>, [u8; 32]) {
+        let root = work.join("archive-stage");
+        let _ = fs::remove_dir_all(&root);
+        let mut tops: Vec<String> = Vec::new();
+        for (rel, bytes) in files {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, bytes).unwrap();
+            let top = rel.split('/').next().unwrap().to_string();
+            if !tops.contains(&top) {
+                tops.push(top);
+            }
+        }
+        let archive = work.join("archive.tar.gz");
+        let st = std::process::Command::new("/usr/bin/tar").arg("-czf").arg(&archive).arg("-C").arg(&root).args(&tops).status().unwrap();
+        assert!(st.success());
+        let bytes = fs::read(&archive).unwrap();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        (bytes, digest)
+    }
+
+    const LINUX_ARCHIVE: [(&str, &[u8]); 2] = [("bin/rts", b"rts-linux"), ("share/nearai-red-sandbox/plugin/index.ts", b"plugin-linux")];
+
+    fn prefix_ctx<'a>(r: &'a SetupRig, s: &'a Seams) -> SetupContext<'a> {
+        SetupContext {
+            home: &r.home,
+            defaults: &r.defaults,
+            explicit_mvmctl: false,
+            supervisor: &r.supervisor,
+            rts: &r.rts,
+            fetch: &r.fetch,
+            host: &s.host,
+            mvm_plain: &s.plain,
+            mvm: &s.mvm,
+        }
+    }
+
+    /// The members `/usr/bin/tar` was asked to extract from the release.
+    fn tar_members(s: &Seams) -> Vec<String> {
+        let calls = s.host.calls();
+        let tar = calls.iter().find(|a| a[0] == "/usr/bin/tar" && a.iter().any(|x| x.ends_with("release.tar.gz"))).expect("no release unpack");
+        tar.iter().skip_while(|x| *x != "--").skip(1).cloned().collect()
+    }
+
+    #[test]
+    fn a_firecracker_prefix_installs_a_plugin_only_release_with_no_supervisor() {
+        let r = SetupRig::new_linux();
+        let kvm = fake_kvm(&r);
+        let prefix = r._dir.path().join("embedded-prefix");
+        let (bytes, sha256) = archive_of(r._dir.path(), &LINUX_ARCHIVE);
+        let url = "https://github.com/nearai/nearai-red-sandbox/releases/download/v0.1.8/rts-0.1.8-x86_64-unknown-linux-gnu.tar.gz";
+        r.fetch.inner.body(url, bytes);
+        let release = ReleaseArchive { url: url.into(), sha256 };
+        let s = r.seams(host_linux_ok, plain_pinned, mvm_fc_ok);
+        let lines = run_in_prefix_flavor(&SetupOptions::default(), &prefix_ctx(&r, &s), &prefix, &release, (&r.components.0, &r.components.1), Flavor::Firecracker, &kvm).unwrap();
+        assert_eq!(tar_members(&s), ["share/nearai-red-sandbox/plugin"]);
+        assert_eq!(fs::read_to_string(crate::install::prefix_plugin(&prefix).join("index.ts")).unwrap(), "plugin-linux");
+        assert!(!prefix.join("libexec").exists(), "a Linux prefix got a libexec");
+        assert!(!prefix.join("bin").exists(), "the archive's rts was installed into the prefix");
+        assert!(mvm_dir(&prefix).join("mvmctl").is_file(), "mvm not installed under the prefix");
+        assert!(r.log().iter().any(|l| l == "mvm bootstrap"), "{:?}", r.log());
+        assert!(!lines.iter().any(|l| l.contains("supervisor")), "{lines:?}");
+    }
+
+    #[test]
+    fn an_hvf_prefix_still_refuses_a_release_without_the_supervisor() {
+        let no_supervisor: [(&str, &[u8]); 2] = [
+            ("libexec/nearai-red-sandbox/mvm-hvf-supervisor.build-info", b"build=1\n"),
+            ("share/nearai-red-sandbox/plugin/index.ts", b"plugin-new"),
+        ];
+        for (name, files) in [("plugin only (the Linux archive)", &LINUX_ARCHIVE[..]), ("libexec without the supervisor", &no_supervisor[..])] {
+            let r = SetupRig::new();
+            let prefix = r._dir.path().join("embedded-prefix");
+            let old_sup = crate::install::prefix_supervisor(&prefix);
+            fs::create_dir_all(old_sup.parent().unwrap()).unwrap();
+            fs::write(&old_sup, b"previous-supervisor-bytes").unwrap();
+            let old_plugin = crate::install::prefix_plugin(&prefix).join("index.ts");
+            fs::create_dir_all(old_plugin.parent().unwrap()).unwrap();
+            fs::write(&old_plugin, "previous-plugin").unwrap();
+            let (bytes, sha256) = archive_of(r._dir.path(), files);
+            let url = "https://github.com/nearai/nearai-red-sandbox/releases/download/v0.1.8/rts.tar.gz";
+            r.fetch.inner.body(url, bytes);
+            let release = ReleaseArchive { url: url.into(), sha256 };
+            let s = r.seams(host_ok, plain_ok, mvm_ok);
+            let kvm = r._dir.path().join("no-kvm");
+            let err = run_in_prefix_flavor(&SetupOptions::default(), &prefix_ctx(&r, &s), &prefix, &release, (&r.components.0, &r.components.1), Flavor::Hvf, &kvm).unwrap_err();
+            assert!(err.contains("nothing was installed"), "{name}: {err}");
+            assert_eq!(tar_members(&s), ["libexec/nearai-red-sandbox", "share/nearai-red-sandbox/plugin"], "{name}");
+            if name.starts_with("libexec") {
+                assert!(err.contains("mvm-hvf-supervisor"), "{name}: {err}");
+            }
+            assert_eq!(fs::read(&old_sup).unwrap(), b"previous-supervisor-bytes", "{name}");
+            assert_eq!(fs::read_to_string(&old_plugin).unwrap(), "previous-plugin", "{name}");
+            assert!(s.mvm.calls().is_empty() && s.plain.calls().is_empty(), "{name}: ran mvm after a refused release");
+        }
+    }
+
+    #[test]
+    fn the_native_release_layout_needs_the_supervisor_only_on_macos() {
+        let owned = release_owned(Flavor::native());
+        assert_eq!(owned.contains(&"libexec/nearai-red-sandbox"), cfg!(target_os = "macos"), "{owned:?}");
+        assert!(owned.contains(&"share/nearai-red-sandbox/plugin"), "{owned:?}");
+    }
+
+    /// The archive `scripts/package-linux.sh` (or `package-release.sh`)
+    /// built, installed into a prefix for this host's flavor, twice.
+    #[test]
+    #[ignore = "needs RTS_RELEASE_TAR_GZ (linux-check and release.yml set it)"]
+    fn a_built_release_tar_gz_installs_into_a_prefix() {
+        let bytes = fs::read(std::env::var("RTS_RELEASE_TAR_GZ").expect("RTS_RELEASE_TAR_GZ")).unwrap();
+        let sha256: [u8; 32] = Sha256::digest(&bytes).into();
+        let url = "https://github.com/nearai/nearai-red-sandbox/releases/download/v0.0.0/rts.tar.gz";
+        let fetch = FakeFetch::new();
+        fetch.body(url, bytes);
+        let release = ReleaseArchive { url: url.into(), sha256 };
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("prefix");
+        for _ in 0..2 {
+            install_release_components(&prefix, &release, &fetch, &RealHost, Flavor::native()).unwrap();
+        }
+        let plugin = crate::install::prefix_plugin(&prefix);
+        for f in ["index.ts", "audit.ts", "package.json", "branding/tui.tsx", "branding/footer.ts", "branding/startup.ts", crate::brand::theme::THEME_FILE] {
+            assert!(plugin.join(f).is_file(), "missing {}", plugin.join(f).display());
+        }
+        assert_eq!(crate::install::prefix_supervisor(&prefix).is_file(), Flavor::native() == Flavor::Hvf);
     }
 
     #[test]
