@@ -1,6 +1,6 @@
 # Build, sign, notarize and publish an rts release for aarch64-apple-darwin,
-# with the Windows and Linux archives for embedders (build-windows,
-# build-linux).
+# with the Windows and Linux (x86_64, aarch64) archives for embedders
+# (build-windows, build-linux).
 #
 # A pushed tag v<X.Y.Z> (equal to Cargo.toml's version) publishes the GitHub
 # release and pushes a formula bump to nearai/homebrew-tap's main branch.
@@ -389,6 +389,7 @@ jobs:
             --rts target/x86_64-pc-windows-msvc/release/rts.exe \
             --egress target/x86_64-pc-windows-msvc/egress/rts-egress.exe \
             --out "$RUNNER_TEMP/dist-windows"
+          scripts/release/check-sha256-lines.sh "$RUNNER_TEMP/dist-windows/rts-$V-x86_64-pc-windows-msvc.tar.sha256"
           RTS_RELEASE_TAR="$RUNNER_TEMP/dist-windows/rts-$V-x86_64-pc-windows-msvc.tar" \
             cargo test --locked --target x86_64-pc-windows-msvc --lib -- --ignored --exact \
             backend::hyperv::setup::tests::a_built_release_archive_installs_into_a_prefix
@@ -406,17 +407,29 @@ jobs:
   # request. An embedder pins its sha256 and installs it with
   # rts::setup::run_in_prefix. No update key is compiled in (rts update
   # serves macOS only); SHA256SUMS and a build-provenance attestation cover
-  # it. Built on ubuntu-22.04, so it needs glibc 2.35 or later (Debian 12
-  # has 2.36); the Package step refuses a binary that needs newer.
+  # it. One per architecture, each built natively on ubuntu-22.04 (arm64
+  # for aarch64), so it needs glibc 2.35 or later (Debian 12 has 2.36); the
+  # Package step refuses a binary that needs newer.
   build-linux:
-    name: build and package for Linux
+    name: build and package for Linux (${{ matrix.arch }})
     needs: release-config
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
       RUSTFLAGS: "-D warnings"
       CARGO_INCREMENTAL: "0"
       CARGO_TERM_COLOR: never
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -443,8 +456,9 @@ jobs:
           V: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          scripts/package-linux.sh --version "$V" --rts target/release/rts --out "$RUNNER_TEMP/dist-linux"
-          archive="$RUNNER_TEMP/dist-linux/rts-$V-x86_64-unknown-linux-gnu.tar.gz"
+          scripts/package-linux.sh --version "$V" --rts target/release/rts --out "$RUNNER_TEMP/dist-linux" --target "$TARGET"
+          archive="$RUNNER_TEMP/dist-linux/rts-$V-$TARGET.tar.gz"
+          scripts/release/check-sha256-lines.sh "$archive.sha256"
           mkdir "$RUNNER_TEMP/smoke"
           tar -xzf "$archive" -C "$RUNNER_TEMP/smoke"
           [ "$("$RUNNER_TEMP/smoke/bin/rts" --version)" = "rts $V" ] || { echo "refusing: packaged rts --version is not rts $V" >&2; exit 1; }
@@ -456,10 +470,10 @@ jobs:
             setup::tests::a_built_release_tar_gz_installs_into_a_prefix
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: ${{ runner.temp }}/dist-linux/rts-${{ steps.version.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+          subject-path: ${{ runner.temp }}/dist-linux/rts-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: dist-linux
+          name: dist-linux-${{ matrix.arch }}
           path: ${{ runner.temp }}/dist-linux/
           if-no-files-found: error
 
@@ -498,14 +512,23 @@ jobs:
           (cd "$RUNNER_TEMP/dist-windows" && sha256sum -c "$win.sha256")
           cp "$RUNNER_TEMP/dist-windows/$win" .
           grep -qF "  $win" SHA256SUMS || cat "$RUNNER_TEMP/dist-windows/$win.sha256" >> SHA256SUMS
-          # The Linux archive, the same way (only the tarball goes into
+          # The Linux archives, the same way (only the tarballs go into
           # dist/: gh release create uploads every file there).
-          linux="rts-$V-x86_64-unknown-linux-gnu.tar.gz"
-          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name dist-linux --dir "$RUNNER_TEMP/dist-linux"
-          (cd "$RUNNER_TEMP/dist-linux" && sha256sum -c "$linux.sha256")
-          cp "$RUNNER_TEMP/dist-linux/$linux" .
-          grep -qF "  $linux" SHA256SUMS || cat "$RUNNER_TEMP/dist-linux/$linux.sha256" >> SHA256SUMS
+          for arch in x86_64 aarch64; do
+            linux="rts-$V-$arch-unknown-linux-gnu.tar.gz"
+            gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "dist-linux-$arch" --dir "$RUNNER_TEMP/dist-linux-$arch"
+            (cd "$RUNNER_TEMP/dist-linux-$arch" && sha256sum -c "$linux.sha256")
+            cp "$RUNNER_TEMP/dist-linux-$arch/$linux" .
+            grep -qF "  $linux" SHA256SUMS || cat "$RUNNER_TEMP/dist-linux-$arch/$linux.sha256" >> SHA256SUMS
+          done
           sha256sum -c SHA256SUMS
+          # Every line `<sha256>  <name>`, and every file published from
+          # dist/ but SHA256SUMS itself listed in it.
+          "$GITHUB_WORKSPACE/scripts/release/check-sha256-lines.sh" SHA256SUMS
+          for f in *; do
+            [ "$f" = SHA256SUMS ] && continue
+            awk -v f="$f" '$2 == f { found = 1 } END { exit !found }' SHA256SUMS || { echo "refusing: $f is not listed in SHA256SUMS" >&2; exit 1; }
+          done
 
       # A re-run of this job after the release was created but the tap step
       # failed finds the release already there. It skips creation only when the
@@ -550,10 +573,11 @@ jobs:
           Authenticode-signed; verify it with SHA256SUMS and
           gh attestation verify.
 
-          rts-$V-x86_64-unknown-linux-gnu.tar.gz is the Linux build (rts
+          rts-$V-x86_64-unknown-linux-gnu.tar.gz and
+          rts-$V-aarch64-unknown-linux-gnu.tar.gz are the Linux builds (rts
           and the plugin; Firecracker needs no supervisor) for embedders,
-          which pin its sha256 from SHA256SUMS. It needs glibc 2.35 or later.
-          Verify it with SHA256SUMS and gh attestation verify.
+          which pin their sha256 from SHA256SUMS. They need glibc 2.35 or
+          later. Verify them with SHA256SUMS and gh attestation verify.
 
           Installed with curl? rts update installs later releases; it accepts
           only a release whose latest.json is signed with the update key in
