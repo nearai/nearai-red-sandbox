@@ -2,3 +2,8 @@
 # The hyperv-guest workflow reads this file from the default branch, never
 # from the tag being verified.
 zaki@iqlusion.io namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBjWQKtTAKndWNgInurUfs3/Z6L/WYgJ8Xz0nT70Tt7h
+# The owner's Device Passport key (ECDSA, SHA256:LkAPJ+xU7yrs5ZdzJQBjL5YofFrTSSS/c0CneqERd2A):
+# the key inside its short-lived dp:git-signing certificates. Its signatures
+# carry the bare key, not the certificate, so it is listed as a key, not
+# through cert-authority. dp signs commits only, not tags.
+dp:git-signing namespaces="git" ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBHwoiNk/skUdKwf9JbgIXriztBL9b0Y0W5MJ3lSOZbWvpLMRwbk5+WizDJsDTOLnuQb9WT+ubkWapaZDUy/Yho=
