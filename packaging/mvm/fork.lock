@@ -1,0 +1,8 @@
+# The nearai/mvm commit .github/workflows/mvm-linux.yml builds into the Linux
+# mvm release (tag mvm-v<version> in this repository). The commit must carry
+# an SSH signature by a key in allowed_signers, and its workspace version
+# must equal `version`. Changing this file changes what rts ships: review it
+# like code.
+repository=nearai/mvm
+commit=017cafa67966226a15fe6d2abcbd896dd36a68d8
+version=0.28.0-rts.2
