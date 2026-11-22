@@ -8,6 +8,24 @@ use zeroize::{Zeroize, Zeroizing};
 const UNAVAILABLE: &str = "NEAR AI credential storage unavailable";
 const INVALID: &str = "Stored NEAR AI credential is invalid; run rts login";
 
+/// Why this OS has no NEAR AI key store, or `None` where the OS keychain is
+/// used (macOS Keychain, Linux Secret Service). rts never falls back to
+/// storing a key in a file.
+#[cfg_attr(
+    all(not(test), any(target_os = "macos", target_os = "linux")),
+    allow(dead_code)
+)]
+pub(super) fn store_refusal(os: &str) -> Option<&'static str> {
+    match os {
+        "macos" | "linux" => None,
+        "windows" => Some(
+            "rts login is not available on Windows: rts keeps no NEAR AI key there. \
+             Sign in through the app that launches rts; it supplies the key for each session.",
+        ),
+        _ => Some("NEAR AI sign-in is not supported on this OS"),
+    }
+}
+
 pub(super) struct NativeStore {
     #[cfg(not(test))]
     entry: keyring_core::Entry,
@@ -35,7 +53,9 @@ impl NativeStore {
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            Err(UNAVAILABLE.into())
+            Err(store_refusal(std::env::consts::OS)
+                .unwrap_or(UNAVAILABLE)
+                .into())
         }
     }
 }

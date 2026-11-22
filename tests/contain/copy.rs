@@ -4,10 +4,10 @@ use std::path::Path;
 use rts::copy::{CopyLimits, copy_out_via};
 use rts::files::{guest_sha256, guest_write};
 use rts::protocol::random_hex;
-use rts::sandbox::{CopyOutResult, Error, Exec, ExecOptions, Sandbox, sv};
+use rts::sandbox::{CopyOutResult, Error, ExecOptions, sv};
 use sha2::{Digest, Sha256};
 
-use crate::harness::{Machine, fresh_machine, limits, mvm, tempdir};
+use crate::harness::{Guest, fresh_guest, limits, tempdir};
 
 fn sha(b: &[u8]) -> String {
     Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
@@ -19,10 +19,9 @@ fn random(n: usize) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "real mvm"]
+#[ignore = "real VM"]
 fn copy_in_delivers_a_nested_tree_with_a_300_kib_file() {
-    let Some(h) = mvm() else { return };
-    let m = fresh_machine(h);
+    let m = fresh_guest();
     let root = tempdir("copy");
     let src = root.join("inputs");
     fs::create_dir_all(src.join("a/b")).unwrap();
@@ -36,10 +35,9 @@ fn copy_in_delivers_a_nested_tree_with_a_300_kib_file() {
 }
 
 #[test]
-#[ignore = "real mvm"]
+#[ignore = "real VM"]
 fn copy_out_brings_guest_out_back_byte_exact() {
-    let Some(h) = mvm() else { return };
-    let m = fresh_machine(h);
+    let m = fresh_guest();
     let root = tempdir("copy");
     let blob = random(700 * 1024); // spans multiple transport read slices
     guest_write(&*m, "/out/sub/blob", &blob).unwrap();
@@ -56,10 +54,9 @@ fn copy_out_brings_guest_out_back_byte_exact() {
 }
 
 #[test]
-#[ignore = "real mvm"]
+#[ignore = "real VM"]
 fn a_missing_or_empty_out_is_nothing_to_export() {
-    let Some(h) = mvm() else { return };
-    let m = fresh_machine(h);
+    let m = fresh_guest();
     let root = tempdir("copy");
     m.exec(&sv(&["rm", "-rf", "/out"]), &limits()).unwrap();
     assert_eq!(m.copy_out("/out", &root.join("o1")).unwrap(), CopyOutResult::NothingToExport);
@@ -68,13 +65,12 @@ fn a_missing_or_empty_out_is_nothing_to_export() {
     fs::remove_dir_all(root).unwrap();
 }
 
-fn hostile(plant: impl FnOnce(&Machine, &Path), reason: &str) {
+fn hostile(plant: impl FnOnce(&Guest, &Path), reason: &str) {
     hostile_with_limits(plant, reason, CopyLimits::default());
 }
 
-fn hostile_with_limits(plant: impl FnOnce(&Machine, &Path), reason: &str, copy_limits: CopyLimits) {
-    let Some(h) = mvm() else { return };
-    let m = fresh_machine(h);
+fn hostile_with_limits(plant: impl FnOnce(&Guest, &Path), reason: &str, copy_limits: CopyLimits) {
+    let m = fresh_guest();
     let root = tempdir("copy");
     let sentinel = root.join("sentinel");
     fs::write(&sentinel, "untouched").unwrap();
@@ -90,26 +86,26 @@ fn hostile_with_limits(plant: impl FnOnce(&Machine, &Path), reason: &str, copy_l
 }
 
 #[test]
-#[ignore = "real mvm"]
+#[ignore = "real VM"]
 fn hostile_out_a_symlink_to_the_host_sentinel_is_refused() {
     hostile(|m, s| assert_eq!(m.exec(&sv(&["ln", "-s", &s.to_string_lossy(), "/out/evil"]), &limits()).unwrap().exit_code, 0), "unsupported tar entry type 2");
 }
 
 #[test]
-#[ignore = "real mvm"]
+#[ignore = "real VM"]
 fn hostile_out_a_hardlink_is_refused() {
     hostile(|m, _| assert_eq!(m.exec(&sv(&["sh", "-c", "echo a > /out/a && ln /out/a /out/b"]), &limits()).unwrap().exit_code, 0), "unsupported tar entry type 1");
 }
 
 #[test]
-#[ignore = "real mvm"]
+#[ignore = "real VM"]
 fn hostile_out_a_120_byte_file_name_is_refused() {
     let cmd = format!("echo x > /out/{}", "n".repeat(120));
     hostile(|m, _| assert_eq!(m.exec(&sv(&["sh", "-c", &cmd]), &limits()).unwrap().exit_code, 0), "unsupported tar entry type L");
 }
 
 #[test]
-#[ignore = "real mvm"]
+#[ignore = "real VM"]
 fn hostile_out_a_file_over_the_size_cap_is_refused() {
     // /out and the packed archive share /tmp's RAM-backed filesystem.
     // Exercise the size limit without exhausting the 512 MiB fixture VM.

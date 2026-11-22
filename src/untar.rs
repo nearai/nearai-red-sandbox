@@ -10,11 +10,15 @@
 //! 8 KiB, and it counts toward the entry cap. The whole archive
 //! is validated before anything is written; extraction goes to
 //! `<dest>.partial` and is renamed into place only on success.
+//! On Windows it also refuses names Windows would read differently
+//! (separators, drive and stream markers, trailing dots and spaces,
+//! device names) and paths that differ only in case.
 
 use std::fmt;
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs;
+#[cfg(unix)]
+use std::fs::{DirBuilder, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +105,50 @@ fn normalize(raw: &str, entry: &str) -> Result<Vec<String>, TarRejected> {
         return Err(rej(entry, "path escapes the destination (..)"));
     }
     Ok(segs)
+}
+
+/// Why `seg` cannot be extracted as written on Windows, if it cannot:
+/// characters Windows treats as separators, drive or stream markers, or
+/// wildcards; trailing dots and spaces (Win32 strips them, so the name
+/// would alias another); and reserved device names, with or without an
+/// extension.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_name_problem(seg: &str) -> Option<&'static str> {
+    if seg.chars().any(|c| matches!(c, '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') || (c as u32) < 0x20) {
+        return Some("character not allowed in a Windows file name");
+    }
+    if seg.ends_with('.') || seg.ends_with(' ') {
+        return Some("Windows file name ends with a dot or space");
+    }
+    let stem = seg.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.chars().count() == 4
+            && stem.chars().last().is_some_and(|c| c.is_ascii_digit() || matches!(c, '\u{b9}' | '\u{b2}' | '\u{b3}')));
+    if device {
+        return Some("reserved Windows device name");
+    }
+    None
+}
+
+/// Refuses two entries whose paths differ only in case: on Windows they
+/// are the same file. Directories may repeat (they are one directory).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_collisions(entries: &[Planned]) -> Result<(), TarRejected> {
+    let mut seen: std::collections::HashMap<String, (bool, String)> = std::collections::HashMap::new();
+    for e in entries {
+        let path = e.segments.join("/");
+        let key = path.to_lowercase();
+        let is_dir = matches!(e.kind, Kind::Dir);
+        if let Some((was_dir, first)) = seen.get(&key)
+            && !(*was_dir && is_dir)
+        {
+            let why = if *first == path { "duplicate path" } else { "names differ only in case (one file on Windows)" };
+            return Err(rej(&e.display, why));
+        }
+        seen.insert(key, (is_dir, path));
+    }
+    Ok(())
 }
 
 /// The largest pax extended header accepted, records included.
@@ -265,6 +313,10 @@ fn plan(archive: &[u8], limits: ExtractLimits) -> Result<Vec<Planned>, TarReject
             return Err(rej(&entry, format!("entry cap of {} exceeded", limits.max_entries)));
         }
         let segments = normalize(&entry, &entry)?;
+        #[cfg(windows)]
+        if let Some(why) = segments.iter().find_map(|seg| windows_name_problem(seg)) {
+            return Err(rej(&entry, why));
+        }
         match kind {
             Kind::File if segments.is_empty() => return Err(rej(&entry, "empty path for a file")),
             Kind::Dir if size != 0 => return Err(rej(&entry, "directory with data")),
@@ -296,26 +348,28 @@ pub fn extract_tar(archive: &[u8], dest: &Path, limits: ExtractLimits) -> Result
         return Err(rej(dest.display().to_string(), "destination exists"));
     }
     let entries = plan(archive, limits)?;
+    #[cfg(windows)]
+    windows_collisions(&entries)?;
     let partial = partial_of(dest);
     let io = |e: std::io::Error| rej(dest.display().to_string(), format!("cannot create destination: {e}"));
     let _ = fs::remove_dir_all(&partial);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(io)?;
     }
-    DirBuilder::new().mode(0o755).create(&partial).map_err(io)?;
+    make_dir(&partial, false).map_err(io)?;
     let result = (|| {
         let (mut files, mut bytes) = (0u64, 0u64);
         for e in &entries {
             let target = e.segments.iter().fold(partial.clone(), |p, s| p.join(s));
             let fail = |err: std::io::Error| rej(&e.display, format!("cannot create: {}", err.kind()));
             match e.kind {
-                Kind::Dir => DirBuilder::new().recursive(true).mode(0o755).create(&target).map_err(fail)?,
+                Kind::Dir => make_dir(&target, true).map_err(fail)?,
                 Kind::File => {
                     if let Some(p) = target.parent() {
-                        DirBuilder::new().recursive(true).mode(0o755).create(p).map_err(fail)?;
+                        make_dir(p, true).map_err(fail)?;
                     }
                     // create_new is O_CREAT|O_EXCL: an existing path is never opened or followed.
-                    let mut f = OpenOptions::new().write(true).create_new(true).mode(0o644).open(&target).map_err(fail)?;
+                    let mut f = create_file(&target).map_err(fail)?;
                     f.write_all(&archive[e.data.clone()]).map_err(fail)?;
                     files += 1;
                     bytes += e.data.len() as u64;
@@ -329,6 +383,35 @@ pub fn extract_tar(archive: &[u8], dest: &Path, limits: ExtractLimits) -> Result
         let _ = fs::remove_dir_all(&partial);
     }
     result
+}
+
+/// A directory of the extracted tree: 0755 on Unix.
+#[cfg(unix)]
+fn make_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    DirBuilder::new().recursive(recursive).mode(0o755).create(path)
+}
+
+/// A new file of the extracted tree: 0644 on Unix, created with O_CREAT|O_EXCL
+/// so an existing path is never opened or followed.
+#[cfg(unix)]
+fn create_file(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new().write(true).create_new(true).mode(0o644).open(path)
+}
+
+/// A directory of the extracted tree on Windows: it inherits the
+/// destination's ACL. Names were checked by `windows_name_problem`.
+#[cfg(windows)]
+fn make_dir(path: &Path, recursive: bool) -> std::io::Result<()> {
+    fs::DirBuilder::new().recursive(recursive).create(path)
+}
+
+/// A new file of the extracted tree on Windows, CREATE_NEW: an existing
+/// path (including one that differs only in case) is never opened.
+#[cfg(windows)]
+fn create_file(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 #[cfg(test)]
@@ -442,6 +525,41 @@ mod tests {
     }
 
     #[test]
+    fn windows_name_rules_refuse_separators_streams_devices_and_aliases() {
+        for bad in [
+            "a\\b", "..\\x", "c:", "C:x", "f.txt:stream", "a*", "a?", "a\"", "a<", "a>", "a|", "a\u{1}b",
+            "x.", "x ", "x. .", "CON", "con", "Con.txt", "NUL.tar.gz", "aux", "PRN", "COM1", "com9.log", "LPT1",
+            "lpt0", "COM\u{b9}", "LPT\u{b3}.x", "CONIN$", "conout$", "CON .txt",
+        ] {
+            assert!(windows_name_problem(bad).is_some(), "{bad:?} accepted");
+        }
+        for good in ["a", "report.md", "CONSOLE", "com10", "LPTX", "nul_file", ".hidden", "a.b.c", "ünïcode", "x y"] {
+            assert_eq!(windows_name_problem(good), None, "{good:?} refused");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hostile_names_are_refused_before_anything_is_written() {
+        refused(&tar(&[file("./a\\..\\..\\evil", b"x")]), "character not allowed", LIM);
+        refused(&tar(&[file("./out.txt:hidden", b"x")]), "character not allowed", LIM);
+        refused(&tar(&[file("./CON.txt", b"x")]), "reserved Windows device name", LIM);
+        refused(&tar(&[file("./report. ", b"x")]), "dot or space", LIM);
+        refused(&tar(&[file("./a.txt", b"x"), file("./A.TXT", b"y")]), "differ only in case", LIM);
+    }
+
+    #[test]
+    fn names_that_differ_only_in_case_collide_on_windows() {
+        let plan = |names: &[&str]| -> Result<(), TarRejected> {
+            let entries: Vec<_> = names.iter().map(|n| file(n, b"x")).collect();
+            windows_collisions(&super::plan(&tar(&entries), LIM)?)
+        };
+        assert!(plan(&["./a/b.txt", "./A/B.TXT"]).is_err());
+        assert!(plan(&["./dir/x", "./Dir/y"]).is_ok(), "the same directory, spelled two ways, is one directory");
+        assert!(plan(&["./a/b.txt", "./a/c.txt"]).is_ok());
+    }
+
+    #[test]
     fn dirs_and_files_extract_byte_exact() {
         let e = env();
         let bin: Vec<u8> = (0..3000u32).map(|i| (i * 7 % 251) as u8).collect();
@@ -469,6 +587,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn host_tar_round_trips() {
         let e = env();
         let src = e.root.join("src");
@@ -731,7 +850,9 @@ mod tests {
 
     #[test]
     fn duplicates_are_refused_not_overwritten() {
-        refused(&tar(&[file("a", b"1"), file("./a", b"2")]), "cannot create", LIM);
+        // Windows refuses the duplicate while planning, before any file exists.
+        let reason = if cfg!(windows) { "duplicate path" } else { "cannot create" };
+        refused(&tar(&[file("a", b"1"), file("./a", b"2")]), reason, LIM);
     }
 
     #[test]

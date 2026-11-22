@@ -13,13 +13,20 @@ use std::time::{Duration, Instant};
 
 use rts::config::ProviderConfig;
 use rts::files::guest_sha256;
-use rts::mvm::{list_machines, run_captured};
+#[cfg(unix)]
+use rts::mvm::list_machines;
+use rts::mvm::run_captured;
 use rts::protocol::{new_nonce, random_hex};
-use rts::sandbox::{Exec, sv};
+use rts::sandbox::sv;
 use rts::session::{SessionPaths, ancestor_config, opencode_launch, prepare_session_dirs, session_paths, write_opencode_config};
 use serde_json::{Value, json};
 
-use crate::harness::{Harness, bridge_options, fake_ironwire, fresh_machine, limits, mvm, opencode, rts_tool, tempdir};
+use crate::harness::{
+    Guest, fake_ironwire, fake_provider_calling_shell, fresh_guest, limits, opencode, plugin_dir,
+    rts_exe, rts_tool, tempdir,
+};
+#[cfg(unix)]
+use crate::harness::{bridge_options, mvm};
 
 const ALLOWED_TOOLS: [&str; 7] = ["edit", "glob", "grep", "question", "read", "shell", "write"];
 
@@ -30,10 +37,6 @@ const BUILTIN_TOOLS: &[&str] = &[
     "opencode_list_mcp_resources", "opencode_read_mcp_resource", "opencode_models", "opencode_session_move",
     "opencode_session_rename", "opencode_worktree_create", "opencode_worktree_list", "opencode_worktree_remove",
 ];
-
-fn plugin_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin")
-}
 
 fn provider() -> ProviderConfig {
     ProviderConfig { id: "ironwire".into(), base_url: "http://127.0.0.1:8463/openai/v1".into(), models: vec!["z-ai/glm-5.3-flash".into()], api_key_env: None }
@@ -58,22 +61,53 @@ fn session() -> Session {
 }
 
 /// Plugin options as the launcher writes them.
-fn options(h: &Harness, p: &SessionPaths, machine: &str, nonce: &str) -> Value {
+fn options(g: &Guest, p: &SessionPaths, nonce: &str) -> Value {
     json!({
-        "machine": machine,
+        "machine": g.name,
         "nonce": nonce,
         "readyFile": p.ready_file,
         "auditFile": p.audit_file,
         "provider": "ironwire",
         "models": provider().models,
-        "toolCommand": [env!("CARGO_BIN_EXE_rts"), "tool"],
-        "bridge": bridge_options(h, machine, &p.state_dir),
+        "toolCommand": [rts_exe(), "tool"],
+        "bridge": g.bridge(&p.state_dir),
         "debugFile": p.runtime.join("debug.json"),
     })
 }
 
-fn configure(h: &Harness, p: &SessionPaths, machine: &str, nonce: &str) -> PathBuf {
-    write_opencode_config(&p.config_dir, &plugin_dir(), &options(h, p, machine, nonce), &provider(), false).unwrap()
+fn configure(g: &Guest, p: &SessionPaths, nonce: &str) -> PathBuf {
+    write_opencode_config(
+        &p.config_dir,
+        &plugin_dir(),
+        &options(g, p, nonce),
+        &provider(),
+        false,
+    )
+    .unwrap()
+}
+
+/// A host command that creates `sentinel` and lingers, as a planted MCP
+/// server would; one that really runs on this OS, so its absence counts.
+fn touch_and_linger(sentinel: &Path) -> Value {
+    #[cfg(unix)]
+    {
+        json!([
+            "sh",
+            "-c",
+            format!("touch '{}'; sleep 5", sentinel.display())
+        ])
+    }
+    #[cfg(windows)]
+    {
+        json!([
+            "cmd",
+            "/C",
+            format!(
+                "type nul > \"{}\" & ping -n 6 127.0.0.1 > nul",
+                sentinel.display()
+            )
+        ])
+    }
 }
 
 /// Load plugins through real opencode without spending inference.
@@ -96,13 +130,13 @@ fn edit_config(file: &Path, f: impl FnOnce(&mut Value)) {
 }
 
 #[test]
-#[ignore = "real mvm and opencode"]
+#[ignore = "real VM and opencode"]
 fn the_plugin_loads_reports_ready_and_leaves_exactly_the_seven_tools() {
-    let (Some(h), Some(oc)) = (mvm(), opencode()) else { return };
-    let m = fresh_machine(h);
+    let Some(oc) = opencode() else { return };
+    let m = fresh_guest();
     let s = session();
     let nonce = new_nonce();
-    configure(h, &s.p, &m.name, &nonce);
+    configure(&m, &s.p, &nonce);
     let err = probe(&oc, &s.p);
     assert!(ready_holds(&s.p, &nonce), "{err}");
     let debug: Value = serde_json::from_str(&fs::read_to_string(s.p.runtime.join("debug.json")).unwrap()).unwrap();
@@ -111,28 +145,29 @@ fn the_plugin_loads_reports_ready_and_leaves_exactly_the_seven_tools() {
 }
 
 #[test]
-#[ignore = "real mvm and opencode"]
+#[ignore = "real VM and opencode"]
 fn a_project_opencode_json_with_an_mcp_server_is_refused_by_the_launcher_and_its_server_never_spawns() {
-    let (Some(h), Some(oc)) = (mvm(), opencode()) else { return };
-    let m = fresh_machine(h);
+    let Some(oc) = opencode() else { return };
+    let m = fresh_guest();
     let s = session();
     let sentinel = s.root.join("mcp-spawned");
-    let evil = json!({ "mcp": { "evil": { "type": "local", "command": ["sh", "-c", format!("touch '{}'; sleep 5", sentinel.display())] } } });
+    let evil =
+        json!({ "mcp": { "evil": { "type": "local", "command": touch_and_linger(&sentinel) } } });
     fs::write(s.p.work.join("opencode.json"), evil.to_string()).unwrap();
     // The launcher refuses a work dir that holds config before it starts opencode.
     assert!(ancestor_config(&s.p.work).contains(&s.p.work.join("opencode.json")));
     // And if opencode is started anyway, the plugin's MCP removal keeps the server from spawning.
-    configure(h, &s.p, &m.name, &new_nonce());
+    configure(&m, &s.p, &new_nonce());
     probe(&oc, &s.p);
     thread::sleep(Duration::from_secs(2));
     assert!(!sentinel.exists());
 }
 
 #[test]
-#[ignore = "real mvm and opencode"]
+#[ignore = "real VM and opencode"]
 fn a_second_plugin_stray_tool_is_removed_before_the_session_is_ready() {
-    let (Some(h), Some(oc)) = (mvm(), opencode()) else { return };
-    let m = fresh_machine(h);
+    let Some(oc) = opencode() else { return };
+    let m = fresh_guest();
     let s = session();
     let stray = s.root.join("stray-plugin");
     fs::create_dir(&stray).unwrap();
@@ -143,7 +178,7 @@ fn a_second_plugin_stray_tool_is_removed_before_the_session_is_ready() {
     )
     .unwrap();
     let nonce = new_nonce();
-    let file = configure(h, &s.p, &m.name, &nonce);
+    let file = configure(&m, &s.p, &nonce);
     // Loads before ours, so the sandbox transform removes its tool.
     edit_config(&file, |c| c["plugin"].as_array_mut().unwrap().insert(0, json!([stray, {}])));
     let err = probe(&oc, &s.p);
@@ -153,13 +188,13 @@ fn a_second_plugin_stray_tool_is_removed_before_the_session_is_ready() {
 }
 
 #[test]
-#[ignore = "real mvm and opencode"]
+#[ignore = "real VM and opencode"]
 fn the_plugin_configured_as_a_file_path_is_skipped_so_no_ready_file_appears() {
-    let (Some(h), Some(oc)) = (mvm(), opencode()) else { return };
-    let m = fresh_machine(h);
+    let Some(oc) = opencode() else { return };
+    let m = fresh_guest();
     let s = session();
     let nonce = new_nonce();
-    let file = configure(h, &s.p, &m.name, &nonce);
+    let file = configure(&m, &s.p, &nonce);
     edit_config(&file, |c| c["plugin"][0][0] = json!(plugin_dir().join("index.ts")));
     probe(&oc, &s.p);
     assert!(!ready_holds(&s.p, &nonce));
@@ -173,10 +208,10 @@ fn local_plugin(dir: &Path, name: &str, source: &str) {
 }
 
 #[test]
-#[ignore = "real mvm and opencode"]
+#[ignore = "real VM and opencode"]
 fn opencode_offers_exactly_the_recorded_built_in_tools() {
-    let (Some(h), Some(oc)) = (mvm(), opencode()) else { return };
-    let m = fresh_machine(h);
+    let Some(oc) = opencode() else { return };
+    let m = fresh_guest();
     let s = session();
     let out = s.root.join("tools.json");
     let inventory = s.root.join("inventory-plugin");
@@ -190,7 +225,7 @@ fn opencode_offers_exactly_the_recorded_built_in_tools() {
         ),
     );
     let nonce = new_nonce();
-    let file = configure(h, &s.p, &m.name, &nonce);
+    let file = configure(&m, &s.p, &nonce);
     edit_config(&file, |c| c["plugin"].as_array_mut().unwrap().insert(0, json!([inventory, {}])));
     let err = probe(&oc, &s.p);
     let mut seen: Vec<String> = serde_json::from_str(&fs::read_to_string(&out).unwrap_or_else(|e| panic!("no tools.json ({e}): {err}"))).unwrap();
@@ -202,17 +237,21 @@ fn opencode_offers_exactly_the_recorded_built_in_tools() {
 }
 
 #[test]
-#[ignore = "real mvm and opencode"]
+#[ignore = "real VM and opencode"]
 fn an_mcp_server_in_the_global_config_never_spawns() {
-    let (Some(h), Some(oc)) = (mvm(), opencode()) else { return };
-    let m = fresh_machine(h);
+    let Some(oc) = opencode() else { return };
+    let m = fresh_guest();
     let s = session();
     let sentinel = s.root.join("mcp-global");
     let nonce = new_nonce();
-    let file = configure(h, &s.p, &m.name, &nonce);
-    edit_config(&file, |c| {
-        c["mcp"] = json!({ "evil": { "type": "local", "command": ["sh", "-c", format!("touch '{}'; sleep 5", sentinel.display())] } })
-    });
+    let file = configure(&m, &s.p, &nonce);
+    edit_config(
+        &file,
+        |c| {
+            c["mcp"] =
+                json!({ "evil": { "type": "local", "command": touch_and_linger(&sentinel) } })
+        },
+    );
     let err = probe(&oc, &s.p);
     thread::sleep(Duration::from_secs(2));
     assert!(!sentinel.exists());
@@ -221,19 +260,91 @@ fn an_mcp_server_in_the_global_config_never_spawns() {
     assert_eq!(debug["mcp"], json!([]));
 }
 
+/// The path a model's tool call takes: the (fake) provider asks for
+/// `shell`, real OpenCode runs the plugin's tool, the plugin spawns
+/// `rts tool shell`, and the command runs in the guest, never on the host.
+#[test]
+#[ignore = "real VM and opencode"]
+fn a_model_tool_call_reaches_the_guest_through_opencode_and_rts_tool() {
+    let Some(oc) = opencode() else { return };
+    let m = fresh_guest();
+    let s = session();
+    let nonce = new_nonce();
+    let marker = random_hex(8);
+    let file = format!("/out/from-model-{marker}.txt");
+    let (url, chats) =
+        fake_provider_calling_shell(&provider().models[0], &format!("echo {marker} > {file}"));
+    let p = ProviderConfig {
+        base_url: url,
+        ..provider()
+    };
+    write_opencode_config(
+        &s.p.config_dir,
+        &plugin_dir(),
+        &options(&m, &s.p, &nonce),
+        &p,
+        false,
+    )
+    .unwrap();
+    let l = opencode_launch(&s.p, &oc, std::env::vars());
+    let mut cmd = Command::new(&oc);
+    let model = format!("{}/{}", p.id, p.models[0]);
+    cmd.args(["run", "--standalone", "--model", &model, "write the marker"])
+        .current_dir(&l.cwd)
+        .env_clear()
+        .envs(l.env.iter().map(|(k, v)| (k, v)));
+    let r = run_captured(cmd, Duration::from_secs(180)).unwrap();
+    let out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&r.stdout),
+        String::from_utf8_lossy(&r.stderr)
+    );
+    assert!(ready_holds(&s.p, &nonce), "{out}");
+    let audit =
+        fs::read_to_string(&s.p.audit_file).unwrap_or_else(|e| panic!("no audit log ({e}): {out}"));
+    let shell: Vec<Value> = audit
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["tool"] == "shell")
+        .collect();
+    assert_eq!(shell.len(), 1, "{audit}\n{out}");
+    assert_eq!(shell[0]["status"], "completed", "{audit}");
+    let got = m.exec(&sv(&["cat", &file]), &limits()).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&got.stdout).trim(),
+        marker,
+        "the command did not run in the guest: {out}"
+    );
+    assert!(
+        !Path::new(&file).exists(),
+        "LEAK: the model's command ran on the host"
+    );
+    let chats = chats.lock().unwrap();
+    assert!(
+        chats.len() >= 2 && chats.iter().any(|b| b.contains("\"role\":\"tool\"")),
+        "the tool's result never went back to the model: {} requests",
+        chats.len()
+    );
+}
+
 /// The leak check reruns this test with RTS_TEST_LEAK=shell and requires
 /// it to fail on the host-sentinel line, so keep that check first.
 #[test]
-#[ignore = "real mvm"]
+#[ignore = "real VM"]
 fn sentinel_write_and_shell_touch_land_in_the_guest_and_not_on_the_host() {
-    let Some(h) = mvm() else { return };
-    let m = fresh_machine(h);
+    let m = fresh_guest();
     let s = session();
     let id = random_hex(6);
     let (s1, s2) = (format!("/tmp/rts-sentinel-{id}"), format!("/tmp/rts-sentinel2-{id}"));
-    let o = bridge_options(h, &m.name, &s.p.state_dir);
+    // On Windows "/tmp/..." is C:\tmp\... on the host: make it exist, so a
+    // leaked shell would land where this test looks.
+    #[cfg(windows)]
+    fs::create_dir_all("/tmp").unwrap();
+    let o = m.bridge(&s.p.state_dir);
     let w = rts_tool(&o, "write", json!({ "path": s1, "content": "sentinel" }));
-    let t = rts_tool(&o, "shell", json!({ "command": format!("touch {s2}") }));
+    // Runs in the guest's sh, and in cmd when the leak seam sends it to a
+    // Windows host.
+    let t = rts_tool(&o, "shell", json!({ "command": format!("echo x > {s2}") }));
     let leaked: Vec<&String> = [&s1, &s2].into_iter().filter(|p| Path::new(p).exists()).collect();
     for p in [&s1, &s2] {
         let _ = fs::remove_file(p);
@@ -245,20 +356,35 @@ fn sentinel_write_and_shell_touch_land_in_the_guest_and_not_on_the_host() {
 }
 
 #[test]
-#[ignore = "real mvm"]
+#[ignore = "real VM"]
 fn lost_vm_after_machine_stop_tool_calls_fail_and_nothing_runs_on_the_host() {
-    let Some(h) = mvm() else { return };
-    let m = fresh_machine(h);
+    let m = fresh_guest();
     let s = session();
-    let o = bridge_options(h, &m.name, &s.p.state_dir);
+    let o = m.bridge(&s.p.state_dir);
     assert_eq!(rts_tool(&o, "shell", json!({ "command": "echo up" })).1, "up");
-    let stopped = h.run.run(&sv(&["machine", "stop", &m.name, "--yes"]), Duration::from_secs(120)).unwrap();
-    assert_eq!(stopped.code, Some(0), "{}", String::from_utf8_lossy(&stopped.stderr));
-    let listed = h.run.run(&sv(&["machine", "ps", "--json"]), Duration::from_secs(30)).unwrap();
-    assert_eq!(listed.code, Some(0), "{}", String::from_utf8_lossy(&listed.stderr));
-    let inventory: Value = serde_json::from_slice(&listed.stdout).unwrap();
-    let machine = inventory.as_array().unwrap().iter().find(|v| v["name"] == m.name).expect("stopped persistent machine is still listed");
-    assert_eq!(machine["status"], "stopped");
+    m.stop_out_from_under();
+    #[cfg(unix)]
+    {
+        let h = mvm().unwrap();
+        let listed = h
+            .run
+            .run(&sv(&["machine", "ps", "--json"]), Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(
+            listed.code,
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        let inventory: Value = serde_json::from_slice(&listed.stdout).unwrap();
+        let machine = inventory
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == m.name)
+            .expect("stopped persistent machine is still listed");
+        assert_eq!(machine["status"], "stopped");
+    }
     let sentinel = format!("/tmp/rts-sentinel3-{}", random_hex(6));
     let a = rts_tool(&o, "shell", json!({ "command": format!("touch {sentinel}") }));
     let b = rts_tool(&o, "write", json!({ "path": sentinel, "content": "x" }));
@@ -267,30 +393,86 @@ fn lost_vm_after_machine_stop_tool_calls_fail_and_nothing_runs_on_the_host() {
     assert!(!Path::new(&sentinel).exists());
 }
 
+/// The bridge options the running launcher wrote for `machine`, from the
+/// OpenCode config in its runtime directory (`%TEMP%\\rts-<id>-<hex>`): on
+/// Hyper-V only they carry the VM id.
+#[cfg(windows)]
+fn launcher_bridge(machine: &str) -> Value {
+    let id = &machine[4..];
+    let runtime = fs::read_dir(std::env::temp_dir())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&format!("rts-{id}-")))
+        })
+        .expect("the launcher's runtime directory");
+    let config: Value = serde_json::from_str(
+        &fs::read_to_string(runtime.join("xdg/config/opencode/opencode.json")).unwrap(),
+    )
+    .unwrap();
+    config["plugin"][0][1]["bridge"].clone()
+}
+
+/// Ctrl-Break to the launcher's process group: the console event rts maps
+/// to SIGINT, delivered as Windows delivers it (not a process kill).
+#[cfg(windows)]
+fn interrupt(child: &std::process::Child) {
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
+    // SAFETY: a plain call; the launcher leads its own process group.
+    let sent = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) };
+    assert_ne!(
+        sent,
+        0,
+        "Ctrl-Break could not be sent: {}",
+        std::io::Error::last_os_error()
+    );
+}
+
+#[cfg(unix)]
+fn interrupt(child: &std::process::Child) {
+    rts::sys::send_signal(child.id() as i32, rts::sys::SIGINT);
+}
+
 #[test]
-#[ignore = "real mvm and opencode"]
+#[ignore = "real VM and opencode"]
 fn sigint_to_the_launcher_exports_out_and_leaves_no_rts_machine() {
-    let (Some(h), Some(oc)) = (mvm(), opencode()) else { return };
+    let Some(oc) = opencode() else { return };
     let root = tempdir("e2e");
     let cfg = root.join("session.json");
     let model = "z-ai/glm-5.3-flash";
-    let config = json!({
+    #[allow(unused_mut)]
+    let mut config = json!({
         "provider": { "baseURL": fake_ironwire(model), "models": [model] },
         "sessionsDir": root.join("sessions"),
-        "mvmctl": h.mvmctl,
         "opencode": oc,
+        "pluginDir": plugin_dir(),
         "limits": { "handshakeMs": 60_000 },
     });
+    #[cfg(unix)]
+    let h = mvm().unwrap();
+    #[cfg(unix)]
+    {
+        config["mvmctl"] = json!(h.mvmctl);
+    }
     fs::write(&cfg, config.to_string()).unwrap();
     // A fake external IronWire is not attested: allow it explicitly.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rts"))
+    let mut launch = Command::new(rts_exe());
+    launch
         .args(["launch", "--allow-unattested-provider", "--config"])
         .arg(&cfg)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Its own process group, so Ctrl-Break reaches the launcher alone.
+        launch.creation_flags(0x0000_0200);
+    }
+    let mut child = launch.spawn().unwrap();
     let err = Arc::new(Mutex::new(String::new()));
     let (e, mut stderr) = (err.clone(), child.stderr.take().unwrap());
     let reader = thread::spawn(move || {
@@ -309,14 +491,30 @@ fn sigint_to_the_launcher_exports_out_and_leaves_no_rts_machine() {
     let text = err.lock().unwrap().clone();
     assert!(text.contains("plugin ready"), "{text}");
     let machine = text.split("created ").nth(1).unwrap()[..16].to_string();
+    #[cfg(unix)]
     let o = bridge_options(h, &machine, &root.join("state"));
+    #[cfg(windows)]
+    let o = launcher_bridge(&machine);
     assert_eq!(rts_tool(&o, "write", json!({ "path": "/out/hello.txt", "content": "hi" })).0, 0);
-    rts::sys::send_signal(child.id() as i32, rts::sys::SIGINT);
+    interrupt(&child);
     child.wait().unwrap();
     reader.join().unwrap();
     let text = err.lock().unwrap().clone();
     assert!(text.contains("teardown"), "{text}");
+    #[cfg(unix)]
     assert!(!list_machines(h.run.as_ref()).unwrap().contains(&machine));
+    #[cfg(windows)]
+    {
+        let vm = o["hypervVmId"]
+            .as_str()
+            .expect("the launcher's bridge names its VM");
+        assert!(
+            rts::backend::hyperv::hcs::ComputeSystem::open(vm)
+                .unwrap()
+                .is_none(),
+            "the VM outlived the launcher"
+        );
+    }
     let id = &machine[4..];
     assert_eq!(fs::read_to_string(root.join("sessions").join(id).join("out/hello.txt")).unwrap(), "hi");
     fs::remove_dir_all(root).unwrap();

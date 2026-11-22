@@ -5,12 +5,11 @@
 
 use std::process::Command;
 
-use crate::harness::mvm;
-
 #[test]
-#[ignore = "real mvm"]
+#[ignore = "real VM"]
 fn the_sentinel_test_fails_when_shell_leaks_to_the_host() {
-    if mvm().is_none() {
+    #[cfg(unix)]
+    if crate::harness::mvm().is_none() {
         return;
     }
     let out = Command::new(std::env::current_exe().unwrap())

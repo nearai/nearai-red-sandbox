@@ -122,7 +122,44 @@ pub fn stdin_stdout_are_ttys() -> (bool, bool) {
     (std::io::stdin().is_terminal(), std::io::stdout().is_terminal())
 }
 
+/// The window size of the console behind a standard descriptor (0, 1 or 2),
+/// as (cols, rows): the visible window, not the scrollback buffer. None when
+/// that handle is not a console (a pipe, a file, or no console at all).
+/// A console input handle has no screen buffer, so 0 reads stdout's.
+#[cfg(windows)]
+pub fn window_size(fd: i32) -> Option<(usize, usize)> {
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, STD_ERROR_HANDLE,
+        STD_OUTPUT_HANDLE,
+    };
+    let which = match fd {
+        0 | 1 => STD_OUTPUT_HANDLE,
+        2 => STD_ERROR_HANDLE,
+        _ => return None,
+    };
+    // SAFETY: GetStdHandle has no preconditions; the info struct is ours.
+    unsafe {
+        let handle = GetStdHandle(which);
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        if handle.is_null()
+            || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+            || GetConsoleScreenBufferInfo(handle, &mut info) == 0
+        {
+            return None;
+        }
+        window_cols_rows(&info.srWindow)
+    }
+}
+
+#[cfg(windows)]
+fn window_cols_rows(r: &windows_sys::Win32::System::Console::SMALL_RECT) -> Option<(usize, usize)> {
+    let cols = i32::from(r.Right) - i32::from(r.Left) + 1;
+    let rows = i32::from(r.Bottom) - i32::from(r.Top) + 1;
+    (cols > 0 && rows > 0).then_some((cols as usize, rows as usize))
+}
+
 /// The window size of a terminal file descriptor, as (cols, rows).
+#[cfg(unix)]
 pub fn window_size(fd: i32) -> Option<(usize, usize)> {
     let mut size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
     // SAFETY: TIOCGWINSZ writes one winsize into the struct we own.
@@ -160,6 +197,37 @@ pub fn strip_escapes(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(all(test, windows))]
+mod window_size_tests {
+    use windows_sys::Win32::System::Console::SMALL_RECT;
+
+    #[test]
+    fn the_visible_window_not_the_buffer_gives_cols_and_rows() {
+        let r = SMALL_RECT {
+            Left: 0,
+            Top: 9000,
+            Right: 119,
+            Bottom: 9029,
+        };
+        assert_eq!(super::window_cols_rows(&r), Some((120, 30)));
+        assert_eq!(
+            super::window_cols_rows(&SMALL_RECT {
+                Left: 5,
+                Top: 5,
+                Right: 4,
+                Bottom: 5
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_three_standard_descriptors_have_a_size() {
+        assert_eq!(super::window_size(7), None);
+        assert_eq!(super::window_size(-1), None);
+    }
 }
 
 #[cfg(test)]

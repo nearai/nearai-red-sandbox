@@ -2308,7 +2308,10 @@ mod tests {
             "the unpinned connection saw a request"
         );
         assert!(rig.fatal.reason().unwrap().contains("pin"));
-        assert_eq!(rig.doc()["status"], "pin-failed");
+        // The fatal can be raised by request 1's receipt fetch, which then
+        // writes the record; request 2 may see the fatal before that write
+        // lands (fsync and rename are slow on Windows).
+        wait_for("pin-failed", || rig.doc()["status"] == "pin-failed");
         wait_for("both connections", || up.handshakes().len() >= 2);
         assert_eq!(up.handshakes()[0], Some(HandshakeKind::Full));
         assert!(up.handshakes()[1..].iter().all(Option::is_none));

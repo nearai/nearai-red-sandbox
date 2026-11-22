@@ -441,10 +441,12 @@ pub fn play(out: &mut dyn Write, keys: &mut dyn Keys, sp: &Splash, depth: Depth)
 /// Stdin in non-canonical, no-echo mode for the length of the splash. ISIG is
 /// off too, so Ctrl-C arrives as a byte rather than a signal: the splash ends
 /// cleanly without changing SIGINT handling for the steps after it.
+#[cfg(unix)]
 pub struct StdinKeys {
     original: Option<libc::termios>,
 }
 
+#[cfg(unix)]
 impl StdinKeys {
     pub fn new() -> Self {
         // SAFETY: termios is plain data filled by tcgetattr before use.
@@ -461,12 +463,14 @@ impl StdinKeys {
     }
 }
 
+#[cfg(unix)]
 impl Default for StdinKeys {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(unix)]
 impl Keys for StdinKeys {
     fn wait(&mut self, timeout: Duration) -> Option<bool> {
         let mut fds = libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 };
@@ -487,6 +491,7 @@ impl Keys for StdinKeys {
     }
 }
 
+#[cfg(unix)]
 impl Drop for StdinKeys {
     fn drop(&mut self) {
         if let Some(t) = self.original {
@@ -499,6 +504,159 @@ impl Drop for StdinKeys {
     }
 }
 
+/// The console's input and output for the length of the splash (Windows):
+/// input without line, echo or Ctrl-C processing, so Ctrl-C arrives as a key
+/// rather than a console event; output with VT sequences on. Both modes are
+/// restored, and keys typed during the splash discarded, on drop.
+#[cfg(windows)]
+pub struct ConsoleKeys {
+    input: windows_sys::Win32::Foundation::HANDLE,
+    input_mode: Option<u32>,
+    output: windows_sys::Win32::Foundation::HANDLE,
+    output_mode: Option<u32>,
+}
+
+#[cfg(windows)]
+impl ConsoleKeys {
+    pub fn new() -> Self {
+        use windows_sys::Win32::System::Console::{
+            ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
+            STD_OUTPUT_HANDLE, SetConsoleMode,
+        };
+        // SAFETY: standard handles owned by the process; modes are read
+        // before they are changed, and only on a console.
+        unsafe {
+            let (input, output) = (
+                GetStdHandle(STD_INPUT_HANDLE),
+                GetStdHandle(STD_OUTPUT_HANDLE),
+            );
+            let mode = |h| {
+                let mut m = 0;
+                (GetConsoleMode(h, &mut m) != 0).then_some(m)
+            };
+            let (input_mode, output_mode) = (mode(input), mode(output));
+            if input_mode.is_some() {
+                SetConsoleMode(input, ENABLE_VIRTUAL_TERMINAL_INPUT);
+            }
+            if let Some(m) = output_mode {
+                SetConsoleMode(
+                    output,
+                    m | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                );
+            }
+            ConsoleKeys {
+                input,
+                input_mode,
+                output,
+                output_mode,
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Default for ConsoleKeys {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Some(true) for a Ctrl-C key press, Some(false) for another key press
+/// (one that types a character), None when `records` hold neither.
+#[cfg(windows)]
+fn key_in(records: &[windows_sys::Win32::System::Console::INPUT_RECORD]) -> Option<bool> {
+    let mut pressed = None;
+    for r in records {
+        if u32::from(r.EventType) != windows_sys::Win32::System::Console::KEY_EVENT {
+            continue;
+        }
+        // SAFETY: EventType says this is a key event; UnicodeChar is the arm
+        // ReadConsoleInputW fills.
+        let (down, ch) = unsafe {
+            (
+                r.Event.KeyEvent.bKeyDown != 0,
+                r.Event.KeyEvent.uChar.UnicodeChar,
+            )
+        };
+        if down && ch == 0x03 {
+            return Some(true);
+        }
+        if down && ch != 0 {
+            pressed = Some(false);
+        }
+    }
+    pressed
+}
+
+#[cfg(windows)]
+impl Keys for ConsoleKeys {
+    fn wait(&mut self, timeout: Duration) -> Option<bool> {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Console::{
+            GetNumberOfConsoleInputEvents, INPUT_RECORD, ReadConsoleInputW,
+        };
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        self.input_mode?;
+        let end = Instant::now() + timeout;
+        loop {
+            let left = end
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(u128::from(u32::MAX - 1)) as u32;
+            // SAFETY: a console input handle; the records and counts are ours,
+            // and ReadConsoleInputW reads only events already pending.
+            unsafe {
+                if WaitForSingleObject(self.input, left) != WAIT_OBJECT_0 {
+                    return None;
+                }
+                let mut pending = 0u32;
+                if GetNumberOfConsoleInputEvents(self.input, &mut pending) == 0 {
+                    return None;
+                }
+                if pending > 0 {
+                    let mut records = [INPUT_RECORD::default(); 64];
+                    let mut read = 0u32;
+                    if ReadConsoleInputW(
+                        self.input,
+                        records.as_mut_ptr(),
+                        pending.min(64),
+                        &mut read,
+                    ) == 0
+                    {
+                        return None;
+                    }
+                    if let Some(k) = key_in(&records[..read as usize]) {
+                        return Some(k);
+                    }
+                }
+            }
+            if Instant::now() >= end {
+                return None;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ConsoleKeys {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Console::{FlushConsoleInputBuffer, SetConsoleMode};
+        // SAFETY: restores the modes read in new() on the same handles. The
+        // flush discards keys typed during the splash, so none (a Ctrl-C
+        // included) reaches sign-in or opencode.
+        unsafe {
+            if let Some(m) = self.input_mode {
+                FlushConsoleInputBuffer(self.input);
+                SetConsoleMode(self.input, m);
+            }
+            if let Some(m) = self.output_mode {
+                SetConsoleMode(self.output, m);
+            }
+        }
+    }
+}
+
 /// Show the splash on stdout when `wanted`; Err only when it was interrupted.
 pub fn show(wanted: bool, depth: Depth) -> Result<(), String> {
     if !wanted {
@@ -507,12 +665,56 @@ pub fn show(wanted: bool, depth: Depth) -> Result<(), String> {
     let Some(sp) = super::window_size(1).and_then(|(c, r)| Splash::new(c, r)) else {
         return Ok(());
     };
+    #[cfg(not(any(unix, windows)))]
+    return {
+        let _ = (sp, depth);
+        Ok(())
+    };
+    #[cfg(unix)]
     let mut keys = StdinKeys::new();
+    #[cfg(windows)]
+    let mut keys = ConsoleKeys::new();
     let ended = play(&mut io::stdout().lock(), &mut keys, &sp, depth);
     drop(keys);
     match ended {
         Ok(Ended::Interrupted) => Err("interrupted (Ctrl-C) during the splash; nothing was started".into()),
         _ => Ok(()),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod console_key_tests {
+    use windows_sys::Win32::System::Console::{INPUT_RECORD, KEY_EVENT};
+
+    fn key(down: bool, ch: u16) -> INPUT_RECORD {
+        let mut r = INPUT_RECORD {
+            EventType: KEY_EVENT as u16,
+            ..Default::default()
+        };
+        r.Event.KeyEvent.bKeyDown = i32::from(down);
+        r.Event.KeyEvent.uChar.UnicodeChar = ch;
+        r
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_another_key_skips_and_other_events_are_ignored() {
+        assert_eq!(super::key_in(&[key(true, 0x03)]), Some(true));
+        assert_eq!(super::key_in(&[key(true, u16::from(b'x'))]), Some(false));
+        assert_eq!(
+            super::key_in(&[key(true, u16::from(b'x')), key(true, 0x03)]),
+            Some(true),
+            "Ctrl-C wins"
+        );
+        // Key-up, a bare modifier (no character) and non-key events are not presses.
+        let focus = INPUT_RECORD {
+            EventType: 0x10,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::key_in(&[key(false, u16::from(b'x')), key(true, 0), focus]),
+            None
+        );
+        assert_eq!(super::key_in(&[]), None);
     }
 }
 

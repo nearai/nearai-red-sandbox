@@ -50,6 +50,10 @@ pub struct BridgeOptions {
     /// Host-only registry created by the launcher. Never supplied by guest input.
     #[serde(default)]
     pub canary_registry: Option<PathBuf>,
+    /// Windows: the session's Hyper-V VM id, reached over hvsocket instead
+    /// of through mvmctl.
+    #[serde(default)]
+    pub hyperv_vm_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,11 +102,11 @@ pub fn parse_request(raw: &[u8]) -> Result<Request, String> {
 /// from a genuine no-match result. Do not persist any token-bearing error.
 fn monitoring_failure(o: &BridgeOptions, message: &str) -> Outcome {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     StateDir(o.state_dir.clone()).mark("canary monitoring failed");
-    let marker = std::fs::OpenOptions::new()
-        .write(true).create_new(true).mode(0o600)
-        .open(o.state_dir.join("canary-monitoring-failed"));
+    let marker = crate::sys::fs::open_private(
+        &o.state_dir.join("canary-monitoring-failed"),
+        crate::sys::fs::Create::New,
+    );
     if let Ok(mut marker) = marker {
         let _ = marker.write_all(b"canary monitoring failed; observation coverage incomplete\n");
     }
@@ -175,6 +179,10 @@ pub fn run(tool: &str) -> Outcome {
         Err(e) => return Outcome::fail(EXIT_BAD_REQUEST, e),
     };
     let o = &req.options;
+    let leak = std::env::var("RTS_TEST_LEAK").as_deref() == Ok("shell");
+    if let Some(vm) = &o.hyperv_vm_id {
+        return run_hyperv(tool, vm, o, &req.input, leak);
+    }
     let mut extra_env = HashMap::new();
     if let Some(h) = &o.mvm_home {
         extra_env.insert("HOME".to_string(), h.clone());
@@ -184,11 +192,31 @@ pub fn run(tool: &str) -> Outcome {
         Ok(sb) => sb.with_state(StateDir(o.state_dir.clone())),
         Err(e) => return Outcome::fail(EXIT_BAD_REQUEST, e.to_string()),
     };
-    let leak = std::env::var("RTS_TEST_LEAK").as_deref() == Ok("shell");
     if leak {
         eprintln!("rts: RTS_TEST_LEAK=shell is set; shell runs ON THE HOST (leak check only)");
     }
     call(tool, &sb, o, &req.input, leak)
+}
+
+/// A tool call on a Windows session: hvsocket to the VM, under the
+/// session's state directory (marker and exec lock).
+#[cfg(windows)]
+fn run_hyperv(tool: &str, vm: &str, o: &BridgeOptions, input: &Value, leak: bool) -> Outcome {
+    use crate::backend::hyperv::{doc, hvsock::HvConnect, tool::ToolExec};
+    let connect = match HvConnect::new(vm, &doc::service_id(doc::EXEC_PORT), std::time::Duration::from_secs(5)) {
+        Ok(c) => c,
+        Err(e) => return Outcome::fail(EXIT_BAD_REQUEST, format!("bad Hyper-V VM id: {e}")),
+    };
+    let sb = ToolExec::new(connect, StateDir(o.state_dir.clone()));
+    if leak {
+        eprintln!("rts: RTS_TEST_LEAK=shell is set; shell runs ON THE HOST (leak check only)");
+    }
+    call(tool, &sb, o, input, leak)
+}
+
+#[cfg(not(windows))]
+fn run_hyperv(_tool: &str, _vm: &str, _o: &BridgeOptions, _input: &Value, _leak: bool) -> Outcome {
+    Outcome::fail(EXIT_BAD_REQUEST, "a Hyper-V session's tools run only on Windows".to_string())
 }
 
 #[cfg(test)]
@@ -197,6 +225,18 @@ mod tests {
     use crate::sandbox::sv;
     use crate::testutil::{Recorder, ok};
     use serde_json::json;
+
+    #[test]
+    fn a_hyperv_vm_id_routes_the_tool_to_hvsocket_and_only_on_windows() {
+        let raw = br#"{"options":{"machine":"rts-0123456789ab","mvmctl":"/m","emptyGitConfig":"/g","stateDir":"/s","timeoutMs":1000,"maxOutputBytes":64,"hypervVmId":"5191fbb2-f3b9-4de2-9de9-39de5b0ad75c"},"input":{}}"#;
+        let req = parse_request(raw).unwrap();
+        assert_eq!(req.options.hyperv_vm_id.as_deref(), Some("5191fbb2-f3b9-4de2-9de9-39de5b0ad75c"));
+        #[cfg(not(windows))]
+        {
+            let out = run_hyperv("shell", "5191fbb2-f3b9-4de2-9de9-39de5b0ad75c", &req.options, &req.input, false);
+            assert_eq!(out.code, EXIT_BAD_REQUEST);
+        }
+    }
 
     fn request(extra: Value) -> Value {
         let mut o = json!({
@@ -269,6 +309,7 @@ mod tests {
         assert!(error.contains("absolute"), "{error}");
     }
 
+    #[cfg(unix)]
     fn canary_fixture() -> (tempfile::TempDir, crate::canary::Registry, Request, String, String) {
         use crate::canary::{CanarySpec, Placement, Registry};
         let dir = tempfile::tempdir().unwrap();
@@ -290,6 +331,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn tool_output_matches_are_redacted_and_observed_without_raw_values() {
         let (dir, _registry, request, host, guest) = canary_fixture();
         // The shell tool combines guest stdout and stderr into returned text.
@@ -313,6 +355,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn tool_error_channels_are_redacted_and_keep_failure_status() {
         struct Failing(String);
         impl Exec for Failing {
@@ -330,6 +373,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn failed_canary_persistence_withholds_the_entire_tool_result() {
         let (dir, _registry, request, host, _) = canary_fixture();
         let audit = dir.path().join("canaries.jsonl");
@@ -351,6 +395,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn configured_monitor_does_not_change_unmatched_tool_output() {
         let (_dir, _registry, request, _, _) = canary_fixture();
         let rec = Recorder::new(|_, _| ok(b"ordinary output"));

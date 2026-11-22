@@ -198,6 +198,7 @@ fn native_store_is_unavailable_to_automated_unit_tests() {
 }
 
 #[test]
+#[cfg(unix)]
 fn callback_timeout_and_cancellation_release_the_listener() {
     let callback = browser::Callback::bind().unwrap();
     let address = url::Url::parse(&callback.url()).unwrap();
@@ -257,6 +258,7 @@ fn callback_timeout_and_cancellation_release_the_listener() {
     );
 }
 
+#[cfg(unix)]
 fn client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .no_proxy()
@@ -265,6 +267,7 @@ fn client() -> reqwest::blocking::Client {
         .unwrap()
 }
 
+#[cfg(unix)]
 fn page_nonce(page: &str) -> String {
     page.split("body.set(\"state\", \"")
         .nth(1)
@@ -276,6 +279,7 @@ fn page_nonce(page: &str) -> String {
 }
 
 #[test]
+#[cfg(unix)]
 fn real_loopback_callback_ignores_spoofs_and_acknowledges_only_after_storage() {
     let callback = browser::Callback::bind().unwrap();
     let url = callback.url();
@@ -611,7 +615,9 @@ fn sponsored_storage_is_versioned_redacted_and_replaced_by_personal_login() {
 }
 
 #[test]
+#[cfg(unix)]
 fn sponsored_key_file_bounds_newlines_permissions_and_symlinks() {
+    #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
     let directory = std::env::temp_dir().join(format!(
         "rts-sponsored-test-{}-{}",
@@ -703,4 +709,18 @@ fn cloud_session_cancellation_uses_supplied_callback_before_network() {
             .unwrap_err(),
         "NEAR AI sign-in interrupted"
     );
+}
+
+#[test]
+fn only_macos_and_linux_have_a_key_store_and_windows_says_why() {
+    assert_eq!(storage::store_refusal("macos"), None);
+    assert_eq!(storage::store_refusal("linux"), None);
+    let windows = storage::store_refusal("windows").unwrap();
+    assert!(windows.contains("not available on Windows"), "{windows}");
+    assert!(windows.contains("app"), "{windows}");
+    assert!(
+        !windows.contains("file"),
+        "no plaintext fallback is offered: {windows}"
+    );
+    assert!(storage::store_refusal("freebsd").is_some());
 }

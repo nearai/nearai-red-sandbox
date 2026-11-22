@@ -1,0 +1,120 @@
+name: windows-check
+
+# Checks rts builds, lints and passes its unit tests on Windows (msvc).
+# Read-only token, no secrets, actions pinned by commit.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  msvc:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      # A static C runtime: rts.exe and rts-egress.exe must start on a
+      # stock Windows install, without the Visual C++ Redistributable.
+      RUSTFLAGS: "-D warnings -C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version
+      - name: cargo check
+        run: cargo check --locked --target x86_64-pc-windows-msvc --all-targets
+      - name: cargo clippy
+        run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets
+      - name: unit tests
+        run: cargo test --locked --target x86_64-pc-windows-msvc --lib --bins
+      - name: rts.exe starts without Hyper-V (no computecore.dll import)
+        run: cargo test --locked --target x86_64-pc-windows-msvc --test windows_imports
+      - name: rts-egress.exe imports nothing an AppContainer cannot load
+        shell: bash
+        run: |
+          cargo build --locked --target x86_64-pc-windows-msvc --profile egress --bin rts-egress
+          RTS_EGRESS_EXE=target/x86_64-pc-windows-msvc/egress/rts-egress.exe \
+            cargo test --locked --target x86_64-pc-windows-msvc --test windows_imports -- --ignored
+      - name: the confined egress proxy (AppContainer and job object, no VM)
+        shell: bash
+        run: |
+          cargo build --locked --target x86_64-pc-windows-msvc --profile egress --bin rts-egress --example egress_probe
+          export RTS_EGRESS_PROXY_EXE="$PWD/target/x86_64-pc-windows-msvc/egress/rts-egress.exe"
+          export RTS_HV_PROBE_EXE="$PWD/target/x86_64-pc-windows-msvc/egress/examples/egress_probe.exe"
+          cargo test --locked --target x86_64-pc-windows-msvc --lib -- --ignored --exact --test-threads=1 \
+            backend::hyperv::live::the_confined_proxy_cannot_read_the_user_profile_or_reach_host_loopback \
+            backend::hyperv::live::a_killed_rts_takes_its_confined_proxy_down
+      # The runner has no nested Hyper-V, so the VM suites run elsewhere
+      # (a Hyper-V host) from these msvc builds.
+      - name: collect test binaries for a Hyper-V host
+        shell: bash
+        run: |
+          cargo build --locked --target x86_64-pc-windows-msvc --bin rts
+          cargo test --locked --target x86_64-pc-windows-msvc --lib --test contain --no-run --message-format=json > build.jsonl
+          mkdir dist
+          python -c "import json,shutil; [shutil.copy(m['executable'], 'dist/' + m['target']['name'] + '-' + m['target']['kind'][0] + '.exe') for m in map(json.loads, open('build.jsonl')) if m.get('reason') == 'compiler-artifact' and m.get('profile', {}).get('test') and m.get('executable')]"
+          cp target/x86_64-pc-windows-msvc/debug/rts.exe target/x86_64-pc-windows-msvc/egress/rts-egress.exe target/x86_64-pc-windows-msvc/egress/examples/egress_probe.exe dist/
+          ls -la dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-test-binaries
+          path: dist/
+          retention-days: 3
+          if-no-files-found: error
+
+  # The Windows release archive exactly as release.yml's build-windows job
+  # builds and packages it (--release rts.exe, rts-egress.exe with the
+  # egress profile, scripts/package-windows.sh), on every pull request, so
+  # a break shows up before tag time: release publishing waits on it. Its
+  # own job, in parallel with msvc.
+  release-archive:
+    name: release archive (as release.yml builds it)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      # A static C runtime: rts.exe and rts-egress.exe must start on a
+      # stock Windows install, without the Visual C++ Redistributable.
+      RUSTFLAGS: "-D warnings -C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+      - name: build rts and rts-egress as release.yml does
+        shell: bash
+        run: |
+          cargo build --locked --release --target x86_64-pc-windows-msvc --bin rts
+          cargo build --locked --profile egress --target x86_64-pc-windows-msvc --bin rts-egress
+      - name: package, then install into a prefix through rts's untar
+        shell: bash
+        run: |
+          scripts/package-windows.sh --version 0.0.0-ci \
+            --rts target/x86_64-pc-windows-msvc/release/rts.exe \
+            --egress target/x86_64-pc-windows-msvc/egress/rts-egress.exe --out dist
+          RTS_RELEASE_TAR="$PWD/dist/rts-0.0.0-ci-x86_64-pc-windows-msvc.tar" \
+            cargo test --locked --target x86_64-pc-windows-msvc --lib -- --ignored --exact \
+            backend::hyperv::setup::tests::a_built_release_archive_installs_into_a_prefix
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-release-archive
+          path: dist/
+          retention-days: 3
+          if-no-files-found: error

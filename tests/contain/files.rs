@@ -2,7 +2,7 @@ use rts::files::{GuestRead, guest_read, guest_sha256, guest_write};
 use rts::protocol::random_hex;
 use sha2::{Digest, Sha256};
 
-use crate::harness::{fresh_machine, mvm};
+use crate::harness::fresh_guest;
 
 fn sha(b: &[u8]) -> String {
     Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
@@ -14,10 +14,9 @@ fn random(n: usize) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "real mvm"]
+#[ignore = "real VM"]
 fn guest_file_primitives_round_trip() {
-    let Some(h) = mvm() else { return };
-    let m = fresh_machine(h);
+    let m = fresh_guest();
 
     // A 200 KiB random write matches its sha256 in the guest.
     let data = random(200 * 1024);

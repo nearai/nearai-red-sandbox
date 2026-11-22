@@ -1,0 +1,4 @@
+# Keys whose SSH signatures make a hyperv-guest-v* tag publishable.
+# The hyperv-guest workflow reads this file from the default branch, never
+# from the tag being verified.
+zaki@iqlusion.io namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBjWQKtTAKndWNgInurUfs3/Z6L/WYgJ8Xz0nT70Tt7h

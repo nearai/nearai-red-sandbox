@@ -10,7 +10,18 @@ use serde::Deserialize;
 
 use crate::mvm::is_image_ref;
 
+/// The arm64 guest image (Apple-silicon macOS, arm64 Linux).
 pub const DEFAULT_IMAGE: &str = "us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images/guest@sha256:56406743ca98389029c795a9cd55f0d1f55e569d57226c10e6c4f6f340cf9ac1";
+/// The amd64 guest image: the other member of the multi-arch index
+/// `guest@sha256:28197decf607aabcf0e6c64fb03aa364d59ad9b8be533ef0957f6c82c7e1acdd`,
+/// built reproducibly from `guest/Dockerfile`.
+pub const DEFAULT_IMAGE_AMD64: &str = "us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images/guest@sha256:6b72caa2757b31d48d93cb439fc78ae7495cf1acc93feda9a3196e8ad130b882";
+
+/// The guest image for this host's architecture. A manifest digest, not the
+/// index, so mvm never chooses a platform.
+pub fn default_image() -> &'static str {
+    if cfg!(target_arch = "x86_64") { DEFAULT_IMAGE_AMD64 } else { DEFAULT_IMAGE }
+}
 pub const IRONWIRE_PROVIDER_ID: &str = "ironwire";
 /// The provider rts itself configures after attestation (src/inference.rs).
 pub const EMBEDDED_PROVIDER_ID: &str = "nearai-red-embedded";
@@ -162,6 +173,19 @@ pub struct OperatorConfig {
     pub update_check: bool,
     /// Synthetic canaries managed by the launcher; disabled when empty.
     pub canaries: Vec<crate::canary::CanarySpec>,
+    /// Where the Hyper-V backend's own files are (from `Defaults` only:
+    /// a session config cannot move them).
+    pub hyperv: HyperVPaths,
+}
+
+/// The Hyper-V backend's files, when not in their default places.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HyperVPaths {
+    /// rts-egress.exe; `None`: beside the running rts.exe.
+    pub egress_exe: Option<PathBuf>,
+    /// The guest kernel and initramfs; `None`: `RTS_HV_DIR`, else
+    /// `%LOCALAPPDATA%\nearai-red-sandbox\hyperv`.
+    pub guest_dir: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Default)]
@@ -306,15 +330,15 @@ pub struct Defaults {
     pub plugin_dir: PathBuf,
     pub opencode: String,
     pub sessions_dir: PathBuf,
+    pub hyperv: HyperVPaths,
 }
 
 impl Defaults {
     /// From HOME (empty if unset), RTS_MVMCTL, the install prefix of the
     /// running binary, and the checkout it was built from.
     pub fn from_env() -> Self {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
+        let env: Vec<(String, String)> = std::env::vars().collect();
+        let home = crate::install::home_in(&env, cfg!(windows)).unwrap_or_default();
         let rts_mvmctl = std::env::var_os("RTS_MVMCTL").map(PathBuf::from);
         let prefix = crate::install::current_prefix();
         crate::install::defaults(&crate::install::Lookup {
@@ -332,10 +356,14 @@ impl Defaults {
             mvmctl: crate::install::mvm_dir(prefix).join("mvmctl"),
             plugin_dir: crate::install::prefix_plugin(prefix),
             opencode: crate::install::opencode_dir(prefix)
-                .join("opencode")
+                .join(crate::install::OPENCODE_BINARY)
                 .to_string_lossy()
                 .into_owned(),
             sessions_dir: sessions_dir.to_path_buf(),
+            hyperv: HyperVPaths {
+                egress_exe: Some(crate::install::prefix_egress(prefix)),
+                guest_dir: Some(crate::install::prefix_hyperv(prefix)),
+            },
         }
     }
 }
@@ -439,7 +467,7 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
             "config: provider.apiKeyEnv is required for a provider that is not on loopback".into(),
         );
     }
-    let image = raw.image.unwrap_or_else(|| DEFAULT_IMAGE.into());
+    let image = raw.image.unwrap_or_else(|| default_image().into());
     if !is_image_ref(&image) {
         return Err(
             "config: image must be a digest-pinned reference (name@sha256:<64 hex>)".into(),
@@ -495,6 +523,7 @@ pub fn parse_config(text: &str, base_dir: &Path, d: &Defaults) -> Result<Operato
         network,
         update_check: raw.update_check.unwrap_or(true),
         canaries: raw.canaries,
+        hyperv: d.hyperv.clone(),
     })
 }
 
@@ -509,12 +538,48 @@ pub fn load_config(file: &Path, d: &Defaults) -> Result<OperatorConfig, String> 
 mod tests {
     use super::*;
 
+    #[test]
+    fn for_prefix_puts_the_hyperv_files_under_the_prefix_and_a_config_cannot_move_them() {
+        let prefix = Path::new("/p");
+        let d = Defaults::for_prefix(prefix, Path::new("/s"));
+        assert_eq!(
+            d.hyperv.egress_exe,
+            Some(
+                prefix
+                    .join("libexec")
+                    .join("nearai-red-sandbox")
+                    .join("rts-egress.exe")
+            )
+        );
+        assert_eq!(
+            d.hyperv.guest_dir,
+            Some(
+                prefix
+                    .join("share")
+                    .join("nearai-red-sandbox")
+                    .join("hyperv")
+            )
+        );
+        let cfg = parse_config("{}", Path::new("/cfg"), &d).unwrap();
+        assert_eq!(cfg.hyperv, d.hyperv);
+        // Not a session config key: deny_unknown_fields refuses it.
+        assert!(
+            parse_config(
+                r#"{ "hyperv": { "egressExe": "/evil.exe" } }"#,
+                Path::new("/cfg"),
+                &d
+            )
+            .is_err()
+        );
+    }
+
     fn d() -> Defaults {
         Defaults {
             mvmctl: "/home/op/.local/mvm/v0.22.0/mvmctl".into(),
             plugin_dir: "/repo/plugin".into(),
             opencode: "opencode".into(),
             sessions_dir: "/repo/sessions".into(),
+            hyperv: Default::default(),
         }
     }
 
@@ -644,6 +709,7 @@ mod tests {
             sessions_dir: "/p/sessions".into(),
             opencode: "/p/opencode".into(),
             mvmctl: "/p/mvmctl".into(),
+            hyperv: Default::default(),
         };
         let c = parse_config(
             r#"{ "pluginDir": "pl", "sessionsDir": "s", "opencode": "/oc", "mvmctl": "/m", "provider": { "models": ["m"] } }"#,
@@ -734,7 +800,7 @@ mod tests {
             c.provider.loopback(),
             Some(("127.0.0.1".into(), 8463, "/openai/v1".into()))
         );
-        assert_eq!(c.image, DEFAULT_IMAGE);
+        assert_eq!(c.image, default_image());
         assert_eq!(c.limits, Limits::default());
         assert_eq!(c.sessions_dir, PathBuf::from("/repo/sessions"));
         assert_eq!(c.plugin_dir, PathBuf::from("/repo/plugin"));
@@ -877,4 +943,16 @@ mod tests {
         l.resize(None, Some(8192)).unwrap();
         assert_eq!(l.host_rss_ceiling_mib, 8192 + RSS_HEADROOM_MIB);
     }
+
+    #[test]
+    fn the_default_guest_image_is_this_hosts_architecture() {
+        // macOS (and any arm64 host) keeps the arm64 image it has always pinned.
+        assert_eq!(DEFAULT_IMAGE, "us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images/guest@sha256:56406743ca98389029c795a9cd55f0d1f55e569d57226c10e6c4f6f340cf9ac1");
+        // The amd64 member of the same image's multi-arch index (sha256:28197dec...).
+        assert_eq!(DEFAULT_IMAGE_AMD64, "us-west1-docker.pkg.dev/nearai-red-sandbox/sandbox-images/guest@sha256:6b72caa2757b31d48d93cb439fc78ae7495cf1acc93feda9a3196e8ad130b882");
+        assert!(is_image_ref(DEFAULT_IMAGE_AMD64));
+        let want = if cfg!(target_arch = "x86_64") { DEFAULT_IMAGE_AMD64 } else { DEFAULT_IMAGE };
+        assert_eq!(default_image(), want);
+    }
+
 }

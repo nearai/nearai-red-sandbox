@@ -1,0 +1,21 @@
+[package]
+name = "rts-guest"
+version = "0.1.0"
+edition = "2024"
+description = "rts's agent inside a Hyper-V guest: runs host commands over hvsocket"
+license = "Apache-2.0"
+publish = false
+
+# A standalone package (not part of the rts crate): it is built only for
+# x86_64-unknown-linux-musl and shares the exec protocol source with rts.
+[workspace]
+
+[dependencies]
+# The same libc rts already uses (Cargo.lock 0.2.191); no new package.
+libc = "=0.2.191"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+strip = true

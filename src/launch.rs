@@ -88,18 +88,13 @@ impl LaunchSpec {
 
 /// A private temp directory holding an empty Git config for mvmctl.
 pub fn private_git_config(prefix: &str) -> Result<(tempfile::TempDir, PathBuf), String> {
-    use std::os::unix::fs::OpenOptionsExt;
     let temp = tempfile::Builder::new()
         .prefix(prefix)
         .tempdir()
         .map_err(|_| "Cannot create a private temp directory")?;
     let empty_git_config = temp.path().join("empty.gitconfig");
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&empty_git_config)
-        .map_err(|_| "Cannot create an empty Git configuration")?;
+    crate::sys::fs::open_private(&empty_git_config, crate::sys::fs::Create::New)
+    .map_err(|_| "Cannot create an empty Git configuration")?;
     Ok((temp, empty_git_config))
 }
 
@@ -112,26 +107,17 @@ fn local_preflight(
     let (temp, empty_git_config) = private_git_config("rts-preflight-")?;
     let work = temp.path().join("work");
     std::fs::create_dir(&work).map_err(|_| "Cannot create preflight work directory")?;
-    let supervisor = session::supervisor_path(env, crate::install::current_prefix().as_deref())?;
-    let runner = crate::mvm::SpawnRunner {
-        mvmctl: cfg.mvmctl.clone(),
-        empty_git_config,
-        extra_env: session::mvm_environment(env, &supervisor),
-        remove_env: Vec::new(),
-    };
+    let backend = crate::backend::for_preflight(cfg, env, empty_git_config)?;
     // A pinned HTTPS placeholder skips the loopback-provider probe. Local
     // prerequisites must succeed before any native credential read or browser.
     let provider = config::ProviderConfig {
         base_url: near.base_url().into(),
         ..cfg.provider.clone()
     };
-    session::preflight(&session::PreflightInput {
+    backend.preflight(&crate::backend::HostCheck {
         host,
-        run: &runner,
-        mvmctl: &cfg.mvmctl,
         opencode: &cfg.opencode,
         leak_seam_set: env.iter().any(|(key, _)| key == "RTS_TEST_LEAK"),
-        supervisor_path: Some(&supervisor),
         work_dir: Some(&work),
         provider: &provider,
     })
@@ -240,7 +226,7 @@ fn start_connected<F, I>(
     Ok((forwarder, inference))
 }
 
-fn run_connected<G>(
+pub(crate) fn run_connected<G>(
     cfg: &mut config::OperatorConfig,
     preflight: impl FnOnce(&config::OperatorConfig) -> Result<(), String>,
     connect: impl FnOnce(&config::OperatorConfig) -> Result<(config::ProviderConfig, G), String>,
@@ -557,6 +543,7 @@ mod tests {
                 plugin_dir: "/repo/plugin".into(),
                 opencode: "opencode".into(),
                 sessions_dir: "/repo/sessions".into(),
+                hyperv: Default::default(),
             },
         )
         .unwrap()
@@ -785,6 +772,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_verified_record_that_cannot_be_written_names_the_record() {
         use std::os::unix::fs::PermissionsExt;
         let (_d, record) = verified_record();
@@ -814,6 +802,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn unpatched_supervisor_is_rejected_before_credentials_or_browser_login() {
         struct StockSupervisor;
         impl session::Host for StockSupervisor {

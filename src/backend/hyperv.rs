@@ -1,0 +1,25 @@
+//! The Windows backend: a Hyper-V compute system per session, booted
+//! from rts's own kernel and initramfs, reached only over hvsocket. See
+//! docs/design/linux-windows-backends.md section 5. The document and
+//! protocol pieces are portable and tested everywhere.
+
+pub mod backend;
+pub mod doc;
+pub mod egress;
+pub mod exec;
+pub mod machine;
+pub mod mux;
+pub mod props;
+pub mod setup;
+pub mod tool;
+#[cfg(windows)]
+pub mod hvsock;
+#[cfg(windows)]
+pub mod hcs;
+#[cfg(windows)]
+pub mod appcontainer;
+#[cfg(all(test, windows))]
+mod live;
+
+/// The egress proxy's file name.
+pub const EGRESS_EXE: &str = "rts-egress.exe";

@@ -6,7 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,12 +14,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use crate::config::{EMBEDDED_PROVIDER_ID, OperatorConfig, PLACEHOLDER_API_KEY, ProviderConfig, model_display_name};
-use crate::copy::CopyLimits;
-use crate::mvm::{MvmSandbox, RunOutput, Runner, SpawnRunner, StateDir, list_machines, run_captured, tail};
+use crate::mvm::{RunOutput, Runner, StateDir, list_machines, run_captured, tail};
 use crate::protocol::{new_nonce, random_hex};
-use crate::sandbox::{CopyOutResult, CreateSpec, Exec, ExecOptions, Sandbox, sv};
+use crate::backend::{Backend, HostCheck, Machine};
+use crate::sandbox::{CopyOutResult, CreateSpec, Exec, ExecOptions, sv};
 use crate::sys;
-use crate::terminal::Terminal;
+use crate::terminal::{Child, Terminal};
 use crate::brand::progress::Live as Shown;
 
 pub const OPENCODE_VERSION: &str = "2.2.2";
@@ -236,8 +236,7 @@ fn write_tui_config_with_prompt(dir: &Path, plugin_dir: &Path, model_display: &s
 }
 
 fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(path)?.write_all(data)
+    crate::sys::fs::open_private(path, crate::sys::fs::Create::Truncate)?.write_all(data)
 }
 
 // --- session layout ---
@@ -312,23 +311,13 @@ fn session_tmp(p: &SessionPaths) -> PathBuf {
 }
 
 pub fn prepare_session_dirs(p: &SessionPaths) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    for d in [
-        &p.home,
-        &p.xdg_config,
-        &p.xdg_data,
-        &p.xdg_cache,
-        &p.xdg_state,
-        &p.config_dir,
-        &p.work,
-        &p.state_dir,
-        &p.session_dir,
-        &session_tmp(p),
-    ] {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(d)?;
+    for d in [&p.home, &p.xdg_config, &p.xdg_data, &p.xdg_cache, &p.xdg_state, &p.config_dir, &p.work, &p.state_dir, &p.session_dir, &session_tmp(p)] {
+        crate::sys::fs::create_private_dir_all(d)?;
+    }
+    if cfg!(windows) {
+        for (_, d) in windows_profile(p) {
+            crate::sys::fs::create_private_dir_all(&d)?;
+        }
     }
     fs::write(&p.empty_git_config, "")
 }
@@ -371,27 +360,74 @@ pub fn opencode_launch(p: &SessionPaths, opencode: &str, base_env: impl IntoIter
     opencode_launch_with_key(p, opencode, base_env, None)
 }
 
+/// Terminal and runtime essentials that pass to OpenCode on every OS.
+const OPENCODE_ENV: [&str; 10] = [
+    "PATH",
+    "TERM",
+    "COLORTERM",
+    "LANG",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "NO_COLOR",
+];
+
+/// The few system variables a Windows process needs to run at all (without
+/// SystemRoot, Winsock fails). No token or secret is among them. The
+/// profile folders (USERPROFILE, APPDATA, LOCALAPPDATA) and TEMP/TMP are not passed:
+/// OpenCode takes its home from USERPROFILE there, so the launch sets them
+/// to the session, as HOME is.
+const OPENCODE_ENV_WINDOWS: [&str; 5] =
+    ["SystemRoot", "windir", "ComSpec", "PATHEXT", "SystemDrive"];
+
+/// Whether the host variable `name` passes to OpenCode. Only the lists above
+/// and the explicitly selected direct provider key pass; host credentials
+/// stay on the host. Windows names are case-insensitive (std reports `Path`).
+fn opencode_env_passes(name: &str, windows: bool, direct_key: Option<&str>) -> bool {
+    if direct_key == Some(name) {
+        return true;
+    }
+    if windows {
+        let listed = OPENCODE_ENV
+            .iter()
+            .chain(&OPENCODE_ENV_WINDOWS)
+            .any(|k| k.eq_ignore_ascii_case(name));
+        return listed || name.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("LC_"));
+    }
+    OPENCODE_ENV.contains(&name) || name.starts_with("LC_")
+}
+
 pub fn opencode_launch_with_key(p: &SessionPaths, opencode: &str, base_env: impl IntoIterator<Item = (String, String)>, direct_key: Option<&str>) -> Launch {
+    opencode_launch_for(p, opencode, base_env, direct_key, cfg!(windows))
+}
+
+/// The session's Windows profile folders, which stand in for the operator's.
+/// TEMP and TMP too: OpenCode's tmp follows them, and the host's %TEMP% is
+/// shared with other sessions and the operator's own OpenCode.
+fn windows_profile(p: &SessionPaths) -> [(&'static str, PathBuf); 5] {
+    let app_data = p.home.join("AppData");
+    let tmp = p.runtime.join("tmp");
+    [
+        ("USERPROFILE", p.home.clone()),
+        ("APPDATA", app_data.join("Roaming")),
+        ("LOCALAPPDATA", app_data.join("Local")),
+        ("TEMP", tmp.clone()),
+        ("TMP", tmp),
+    ]
+}
+
+fn opencode_launch_for(
+    p: &SessionPaths,
+    opencode: &str,
+    base_env: impl IntoIterator<Item = (String, String)>,
+    direct_key: Option<&str>,
+    windows: bool,
+) -> Launch {
     let mut env: Vec<(String, String)> = base_env
         .into_iter()
-        // Only terminal/runtime essentials and the explicitly selected direct
-        // provider key pass to OpenCode. Host credentials stay on the host.
-        .filter(|(k, _)| {
-            matches!(
-                k.as_str(),
-                "PATH"
-                    | "TERM"
-                    | "COLORTERM"
-                    | "LANG"
-                    | "USER"
-                    | "LOGNAME"
-                    | "SHELL"
-                    | "DISPLAY"
-                    | "WAYLAND_DISPLAY"
-                    | "NO_COLOR"
-            ) || k.starts_with("LC_")
-                || direct_key == Some(k.as_str())
-        })
+        .filter(|(k, _)| opencode_env_passes(k, windows, direct_key))
         .collect();
     for (k, v) in [
         ("HOME", &p.home),
@@ -404,6 +440,13 @@ pub fn opencode_launch_with_key(p: &SessionPaths, opencode: &str, base_env: impl
         ("TMPDIR", &session_tmp(p)),
     ] {
         env.push((k.into(), v.to_string_lossy().into_owned()));
+    }
+    if windows {
+        env.extend(
+            windows_profile(p)
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.to_string_lossy().into_owned())),
+        );
     }
     Launch { argv: sv(&[opencode, "--standalone"]), env, cwd: p.work.clone() }
 }
@@ -511,13 +554,21 @@ pub struct PreflightInput<'a> {
 pub const DOCTOR: [&str; 3] = ["doctor", "--workflow", "bundle-run"];
 
 pub fn preflight(o: &PreflightInput) -> Result<(), String> {
+    preflight_with(o, &|| {
+        let supervisor = o.supervisor_path.filter(|p| p.is_absolute() && p.to_str().is_some())
+            .ok_or_else(|| format!("An absolute patched HVF supervisor path is required ({SUPERVISOR_FIX_VERSION}). {SUPERVISOR_INSTALL}"))?;
+        check_supervisor_marker(o.host, supervisor)
+    })
+}
+
+/// [`preflight`] with the VMM prerequisite check supplied: it runs after
+/// the OpenCode check and before `mvmctl doctor`.
+pub(crate) fn preflight_with(o: &PreflightInput, vmm_check: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
     if o.leak_seam_set {
         return Err("RTS_TEST_LEAK is set; refusing to start a real session".into());
     }
     check_opencode(o.host, o.opencode)?;
-    let supervisor = o.supervisor_path.filter(|p| p.is_absolute() && p.to_str().is_some())
-        .ok_or_else(|| format!("An absolute patched HVF supervisor path is required ({SUPERVISOR_FIX_VERSION}). {SUPERVISOR_INSTALL}"))?;
-    check_supervisor_marker(o.host, supervisor)?;
+    vmm_check()?;
     let doctor = o.run.run(&sv(&DOCTOR), Duration::from_secs(60)).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             format!("mvmctl not found at {}; run rts setup", o.mvmctl.display())
@@ -632,31 +683,43 @@ pub fn mvm_root(env: &[(String, String)]) -> Result<PathBuf, String> {
         .ok_or_else(|| "neither HOME nor MVM_HOME is set".to_string())
 }
 
-fn supervisor_pid_file(name: &str, env: &[(String, String)]) -> Result<PathBuf, String> {
-    let root = mvm_root(env).map_err(|e| format!("cannot monitor HVF supervisor: {e}"))?;
-    Ok(root.join("vms").join(name).join("hvf.pid"))
+/// The VMM process held to the host RSS ceiling: the HVF supervisor, or
+/// another flavor's VMM through [`Supervisor::discover_vmm`].
+#[cfg(unix)]
+pub(crate) struct Supervisor {
+    pub(crate) pid: u32,
+    pub(crate) pid_file: PathBuf,
+    /// The executable name the PID must have.
+    pub(crate) vmm: &'static str,
+    /// What the errors call it.
+    pub(crate) what: &'static str,
+    /// How the PID's executable is named on this host.
+    pub(crate) name_of: NameOf,
 }
 
-struct Supervisor {
-    pid: u32,
-    pid_file: PathBuf,
-}
-
+#[cfg(unix)]
 impl Supervisor {
-    fn discover(name: &str, env: &[(String, String)]) -> Result<Self, String> {
-        let pid_file = supervisor_pid_file(name, env)?;
-        let pid = fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok())
-            .filter(|&pid| pid > 0 && pid <= i32::MAX as u32)
-            .ok_or_else(|| format!("cannot monitor HVF supervisor: missing or invalid PID in {}", pid_file.display()))?;
-        Ok(Self { pid, pid_file })
+    pub(crate) fn discover(name: &str, env: &[(String, String)]) -> Result<Self, String> {
+        let root = mvm_root(env).map_err(|e| format!("cannot monitor HVF supervisor: {e}"))?;
+        Self::discover_vmm(&root.join("vms").join(name).join("hvf.pid"), "mvm-hvf-supervisor", "HVF supervisor", process_name)
     }
 
-    fn sample(&self, host: &dyn Host, ceiling_mib: u64) -> Result<u64, String> {
+    /// The VMM named `vmm` (by `name_of`) whose PID mvm wrote to `pid_file`.
+    pub(crate) fn discover_vmm(pid_file: &Path, vmm: &'static str, what: &'static str, name_of: NameOf) -> Result<Self, String> {
+        let pid_file = pid_file.to_path_buf();
+        let pid = fs::read_to_string(&pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&pid| pid > 0 && pid <= i32::MAX as u32)
+            .ok_or_else(|| format!("cannot monitor {what}: missing or invalid PID in {}", pid_file.display()))?;
+        Ok(Self { pid, pid_file, vmm, what, name_of })
+    }
+
+    pub(crate) fn sample(&self, host: &dyn Host, ceiling_mib: u64) -> Result<u64, String> {
+        let what = self.what;
         let current = fs::read_to_string(&self.pid_file).ok().and_then(|s| s.trim().parse::<u32>().ok());
         if current != Some(self.pid) {
-            return Err("cannot monitor HVF supervisor: PID file changed or disappeared".into());
+            return Err(format!("cannot monitor {what}: PID file changed or disappeared"));
         }
-        let rss = host_rss_mib(host, self.pid).ok_or_else(|| format!("cannot monitor HVF supervisor: PID {} is gone, has the wrong executable, or has no RSS sample", self.pid))?;
+        let rss = host_rss_mib_of(host, self.pid, self.vmm, self.name_of).ok_or_else(|| format!("cannot monitor {what}: PID {} is gone, has the wrong executable, or has no RSS sample", self.pid))?;
         if rss > ceiling_mib {
             return Err(format!("host RSS {rss} MiB over the {ceiling_mib} MiB ceiling (pid {} via {})", self.pid, self.pid_file.display()));
         }
@@ -664,9 +727,27 @@ impl Supervisor {
     }
 }
 
+/// How a flavor names a host process: [`process_name`] or [`exe_name`].
+pub(crate) type NameOf = fn(&dyn Host, u32) -> Option<String>;
+
+/// The basename of `/proc/<pid>/exe` (Linux), without the kernel's
+/// ` (deleted)` suffix. Unlike `ps -o comm=`, which Linux caps at 15
+/// characters, it names `mvm-network-endpoint` in full.
+#[cfg(unix)]
+pub(crate) fn exe_name(host: &dyn Host, pid: u32) -> Option<String> {
+    let link = host.run(&sv(&["readlink", &format!("/proc/{pid}/exe")]), Duration::from_secs(5)).ok()?;
+    if link.code != Some(0) || link.killed {
+        return None;
+    }
+    let target = String::from_utf8_lossy(&link.stdout);
+    let target = target.trim_end_matches('\n');
+    let target = target.strip_suffix(" (deleted)").unwrap_or(target);
+    Some(Path::new(target).file_name()?.to_str()?.to_string())
+}
+
 /// The basename of `pid`'s executable from `ps -o comm=` (macOS prints a
 /// full path), or None if `ps` fails or prints nothing.
-fn process_name(host: &dyn Host, pid: u32) -> Option<String> {
+pub(crate) fn process_name(host: &dyn Host, pid: u32) -> Option<String> {
     let command = host.run(&sv(&["ps", "-o", "comm=", "-p", &pid.to_string()]), Duration::from_secs(5)).ok()?;
     if command.code != Some(0) {
         return None;
@@ -676,7 +757,12 @@ fn process_name(host: &dyn Host, pid: u32) -> Option<String> {
 }
 
 pub fn host_rss_mib(host: &dyn Host, pid: u32) -> Option<u64> {
-    if process_name(host, pid)? != "mvm-hvf-supervisor" {
+    host_rss_mib_of(host, pid, "mvm-hvf-supervisor", process_name)
+}
+
+/// Host RSS of `pid` in MiB, only while `name_of` names it `vmm`.
+pub(crate) fn host_rss_mib_of(host: &dyn Host, pid: u32, vmm: &str, name_of: NameOf) -> Option<u64> {
+    if name_of(host, pid)? != vmm {
         return None;
     }
     let r = host.run(&sv(&["ps", "-o", "rss=", "-p", &pid.to_string()]), Duration::from_secs(5)).ok()?;
@@ -686,14 +772,20 @@ pub fn host_rss_mib(host: &dyn Host, pid: u32) -> Option<u64> {
 
 // --- network processes ---
 
-const ENDPOINT: &str = "mvm-network-endpoint";
-const NETWORK_PROCESSES: [&str; 2] = [ENDPOINT, "mvm-hvf-supervisor"];
+pub(crate) const ENDPOINT: &str = "mvm-network-endpoint";
+pub(crate) const NETWORK_PROCESSES: [&str; 2] = [ENDPOINT, "mvm-hvf-supervisor"];
 
 /// The children of the attached `machine run` (`attach_pid`) that are mvm's
 /// network endpoint or HVF supervisor, by `pgrep -P` and `ps -o comm=`.
 /// Refuses unless an endpoint is among them: without it the network path
 /// cannot be confirmed, or confirmed gone at teardown.
 pub fn network_children(host: &dyn Host, attach_pid: u32) -> Result<Vec<u32>, String> {
+    network_children_of(host, attach_pid, &NETWORK_PROCESSES, process_name)
+}
+
+/// [`network_children`] keeping the children `name_of` names in `names`,
+/// which must include the endpoint.
+pub(crate) fn network_children_of(host: &dyn Host, attach_pid: u32, names: &[&str], name_of: NameOf) -> Result<Vec<u32>, String> {
     let fail = |why: String| format!("cannot find the network processes of mvmctl machine run (pid {attach_pid}): {why}");
     let r = host.run(&sv(&["pgrep", "-P", &attach_pid.to_string()]), Duration::from_secs(5)).map_err(|e| fail(format!("pgrep failed: {e}")))?;
     if r.killed || r.code != Some(0) {
@@ -703,7 +795,7 @@ pub fn network_children(host: &dyn Host, attach_pid: u32) -> Result<Vec<u32>, St
     let mut endpoint = false;
     for pid in String::from_utf8_lossy(&r.stdout).split_whitespace() {
         let pid: u32 = pid.parse().ok().filter(|&p| p > 0 && p <= i32::MAX as u32).ok_or_else(|| fail(format!("pgrep printed {pid:?}")))?;
-        if let Some(name) = process_name(host, pid).filter(|n| NETWORK_PROCESSES.contains(&n.as_str())) {
+        if let Some(name) = name_of(host, pid).filter(|n| names.contains(&n.as_str())) {
             endpoint |= name == ENDPOINT;
             kept.push(pid);
         }
@@ -792,16 +884,11 @@ impl Logger {
 
 struct Live<'a> {
     log: &'a Logger,
-    sb: &'a MvmSandbox,
+    sb: &'a dyn Machine,
     paths: &'a SessionPaths,
-    host: &'a dyn Host,
     machine_attempted: bool,
     machine_created: bool,
     child: Option<Child>,
-    /// The attach process's endpoint and supervisor, checked after removal.
-    network_pids: Vec<u32>,
-    /// mvm's audit directory, read at teardown into `network.jsonl`.
-    audit_dir: Option<PathBuf>,
     canaries: Option<crate::canary::Registry>,
     monitoring_failed: bool,
     canary_setup_complete: bool,
@@ -843,6 +930,25 @@ fn finish_canaries(registry: &crate::canary::Registry, paths: &SessionPaths, exp
     failed
 }
 
+/// Windows has no mode bits: directories are created owner-only (as every
+/// session directory is) and files inherit that DACL. Links and other
+/// non-regular entries are skipped, as on Unix.
+#[cfg(windows)]
+fn copy_tree_preserving_mode(src: &Path, dst: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(src)?;
+    if meta.is_dir() {
+        crate::sys::fs::create_private_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            copy_tree_preserving_mode(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else if meta.is_file() {
+        fs::copy(src, dst)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn copy_tree_preserving_mode(src: &Path, dst: &Path) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let meta = fs::symlink_metadata(src)?;
@@ -900,15 +1006,13 @@ impl Live<'_> {
         crate::brand::progress::teardown();
         self.log.log(&format!("teardown: {why}"));
         if let Some(mut c) = self.child.take() {
-            // Terminal::spawn gives OpenCode its own session and process group.
-            // Stop descendants too, even if the group leader already exited.
-            sys::send_signal(-(c.id() as i32), sys::SIGTERM);
-            let end = Instant::now() + Duration::from_secs(10);
-            while c.try_wait().ok().flatten().is_none() && Instant::now() < end {
-                thread::sleep(Duration::from_millis(100));
-            }
-            sys::send_signal(-(c.id() as i32), sys::SIGKILL);
-            let _ = c.wait();
+            // A closing Windows console allows only seconds: no grace then.
+            let grace = if sys::closing() {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(10)
+            };
+            crate::terminal::stop_tree(&mut c, grace);
             self.log.log("teardown: opencode stopped");
         }
         keep_opencode_data(self.paths, self.log);
@@ -942,19 +1046,8 @@ impl Live<'_> {
             Ok(()) => self.log.log(&format!("teardown: removed {}", self.paths.machine)),
             Err(e) => self.log.log(&format!("teardown: MACHINE REMOVAL FAILED: {e}")),
         }
-        // Both run after export and removal, so neither can stop them.
-        for &pid in &self.network_pids {
-            if let Some(name) = process_name(self.host, pid).filter(|n| NETWORK_PROCESSES.contains(&n.as_str())) {
-                self.log.log(&format!("teardown: NETWORK PROCESS REMAINED: pid {pid} ({name}); killed"));
-                let _ = self.host.run(&sv(&["kill", "-KILL", &pid.to_string()]), Duration::from_secs(5));
-            }
-        }
-        if let Some(dir) = &self.audit_dir {
-            match crate::network::extract_audit(dir, &self.paths.machine, &self.paths.network_audit) {
-                Ok(n) => self.log.log(&format!("teardown: copied {n} network audit entries to {}", self.paths.network_audit.display())),
-                Err(e) => self.log.log(&format!("teardown: NETWORK AUDIT FAILED: {e}")),
-            }
-        }
+        // Residue and audit run after export and removal, so neither can stop them.
+        self.sb.finish(&self.paths.network_audit, &|m| self.log.log(m));
     }
 }
 
@@ -981,39 +1074,24 @@ pub fn run_session_with_prompt(cfg: &OperatorConfig, deps: Deps, initial_prompt:
         log.log("tool command must not be empty");
         return 1;
     }
-    let install_prefix = deps
-        .tool_command
-        .first()
-        .map(Path::new)
-        .and_then(crate::install::install_prefix);
-    let supervisor = match supervisor_path(&deps.env, install_prefix.as_deref()) {
-        Ok(path) => path,
+    let backend = match crate::backend::for_session(cfg, &deps, &p) {
+        Ok(backend) => backend,
         Err(error) => {
             log.log(&error);
             return 1;
         }
     };
     let operator_home = deps.env.iter().find(|(k, _)| k == "HOME").map(|(_, v)| v.clone()).unwrap_or_default();
-    let run: Arc<dyn Runner> = deps.runner.clone().unwrap_or_else(|| {
-        Arc::new(SpawnRunner {
-            mvmctl: cfg.mvmctl.clone(),
-            empty_git_config: p.empty_git_config.clone(),
-            extra_env: mvm_environment(&deps.env, &supervisor),
-            remove_env: Vec::new(),
-        })
-    });
-    // The launcher's handle does not share the state dir's marker: teardown
-    // marks every tool process's view unavailable first, then still exports.
-    let sb = match MvmSandbox::new(&p.machine, Box::new(run.clone())) {
-        Ok(sb) => sb.with_copy_limits(CopyLimits::default()),
+    let sb = match backend.machine(&p.machine) {
+        Ok(sb) => sb,
         Err(e) => {
-            log.log(&e.to_string());
+            log.log(&e);
             return 1;
         }
     };
     sys::catch_termination_signals();
-    let mut live = Live { log: &log, sb: &sb, paths: &p, host: deps.host.as_ref(), machine_attempted: false, machine_created: false, child: None, network_pids: vec![], audit_dir: None, canaries: None, monitoring_failed: false, canary_setup_complete: false };
-    let code = match session_body(cfg, &deps, &run, &operator_home, &supervisor, &mut live, initial_prompt) {
+    let mut live = Live { log: &log, sb: sb.as_ref(), paths: &p, machine_attempted: false, machine_created: false, child: None, canaries: None, monitoring_failed: false, canary_setup_complete: false };
+    let code = match session_body(cfg, &deps, backend.as_ref(), &operator_home, &mut live, initial_prompt) {
         Ok(code) => code,
         Err(e) => {
             log.log(&e);
@@ -1046,6 +1124,7 @@ fn write_session_record(p: &SessionPaths, plan: &crate::network::Plan, probes: &
 }
 
 /// How long to wait for mvm's audit log to show a pin for every name.
+#[cfg(unix)]
 const PIN_WAIT: Duration = Duration::from_secs(10);
 
 /// Read this VM's pins from mvm's audit log in `audit_dir` until every name
@@ -1053,7 +1132,8 @@ const PIN_WAIT: Duration = Duration::from_secs(10);
 /// with no names reads nothing. A missing log counts as no pins yet, and
 /// ends the session if it is still missing at the deadline; an unreadable
 /// or malformed one ends it at once.
-fn wait_for_pins(plan: &crate::network::Plan, audit_dir: &Path, machine: &str, clock: &Clock) -> Result<Pinned, String> {
+#[cfg(unix)]
+pub(crate) fn wait_for_pins(plan: &crate::network::Plan, audit_dir: &Path, machine: &str, clock: &Clock) -> Result<Pinned, String> {
     let names = plan.pinning_names();
     if names.is_empty() {
         return Ok(Pinned::new());
@@ -1110,35 +1190,38 @@ pub fn plugin_options(p: &SessionPaths, cfg: &OperatorConfig, tool_command: &[St
     })
 }
 
-fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operator_home: &str, supervisor: &Path, live: &mut Live, initial_prompt: Option<&str>) -> Result<i32, String> {
+/// Tell `rts tool` how to reach a machine it cannot find by name alone
+/// (a Hyper-V VM, by id).
+pub fn with_tool_target(plugin_options: &mut Value, target: Option<String>) {
+    if let Some(id) = target {
+        plugin_options["bridge"]["hypervVmId"] = json!(id);
+    }
+}
+
+fn session_body(cfg: &OperatorConfig, deps: &Deps, backend: &dyn Backend, operator_home: &str, live: &mut Live, initial_prompt: Option<&str>) -> Result<i32, String> {
     let p = live.paths;
     let leak_seam_set = deps.env.iter().any(|(k, _)| k == "RTS_TEST_LEAK");
     let step = crate::brand::progress::step("host check", Shown::Sweep);
-    preflight(&PreflightInput {
+    backend.preflight(&HostCheck {
         host: deps.host.as_ref(),
-        run: run.as_ref(),
-        mvmctl: &cfg.mvmctl,
         opencode: &cfg.opencode,
         leak_seam_set,
-        supervisor_path: Some(supervisor),
         work_dir: Some(&p.work),
         provider: &cfg.provider,
     })?;
     // Every launch, with or without an allowlist, before any machine command.
-    let root = mvm_root(&deps.env)?;
-    crate::network::check_mvm_host(&deps.env, &root)?;
+    backend.check_host_config()?;
     step.ok("opencode, mvm, supervisor and provider");
     let step = crate::brand::progress::step("allowlist", Shown::Sweep);
     let plan = crate::network::plan(&cfg.network, deps.resolver.as_ref())?;
     write_session_record(p, &plan, &[], &Pinned::new())?;
     step.ok(&plan.allowlist_line());
-    sweep_orphans(run, &mut |m| live.log.log(m))?;
+    backend.sweep(&mut |m| live.log.log(m))?;
     if let Some(why) = interrupted(live.log).or_else(|| stopped(deps, live.log)) {
         return Err(why);
     }
 
     live.machine_attempted = true;
-    live.audit_dir = Some(root.join("audit"));
     let hosts = plan.allow_hosts();
     let egress = (!plan.is_empty()).then(|| crate::sandbox::Egress { allow_hosts: &hosts, attach_log: &p.attach_log, session_hours: cfg.limits.session_hours });
     // Read before create, so this limit ends no later than the attach `--ttl`.
@@ -1152,8 +1235,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     live.machine_created = true;
     live.log.log(&format!("created {}", p.machine));
     if !plan.is_empty() {
-        let attach = live.sb.attach_pid().ok_or("network machine has no attached mvmctl machine run")?;
-        live.network_pids = network_children(live.host, attach)?;
+        live.sb.track_network()?;
     }
     step.ok(&format!("{} · {} MiB · {} vCPU · {}", p.machine, cfg.limits.memory_mib, cfg.limits.cpus, plan.net_label()));
     let step = crate::brand::progress::step("probes", Shown::Sweep);
@@ -1165,7 +1247,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
     // An empty plan has no egress to pin, and no status line for it.
     let pin_line = plan.pinned_line();
     let step = pin_line.as_ref().map(|_| crate::brand::progress::step("pinned IPs", Shown::Sweep));
-    let pinned = wait_for_pins(&plan, &root.join("audit"), &p.machine, &deps.clock)?;
+    let pinned = live.sb.wait_for_pins(&plan, &deps.clock)?;
     write_session_record(p, &plan, &probes, &pinned)?;
     crate::network::check_pinned(&plan, &pinned)?;
     if let (Some(step), Some(line)) = (step, pin_line) {
@@ -1200,12 +1282,13 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         return Err(format!("{why} before opencode started"));
     }
 
-    let supervisor = Supervisor::discover(&p.machine, &deps.env)?;
-    supervisor.sample(deps.host.as_ref(), cfg.limits.host_rss_ceiling_mib)?;
-    live.log.log(&format!("sampling host RSS of pid {} (found via {})", supervisor.pid, supervisor.pid_file.display()));
+    let monitor = live.sb.monitor()?;
+    monitor.sample(cfg.limits.host_rss_ceiling_mib)?;
+    live.log.log(&format!("sampling host RSS of {}", monitor.describe()));
 
     let nonce = new_nonce();
     let mut plugin_options = plugin_options(p, cfg, &deps.tool_command, &nonce, operator_home);
+    with_tool_target(&mut plugin_options, live.sb.tool_target());
     if let Some(registry) = &live.canaries {
         plugin_options["canaryManifest"] = json!(registry.manifest_path());
     }
@@ -1288,15 +1371,80 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, run: &Arc<dyn Runner>, operat
         }
         if Instant::now() >= next_sample {
             next_sample = Instant::now() + Duration::from_secs(5);
-            supervisor.sample(deps.host.as_ref(), cfg.limits.host_rss_ceiling_mib)?;
+            monitor.sample(cfg.limits.host_rss_ceiling_mib)?;
         }
         thread::sleep(Duration::from_millis(10));
     }
 }
 
+#[cfg(all(test, windows))]
+mod windows_launch_tests {
+    use std::path::Path;
+
+    #[test]
+    fn opencode_on_windows_gets_the_system_variables_and_no_host_token() {
+        let p = super::session_paths("0123456789ab", Path::new(r"C:\s"), Path::new(r"C:\r"));
+        let env = [
+            ("Path", r"C:\Windows"),
+            ("SystemRoot", r"C:\Windows"),
+            ("USERPROFILE", r"C:\Users\op"),
+            ("GITHUB_TOKEN", "ghp_x"),
+            ("NEARAI_API_KEY", "k"),
+        ];
+        let l = super::opencode_launch(
+            &p,
+            "opencode.exe",
+            env.iter().map(|(k, v)| (k.to_string(), v.to_string())),
+        );
+        let names: Vec<&str> = l.env.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(
+            names.contains(&"Path") && names.contains(&"SystemRoot"),
+            "{names:?}"
+        );
+        assert!(
+            !names.contains(&"GITHUB_TOKEN") && !names.contains(&"NEARAI_API_KEY"),
+            "{names:?}"
+        );
+        let profile: Vec<&str> = l
+            .env
+            .iter()
+            .filter(|(k, _)| k == "USERPROFILE")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(profile, [p.home.to_str().unwrap()]);
+    }
+}
+
 #[cfg(test)]
+mod copy_tree_tests {
+    use std::fs;
+
+    #[test]
+    fn kept_opencode_data_is_copied_as_a_whole_tree() {
+        let base = std::env::temp_dir().join(format!("rts-copy-tree-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        fs::create_dir_all(src.join("storage/session")).unwrap();
+        fs::write(src.join("auth.json"), b"{}").unwrap();
+        fs::write(src.join("storage/session/ses_1.json"), b"one").unwrap();
+        fs::create_dir_all(src.join("empty")).unwrap();
+        let dst = base.join("dst");
+        super::copy_tree_preserving_mode(&src, &dst).unwrap();
+        assert_eq!(fs::read(dst.join("auth.json")).unwrap(), b"{}");
+        assert_eq!(
+            fs::read(dst.join("storage/session/ses_1.json")).unwrap(),
+            b"one"
+        );
+        assert!(dst.join("empty").is_dir());
+        fs::remove_dir_all(&base).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::backend::mvm::MvmMachine;
+    use crate::mvm::MvmSandbox;
     use crate::config::{Defaults, parse_config};
     use crate::testutil::tempdir;
     use std::net::TcpListener;
@@ -1313,7 +1461,18 @@ mod tests {
 
     #[test]
     fn plugin_options_carry_the_exact_model_allowlist() {
-        let mut cfg = parse_config("{}", Path::new("/cfg"), &Defaults { mvmctl: "/m".into(), plugin_dir: "/r/plugin".into(), opencode: "opencode".into(), sessions_dir: "/r/sessions".into() }).unwrap();
+        let mut cfg = parse_config(
+            "{}",
+            Path::new("/cfg"),
+            &Defaults {
+                mvmctl: "/m".into(),
+                plugin_dir: "/r/plugin".into(),
+                opencode: "opencode".into(),
+                sessions_dir: "/r/sessions".into(),
+                hyperv: Default::default(),
+            },
+        )
+        .unwrap();
         cfg.provider.models = vec!["m-one".into(), "m-two".into()];
         let p = session_paths("0123456789ab", Path::new("/s"), Path::new("/rt"));
         let cmd = sv(&["/x/rts", "tool"]);
@@ -1329,7 +1488,18 @@ mod tests {
 
     #[test]
     fn plugin_options_carry_the_configured_tool_command() {
-        let cfg = parse_config("{}", Path::new("/cfg"), &Defaults { mvmctl: "/m".into(), plugin_dir: "/r/plugin".into(), opencode: "opencode".into(), sessions_dir: "/r/sessions".into() }).unwrap();
+        let cfg = parse_config(
+            "{}",
+            Path::new("/cfg"),
+            &Defaults {
+                mvmctl: "/m".into(),
+                plugin_dir: "/r/plugin".into(),
+                opencode: "opencode".into(),
+                sessions_dir: "/r/sessions".into(),
+                hyperv: Default::default(),
+            },
+        )
+        .unwrap();
         let p = session_paths("0123456789ab", Path::new("/s"), Path::new("/rt"));
         let cmd = sv(&["/x/gateway", "red-team", "tool"]);
         let o = plugin_options(&p, &cfg, &cmd, &"ab".repeat(12), "/home/op");
@@ -1518,6 +1688,15 @@ mod tests {
         fn resolve(&self, _: &str) -> io::Result<Vec<std::net::IpAddr>> {
             Err(io::Error::other("nodename nor servname provided"))
         }
+    }
+
+    #[test]
+    fn only_a_machine_with_a_tool_target_adds_it_to_the_bridge_options() {
+        let mut o = json!({"bridge": {"machine": "rts-0123456789ab"}});
+        with_tool_target(&mut o, None);
+        assert_eq!(o, json!({"bridge": {"machine": "rts-0123456789ab"}}));
+        with_tool_target(&mut o, Some("5191fbb2-f3b9-4de2-9de9-39de5b0ad75c".into()));
+        assert_eq!(o["bridge"]["hypervVmId"], "5191fbb2-f3b9-4de2-9de9-39de5b0ad75c");
     }
 
     #[test]
@@ -1870,6 +2049,115 @@ mod tests {
         assert_eq!(get("PATH"), ["/bin"]);
         assert_eq!(p.machine, "rts-0123456789ab");
         assert_eq!(p.audit_file, PathBuf::from("/s/0123456789ab/tools.jsonl"));
+    }
+
+    #[test]
+    fn on_windows_opencode_gets_only_the_minimal_system_variables_matched_case_insensitively() {
+        for name in [
+            "SystemRoot",
+            "windir",
+            "ComSpec",
+            "PATHEXT",
+            "SystemDrive",
+            "Path",
+            "SYSTEMROOT",
+        ] {
+            assert!(
+                opencode_env_passes(name, true, None),
+                "{name} must reach OpenCode on Windows"
+            );
+            assert!(
+                !opencode_env_passes(name, false, None),
+                "{name} is Windows-only"
+            );
+        }
+        // The operator's profile folders never pass: OpenCode takes its home
+        // from USERPROFILE on Windows, so the launch sets them to the session.
+        for name in [
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "TEMP",
+            "TMP",
+            "UserProfile",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "USERDOMAIN",
+            "COMPUTERNAME",
+            "ProgramData",
+            "OneDrive",
+            "GITHUB_TOKEN",
+            "NEARAI_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "SSH_AUTH_SOCK",
+            "OPENCODE_CONFIG",
+            "PSModulePath",
+        ] {
+            assert!(
+                !opencode_env_passes(name, true, None),
+                "{name} must not reach OpenCode on Windows"
+            );
+        }
+        // The direct provider key still passes, by its exact name.
+        assert!(opencode_env_passes(
+            "NEARAI_API_KEY",
+            true,
+            Some("NEARAI_API_KEY")
+        ));
+        // Unix keeps its exact-case list: no Windows names, no case folding.
+        assert!(
+            opencode_env_passes("PATH", false, None)
+                && !opencode_env_passes("SystemRoot", false, None)
+                && !opencode_env_passes("path", false, None)
+        );
+    }
+
+    #[test]
+    fn on_windows_opencode_home_and_app_data_are_the_session_not_the_operator_profile() {
+        let p = session_paths("0123456789ab", Path::new("/s"), Path::new("/tmp/rts-x"));
+        let env = [
+            ("USERPROFILE", "C:/Users/op"),
+            ("APPDATA", "C:/Users/op/AppData/Roaming"),
+            ("LOCALAPPDATA", "C:/Users/op/AppData/Local"),
+            ("TEMP", "C:/Users/op/AppData/Local/Temp"),
+            ("Path", "C:/Windows"),
+        ];
+        let l = opencode_launch_for(
+            &p,
+            "opencode.exe",
+            env.iter().map(|(k, v)| (k.to_string(), v.to_string())),
+            None,
+            true,
+        );
+        let get = |k: &str| {
+            l.env
+                .iter()
+                .filter(|(n, _)| n.eq_ignore_ascii_case(k))
+                .map(|(_, v)| PathBuf::from(v))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(get("USERPROFILE"), std::slice::from_ref(&p.home));
+        assert_eq!(get("APPDATA"), [p.home.join("AppData").join("Roaming")]);
+        assert_eq!(get("LOCALAPPDATA"), [p.home.join("AppData").join("Local")]);
+        assert_eq!(get("HOME"), std::slice::from_ref(&p.home));
+        // OpenCode's tmp follows TEMP: the session's, never the host's
+        // shared %TEMP% (checked with `opencode debug paths`).
+        assert_eq!(get("TEMP"), [p.runtime.join("tmp")]);
+        assert_eq!(get("TMP"), [p.runtime.join("tmp")]);
+        assert_eq!(get("Path"), [PathBuf::from("C:/Windows")]);
+        // Unix launches set no Windows profile variables.
+        let u = opencode_launch_for(
+            &p,
+            "opencode",
+            env.iter().map(|(k, v)| (k.to_string(), v.to_string())),
+            None,
+            false,
+        );
+        assert!(
+            u.env
+                .iter()
+                .all(|(k, _)| !["USERPROFILE", "APPDATA", "LOCALAPPDATA"].contains(&k.as_str()))
+        );
     }
 
     #[test]
@@ -2307,7 +2595,8 @@ mod tests {
         let worker = thread::spawn(move || {
             let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
             let sb = MvmSandbox::new(&p.machine, Box::new(f.clone())).unwrap();
-            let mut live = Live { log: &log, sb: &sb, paths: &p, host: f.as_ref(), machine_attempted: true, machine_created: true, child: None, network_pids: vec![], audit_dir: None, canaries: None, monitoring_failed: false, canary_setup_complete: false };
+            let sb = MvmMachine::from_parts(sb, f.clone(), vec![], vec![]);
+            let mut live = Live { log: &log, sb: &sb, paths: &p, machine_attempted: true, machine_created: true, child: None, canaries: None, monitoring_failed: false, canary_setup_complete: false };
             started_tx.send(()).unwrap();
             live.teardown("test");
         });
@@ -2321,7 +2610,18 @@ mod tests {
 
 
     fn session_cfg(sessions: &Path, plugin: &Path, provider: ProviderConfig) -> OperatorConfig {
-        let mut c = parse_config(r#"{ "provider": { "models": ["z-ai/glm-5.3-flash"] } }"#, Path::new("/"), &Defaults { mvmctl: "/x/mvmctl".into(), plugin_dir: "/repo/plugin".into(), opencode: "opencode".into(), sessions_dir: "/repo/sessions".into() }).unwrap();
+        let mut c = parse_config(
+            r#"{ "provider": { "models": ["z-ai/glm-5.3-flash"] } }"#,
+            Path::new("/"),
+            &Defaults {
+                mvmctl: "/x/mvmctl".into(),
+                plugin_dir: "/repo/plugin".into(),
+                opencode: "opencode".into(),
+                sessions_dir: "/repo/sessions".into(),
+                hyperv: Default::default(),
+            },
+        )
+        .unwrap();
         c.sessions_dir = sessions.into();
         c.plugin_dir = plugin.into();
         c.provider = provider;
@@ -2785,10 +3085,10 @@ mod tests {
         });
         let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
         let sb = MvmSandbox::new(&p.machine, Box::new(f.clone())).unwrap();
+        let sb = MvmMachine::from_parts(sb, f.clone(), vec![("MVM_HOME".into(), d.join("no-such-mvm").to_string_lossy().into_owned())], vec![4243, 4245]);
         let mut live = Live {
-            log: &log, sb: &sb, paths: &p, host: f.as_ref(),
+            log: &log, sb: &sb, paths: &p,
             machine_attempted: true, machine_created: false, child: None,
-            network_pids: vec![4243, 4245], audit_dir: Some(d.join("no-such-audit")),
             canaries: None, monitoring_failed: false, canary_setup_complete: false,
         };
         live.teardown("test");
@@ -2917,17 +3217,15 @@ mod tests {
         let f = Fake::new(|_| out(0, "", ""));
         let run: Arc<dyn Runner> = f.clone();
         let sb = MvmSandbox::new(&p.machine, Box::new(run)).unwrap();
+        let sb = MvmMachine::from_parts(sb, f.clone(), vec![], vec![]);
         let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
         let mut live = Live {
             log: &log,
             sb: &sb,
             paths: &p,
-            host: f.as_ref(),
             machine_attempted: true,
             machine_created: true,
             child: None,
-            network_pids: vec![],
-            audit_dir: None,
             canaries: None,
             monitoring_failed: false,
             canary_setup_complete: false,
@@ -2949,17 +3247,15 @@ mod tests {
         let f = Fake::new(|_| out(0, "", ""));
         let run: Arc<dyn Runner> = f.clone();
         let sb = MvmSandbox::new(&p.machine, Box::new(run)).unwrap();
+        let sb = MvmMachine::from_parts(sb, f.clone(), vec![], vec![]);
         let log = Logger { id: p.id.clone(), file: p.log_file.clone() };
         let mut live = Live {
             log: &log,
             sb: &sb,
             paths: &p,
-            host: f.as_ref(),
             machine_attempted: true,
             machine_created: true,
             child: None,
-            network_pids: vec![],
-            audit_dir: None,
             canaries: None,
             monitoring_failed: false,
             canary_setup_complete: false,

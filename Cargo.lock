@@ -2811,6 +2811,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "url",
+ "windows-sys 0.61.2",
  "zbus-secret-service-keyring-store",
  "zeroize",
 ]

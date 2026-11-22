@@ -5,7 +5,10 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+pub use std::process::Child;
 
 const BUFFER_LIMIT: usize = 64 * 1024;
 
@@ -174,6 +177,19 @@ impl Drop for Terminal {
             }
         }
     }
+}
+
+/// Stop OpenCode and everything it started: Terminal::spawn gives it its
+/// own session and process group, so signal the group (descendants too,
+/// even if the leader already exited), wait up to `grace`, then kill it.
+pub fn stop_tree(child: &mut Child, grace: Duration) {
+    crate::sys::send_signal(-(child.id() as i32), crate::sys::SIGTERM);
+    let end = Instant::now() + grace;
+    while child.try_wait().ok().flatten().is_none() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    crate::sys::send_signal(-(child.id() as i32), crate::sys::SIGKILL);
+    let _ = child.wait();
 }
 
 fn attributes(fd: i32) -> io::Result<Option<libc::termios>> {

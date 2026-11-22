@@ -5,8 +5,6 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
@@ -133,16 +131,12 @@ impl Runner for SpawnRunner {
     /// 0600 log, and its own process group so the operator's Ctrl-C never
     /// reaches it.
     fn attach(&self, argv: &[String], log: &Path) -> io::Result<Box<dyn Attached>> {
-        let file = OpenOptions::new().create(true).append(true).mode(0o600).open(log)?;
-        // The mode above applies only to a new file.
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        let child = self
-            .command(argv)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(file.try_clone()?))
-            .stderr(Stdio::from(file))
-            .process_group(0)
-            .spawn()?;
+        let file = crate::sys::fs::open_private(log, crate::sys::fs::Create::Append)?;
+        // The owner-only mode above applies only to a new file.
+        crate::sys::fs::restrict_file(&file)?;
+        let mut cmd = self.command(argv);
+        cmd.stdin(Stdio::null()).stdout(Stdio::from(file.try_clone()?)).stderr(Stdio::from(file));
+        let child = crate::sys::own_process_group(&mut cmd).spawn()?;
         Ok(Box::new(SpawnedAttach { child, status: None }))
     }
 }
@@ -176,8 +170,8 @@ impl Attached for SpawnedAttach {
         if self.exited().is_some() {
             return;
         }
-        let pgid = self.child.id() as i32;
-        crate::sys::send_signal(-pgid, crate::sys::SIGTERM);
+        let pgid = self.child.id();
+        crate::sys::signal_group(pgid, crate::sys::SIGTERM);
         let deadline = Instant::now() + grace;
         while Instant::now() < deadline {
             if self.exited().is_some() {
@@ -185,7 +179,7 @@ impl Attached for SpawnedAttach {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        crate::sys::send_signal(-pgid, crate::sys::SIGKILL);
+        crate::sys::signal_group(pgid, crate::sys::SIGKILL);
         let _ = self.child.kill();
         self.status = Some(match self.child.wait() {
             Ok(s) => s.to_string(),
@@ -198,14 +192,10 @@ impl Attached for SpawnedAttach {
 /// capture at most 16 MiB of each stream, and kill the whole group at the
 /// deadline.
 pub fn run_captured(mut cmd: Command, timeout: Duration) -> io::Result<RunOutput> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Own process group, so a timeout kills the command and anything it started.
-        .process_group(0)
-        .spawn()?;
-    let pgid = child.id() as i32;
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Own process group, so a timeout kills the command and anything it started.
+    let mut child = crate::sys::own_process_group(&mut cmd).spawn()?;
+    let pgid = child.id();
     let out = child.stdout.take().unwrap();
     let err = child.stderr.take().unwrap();
     let t_out = thread::spawn(move || read_capped(out, MAX_CAPTURE_BYTES));
@@ -218,7 +208,7 @@ pub fn run_captured(mut cmd: Command, timeout: Duration) -> io::Result<RunOutput
         }
         if Instant::now() >= deadline {
             killed = true;
-            crate::sys::send_signal(-pgid, crate::sys::SIGKILL);
+            crate::sys::signal_group(pgid, crate::sys::SIGKILL);
             let _ = child.kill();
             break child.wait()?;
         }
@@ -294,7 +284,7 @@ impl StateDir {
         }
     }
 
-    fn lock(&self) -> io::Result<File> {
+    pub(crate) fn lock(&self) -> io::Result<File> {
         fs::create_dir_all(&self.0)?;
         let f = OpenOptions::new().create(true).truncate(false).write(true).open(self.0.join("exec.lock"))?;
         f.lock()?;
@@ -520,7 +510,7 @@ impl Sandbox for MvmSandbox {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::protocol::wrap_argv;

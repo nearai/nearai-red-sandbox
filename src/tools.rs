@@ -121,7 +121,16 @@ impl Tools<'_> {
             return Err("background commands are not supported in the sandbox".into());
         }
         if self.limits.leak_shell {
-            let o = std::process::Command::new("sh").args(["-c", command]).output().map_err(|e| Error::Other(e.to_string()))?;
+            // The host's own shell: sh, or cmd on Windows (which has no sh).
+            let (shell, flag) = if cfg!(windows) {
+                ("cmd", "/C")
+            } else {
+                ("sh", "-c")
+            };
+            let o = std::process::Command::new(shell)
+                .args([flag, command])
+                .output()
+                .map_err(|e| Error::Other(e.to_string()))?;
             let code = o.status.code().unwrap_or(-1);
             return Ok(join_output(vec![text(&o.stdout).trim_end().into(), text(&o.stderr).trim_end().into(), if code != 0 { format!("exit status: {code}") } else { String::new() }]));
         }

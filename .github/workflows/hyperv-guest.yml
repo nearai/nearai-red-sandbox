@@ -1,0 +1,98 @@
+name: hyperv-guest
+
+# Rebuilds the Windows guest kernel and initramfs from guest/hyperv and
+# fails unless their sha256 match the pins in src/backend/hyperv/backend.rs
+# (what rts checks before every boot). On a signed hyperv-guest-v* tag it
+# publishes them as that release; nothing else ever publishes.
+on:
+  pull_request:
+    paths:
+      - "guest/hyperv/**"
+      - "src/hvexec/**"
+      - "src/backend/hyperv/backend.rs"
+      - ".github/workflows/hyperv-guest.yml"
+  push:
+    tags:
+      - "hyperv-guest-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hyperv-guest-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the kernel, the agent and the initramfs
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/out"
+          mkdir -p "$out"
+          guest/hyperv/build.sh "$RUNNER_TEMP/kernel"
+          guest/hyperv/build-agent.sh "$RUNNER_TEMP/agent"
+          python3 -I guest/hyperv/build-initramfs.py "$RUNNER_TEMP/agent/rts-guest" "$out/initramfs.cpio.gz"
+          cp "$RUNNER_TEMP/kernel/vmlinuz" "$out/vmlinuz"
+          (cd "$out" && sha256sum vmlinuz initramfs.cpio.gz > SHA256SUMS && cat SHA256SUMS)
+      - name: Require the pinned digests
+        run: guest/hyperv/check-pins.sh "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hyperv-guest
+          path: ${{ runner.temp }}/out
+          retention-days: 7
+
+  publish:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/hyperv-guest-v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      # The signers come from the default branch, so a tag cannot bring its own.
+      - name: Require an SSH signature on the tag by an allowed signer
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}" "+refs/heads/main:refs/remotes/origin/main"
+          git show origin/main:guest/hyperv/allowed_signers > "$RUNNER_TEMP/allowed_signers" || {
+            echo "refusing: main has no guest/hyperv/allowed_signers yet; tags are verifiable only after it merges" >&2
+            exit 1
+          }
+          [ "$(git cat-file -t "$GITHUB_REF_NAME")" = tag ] || { echo "refusing: $GITHUB_REF_NAME is not an annotated, signed tag" >&2; exit 1; }
+          git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$RUNNER_TEMP/allowed_signers" verify-tag "$GITHUB_REF_NAME"
+      - name: Download this run's files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name hyperv-guest --dir "$RUNNER_TEMP/out"
+          (cd "$RUNNER_TEMP/out" && sha256sum -c SHA256SUMS)
+          guest/hyperv/check-pins.sh "$RUNNER_TEMP/out"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "refusing: release $GITHUB_REF_NAME already exists" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            "$RUNNER_TEMP/out/vmlinuz" "$RUNNER_TEMP/out/initramfs.cpio.gz" "$RUNNER_TEMP/out/SHA256SUMS" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "rts Hyper-V guest ($GITHUB_REF_NAME)" \
+            --notes "The Windows guest kernel and initramfs rts setup installs. Built by this workflow from guest/hyperv; each file matches the sha256 pinned in src/backend/hyperv/backend.rs, which rts checks before every boot."
