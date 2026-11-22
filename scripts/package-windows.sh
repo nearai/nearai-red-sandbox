@@ -47,8 +47,10 @@ cp -R "$plugin" "$stage/share/nearai-red-sandbox/plugin"
 mkdir -p "$out"
 name="rts-$version-x86_64-pc-windows-msvc.tar"
 epoch="${SOURCE_DATE_EPOCH:-$(git -C "$here" log -1 --format=%ct)}"
-tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
+# --force-local: on a Windows runner $out is a drive path (D:\a\_temp\...),
+# and GNU tar otherwise reads "D:" as a remote host ("Cannot connect to D:").
+tar --force-local --format=ustar --sort=name --owner=0 --group=0 --numeric-owner \
   --mode='u+rwX,go+rX,go-w' --mtime="@$epoch" \
   -C "$stage" -cf "$out/$name" bin libexec share
 (cd "$out" && sha256sum "$name" > "$name.sha256" && cat "$name.sha256")
-tar -tvf "$out/$name"
+tar --force-local -tvf "$out/$name"

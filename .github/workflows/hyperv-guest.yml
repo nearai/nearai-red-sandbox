@@ -94,5 +94,6 @@ jobs:
             "$RUNNER_TEMP/out/vmlinuz" "$RUNNER_TEMP/out/initramfs.cpio.gz" "$RUNNER_TEMP/out/SHA256SUMS" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
+            --latest=false \
             --title "rts Hyper-V guest ($GITHUB_REF_NAME)" \
             --notes "The Windows guest kernel and initramfs rts setup installs. Built by this workflow from guest/hyperv; each file matches the sha256 pinned in src/backend/hyperv/backend.rs, which rts checks before every boot."
