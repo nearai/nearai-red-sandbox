@@ -197,6 +197,18 @@ pub struct Component {
     pub max_bytes: u64,
     pub unpack: Unpack,
     pub binary: &'static str,
+    /// Files installed beside `binary`, each checked against its pin
+    /// (mvm on Linux x86_64: the signed guest runtime; empty otherwise).
+    pub guest_runtime: Vec<PinnedFile>,
+}
+
+/// One file downloaded from `url` and installed only if its sha256 is `sha256`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedFile {
+    pub name: &'static str,
+    pub url: String,
+    pub sha256: String,
+    pub max_bytes: u64,
 }
 
 /// mvm for this host; Apple-silicon macOS's assets on a host rts pins none for.
@@ -233,7 +245,41 @@ pub fn mvm_for(t: Target) -> Component {
         max_bytes: 64 << 20,
         unpack: Unpack::TarGzStrip1,
         binary: "mvmctl",
+        guest_runtime: if t == Target::LinuxX86_64 { linux_x86_64_guest_runtime() } else { Vec::new() },
     }
+}
+
+/// sha256 of each guest-runtime file in the mvm-v0.28.0-rts.2 release: GitHub's
+/// asset digests, matching its cosign-verified checksums-sha256.txt (the
+/// archive) and checked by cosign against mvm-linux.yml's identity (the
+/// bundles).
+const LINUX_X86_64_GUEST_RUNTIME: [(&str, &str, u64); 4] = [
+    ("mvm-guest-bins-v0.28.0-rts.2.tar.gz", "14ce3d1cb0a5e500a655e01508580a0e74f650b9ae82483766c452ab1c2b80f4", 64 << 20),
+    ("mvm-guest-bins-v0.28.0-rts.2.tar.gz.sha256", "9bed92cb97f1fb1dc5527b3d9eab91676b72e922e73d517ec35e0c660b221f17", 1 << 16),
+    ("mvm-guest-bins-v0.28.0-rts.2.tar.gz.bundle", "3bc80b41185dc354a4f7aebf9f057943d4901e21972ffe22e113aa75cc484e29", 1 << 20),
+    ("mvm-guest-bins-v0.28.0-rts.2.tar.gz.sha256.bundle", "f19cb0e1349de0f194dc4809bd618c2b6f4c407854ea6d1cf30da90dbae98435", 1 << 20),
+];
+
+/// The guest runtime mvm 0.28's launch reads beside mvmctl
+/// ([`guest_runtime_dir`]): `mvmctl bootstrap` caches only the archive,
+/// where launch does not look, and launch needs the archive's `.sha256`
+/// and both cosign bundles too.
+fn linux_x86_64_guest_runtime() -> Vec<PinnedFile> {
+    LINUX_X86_64_GUEST_RUNTIME
+        .iter()
+        .map(|&(name, sha256, max_bytes)| PinnedFile {
+            name,
+            url: format!("https://github.com/nearai/nearai-red-sandbox/releases/download/mvm-v{MVM_VERSION_LINUX_X86_64}/{name}"),
+            sha256: sha256.into(),
+            max_bytes,
+        })
+        .collect()
+}
+
+/// `<mvmctl's directory>/guest-runtime`, the packaged location mvm's launch
+/// checks first (mvm-build `packaged_runtime_locations`).
+pub fn guest_runtime_dir(mvmctl: &Path) -> std::path::PathBuf {
+    mvmctl.parent().unwrap_or(Path::new(".")).join("guest-runtime")
 }
 
 /// OpenCode for this host; Apple-silicon macOS's assets on a host rts pins none for.
@@ -256,6 +302,7 @@ pub fn opencode_for(t: Target) -> Component {
         max_bytes: 256 << 20,
         unpack,
         binary: "opencode",
+        guest_runtime: Vec::new(),
     }
 }
 
@@ -272,6 +319,7 @@ pub fn opencode_windows() -> Component {
         max_bytes: 256 << 20,
         unpack: Unpack::ZipWindows,
         binary: "opencode.exe",
+        guest_runtime: Vec::new(),
     }
 }
 
@@ -732,7 +780,7 @@ pub(crate) fn run_steps(o: &SetupOptions, c: &SetupContext, components: (&Compon
         if !o.check {
             return Err("--offline requires --check".into());
         }
-        return offline_check(c, flavor, kvm);
+        return offline_check(c, flavor, kvm, components.0);
     }
     let (mvm_c, opencode_c) = components;
     let mut steps = Steps { check: o.check, lines: Vec::new(), failures: Vec::new() };
@@ -757,7 +805,7 @@ pub(crate) fn run_steps(o: &SetupOptions, c: &SetupContext, components: (&Compon
         Flavor::Firecracker => steps.record(kvm_step(kvm))?,
     };
     steps.record(opencode_step(o.check, c, opencode_c))?;
-    if mvm_ok && flavor == Flavor::Firecracker && kvm_ok {
+    if mvm_ok && flavor == Flavor::Firecracker && kvm_ok && steps.record(guest_runtime_step(o.check, c, mvm_c))? {
         steps.record(bootstrap_step(o.check, c))?;
     }
     if mvm_ok {
@@ -770,6 +818,95 @@ pub(crate) fn run_steps(o: &SetupOptions, c: &SetupContext, components: (&Compon
 fn kvm_step(kvm: &Path) -> Result<Option<String>, String> {
     crate::backend::kvm::check_kvm(kvm)?;
     Ok(Some(format!("kvm {} (read-write)", kvm.display())))
+}
+
+/// The pinned guest-runtime files beside mvmctl ([`guest_runtime_dir`]).
+/// Present: each must match its pin. Missing: installed all at once from
+/// a staging directory, each checked first; with `check`, or beside an
+/// `RTS_MVMCTL` rts did not install, an error. mvmctl checks the bundles
+/// against the release workflow's identity at every launch.
+#[cfg(unix)]
+fn guest_runtime_step(check: bool, c: &SetupContext, comp: &Component) -> Result<Option<String>, String> {
+    if comp.guest_runtime.is_empty() {
+        return Ok(None);
+    }
+    let dir = guest_runtime_dir(&c.defaults.mvmctl);
+    let label = format!("{} {} guest runtime files", comp.name, comp.version);
+    if exists(&dir) {
+        verify_pinned_files(&dir, &comp.guest_runtime).map_err(|e| format!("{label}: {e}; remove {} and re-run rts setup", dir.display()))?;
+        return Ok(Some(format!("{label} {}", dir.display())));
+    }
+    if c.explicit_mvmctl {
+        return Err(format!(
+            "{label}: not installed at {}, beside RTS_MVMCTL={}; put the mvm-v{} release's guest runtime files there, or unset RTS_MVMCTL and re-run rts setup",
+            dir.display(),
+            c.defaults.mvmctl.display(),
+            comp.version
+        ));
+    }
+    if check {
+        return Err(format!("{label}: not installed at {}; run rts setup", dir.display()));
+    }
+    install_pinned_files(&dir, &comp.guest_runtime, c.fetch).map_err(|e| format!("{label}: {e}"))?;
+    Ok(Some(format!("{label} {}", dir.display())))
+}
+
+/// Each of `files` is a regular file in `dir` with its pinned sha256.
+#[cfg(unix)]
+fn verify_pinned_files(dir: &Path, files: &[PinnedFile]) -> Result<(), String> {
+    for p in files {
+        let path = dir.join(p.name);
+        let meta = fs::symlink_metadata(&path).map_err(|_| format!("{} is missing", path.display()))?;
+        if !meta.is_file() {
+            return Err(format!("{} is not a regular file", path.display()));
+        }
+        let mut file = fs::File::open(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let n = file.read(&mut buf).map_err(|e| format!("reading {}: {e}", path.display()))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let got = hex(&hasher.finalize());
+        if !got.eq_ignore_ascii_case(&p.sha256) {
+            return Err(format!("{} has sha256 {got}, expected {}", path.display(), p.sha256));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| format!("setting the mode of {}: {e}", path.display()))
+}
+
+/// Download `files` into a staging directory beside `dir`, check each
+/// against its pin, then move the whole directory to `dir`. Any failure
+/// leaves `dir` absent.
+#[cfg(unix)]
+fn install_pinned_files(dir: &Path, files: &[PinnedFile], f: &dyn Fetch) -> Result<(), String> {
+    let parent = dir.parent().ok_or_else(|| format!("{} has no parent directory", dir.display()))?;
+    let tmp = tempfile::Builder::new()
+        .prefix(TEMP_PREFIX)
+        .tempdir_in(parent)
+        .map_err(|e| format!("creating a temp directory in {}: {e}", parent.display()))?;
+    for p in files {
+        let path = tmp.path().join(p.name);
+        let mut file = fs::File::create(&path).map_err(|e| format!("creating {}: {e}", path.display()))?;
+        let got = download(f, &p.url, p.max_bytes, &mut file).map_err(|e| format!("{e}; nothing was installed"))?;
+        file.sync_all().map_err(|e| format!("writing {}: {e}", path.display()))?;
+        if !got.sha256.eq_ignore_ascii_case(&p.sha256) {
+            return Err(format!("sha256 mismatch for {}: expected {}, got {}; nothing was installed", p.url, p.sha256, got.sha256));
+        }
+        set_mode(&path, 0o644)?;
+    }
+    // Explicit modes, not the umask's: nobody else may swap a checked file.
+    set_mode(tmp.path(), 0o755)?;
+    fs::rename(tmp.path(), dir).map_err(|e| format!("moving the guest runtime into {}: {e}; nothing was installed", dir.display()))
 }
 
 /// `mvmctl bootstrap`: the guest runtime this mvmctl's release ships,
@@ -871,7 +1008,7 @@ fn image_step(check: bool, c: &SetupContext) -> Result<Option<String>, String> {
 /// supervisor probes and the signatures of `rts` and the supervisor, on
 /// Firecracker `kvm`. No mvmctl, no network.
 #[cfg(unix)]
-fn offline_check(c: &SetupContext, flavor: Flavor, kvm: &Path) -> Result<Vec<String>, String> {
+fn offline_check(c: &SetupContext, flavor: Flavor, kvm: &Path, mvm_c: &Component) -> Result<Vec<String>, String> {
     let mut steps = Steps { check: true, lines: Vec::new(), failures: Vec::new() };
     let plugin = &c.defaults.plugin_dir;
     let missing: Vec<String> = ["package.json", "index.ts", "branding/tui.tsx", "branding/footer.ts", "branding/startup.ts", crate::brand::theme::THEME_FILE]
@@ -896,6 +1033,7 @@ fn offline_check(c: &SetupContext, flavor: Flavor, kvm: &Path) -> Result<Vec<Str
     })?;
     if flavor == Flavor::Firecracker {
         steps.record(kvm_step(kvm))?;
+        steps.record(guest_runtime_step(true, c, mvm_c))?;
         return steps.finish();
     }
     steps.record(supervisor_step(c))?;
@@ -1028,7 +1166,7 @@ mod tests {
         fetch.body(&url, bytes);
         let parent = dir.path().join("home/.local/mvm");
         let target = parent.join("v0.22.0");
-        let c = Component { name, version: "0.0.1", url, sha256: digest.clone(), max_bytes: 1 << 20, unpack, binary };
+        let c = Component { name, version: "0.0.1", url, sha256: digest.clone(), max_bytes: 1 << 20, unpack, binary, guest_runtime: Vec::new() };
         Rig { _dir: dir, parent, target, fetch, c, digest }
     }
 
@@ -1527,7 +1665,20 @@ mod tests {
             let oc_c = Component { url: "https://github.com/fixture/opencode-linux.tar.gz".into(), sha256: sha256_hex(&tgz), unpack: Unpack::TarGz, ..r.components.1.clone() };
             r.fetch.inner.body(&oc_c.url, tgz);
             r.components.1 = oc_c;
+            r.components.0.guest_runtime = GUEST_RUNTIME_FIXTURE
+                .iter()
+                .map(|(name, body)| {
+                    let url = format!("https://github.com/fixture/guest/{name}");
+                    r.fetch.inner.body(&url, body.to_vec());
+                    PinnedFile { name, url, sha256: sha256_hex(body), max_bytes: 1 << 20 }
+                })
+                .collect();
             r
+        }
+
+        /// Where the Firecracker rig's mvmctl looks for its guest runtime.
+        fn guest_dir(&self) -> PathBuf {
+            guest_runtime_dir(&self.defaults.mvmctl)
         }
 
         fn run_firecracker(&self, o: SetupOptions, s: &Seams, kvm: &Path) -> Result<Vec<String>, String> {
@@ -1601,15 +1752,112 @@ mod tests {
                 format!("fetch {}", r.components.1.url),
                 "host /usr/bin/tar".into(),
                 format!("host {oc} --version"),
+                format!("fetch {}", r.components.0.guest_runtime[0].url),
+                format!("fetch {}", r.components.0.guest_runtime[1].url),
+                format!("fetch {}", r.components.0.guest_runtime[2].url),
+                format!("fetch {}", r.components.0.guest_runtime[3].url),
                 "mvm bootstrap".into(),
                 format!("mvm image inspect {}", default_image()),
                 format!("mvm image pull {}", default_image()),
             ]
         );
-        assert_eq!(lines.len(), 5, "{lines:?}"); // mvm, kvm, opencode, guest runtime, image
+        assert_eq!(lines.len(), 6, "{lines:?}"); // mvm, kvm, opencode, guest runtime files, guest runtime, image
         assert!(lines[1].contains(&kvm.display().to_string()), "{lines:?}");
-        assert!(lines[3].contains("guest runtime"), "{lines:?}");
-        assert!(lines[4].contains(default_image()), "{lines:?}");
+        assert!(lines[3].contains(&r.guest_dir().display().to_string()), "{lines:?}");
+        assert!(lines[4].contains("guest runtime"), "{lines:?}");
+        assert!(lines[5].contains(default_image()), "{lines:?}");
+        for (name, body) in GUEST_RUNTIME_FIXTURE {
+            assert_eq!(fs::read(r.guest_dir().join(name)).unwrap(), body, "{name}");
+            assert_eq!(fs::metadata(r.guest_dir().join(name)).unwrap().permissions().mode() & 0o777, 0o644, "{name}");
+        }
+        assert_eq!(fs::metadata(r.guest_dir()).unwrap().permissions().mode() & 0o777, 0o755);
+    }
+
+    /// The four files mvm's launch needs beside mvmctl, as fixtures.
+    const GUEST_RUNTIME_FIXTURE: [(&str, &[u8]); 4] = [
+        ("mvm-guest-bins-v0.28.0-rts.2.tar.gz", b"guest archive"),
+        ("mvm-guest-bins-v0.28.0-rts.2.tar.gz.sha256", b"archive digest"),
+        ("mvm-guest-bins-v0.28.0-rts.2.tar.gz.bundle", b"archive bundle"),
+        ("mvm-guest-bins-v0.28.0-rts.2.tar.gz.sha256.bundle", b"digest bundle"),
+    ];
+
+    #[test]
+    fn a_tampered_guest_runtime_file_installs_nothing_and_skips_bootstrap() {
+        let r = SetupRig::new_linux();
+        let kvm = fake_kvm(&r);
+        let bad = r.components.0.guest_runtime[2].url.clone();
+        r.fetch.inner.body(&bad, b"tampered".to_vec());
+        let s = r.seams(host_linux_ok, plain_pinned, mvm_fc_ok);
+        let e = r.run_firecracker(SetupOptions::default(), &s, &kvm).unwrap_err();
+        assert!(e.contains("sha256 mismatch") && e.contains("nothing was installed"), "{e}");
+        assert!(!r.guest_dir().exists(), "a partial guest runtime was installed");
+        assert!(!r.log().iter().any(|l| l == "mvm bootstrap"), "{:?}", r.log());
+        assert!(leftovers(r.guest_dir().parent().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn an_installed_guest_runtime_is_verified_not_refetched_and_a_wrong_one_refused() {
+        let r = SetupRig::new_linux();
+        let kvm = fake_kvm(&r);
+        let s = r.seams(host_linux_ok, plain_pinned, mvm_fc_ok);
+        r.run_firecracker(SetupOptions::default(), &s, &kvm).unwrap();
+        let s = r.seams(host_linux_ok, plain_pinned, mvm_fc_ok);
+        r.run_firecracker(SetupOptions::default(), &s, &kvm).unwrap();
+        assert_eq!(r.fetches().iter().filter(|u| u.contains("/guest/")).count(), 4, "{:?}", r.fetches());
+        assert!(!r.log().iter().any(|l| l.contains("/guest/")), "re-fetched: {:?}", r.log());
+        let s = r.seams(host_linux_ok, plain_pinned, mvm_fc_ok);
+        r.run_firecracker(SetupOptions::default(), &s, &kvm).unwrap();
+        let offline = SetupOptions { check: true, offline: true };
+        let oc = opencode_dir(&r.home).join("opencode");
+        assert!(oc.is_file());
+        let s = r.seams(host_linux_ok, plain_pinned, mvm_fc_ok);
+        r.run_firecracker(offline, &s, &kvm).unwrap();
+
+        fs::write(r.guest_dir().join(GUEST_RUNTIME_FIXTURE[1].0), b"edited").unwrap();
+        for o in [SetupOptions::default(), SetupOptions { check: true, offline: false }, offline] {
+            let s = r.seams(host_linux_ok, plain_pinned, mvm_fc_ok);
+            let e = r.run_firecracker(o, &s, &kvm).unwrap_err();
+            assert!(e.contains(GUEST_RUNTIME_FIXTURE[1].0) && e.contains(&format!("remove {}", r.guest_dir().display())), "{o:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_missing_guest_runtime_fails_check_and_an_explicit_mvmctl_is_never_written_beside() {
+        let r = SetupRig::new_linux();
+        let kvm = fake_kvm(&r);
+        let s = r.seams(host_linux_ok, plain_pinned, mvm_fc_ok);
+        r.run_firecracker(SetupOptions::default(), &s, &kvm).unwrap();
+        fs::remove_dir_all(r.guest_dir()).unwrap();
+        let offline = SetupOptions { check: true, offline: true };
+        for o in [SetupOptions { check: true, offline: false }, offline] {
+            let s = r.seams(host_linux_ok, plain_pinned, mvm_fc_ok);
+            let e = r.run_firecracker(o, &s, &kvm).unwrap_err();
+            assert!(e.contains("not installed") && e.contains("run rts setup"), "{o:?}: {e}");
+            assert!(!r.guest_dir().exists());
+        }
+        let mut r = r;
+        r.explicit_mvmctl = true;
+        let s = r.seams(host_linux_ok, plain_pinned, mvm_fc_ok);
+        let e = r.run_firecracker(SetupOptions::default(), &s, &kvm).unwrap_err();
+        assert!(e.contains("RTS_MVMCTL") && e.contains(&r.guest_dir().display().to_string()), "{e}");
+        assert!(!r.guest_dir().exists(), "wrote beside an operator's mvmctl");
+        assert!(!r.log().iter().any(|l| l.contains("/guest/")), "{:?}", r.log());
+    }
+
+    #[test]
+    fn the_linux_guest_runtime_pins_are_the_mvm_release_files() {
+        let c = mvm_for(Target::LinuxX86_64);
+        let base = format!("https://github.com/nearai/nearai-red-sandbox/releases/download/mvm-v{}/", c.version);
+        let archive = format!("mvm-guest-bins-v{}.tar.gz", c.version);
+        let names: Vec<&str> = c.guest_runtime.iter().map(|f| f.name).collect();
+        assert_eq!(names, [archive.clone(), format!("{archive}.sha256"), format!("{archive}.bundle"), format!("{archive}.sha256.bundle")]);
+        for f in &c.guest_runtime {
+            assert_eq!(f.url, format!("{base}{}", f.name));
+            assert!(f.sha256.len() == 64 && f.sha256.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{}", f.name);
+        }
+        for t in [Target::MacosAarch64, Target::LinuxAarch64] {
+            assert!(mvm_for(t).guest_runtime.is_empty(), "{t:?}");
+        }
     }
 
     #[test]
@@ -1633,6 +1881,10 @@ mod tests {
         let oc = opencode_dir(&r.home).join("opencode");
         fs::create_dir_all(oc.parent().unwrap()).unwrap();
         fs::write(&oc, b"").unwrap();
+        fs::create_dir_all(r.guest_dir()).unwrap();
+        for (name, body) in GUEST_RUNTIME_FIXTURE {
+            fs::write(r.guest_dir().join(name), body).unwrap();
+        }
         let s = r.seams(host_linux_ok, plain_pinned, mvm_fc_ok);
         let lines = r.run_firecracker(offline, &s, &kvm).unwrap();
         assert!(s.mvm.calls().is_empty() && s.plain.calls().is_empty() && r.fetches().is_empty());
