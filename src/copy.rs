@@ -223,12 +223,28 @@ mod tests {
         hostile(&e, "unsupported tar entry type 1", &SMALL);
     }
 
+    /// GNU tar (and busybox tar, in the guest) writes a long name as a GNU
+    /// `L` header, which is refused; bsdtar writes it as a pax `path`, which
+    /// is accepted and must land under exactly that name.
     #[test]
-    fn a_long_name_is_refused() {
+    fn a_long_name_is_refused_as_gnu_tar_writes_it_and_kept_as_pax_writes_it() {
         let e = env();
         fs::create_dir(&e.guest).unwrap();
-        fs::write(e.guest.join("n".repeat(120)), "x").unwrap();
-        hostile(&e, "unsupported tar entry type L", &SMALL);
+        let name = "n".repeat(120);
+        fs::write(e.guest.join(&name), "x").unwrap();
+        let version = std::process::Command::new("tar")
+            .arg("--version")
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&version.stdout).contains("GNU tar") {
+            hostile(&e, "unsupported tar entry type L", &SMALL);
+        } else {
+            assert_eq!(
+                copy_out_via(&HostShell::default(), &g(&e), &e.host, &SMALL).unwrap(),
+                CopyOutResult::Exported { files: 1, bytes: 1 }
+            );
+            assert_eq!(fs::read_to_string(e.host.join(&name)).unwrap(), "x");
+        }
     }
 
     #[test]

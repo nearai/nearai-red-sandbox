@@ -303,8 +303,15 @@ pub fn session_paths(id: &str, sessions_dir: &Path, runtime: &Path) -> SessionPa
     }
 }
 
+/// The session's TMPDIR for OpenCode, owner-only. A short name: macOS caps
+/// unix socket paths at 104 bytes (a session with a 117-byte runtime path
+/// was checked to work with OpenCode 2.2.2).
+fn session_tmp(p: &SessionPaths) -> PathBuf {
+    p.runtime.join("tmp")
+}
+
 pub fn prepare_session_dirs(p: &SessionPaths) -> io::Result<()> {
-    for d in [&p.home, &p.xdg_config, &p.xdg_data, &p.xdg_cache, &p.xdg_state, &p.config_dir, &p.work, &p.state_dir, &p.session_dir] {
+    for d in [&p.home, &p.xdg_config, &p.xdg_data, &p.xdg_cache, &p.xdg_state, &p.config_dir, &p.work, &p.state_dir, &p.session_dir, &session_tmp(p)] {
         crate::sys::fs::create_private_dir_all(d)?;
     }
     if cfg!(windows) {
@@ -354,12 +361,11 @@ pub fn opencode_launch(p: &SessionPaths, opencode: &str, base_env: impl IntoIter
 }
 
 /// Terminal and runtime essentials that pass to OpenCode on every OS.
-const OPENCODE_ENV: [&str; 11] = [
+const OPENCODE_ENV: [&str; 10] = [
     "PATH",
     "TERM",
     "COLORTERM",
     "LANG",
-    "TMPDIR",
     "USER",
     "LOGNAME",
     "SHELL",
@@ -429,6 +435,9 @@ fn opencode_launch_for(
         ("XDG_DATA_HOME", &p.xdg_data),
         ("XDG_CACHE_HOME", &p.xdg_cache),
         ("XDG_STATE_HOME", &p.xdg_state),
+        // OpenCode's tmp follows TMPDIR; the host's is shared with every
+        // other session and the operator's own OpenCode.
+        ("TMPDIR", &session_tmp(p)),
     ] {
         env.push((k.into(), v.to_string_lossy().into_owned()));
     }
@@ -2012,8 +2021,19 @@ mod tests {
     #[test]
     fn opencode_runs_with_home_and_all_four_xdg_dirs_in_the_session_an_empty_cwd_and_standalone() {
         let p = session_paths("0123456789ab", Path::new("/s"), Path::new("/tmp/rts-x"));
-        let env = [("HOME", "/Users/op"), ("XDG_CONFIG_HOME", "/Users/op/.config"), ("OPENCODE_CONFIG", "/evil"), ("RTS_TEST_LEAK", "shell"), ("PATH", "/bin")];
-        let l = opencode_launch(&p, "opencode", env.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        let env = [
+            ("HOME", "/Users/op"),
+            ("XDG_CONFIG_HOME", "/Users/op/.config"),
+            ("OPENCODE_CONFIG", "/evil"),
+            ("RTS_TEST_LEAK", "shell"),
+            ("PATH", "/bin"),
+            ("TMPDIR", "/var/folders/op/T/"),
+        ];
+        let l = opencode_launch(
+            &p,
+            "opencode",
+            env.iter().map(|(k, v)| (k.to_string(), v.to_string())),
+        );
         assert_eq!(l.argv, sv(&["opencode", "--standalone"]));
         assert_eq!(l.cwd, PathBuf::from("/tmp/rts-x/work"));
         let get = |k: &str| l.env.iter().filter(|(n, _)| n == k).map(|(_, v)| v.as_str()).collect::<Vec<_>>();
@@ -2022,6 +2042,9 @@ mod tests {
         assert_eq!(get("XDG_DATA_HOME"), ["/tmp/rts-x/xdg/data"]);
         assert_eq!(get("XDG_CACHE_HOME"), ["/tmp/rts-x/xdg/cache"]);
         assert_eq!(get("XDG_STATE_HOME"), ["/tmp/rts-x/xdg/state"]);
+        // OpenCode's tmp follows TMPDIR: the session's, not the host's,
+        // which other sessions and the operator's own OpenCode share.
+        assert_eq!(get("TMPDIR"), ["/tmp/rts-x/tmp"]);
         assert!(get("OPENCODE_CONFIG").is_empty() && get("RTS_TEST_LEAK").is_empty());
         assert_eq!(get("PATH"), ["/bin"]);
         assert_eq!(p.machine, "rts-0123456789ab");
@@ -2135,6 +2158,80 @@ mod tests {
                 .iter()
                 .all(|(k, _)| !["USERPROFILE", "APPDATA", "LOCALAPPDATA"].contains(&k.as_str()))
         );
+    }
+
+    #[test]
+    fn the_session_tmp_is_created_owner_only() {
+        let d = tempdir("tmpdir");
+        let p = session_paths("0123456789ab", &d.join("s"), &d.join("rt"));
+        prepare_session_dirs(&p).unwrap();
+        let tmp = d.join("rt").join("tmp");
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&tmp).unwrap().permissions())
+                & 0o777,
+            0o700
+        );
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    /// Real OpenCode (RTS_OPENCODE, read only here) under exactly the
+    /// launch environment, at a normal and at a long runtime path: every
+    /// path `debug paths` reports is in the session, and a plugin-loading
+    /// `run` meets no socket-path limit (macOS caps those at 104 bytes).
+    #[test]
+    #[ignore = "live: needs RTS_OPENCODE"]
+    fn live_opencode_paths_stay_in_the_session_even_with_a_long_runtime_path() {
+        let oc = std::env::var("RTS_OPENCODE").expect("RTS_OPENCODE");
+        let base = std::env::temp_dir().join(format!("rts-{}", crate::protocol::random_hex(4)));
+        for runtime in [
+            base.join("rt"),
+            base.join("r".repeat(100 - base.as_os_str().len().min(90))),
+        ] {
+            let p = session_paths("0123456789ab", &base.join("s"), &runtime);
+            prepare_session_dirs(&p).unwrap();
+            let l = opencode_launch(&p, &oc, std::env::vars());
+            let run = |args: &[&str]| {
+                let mut cmd = Command::new(&oc);
+                cmd.args(args)
+                    .current_dir(&l.cwd)
+                    .env_clear()
+                    .envs(l.env.iter().map(|(k, v)| (k, v)));
+                crate::mvm::run_captured(cmd, Duration::from_secs(90)).unwrap()
+            };
+            let paths = run(&["debug", "paths"]);
+            let text = String::from_utf8_lossy(&paths.stdout).into_owned();
+            eprintln!(
+                "runtime {} ({} bytes):\n{text}",
+                runtime.display(),
+                runtime.as_os_str().len()
+            );
+            assert_eq!(paths.code, Some(0), "{text}");
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            assert_eq!(lines.len(), 10, "{text}");
+            // OpenCode reports tmp through /private/var, the canonical form
+            // of macOS's /var: the same directory.
+            let canonical = fs::canonicalize(&runtime).unwrap();
+            for line in lines {
+                let value = Path::new(line.split_whitespace().nth(1).unwrap_or(""));
+                assert!(
+                    value.starts_with(&runtime) || value.starts_with(&canonical),
+                    "{line} is outside {}",
+                    runtime.display()
+                );
+            }
+            let probe = run(&["run", "--standalone", "--model", "none/none", "probe"]);
+            let err = String::from_utf8_lossy(&probe.stderr).into_owned();
+            for bad in [
+                "ENAMETOOLONG",
+                "EADDRINUSE",
+                "path too long",
+                "UNIX_PATH_MAX",
+            ] {
+                assert!(!err.contains(bad), "{bad}: {err}");
+            }
+            assert!(!probe.killed, "opencode run did not finish: {err}");
+        }
+        fs::remove_dir_all(&base).unwrap();
     }
 
     fn healthy(argv: &[String]) -> RunOutput {

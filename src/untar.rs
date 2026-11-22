@@ -1,8 +1,13 @@
 //! Host-side tar extractor for archives built by a hostile guest.
 //!
 //! Accepts only regular files and directories. Refuses links, devices, GNU
-//! and pax extension headers, absolute paths, `..`, NUL bytes in names, bad
-//! checksums, and archives over the size or entry caps. The whole archive
+//! extension headers, pax global headers, absolute paths, `..`, NUL bytes
+//! in names, bad checksums, and archives over the size or entry caps. A pax
+//! extended header (type `x`, as bsdtar writes) is accepted for the one
+//! entry after it: only its `path` and `size` are used, held to the same
+//! rules as the ustar fields; `linkpath` is checked but links stay refused;
+//! other keys are ignored. Its records are parsed strictly, it is capped at
+//! 8 KiB, and it counts toward the entry cap. The whole archive
 //! is validated before anything is written; extraction goes to
 //! `<dest>.partial` and is renamed into place only on success.
 //! On Windows it also refuses names Windows would read differently
@@ -146,16 +151,108 @@ fn windows_collisions(entries: &[Planned]) -> Result<(), TarRejected> {
     Ok(())
 }
 
+/// The largest pax extended header accepted, records included.
+const MAX_PAX: u64 = 8 * 1024;
+
+/// What a pax extended header says about the entry after it.
+#[derive(Default)]
+struct Pax {
+    path: Option<String>,
+    size: Option<u64>,
+}
+
+/// Parse pax records ("LEN key=value\n", LEN counting the whole record)
+/// exactly: every record well-formed and together exactly `data`.
+fn parse_pax(data: &[u8], entry: &str) -> Result<Pax, TarRejected> {
+    let bad = |why: &str| rej(entry, format!("bad pax header: {why}"));
+    let mut pax = Pax::default();
+    let mut linkpath = false;
+    let mut rest = data;
+    while !rest.is_empty() {
+        let sp = rest
+            .iter()
+            .position(|&b| b == b' ')
+            .ok_or_else(|| bad("a record has no length"))?;
+        let digits = &rest[..sp];
+        if digits.is_empty()
+            || digits.len() > 5
+            || digits[0] == b'0'
+            || !digits.iter().all(u8::is_ascii_digit)
+        {
+            return Err(bad("a record length is not a decimal number"));
+        }
+        let len: usize = std::str::from_utf8(digits).unwrap().parse().unwrap();
+        if len <= sp + 1 || len > rest.len() {
+            return Err(bad("a record length does not fit the header"));
+        }
+        let Some((&b'\n', kv)) = rest[sp + 1..len].split_last() else {
+            return Err(bad("a record does not end with a newline"));
+        };
+        let eq = kv
+            .iter()
+            .position(|&b| b == b'=')
+            .ok_or_else(|| bad("a record has no '='"))?;
+        let (key, value) = (&kv[..eq], &kv[eq + 1..]);
+        let repeated = |k: &str| rej(entry, format!("pax header repeats {k}"));
+        match key {
+            b"path" => {
+                if pax.path.is_some() {
+                    return Err(repeated("path"));
+                }
+                if value.contains(&0) {
+                    return Err(rej(entry, "NUL in pax path"));
+                }
+                pax.path = Some(
+                    std::str::from_utf8(value)
+                        .map_err(|_| bad("path is not UTF-8"))?
+                        .to_string(),
+                );
+            }
+            b"size" => {
+                if pax.size.is_some() {
+                    return Err(repeated("size"));
+                }
+                if value.is_empty() || value.len() > 20 || !value.iter().all(u8::is_ascii_digit) {
+                    return Err(bad("size is not a decimal number"));
+                }
+                pax.size = Some(
+                    std::str::from_utf8(value)
+                        .unwrap()
+                        .parse()
+                        .map_err(|_| bad("size is out of range"))?,
+                );
+            }
+            b"linkpath" => {
+                if linkpath {
+                    return Err(repeated("linkpath"));
+                }
+                if value.contains(&0) {
+                    return Err(rej(entry, "NUL in pax linkpath"));
+                }
+                linkpath = true;
+            }
+            _ => {}
+        }
+        rest = &rest[len..];
+    }
+    Ok(pax)
+}
+
 fn plan(archive: &[u8], limits: ExtractLimits) -> Result<Vec<Planned>, TarRejected> {
     let mut out = Vec::new();
     let mut total: u64 = 0;
     let mut off = 0usize;
+    let mut pending: Option<Pax> = None;
+    let mut pax_headers = 0usize;
     loop {
         if off + BLOCK > archive.len() {
             return Err(rej(format!("@{off}"), "truncated archive (no end-of-archive marker)"));
         }
         let h = &archive[off..off + BLOCK];
         if h.iter().all(|&b| b == 0) {
+            if pending.is_some() {
+                return Err(rej(format!("@{off}"), "pax header with no entry after it"));
+            }
             break;
         }
         let at = format!("@{off}");
@@ -169,6 +266,37 @@ fn plan(archive: &[u8], limits: ExtractLimits) -> Result<Vec<Planned>, TarReject
         if !checksum_ok(h, &entry)? {
             return Err(rej(&entry, "bad header checksum"));
         }
+        if h[156] == b'x' {
+            if pending.is_some() {
+                return Err(rej(&entry, "pax header follows a pax header"));
+            }
+            pax_headers += 1;
+            if out.len() + pax_headers > limits.max_entries {
+                return Err(rej(
+                    &entry,
+                    format!("entry cap of {} exceeded", limits.max_entries),
+                ));
+            }
+            let size = octal(h, 124, 12, &entry, "size")?;
+            if size > MAX_PAX {
+                return Err(rej(&entry, format!("pax header over {MAX_PAX} bytes")));
+            }
+            let data_start = off + BLOCK;
+            let padded = (size as usize).div_ceil(BLOCK) * BLOCK;
+            if data_start + padded > archive.len() {
+                return Err(rej(&entry, "truncated archive (data runs past the end)"));
+            }
+            pending = Some(parse_pax(
+                &archive[data_start..data_start + size as usize],
+                &entry,
+            )?);
+            off = data_start + padded;
+            continue;
+        }
+        let pax = pending.take().unwrap_or_default();
+        if let Some(path) = pax.path {
+            entry = path;
+        }
         let kind = match h[156] {
             b'0' | 0 => Kind::File,
             b'5' => Kind::Dir,
@@ -177,8 +305,11 @@ fn plan(archive: &[u8], limits: ExtractLimits) -> Result<Vec<Planned>, TarReject
                 return Err(rej(&entry, format!("unsupported tar entry type {shown}")));
             }
         };
-        let size = octal(h, 124, 12, &entry, "size")?;
-        if out.len() + 1 > limits.max_entries {
+        let size = match pax.size {
+            Some(size) => size,
+            None => octal(h, 124, 12, &entry, "size")?,
+        };
+        if out.len() + pax_headers + 1 > limits.max_entries {
             return Err(rej(&entry, format!("entry cap of {} exceeded", limits.max_entries)));
         }
         let segments = normalize(&entry, &entry)?;
@@ -486,10 +617,204 @@ mod tests {
         let mut short = file(&"x".repeat(99), b"v");
         short.gnu = true;
         refused(&tar(&[long, short]), "unsupported tar entry type L", LIM);
-        let mut pax = typed("PaxHeader/f", b'x');
-        pax.data = b"30 path=../../etc/passwd\n".to_vec();
-        refused(&tar(&[pax, file("f", b"v")]), "unsupported tar entry type x", LIM);
-        refused(&tar(&[typed("pax_global_header", b'g')]), "unsupported tar entry type g", LIM);
+        // A pax header's path is held to the same rules as any name.
+        refused(
+            &tar(&[pax(&[("path", "../../etc/passwd")]), file("f", b"v")]),
+            "path escapes",
+            LIM,
+        );
+        refused(
+            &tar(&[typed("pax_global_header", b'g')]),
+            "unsupported tar entry type g",
+            LIM,
+        );
+    }
+
+    /// A pax extended header holding `records`, each "LEN key=value\n"
+    /// where LEN counts the whole record, its own digits included.
+    fn pax(records: &[(&str, &str)]) -> Entry {
+        let mut data = Vec::new();
+        for (k, v) in records {
+            let body = format!(" {k}={v}\n");
+            let mut n = body.len() + 1;
+            while format!("{n}{body}").len() != n {
+                n += 1;
+            }
+            data.extend(format!("{n}{body}").bytes());
+        }
+        Entry {
+            name: "PaxHeader/f".into(),
+            kind: Some(b'x'),
+            data,
+            ..Default::default()
+        }
+    }
+
+    fn pax_raw(data: &[u8]) -> Entry {
+        Entry {
+            name: "PaxHeader/f".into(),
+            kind: Some(b'x'),
+            data: data.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pax_path_and_size_apply_to_the_next_entry() {
+        let e = env();
+        let long = format!("{}/{}", "d".repeat(120), "f".repeat(120));
+        let mut short = file("x", b"abc");
+        short.size = Some(0); // the pax size, not the header's, says how much data follows
+        let xattr = ("LIBARCHIVE.xattr.com.apple.provenance", "AQ");
+        extract_tar(
+            &tar(&[
+                pax(&[("path", &long), ("size", "3"), xattr]),
+                short,
+                file("plain", b"p"),
+            ]),
+            &e.dest,
+            LIM,
+        )
+        .unwrap();
+        assert_eq!(fs::read(e.dest.join(&long)).unwrap(), b"abc");
+        assert_eq!(
+            fs::read(e.dest.join("plain")).unwrap(),
+            b"p",
+            "the pax header applies to one entry only"
+        );
+        assert!(!e.dest.join("x").exists());
+    }
+
+    #[test]
+    fn pax_paths_and_sizes_are_held_to_the_usual_rules() {
+        refused(
+            &tar(&[pax(&[("path", "/etc/passwd")]), file("f", b"v")]),
+            "absolute path",
+            LIM,
+        );
+        refused(
+            &tar(&[pax(&[("path", "a/../../x")]), file("f", b"v")]),
+            "path escapes",
+            LIM,
+        );
+        refused(
+            &tar(&[pax(&[("path", "ok\0../x")]), file("f", b"v")]),
+            "NUL",
+            LIM,
+        );
+        let small = ExtractLimits {
+            max_bytes: 1000,
+            max_entries: 5,
+        };
+        let mut f = file("f", &[b'x'; 10]);
+        f.size = Some(10);
+        refused(
+            &tar(&[pax(&[("size", "5000")]), f.clone()]),
+            "size cap",
+            small,
+        );
+        refused(&tar(&[pax(&[("size", "5000")]), f]), "truncated", LIM);
+        refused(&tar(&[pax(&[("size", "-1")]), file("f", b"v")]), "pax", LIM);
+        refused(
+            &tar(&[pax(&[("size", "99999999999999999999999")]), file("f", b"v")]),
+            "pax",
+            LIM,
+        );
+    }
+
+    #[test]
+    fn pax_records_are_parsed_strictly_and_bounded() {
+        for data in [
+            &b"9 path=ab\n"[..], // the length says 9; the record is 10
+            b"8 patha\n",        // no '='
+            b"3 \n",
+            b"x path=a\n",
+            b"10 path=a\nZ", // bytes after the last record
+            b"10 path=a\0",  // not ended by a newline
+            b"010 path=a\n", // a leading zero
+        ] {
+            refused(&tar(&[pax_raw(data), file("f", b"v")]), "pax", LIM);
+        }
+        // The well-formed record in the same shape is accepted.
+        let e = env();
+        extract_tar(
+            &tar(&[pax_raw(b"10 path=a\n"), file("f", b"v")]),
+            &e.dest,
+            LIM,
+        )
+        .unwrap();
+        assert_eq!(fs::read(e.dest.join("a")).unwrap(), b"v");
+        let big = [("comment", "y".repeat(9000))];
+        let big: Vec<(&str, &str)> = big.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        refused(&tar(&[pax(&big), file("f", b"v")]), "pax header over", LIM);
+        refused(
+            &tar(&[pax(&[("path", "a"), ("path", "b")]), file("f", b"v")]),
+            "repeats",
+            LIM,
+        );
+    }
+
+    #[test]
+    fn a_pax_header_must_describe_a_following_file_or_directory() {
+        refused(
+            &tar(&[
+                pax(&[("path", "a")]),
+                pax(&[("path", "b")]),
+                file("f", b"v"),
+            ]),
+            "pax header follows a pax header",
+            LIM,
+        );
+        refused(&tar(&[pax(&[("path", "a")])]), "pax header", LIM);
+        let mut sym = typed("link", b'2');
+        sym.linkname = "x".into();
+        refused(
+            &tar(&[pax(&[("linkpath", "/etc/passwd")]), sym]),
+            "unsupported tar entry type 2",
+            LIM,
+        );
+        // pax headers count toward the entry cap.
+        let small = ExtractLimits {
+            max_bytes: 1000,
+            max_entries: 2,
+        };
+        refused(
+            &tar(&[
+                pax(&[("path", "a")]),
+                file("a", b"1"),
+                pax(&[("path", "b")]),
+                file("b", b"2"),
+            ]),
+            "entry cap",
+            small,
+        );
+    }
+
+    /// macOS's own tar (bsdtar) writes pax headers, for extended attributes
+    /// and the "." entry among others: such an archive now extracts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bsdtar_archive_with_pax_headers_extracts() {
+        let e = env();
+        let src = e.root.join("src");
+        fs::create_dir_all(src.join("n")).unwrap();
+        fs::write(src.join("n/f.txt"), "from bsdtar").unwrap();
+        let out = std::process::Command::new("/usr/bin/tar")
+            .args(["--format=pax", "-cf", "-", "-C"])
+            .arg(&src)
+            .arg(".")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(
+            out.stdout.windows(9).any(|w| w == b"PaxHeader") || out.stdout.contains(&b'x'),
+            "expected pax headers"
+        );
+        extract_tar(&out.stdout, &e.dest, LIM).unwrap();
+        assert_eq!(
+            fs::read_to_string(e.dest.join("n/f.txt")).unwrap(),
+            "from bsdtar"
+        );
     }
 
     #[test]
