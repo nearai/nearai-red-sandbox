@@ -89,12 +89,14 @@ impl Flavor {
         }
     }
 
-    /// The attached `machine run`'s children that carry guest egress. On
-    /// Firecracker the VMM detaches from mvmctl, so only the endpoint.
+    /// The processes that carry guest egress, which teardown kills if any
+    /// outlive the machine. HVF: the attached `machine run`'s children.
+    /// Firecracker: the endpoints mvm started for the VM's state directory
+    /// ([`kvm::firecracker_endpoints`]) and the VMM from `fc.pid`.
     pub fn network_processes(self) -> &'static [&'static str] {
         match self {
             Self::Hvf => &session::NETWORK_PROCESSES,
-            Self::Firecracker => &[session::ENDPOINT],
+            Self::Firecracker => &[session::ENDPOINT, "firecracker"],
         }
     }
 }
@@ -362,12 +364,28 @@ impl Machine for MvmMachine {
             .sb
             .attach_pid()
             .ok_or("network machine has no attached mvmctl machine run")?;
-        *self.network_pids.lock().unwrap() = session::network_children_of(
-            self.host.as_ref(),
-            attach,
-            self.flavor.network_processes(),
-            self.flavor.name_of(),
-        )?;
+        let pids = match self.flavor {
+            Flavor::Hvf => session::network_children_of(
+                self.host.as_ref(),
+                attach,
+                self.flavor.network_processes(),
+                self.flavor.name_of(),
+            )?,
+            // mvm 0.28 detaches the endpoint from `machine run` (setsid), so
+            // it is found by the state directory it serves, not its parent.
+            Flavor::Firecracker => {
+                let root = session::mvm_root(&self.env)
+                    .map_err(|e| format!("cannot find the network processes: {e}"))?;
+                let mut pids = kvm::firecracker_endpoints(
+                    &kvm::list_processes(Path::new("/proc")),
+                    &root.join("vms").join(&self.sb.name),
+                    kvm::current_uid(),
+                )?;
+                pids.push(self.unprivileged_vmm()?.pid);
+                pids
+            }
+        };
+        *self.network_pids.lock().unwrap() = pids;
         Ok(())
     }
 
@@ -731,7 +749,7 @@ mod tests {
         );
         assert_eq!(
             Flavor::Firecracker.network_processes(),
-            ["mvm-network-endpoint"]
+            ["mvm-network-endpoint", "firecracker"]
         );
     }
 

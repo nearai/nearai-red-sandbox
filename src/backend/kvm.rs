@@ -143,6 +143,130 @@ pub fn current_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// The argument mvm 0.28 starts a VM-lifetime `mvm-network-endpoint` with,
+/// followed by the VM's state directory (`VM_LIFETIME_FLAG` in mvm-vmm's
+/// `host/network_endpoint_spawn.rs`).
+pub const ENDPOINT_STATE_DIR_FLAG: &str = "--vm-state-dir";
+
+/// One host process, as `/proc/<pid>` describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessEntry {
+    pub pid: u32,
+    pub ppid: u32,
+    /// The real uid.
+    pub uid: u32,
+    /// The basename of `exe`, without the kernel's ` (deleted)` suffix.
+    pub exe: String,
+    /// `cmdline`, split at NUL.
+    pub argv: Vec<String>,
+}
+
+/// Every process under `proc_root` (`/proc`) whose `exe`, `status` and
+/// `cmdline` this user can read. The rest (other users' processes, kernel
+/// threads, ones that exited meanwhile) are skipped.
+pub fn list_processes(proc_root: &Path) -> Vec<ProcessEntry> {
+    let Ok(dir) = fs::read_dir(proc_root) else {
+        return Vec::new();
+    };
+    let mut procs: Vec<ProcessEntry> = dir
+        .flatten()
+        .filter_map(|entry| {
+            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            let p = entry.path();
+            let exe = fs::read_link(p.join("exe")).ok()?;
+            let exe = exe.to_str()?;
+            let exe = exe.strip_suffix(" (deleted)").unwrap_or(exe);
+            let exe = Path::new(exe).file_name()?.to_str()?.to_string();
+            let status = fs::read_to_string(p.join("status")).ok()?;
+            let field = |key: &str| -> Option<u32> {
+                status
+                    .lines()
+                    .find_map(|l| l.strip_prefix(key))?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            };
+            let (ppid, uid) = (field("PPid:")?, field("Uid:")?);
+            let cmdline = fs::read(p.join("cmdline")).ok()?;
+            let body = cmdline.strip_suffix(&[0]).unwrap_or(&cmdline);
+            let argv = body
+                .split(|&b| b == 0)
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect();
+            Some(ProcessEntry {
+                pid,
+                ppid,
+                uid,
+                exe,
+                argv,
+            })
+        })
+        .collect();
+    procs.sort_by_key(|p| p.pid);
+    procs
+}
+
+/// The egress processes mvm started for the Firecracker VM whose state
+/// directory is `state_dir`: the VM-lifetime `mvm-network-endpoint` keeper
+/// (started with `--vm-state-dir <state_dir>` and detached with setsid, so
+/// soon not a child of `machine run`), then the endpoints it runs.
+///
+/// Fail-closed: refuses unless exactly one endpoint names `state_dir` as
+/// that argument, and it runs as `uid`.
+pub fn firecracker_endpoints(
+    procs: &[ProcessEntry],
+    state_dir: &Path,
+    uid: u32,
+) -> Result<Vec<u32>, String> {
+    const ENDPOINT: &str = crate::session::ENDPOINT;
+    let fail = |why: String| {
+        format!(
+            "cannot find the network endpoint of the VM at {}: {why}",
+            state_dir.display()
+        )
+    };
+    let keepers: Vec<&ProcessEntry> = procs
+        .iter()
+        .filter(|p| {
+            p.exe == ENDPOINT
+                && p.argv
+                    .windows(2)
+                    .any(|w| w[0] == ENDPOINT_STATE_DIR_FLAG && Path::new(&w[1]) == state_dir)
+        })
+        .collect();
+    let keeper = match keepers.as_slice() {
+        [] => {
+            return Err(fail(format!(
+                "no {ENDPOINT} {ENDPOINT_STATE_DIR_FLAG} {} is running",
+                state_dir.display()
+            )));
+        }
+        [one] => *one,
+        many => {
+            let pids: Vec<u32> = many.iter().map(|p| p.pid).collect();
+            return Err(fail(format!(
+                "{} endpoints claim it (pids {pids:?})",
+                many.len()
+            )));
+        }
+    };
+    if keeper.uid != uid {
+        return Err(fail(format!(
+            "{ENDPOINT} pid {} runs as uid {}, not this user's uid {uid}",
+            keeper.pid, keeper.uid
+        )));
+    }
+    let mut pids = vec![keeper.pid];
+    pids.extend(
+        procs
+            .iter()
+            .filter(|p| p.ppid == keeper.pid && p.exe == ENDPOINT && p.uid == uid)
+            .map(|p| p.pid),
+    );
+    Ok(pids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +420,159 @@ mod tests {
         );
         assert!(check_vmm_uid(&Ps("", 1), 4244, 501).is_err());
         assert!(check_vmm_uid(&Ps("x\n", 0), 4244, 501).is_err());
+    }
+
+    /// `/proc` on rts-linux while the allowlist invariant ran (mvm
+    /// 0.28.0-rts.2, Firecracker): `machine run`, the VM-lifetime endpoint
+    /// keeper (already reparented from `machine run` in other samples), its
+    /// endpoint child, and the VMM in its own systemd scope.
+    fn captured() -> Vec<ProcessEntry> {
+        let p = |pid, ppid, exe: &str, argv: &[&str]| ProcessEntry {
+            pid,
+            ppid,
+            uid: 1000,
+            exe: exe.into(),
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+        };
+        let bin = "/home/rts/.local/mvm/v0.28.0-rts.2";
+        vec![
+            p(
+                52114,
+                52016,
+                "mvmctl",
+                &[
+                    &format!("{bin}/mvmctl"),
+                    "machine",
+                    "run",
+                    "--name",
+                    "rts-3d90ff83e6c6",
+                    "--ttl",
+                    "1h",
+                ],
+            ),
+            p(
+                53971,
+                1,
+                "mvm-network-endpoint",
+                &[
+                    &format!("{bin}/mvm-network-endpoint"),
+                    "--vm-state-dir",
+                    "/home/rts/.mvm-live2/vms/rts-3d90ff83e6c6",
+                ],
+            ),
+            p(
+                53973,
+                53971,
+                "mvm-network-endpoint",
+                &[&format!("{bin}/mvm-network-endpoint")],
+            ),
+            p(
+                54022,
+                1,
+                "firecracker",
+                &[
+                    &format!("{bin}/firecracker/firecracker"),
+                    "--api-sock",
+                    "/home/rts/.mvm-live2/vms/rts-3d90ff83e6c6/fc.socket",
+                ],
+            ),
+        ]
+    }
+
+    const STATE_DIR: &str = "/home/rts/.mvm-live2/vms/rts-3d90ff83e6c6";
+
+    #[test]
+    fn the_endpoint_is_found_by_its_vm_state_dir_not_its_parent() {
+        let procs = captured();
+        assert_eq!(
+            firecracker_endpoints(&procs, Path::new(STATE_DIR), 1000).unwrap(),
+            [53971, 53973]
+        );
+        // A trailing slash names the same directory.
+        assert_eq!(
+            firecracker_endpoints(&procs, Path::new(&format!("{STATE_DIR}/")), 1000).unwrap(),
+            [53971, 53973]
+        );
+    }
+
+    #[test]
+    fn no_endpoint_for_this_vm_is_refused() {
+        let procs = captured();
+        let e = firecracker_endpoints(
+            &procs,
+            Path::new("/home/rts/.mvm-live2/vms/rts-000000000000"),
+            1000,
+        )
+        .unwrap_err();
+        assert!(e.contains("no mvm-network-endpoint"), "{e}");
+        // The state dir in another argument position, or a prefix of it, is not a claim.
+        let mut prefix = captured();
+        prefix[1].argv[2] = format!("{STATE_DIR}-other");
+        assert!(firecracker_endpoints(&prefix, Path::new(STATE_DIR), 1000).is_err());
+        let mut elsewhere = captured();
+        elsewhere[1].argv = vec!["mvm-network-endpoint".into(), STATE_DIR.into()];
+        assert!(firecracker_endpoints(&elsewhere, Path::new(STATE_DIR), 1000).is_err());
+        // Another program carrying the flag is not an endpoint.
+        let mut impostor = captured();
+        impostor[1].exe = "sh".into();
+        assert!(firecracker_endpoints(&impostor, Path::new(STATE_DIR), 1000).is_err());
+    }
+
+    #[test]
+    fn two_endpoints_or_another_users_endpoint_are_refused() {
+        let mut two = captured();
+        let mut second = two[1].clone();
+        second.pid = 60000;
+        two.push(second);
+        let e = firecracker_endpoints(&two, Path::new(STATE_DIR), 1000).unwrap_err();
+        assert!(e.contains("53971") && e.contains("60000"), "{e}");
+        let mut foreign = captured();
+        foreign[1].uid = 0;
+        let e = firecracker_endpoints(&foreign, Path::new(STATE_DIR), 1000).unwrap_err();
+        assert!(e.contains("uid 0"), "{e}");
+        // A child running as another user is not counted as ours.
+        let mut child = captured();
+        child[2].uid = 1001;
+        assert_eq!(
+            firecracker_endpoints(&child, Path::new(STATE_DIR), 1000).unwrap(),
+            [53971]
+        );
+    }
+
+    #[test]
+    fn processes_are_read_from_proc_and_unreadable_ones_skipped() {
+        let d = tempfile::tempdir().unwrap();
+        let proc_dir = |pid: &str, exe: &str, status: &str, cmdline: &[u8]| {
+            let p = d.path().join(pid);
+            fs::create_dir_all(&p).unwrap();
+            std::os::unix::fs::symlink(exe, p.join("exe")).unwrap();
+            fs::write(p.join("status"), status).unwrap();
+            fs::write(p.join("cmdline"), cmdline).unwrap();
+        };
+        proc_dir(
+            "53971",
+            "/opt/mvm/mvm-network-endpoint (deleted)",
+            "Name:\tmvm-network-end\nPPid:\t1\nUid:\t1000\t1000\t1000\t1000\n",
+            b"/opt/mvm/mvm-network-endpoint\0--vm-state-dir\0/s/vms/a b\0\0",
+        );
+        // No exe link (another user's, or a kernel thread): skipped.
+        fs::create_dir_all(d.path().join("2")).unwrap();
+        fs::create_dir_all(d.path().join("self")).unwrap();
+        let procs = list_processes(d.path());
+        assert_eq!(
+            procs,
+            [ProcessEntry {
+                pid: 53971,
+                ppid: 1,
+                uid: 1000,
+                exe: "mvm-network-endpoint".into(),
+                argv: vec![
+                    "/opt/mvm/mvm-network-endpoint".into(),
+                    "--vm-state-dir".into(),
+                    "/s/vms/a b".into(),
+                    String::new()
+                ],
+            }]
+        );
     }
 }
