@@ -79,5 +79,7 @@ name="rts-$version-$target.tar.gz"
 epoch="${SOURCE_DATE_EPOCH:-$(git -C "$here" log -1 --format=%ct)}"
 tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
   -C "$stage" -cf - bin share | gzip -n -9 > "$out/$name"
-(cd "$out" && sha256sum "$name" > "$name.sha256" && cat "$name.sha256")
+# `<sha256>  <name>`, written out: sha256sum on Windows prefixes the name
+# with `*` (binary mode), which breaks readers of SHA256SUMS by field.
+(cd "$out" && printf '%s  %s\n' "$(sha256sum "$name" | cut -d' ' -f1)" "$name" > "$name.sha256" && cat "$name.sha256")
 tar -tvzf "$out/$name"

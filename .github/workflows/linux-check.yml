@@ -55,6 +55,7 @@ jobs:
           set -euo pipefail
           scripts/package-linux.sh --version 0.0.0-ci --rts target/release/rts --out "$RUNNER_TEMP/dist" --target "$TARGET"
           archive="$RUNNER_TEMP/dist/rts-0.0.0-ci-$TARGET.tar.gz"
+          scripts/release/check-sha256-lines.sh "$archive.sha256"
           mkdir "$RUNNER_TEMP/smoke"
           tar -xzf "$archive" -C "$RUNNER_TEMP/smoke"
           "$RUNNER_TEMP/smoke/bin/rts" --version

@@ -389,6 +389,7 @@ jobs:
             --rts target/x86_64-pc-windows-msvc/release/rts.exe \
             --egress target/x86_64-pc-windows-msvc/egress/rts-egress.exe \
             --out "$RUNNER_TEMP/dist-windows"
+          scripts/release/check-sha256-lines.sh "$RUNNER_TEMP/dist-windows/rts-$V-x86_64-pc-windows-msvc.tar.sha256"
           RTS_RELEASE_TAR="$RUNNER_TEMP/dist-windows/rts-$V-x86_64-pc-windows-msvc.tar" \
             cargo test --locked --target x86_64-pc-windows-msvc --lib -- --ignored --exact \
             backend::hyperv::setup::tests::a_built_release_archive_installs_into_a_prefix
@@ -457,6 +458,7 @@ jobs:
           set -euo pipefail
           scripts/package-linux.sh --version "$V" --rts target/release/rts --out "$RUNNER_TEMP/dist-linux" --target "$TARGET"
           archive="$RUNNER_TEMP/dist-linux/rts-$V-$TARGET.tar.gz"
+          scripts/release/check-sha256-lines.sh "$archive.sha256"
           mkdir "$RUNNER_TEMP/smoke"
           tar -xzf "$archive" -C "$RUNNER_TEMP/smoke"
           [ "$("$RUNNER_TEMP/smoke/bin/rts" --version)" = "rts $V" ] || { echo "refusing: packaged rts --version is not rts $V" >&2; exit 1; }
@@ -520,6 +522,13 @@ jobs:
             grep -qF "  $linux" SHA256SUMS || cat "$RUNNER_TEMP/dist-linux-$arch/$linux.sha256" >> SHA256SUMS
           done
           sha256sum -c SHA256SUMS
+          # Every line `<sha256>  <name>`, and every file published from
+          # dist/ but SHA256SUMS itself listed in it.
+          "$GITHUB_WORKSPACE/scripts/release/check-sha256-lines.sh" SHA256SUMS
+          for f in *; do
+            [ "$f" = SHA256SUMS ] && continue
+            awk -v f="$f" '$2 == f { found = 1 } END { exit !found }' SHA256SUMS || { echo "refusing: $f is not listed in SHA256SUMS" >&2; exit 1; }
+          done
 
       # A re-run of this job after the release was created but the tap step
       # failed finds the release already there. It skips creation only when the

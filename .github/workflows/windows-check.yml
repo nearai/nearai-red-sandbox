@@ -111,6 +111,7 @@ jobs:
           scripts/package-windows.sh --version 0.0.0-ci \
             --rts target/x86_64-pc-windows-msvc/release/rts.exe \
             --egress target/x86_64-pc-windows-msvc/egress/rts-egress.exe --out "$RUNNER_TEMP/dist"
+          scripts/release/check-sha256-lines.sh "$RUNNER_TEMP/dist/rts-0.0.0-ci-x86_64-pc-windows-msvc.tar.sha256"
           RTS_RELEASE_TAR="$RUNNER_TEMP/dist/rts-0.0.0-ci-x86_64-pc-windows-msvc.tar" \
             cargo test --locked --target x86_64-pc-windows-msvc --lib -- --ignored --exact \
             backend::hyperv::setup::tests::a_built_release_archive_installs_into_a_prefix
