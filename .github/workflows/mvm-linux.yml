@@ -1,0 +1,291 @@
+name: mvm-linux
+
+# Builds the Linux x86_64 mvm release rts installs: the pinned nearai/mvm
+# commit in packaging/mvm/fork.lock (mvmctl, its host helpers and the locked
+# Firecracker in mvmctl-x86_64-unknown-linux-gnu.tar.gz, and the guest
+# runtime), as the fork's own release workflow did. On a signed mvm-v<version>
+# tag, the publish job signs every file with cosign keyless under this
+# workflow's identity, which the fork's binaries trust
+# (mvm_core::release_trust), and publishes the prerelease mvm-v<version>.
+#
+# Two jobs: build holds no write or signing authority and reads nothing but
+# this repository and the pinned commit; publish holds contents:write and
+# id-token:write and only verifies, signs and uploads what build produced.
+on:
+  pull_request:
+    paths:
+      - "packaging/mvm/**"
+      - ".github/workflows/mvm-linux.yml"
+  push:
+    tags:
+      - "mvm-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mvm-linux-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TARGET: x86_64-unknown-linux-gnu
+  BUILD_TARGET: x86_64-unknown-linux-musl
+  MVMCTL_RELEASE_FEATURES: host,user,release-artifact-bootstrap,release-channel,embed-host-bins
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read the pinned fork commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          lock=packaging/mvm/fork.lock
+          get() { grep -E "^$1=" "$lock" | head -1 | cut -d= -f2-; }
+          repo="$(get repository)" commit="$(get commit)" version="$(get version)"
+          [ "$repo" = nearai/mvm ] || { echo "refusing: fork.lock names $repo, not nearai/mvm" >&2; exit 1; }
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "refusing: fork.lock's commit is not a full SHA: $commit" >&2; exit 1; }
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rts\.[0-9]+$ ]] || { echo "refusing: fork.lock's version is malformed: $version" >&2; exit 1; }
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_NAME" != "mvm-v$version" ]; then
+            echo "refusing: tag $GITHUB_REF_NAME is not mvm-v$version from fork.lock" >&2
+            exit 1
+          fi
+          { echo "FORK_COMMIT=$commit"; echo "VERSION=$version"; } >> "$GITHUB_ENV"
+          # The fork replaces this checkout next (its composite actions read
+          # the workspace root), so keep this repository's signers aside.
+          cp packaging/mvm/allowed_signers "$RUNNER_TEMP/allowed_signers"
+
+      # The pinned fork commit, at the workspace root as its own release
+      # workflow expects; it replaces this repository's checkout.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: nearai/mvm
+          ref: ${{ env.FORK_COMMIT }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Require the pinned commit, its version and its signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          [ "$head" = "$FORK_COMMIT" ] || { echo "refusing: checked out $head, not $FORK_COMMIT" >&2; exit 1; }
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          [ "$version" = "$VERSION" ] || { echo "refusing: the fork commit is version $version, fork.lock says $VERSION" >&2; exit 1; }
+          git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$RUNNER_TEMP/allowed_signers" verify-commit HEAD
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.100.0
+          targets: x86_64-unknown-linux-musl,x86_64-unknown-linux-gnu
+
+      - uses: ./.github/actions/install-zigbuild
+
+      - name: Build mvmctl
+        env:
+          OPENSSL_STATIC: 1
+          OPENSSL_VENDORED: 1
+        run: cargo zigbuild --locked --profile release-min --target "${BUILD_TARGET}" --features "${MVMCTL_RELEASE_FEATURES}"
+
+      - name: Build per-VM host binaries
+        env:
+          OPENSSL_STATIC: 1
+          OPENSSL_VENDORED: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo zigbuild --locked --release --target "${BUILD_TARGET}" -p mvm-hostd -p mvm-gpu \
+            --bin mvm-host-agent \
+            --bin mvm-policy-coordinator \
+            --bin mvm-signer-helper \
+            --bin mvm-network-endpoint \
+            --bin mvm-broker \
+            --bin mvm-audit-signer \
+            --bin mvm-mailbox \
+            --bin mvm-actor-holder \
+            --bin mvm-actor-controller \
+            --bin mvm-gpu-endpoint
+          cargo zigbuild --locked --release --target "${TARGET}" -p mvm-hostlib --features mvm-client/release-channel
+          mkdir -p "target/${BUILD_TARGET}/release"
+          cp "target/${TARGET}/release/libmvm_hostlib.so" "target/${BUILD_TARGET}/release/libmvm_hostlib.so"
+
+      - name: Verify the release payloads are statically linked
+        shell: bash
+        run: |
+          set -euo pipefail
+          for binary in \
+            "target/${BUILD_TARGET}/release-min/mvmctl" \
+            "target/${BUILD_TARGET}/release/mvm-host-agent" \
+            "target/${BUILD_TARGET}/release/mvm-policy-coordinator" \
+            "target/${BUILD_TARGET}/release/mvm-signer-helper" \
+            "target/${BUILD_TARGET}/release/mvm-network-endpoint" \
+            "target/${BUILD_TARGET}/release/mvm-broker" \
+            "target/${BUILD_TARGET}/release/mvm-audit-signer"; do
+            description="$(file --brief "${binary}")"
+            echo "${binary}: ${description}"
+            [[ "${description}" == *"statically linked"* ]] || { echo "::error::${binary} is not statically linked" >&2; exit 1; }
+          done
+
+      - name: Smoke test mvmctl
+        run: |
+          "target/${BUILD_TARGET}/release-min/mvmctl" --version
+          "target/${BUILD_TARGET}/release-min/mvmctl" --version | grep -qx "mvmctl ${VERSION}"
+
+      - name: Build the guest runtime
+        run: cargo run --locked -p mvmctl -- dev guest-bins --out dist
+
+      - name: Stage and package the mvmctl archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE_NAME="mvmctl-${TARGET}"
+          mkdir -p "staging/${ARCHIVE_NAME}"
+          cp "target/${BUILD_TARGET}/release-min/mvmctl" "staging/${ARCHIVE_NAME}/"
+          for hostbin in mvm-host-agent mvm-policy-coordinator mvm-signer-helper mvm-network-endpoint \
+            mvm-broker mvm-audit-signer mvm-mailbox mvm-actor-holder mvm-actor-controller mvm-gpu-endpoint; do
+            cp "target/${BUILD_TARGET}/release/${hostbin}" "staging/${ARCHIVE_NAME}/"
+          done
+          scripts/release/stage-firecracker.sh x86_64 "staging/${ARCHIVE_NAME}/firecracker"
+          cp "target/${BUILD_TARGET}/release/libmvm_hostlib.so" "staging/${ARCHIVE_NAME}/"
+          cp -r assets "staging/${ARCHIVE_NAME}/" 2>/dev/null || true
+          cp README.md LICENSE "staging/${ARCHIVE_NAME}/"
+          cp crates/deps/mvm-macho-sign/LICENSE "staging/${ARCHIVE_NAME}/LICENSE-MPL-2.0.txt"
+          printf '%s\n' \
+            'This release contains mvm-macho-sign, modified MPL-2.0 Covered Software adapted from apple-codesign 0.29.0, Copyright Gregory Szorc.' \
+            'LICENSE-MPL-2.0.txt governs those files, not Apache-2.0 alone.' \
+            'Corresponding source, including modifications, is available under MPL-2.0 at:' \
+            "https://github.com/nearai/mvm/tree/${FORK_COMMIT}/crates/deps/mvm-macho-sign" \
+            > "staging/${ARCHIVE_NAME}/THIRD_PARTY_NOTICES.txt"
+          cargo run --locked --package xtask --features man -- emit-backend-components-tsv > "staging/${ARCHIVE_NAME}/components.tsv"
+          test -s "staging/${ARCHIVE_NAME}/components.tsv"
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          tar -C staging -czf "$RUNNER_TEMP/artifacts/${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+          (cd "$RUNNER_TEMP/artifacts" && sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256")
+
+      - name: Collect the guest runtime and the checksum manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime="mvm-guest-bins-v${VERSION}.tar.gz"
+          test -f "dist/${runtime}" && test -f "dist/${runtime}.sha256"
+          (cd dist && sha256sum --check "${runtime}.sha256")
+          cp "dist/${runtime}" "dist/${runtime}.sha256" "$RUNNER_TEMP/artifacts/"
+          cd "$RUNNER_TEMP/artifacts"
+          cat ./*.sha256 > checksums-sha256.txt
+          cat checksums-sha256.txt
+          echo "$FORK_COMMIT" > fork-commit.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mvm-linux
+          path: ${{ runner.temp }}/artifacts
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/mvm-v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # The signers come from the default branch, so a tag cannot bring its own.
+      - name: Require an SSH signature on the tag by an allowed signer
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}" "+refs/heads/main:refs/remotes/origin/main"
+          git show origin/main:packaging/mvm/allowed_signers > "$RUNNER_TEMP/allowed_signers" || {
+            echo "refusing: main has no packaging/mvm/allowed_signers yet; tags are verifiable only after it merges" >&2
+            exit 1
+          }
+          [ "$(git cat-file -t "$GITHUB_REF_NAME")" = tag ] || { echo "refusing: $GITHUB_REF_NAME is not an annotated, signed tag" >&2; exit 1; }
+          git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$RUNNER_TEMP/allowed_signers" verify-tag "$GITHUB_REF_NAME"
+
+      - name: Refuse a release that already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "refusing: release $GITHUB_REF_NAME already exists" >&2
+            exit 1
+          fi
+
+      - name: Download this run's build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/artifacts"
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name mvm-linux --dir "$out"
+          cd "$out"
+          sha256sum --check checksums-sha256.txt
+          version="${GITHUB_REF_NAME#mvm-v}"
+          for f in mvmctl-x86_64-unknown-linux-gnu.tar.gz "mvm-guest-bins-v${version}.tar.gz" checksums-sha256.txt fork-commit.txt; do
+            [ -f "$f" ] || { echo "refusing: $f is missing from the build" >&2; exit 1; }
+          done
+          ls -l
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v2.5.2
+
+      - name: Sign every published file (cosign keyless)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/artifacts"
+          for blob in ./*.tar.gz ./*.sha256 checksums-sha256.txt; do
+            cosign sign-blob --yes --new-bundle-format --bundle "${blob}.bundle" "${blob}"
+          done
+
+      # The identity mvm_core::release_trust names for this fork's CLI train.
+      - name: Verify the signatures under this workflow's identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/artifacts"
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/mvm-linux.yml@refs/tags/${GITHUB_REF_NAME}"
+          for blob in ./*.tar.gz ./*.sha256 checksums-sha256.txt; do
+            cosign verify-blob --bundle "${blob}.bundle" \
+              --certificate-identity "${identity}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com "${blob}"
+          done
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/artifacts/*.tar.gz
+            ${{ runner.temp }}/artifacts/checksums-sha256.txt
+
+      - name: Publish the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(cat "$RUNNER_TEMP/artifacts/fork-commit.txt")"
+          gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP"/artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --prerelease \
+            --latest=false \
+            --title "mvm ${GITHUB_REF_NAME#mvm-v} for rts (Linux x86_64)" \
+            --notes "The Linux x86_64 mvm build rts installs: nearai/mvm ${commit} (packaging/mvm/fork.lock), built and signed by .github/workflows/mvm-linux.yml with cosign keyless; that identity at this tag is what the build's own mvmctl trusts. checksums-sha256.txt lists every file. Not an rts release."
