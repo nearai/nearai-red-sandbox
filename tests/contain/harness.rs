@@ -213,6 +213,8 @@ pub struct Harness {
     pub empty_git_config: PathBuf,
     /// mvm's root for `run` (MVM_HOME, else HOME/.mvm).
     pub mvm_root: PathBuf,
+    /// The sudo shim directory on a Firecracker `run`'s PATH.
+    pub sudo_shim: PathBuf,
 }
 
 #[cfg(unix)]
@@ -258,13 +260,14 @@ fn probe() -> Result<Harness, String> {
     fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
     let empty_git_config = scratch.join("empty.gitconfig");
     fs::write(&empty_git_config, "").map_err(|e| e.to_string())?;
+    let sudo_shim = scratch.join("sudo-shim");
     // HVF: the patched supervisor. Firecracker: /dev/kvm and the
     // environment a session gives mvmctl (sudo shim, no standby pool).
     let runner = match Flavor::native() {
         Flavor::Hvf => patched_runner(mvmctl.clone(), empty_git_config.clone(), &env, &RealHost)?,
         Flavor::Firecracker => {
             rts::backend::kvm::check_kvm(Path::new(rts::backend::kvm::KVM_DEVICE))?;
-            let extra_env = MvmBackend::mvmctl_environment(Flavor::Firecracker, &env, None, &scratch.join("sudo-shim"))?;
+            let extra_env = MvmBackend::mvmctl_environment(Flavor::Firecracker, &env, None, &sudo_shim)?;
             SpawnRunner { mvmctl: mvmctl.clone(), empty_git_config: empty_git_config.clone(), extra_env, remove_env: Vec::new() }
         }
     };
@@ -278,7 +281,7 @@ fn probe() -> Result<Harness, String> {
         return Err(format!("mvmctl doctor failed: {}", String::from_utf8_lossy(&r.stderr).trim()));
     }
     let image = std::env::var("RTS_IMAGE").unwrap_or_else(|_| default_image().into());
-    Ok(Harness { mvmctl, image, run, empty_git_config, mvm_root })
+    Ok(Harness { mvmctl, image, run, empty_git_config, mvm_root, sudo_shim })
 }
 
 /// Ignored tests run only by explicit request, so missing prerequisites must fail
@@ -388,6 +391,8 @@ pub fn bridge_options_with(h: &Harness, machine: &str, state_dir: &Path, proxy: 
         "timeoutMs": 120_000,
         "maxOutputBytes": 65_536,
         "mvmHome": std::env::var("HOME").unwrap_or_default(),
+        "mvmRoot": h.mvm_root,
+        "sudoShim": h.sudo_shim,
     });
     if proxy {
         o["proxy"] = json!(true);
