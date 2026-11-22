@@ -9,7 +9,18 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Defaults;
 
-pub const MVM_VERSION: &str = "0.22.0";
+/// Upstream mvm (tinylabscom/mvm), for macOS (with the patched HVF
+/// supervisor) and Linux aarch64.
+pub const MVM_VERSION_UPSTREAM: &str = "0.22.0";
+/// The nearai/mvm fork rts builds and signs for Linux x86_64
+/// (.github/workflows/mvm-linux.yml, packaging/mvm/fork.lock).
+pub const MVM_VERSION_LINUX_X86_64: &str = "0.28.0-rts.2";
+/// The mvm version this build installs and requires.
+pub const MVM_VERSION: &str = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    MVM_VERSION_LINUX_X86_64
+} else {
+    MVM_VERSION_UPSTREAM
+};
 
 const SHARE: &str = "share/nearai-red-sandbox";
 const HOME_SHARE: &str = ".local/share/nearai-red-sandbox";
@@ -189,7 +200,7 @@ mod tests {
         let d = defaults(&lookup);
         assert_eq!(d.plugin_dir, prefix.join("share/nearai-red-sandbox/plugin"));
         assert_eq!(d.sessions_dir, home.join(".local/share/nearai-red-sandbox/sessions"));
-        assert_eq!(d.mvmctl, home.join(".local/mvm/v0.22.0/mvmctl"));
+        assert_eq!(d.mvmctl, home.join(format!(".local/mvm/v{MVM_VERSION}/mvmctl")));
         assert_eq!(d.opencode, "opencode");
         // An installed rts finds its egress proxy in the prefix's libexec;
         // the guest files stay where setup puts them for this user.
@@ -221,7 +232,7 @@ mod tests {
         let d = defaults(&Lookup { source: Path::new("/src"), prefix: Some(&bare), home: &home, rts_mvmctl: None });
         assert_eq!(d.plugin_dir, PathBuf::from("/src/plugin"));
         assert_eq!(d.sessions_dir, PathBuf::from("/src/sessions"));
-        assert_eq!(d.mvmctl, home.join(".local/mvm/v0.22.0/mvmctl"));
+        assert_eq!(d.mvmctl, home.join(format!(".local/mvm/v{MVM_VERSION}/mvmctl")));
         // A source build runs the proxy from beside rts.exe.
         assert_eq!(d.hyperv, crate::config::HyperVPaths::default());
     }
@@ -273,7 +284,10 @@ mod tests {
         assert_eq!(prefix_plugin(p), PathBuf::from("/p/share/nearai-red-sandbox/plugin"));
         assert_eq!(prefix_supervisor(p), PathBuf::from("/p/libexec/nearai-red-sandbox/mvm-hvf-supervisor"));
         assert_eq!(home_supervisor(h), PathBuf::from("/h/.local/share/nearai-red-sandbox/mvm-hvf-supervisor"));
-        assert_eq!(mvm_dir(h), PathBuf::from("/h/.local/mvm/v0.22.0"));
+        assert_eq!(mvm_dir(h), PathBuf::from(format!("/h/.local/mvm/v{MVM_VERSION}")));
+        // Linux x86_64 runs the rts-built fork; every other target upstream.
+        assert_eq!(MVM_VERSION, if cfg!(all(target_os = "linux", target_arch = "x86_64")) { MVM_VERSION_LINUX_X86_64 } else { MVM_VERSION_UPSTREAM });
+        assert_eq!((MVM_VERSION_UPSTREAM, MVM_VERSION_LINUX_X86_64), ("0.22.0", "0.28.0-rts.2"));
         assert_eq!(opencode_dir(h), PathBuf::from("/h/.local/share/nearai-red-sandbox/opencode/2.2.2"));
         assert_eq!(home_sessions(h), PathBuf::from("/h/.local/share/nearai-red-sandbox/sessions"));
         assert_eq!(update_cache(h), PathBuf::from("/h/.local/share/nearai-red-sandbox/update-check.json"));

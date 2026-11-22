@@ -19,7 +19,7 @@ use url::Url;
 #[cfg(unix)]
 use crate::backend::mvm::Flavor;
 use crate::config::{Defaults, default_image};
-use crate::install::{MVM_VERSION, mvm_dir, opencode_dir};
+use crate::install::{MVM_VERSION, MVM_VERSION_LINUX_X86_64, MVM_VERSION_UPSTREAM, mvm_dir, opencode_dir};
 use crate::mvm::{RunOutput, Runner, SpawnRunner, tail};
 use crate::session::{Host, OPENCODE_VERSION, SUPERVISOR_FIX_VERSION, check_opencode, check_supervisor_contract, check_supervisor_marker};
 
@@ -204,24 +204,31 @@ pub fn mvm() -> Component {
     mvm_for(Target::host().unwrap_or(Target::MacosAarch64))
 }
 
-/// mvm's release asset for `t`. Digests are GitHub's asset digests,
-/// matching mvm's signed `checksums-sha256.txt` for the release.
+/// sha256 of mvmctl-x86_64-unknown-linux-gnu.tar.gz in the rts repository's
+/// mvm-v0.28.0-rts.2 release, from its cosign-verified checksums-sha256.txt.
+const LINUX_X86_64_MVM_SHA256: &str =
+    "72074ab37d0cd42e859f24360f4efadf30e025334600d54c938c3e1180fad61e";
+
+/// mvm's release asset for `t`. Upstream digests are GitHub's asset digests,
+/// matching mvm's signed `checksums-sha256.txt` for the release. Linux x86_64
+/// is the nearai/mvm fork rts builds and signs itself (upstream v0.22.0's
+/// Linux egress is broken, tinylabscom/mvm#3962), published by this
+/// repository's .github/workflows/mvm-linux.yml as release mvm-v<version>.
 pub fn mvm_for(t: Target) -> Component {
-    let (triple, sha256) = match t {
-        Target::MacosAarch64 => ("aarch64-apple-darwin", "1f2c80b253add28c3856080e3f3a10aa1163f1aef0a7d413ded15100bdcd0c69"),
-        // TODO(linux-mvm-pin): Linux x86_64 must move to the nearai/mvm fork
-        // release v0.28.0-rts.1 (mvmctl-x86_64-unknown-linux-gnu.tar.gz from
-        // https://github.com/nearai/mvm/releases, with MVM_VERSION 0.28.0-rts.1
-        // on this target) once that release exists and its sha256 is known.
-        // Until then this is upstream v0.22.0, whose Linux egress is broken
-        // (tinylabscom/mvm#3962).
-        Target::LinuxX86_64 => ("x86_64-unknown-linux-gnu", "502e84ea3fa1ff04b0138fb6c3cb47b3a72c730d72c8f468df55e01d99c94d64"),
-        Target::LinuxAarch64 => ("aarch64-unknown-linux-gnu", "dafb1d9ebb9480b26841c772bee6322015b727b8cc2bc67d82056631101122f9"),
+    let upstream = |triple: &str| format!("https://github.com/tinylabscom/mvm/releases/download/v{MVM_VERSION_UPSTREAM}/mvmctl-{triple}.tar.gz");
+    let (version, url, sha256) = match t {
+        Target::MacosAarch64 => (MVM_VERSION_UPSTREAM, upstream("aarch64-apple-darwin"), "1f2c80b253add28c3856080e3f3a10aa1163f1aef0a7d413ded15100bdcd0c69"),
+        Target::LinuxX86_64 => (
+            MVM_VERSION_LINUX_X86_64,
+            format!("https://github.com/nearai/nearai-red-sandbox/releases/download/mvm-v{MVM_VERSION_LINUX_X86_64}/mvmctl-x86_64-unknown-linux-gnu.tar.gz"),
+            LINUX_X86_64_MVM_SHA256,
+        ),
+        Target::LinuxAarch64 => (MVM_VERSION_UPSTREAM, upstream("aarch64-unknown-linux-gnu"), "dafb1d9ebb9480b26841c772bee6322015b727b8cc2bc67d82056631101122f9"),
     };
     Component {
         name: "mvm",
-        version: MVM_VERSION,
-        url: format!("https://github.com/tinylabscom/mvm/releases/download/v{MVM_VERSION}/mvmctl-{triple}.tar.gz"),
+        version,
+        url,
         sha256: sha256.into(),
         max_bytes: 64 << 20,
         unpack: Unpack::TarGzStrip1,
@@ -1258,18 +1265,31 @@ mod tests {
             assert_eq!((mvm().url, opencode().url), (mvm_for(Target::MacosAarch64).url, opencode_for(Target::MacosAarch64).url));
         }
         assert_eq!(opencode_for(Target::MacosAarch64).unpack, Unpack::Zip);
+        // Linux x86_64 runs the nearai/mvm fork rts builds and signs
+        // (.github/workflows/mvm-linux.yml, release mvm-v<version>); the
+        // other targets stay on upstream 0.22.0.
         let cases = [
-            (Target::LinuxX86_64, "mvmctl-x86_64-unknown-linux-gnu.tar.gz", "502e84ea3fa1ff04b0138fb6c3cb47b3a72c730d72c8f468df55e01d99c94d64", "opencode-linux-x64.tar.gz", "3a38b8c284450a5ca81a2c1ebbf29ebe05e618518f095da0066652167eb0eb33"),
-            (Target::LinuxAarch64, "mvmctl-aarch64-unknown-linux-gnu.tar.gz", "dafb1d9ebb9480b26841c772bee6322015b727b8cc2bc67d82056631101122f9", "opencode-linux-arm64.tar.gz", "dd866cebb72d11c91a7a7c4c3fd961ee06e03a9d0a5ff8eaa2a8ebebf25de7ba"),
+            (Target::LinuxX86_64, "https://github.com/nearai/nearai-red-sandbox/releases/download/mvm-v0.28.0-rts.2/mvmctl-x86_64-unknown-linux-gnu.tar.gz", "0.28.0-rts.2", LINUX_X86_64_MVM_SHA256, "opencode-linux-x64.tar.gz", "3a38b8c284450a5ca81a2c1ebbf29ebe05e618518f095da0066652167eb0eb33"),
+            (Target::LinuxAarch64, "https://github.com/tinylabscom/mvm/releases/download/v0.22.0/mvmctl-aarch64-unknown-linux-gnu.tar.gz", "0.22.0", "dafb1d9ebb9480b26841c772bee6322015b727b8cc2bc67d82056631101122f9", "opencode-linux-arm64.tar.gz", "dd866cebb72d11c91a7a7c4c3fd961ee06e03a9d0a5ff8eaa2a8ebebf25de7ba"),
         ];
-        for (target, mvm_asset, mvm_sha, oc_asset, oc_sha) in cases {
+        for (target, mvm_url, mvm_version, mvm_sha, oc_asset, oc_sha) in cases {
             let (m, o) = (mvm_for(target), opencode_for(target));
-            assert_eq!(m.url, format!("https://github.com/tinylabscom/mvm/releases/download/v0.22.0/{mvm_asset}"));
+            assert_eq!((m.url.as_str(), m.version), (mvm_url, mvm_version));
             assert_eq!(o.url, format!("https://github.com/anomalyco/opencode/releases/download/v2.2.2/{oc_asset}"));
             assert_eq!((m.sha256.as_str(), o.sha256.as_str()), (mvm_sha, oc_sha));
             assert_eq!((m.unpack, o.unpack), (Unpack::TarGzStrip1, Unpack::TarGz));
             assert_eq!((m.binary, o.binary), ("mvmctl", "opencode"));
             assert!(allowed_url(&m.url).is_ok() && allowed_url(&o.url).is_ok());
+        }
+    }
+
+    /// Every mvm pin is a real sha256: a placeholder fails here, so nothing
+    /// ships pinning an asset that does not exist yet.
+    #[test]
+    fn every_mvm_pin_is_a_sha256() {
+        for t in [Target::MacosAarch64, Target::LinuxX86_64, Target::LinuxAarch64] {
+            let sha = mvm_for(t).sha256;
+            assert!(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)), "{t:?}: {sha}");
         }
     }
 
@@ -1376,7 +1396,7 @@ mod tests {
 
     fn plain_ok(a: &[String]) -> io::Result<RunOutput> {
         Ok(match a.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-            ["--version"] => out(0, "mvmctl 0.22.0\n", ""),
+            ["--version"] => out(0, &format!("mvmctl {MVM_VERSION}\n"), ""),
             ["env", "sign"] => out(0, "", ""),
             _ => panic!("unexpected mvm_plain call {a:?}"),
         })
@@ -1650,7 +1670,7 @@ mod tests {
         );
         assert!(!has_word(&s.mvm.calls(), "sign"), "env sign went to the supervisor-pinned runner");
         assert_eq!(lines.len(), 4, "{lines:?}"); // mvm, supervisor, opencode, image
-        assert!(lines[0].contains("mvm 0.22.0") && lines[0].contains(".local/mvm/v0.22.0"), "{lines:?}");
+        assert!(lines[0].contains(&format!("mvm {MVM_VERSION}")) && lines[0].contains(&format!(".local/mvm/v{MVM_VERSION}")), "{lines:?}");
         assert!(lines[1].contains("rts-vsock-drain-v1") && lines[1].contains(&sup), "{lines:?}");
         assert!(lines[2].contains("opencode 2.2.2") && lines[2].contains(&oc), "{lines:?}");
         assert!(lines[3].contains(default_image()), "{lines:?}");
@@ -1774,7 +1794,7 @@ mod tests {
             assert!(!has_word(&calls, "sign") && !has_word(&calls, "pull"), "{calls:?}");
         }
         assert!(e.lines().count() >= 2 && e.contains("run rts setup"), "{e}"); // every failure reported, not just the first
-        assert!(e.contains("mvm 0.22.0") && e.contains("opencode 2.2.2"), "{e}");
+        assert!(e.contains(&format!("mvm {MVM_VERSION}")) && e.contains("opencode 2.2.2"), "{e}");
         assert!(!r.home.join(".local").exists());
     }
 

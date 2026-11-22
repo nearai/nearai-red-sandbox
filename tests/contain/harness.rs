@@ -234,7 +234,7 @@ fn patched_runner(mvmctl: PathBuf, empty_git_config: PathBuf, env: &[(String, St
 fn probe() -> Result<Harness, String> {
     let env: Vec<(String, String)> = std::env::vars().collect();
     let home = env.iter().find(|(key, _)| key == "HOME").map(|(_, value)| value.as_str()).unwrap_or_default();
-    let mvmctl = std::env::var_os("RTS_MVMCTL").map(PathBuf::from).unwrap_or_else(|| Path::new(&home).join(".local/mvm/v0.22.0/mvmctl"));
+    let mvmctl = std::env::var_os("RTS_MVMCTL").map(PathBuf::from).unwrap_or_else(|| rts::install::mvm_dir(Path::new(&home)).join("mvmctl"));
     let scratch = std::env::temp_dir().join(format!("rts-contain-{}", random_hex(6)));
     fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
     let empty_git_config = scratch.join("empty.gitconfig");
