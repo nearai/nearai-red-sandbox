@@ -540,13 +540,15 @@ fn install_release_components(
 /// installed from it and it holds no supervisor
 /// (`rts-<version>-x86_64-unknown-linux-gnu.tar.gz`).
 ///
-/// MVM_HOME: on macOS and on Linux, the runners in `c` (`mvm_plain` and
-/// `mvm`), and the ones the embedder later launches sessions with, must
-/// run mvmctl with `HOME=<prefix>` and `MVM_HOME=<prefix>/mvm`. mvmctl's
-/// root is MVM_HOME, else `HOME/.mvm`; its image cache, VM state and (Linux)
-/// the guest runtime `mvmctl bootstrap` installs live there, so a runner
-/// without them puts those outside the prefix, where a launch with a
-/// different environment does not find them.
+/// One mvm root, on macOS and on Linux: setup's `c.mvm` runner (doctor,
+/// the image pull and, on Linux, `mvmctl bootstrap`), the `LaunchSpec.env`
+/// sessions are launched with, and the `rts tool` bridge those sessions
+/// spawn must all resolve the same mvm root (MVM_HOME, else `HOME/.mvm`).
+/// mvmctl keeps its image cache, VM state and (Linux) bootstrap's
+/// guest-runtime cache there, so a launch under another root does not find
+/// what setup prepared. Leaving MVM_HOME unset for both setup's `c.mvm`
+/// and the launch, so both use `HOME/.mvm`, satisfies it; trace-commons'
+/// macOS app does that today.
 ///
 /// On Windows: the release archive's egress proxy and plugin, the pinned
 /// Hyper-V guest files and OpenCode, into an owner-only `prefix`

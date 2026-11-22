@@ -381,10 +381,12 @@ runner for W1.
   The pinned release archive for embedders is
   `rts-<v>-x86_64-unknown-linux-gnu.tar.gz` (`scripts/package-linux.sh`):
   `bin/rts` and the plugin, no supervisor; `run_in_prefix` installs only the
-  plugin from it. As on macOS, the embedder's mvmctl runners (setup and
-  launch) must set `HOME=<prefix>` and `MVM_HOME=<prefix>/mvm`, or mvmctl's
-  guest runtime, image cache and VM state land under the operator's
-  `~/.mvm` instead of the prefix.
+  plugin from it. As on macOS, setup's `mvm` runner, the launch
+  (`LaunchSpec.env`) and the `rts tool` bridge must share one mvm root
+  (MVM_HOME, else `HOME/.mvm`): mvmctl keeps its image cache, VM state and
+  bootstrap's guest-runtime cache there, and a launch under another root
+  does not find them. Leaving MVM_HOME unset for setup and launch (root
+  `HOME/.mvm`), as trace-commons' macOS app does, satisfies it.
 - **Windows (W1)**: the trace-commons Windows app checks Windows 11 + "Virtual
   Machine Platform" + nested virtualization, asks the user once to enable the
   feature (admin, reboot), imports the `nearai-rts` distro from a signed
