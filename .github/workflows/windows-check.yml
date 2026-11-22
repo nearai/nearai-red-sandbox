@@ -103,18 +103,20 @@ jobs:
         run: |
           cargo build --locked --release --target x86_64-pc-windows-msvc --bin rts
           cargo build --locked --profile egress --target x86_64-pc-windows-msvc --bin rts-egress
+      # $RUNNER_TEMP, as release.yml uses: a drive path (D:\\...) is what
+      # broke the v0.1.7 packaging, and a relative dist/ never exercised it.
       - name: package, then install into a prefix through rts's untar
         shell: bash
         run: |
           scripts/package-windows.sh --version 0.0.0-ci \
             --rts target/x86_64-pc-windows-msvc/release/rts.exe \
-            --egress target/x86_64-pc-windows-msvc/egress/rts-egress.exe --out dist
-          RTS_RELEASE_TAR="$PWD/dist/rts-0.0.0-ci-x86_64-pc-windows-msvc.tar" \
+            --egress target/x86_64-pc-windows-msvc/egress/rts-egress.exe --out "$RUNNER_TEMP/dist"
+          RTS_RELEASE_TAR="$RUNNER_TEMP/dist/rts-0.0.0-ci-x86_64-pc-windows-msvc.tar" \
             cargo test --locked --target x86_64-pc-windows-msvc --lib -- --ignored --exact \
             backend::hyperv::setup::tests::a_built_release_archive_installs_into_a_prefix
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-release-archive
-          path: dist/
+          path: ${{ runner.temp }}/dist/
           retention-days: 3
           if-no-files-found: error
