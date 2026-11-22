@@ -308,7 +308,7 @@ fn a_model_tool_call_reaches_the_guest_through_opencode_and_rts_tool() {
         .filter(|v| v["tool"] == "shell")
         .collect();
     assert_eq!(shell.len(), 1, "{audit}\n{out}");
-    assert_eq!(shell[0]["status"], "completed", "{audit}");
+    assert_eq!(shell[0]["status"], "completed", "{audit}\n{out}");
     let got = m.exec(&sv(&["cat", &file]), &limits()).unwrap();
     assert_eq!(
         String::from_utf8_lossy(&got.stdout).trim(),

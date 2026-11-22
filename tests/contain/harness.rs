@@ -22,7 +22,9 @@ use std::time::Duration;
 #[cfg(unix)]
 use rts::config::default_image;
 #[cfg(unix)]
-use rts::mvm::{MvmSandbox, Runner, SpawnRunner};
+use rts::backend::mvm::{Flavor, MvmBackend};
+#[cfg(unix)]
+use rts::mvm::{Launch, MvmSandbox, Runner, SpawnRunner};
 #[cfg(unix)]
 use rts::network::{Plan, SystemResolver};
 use rts::protocol::random_hex;
@@ -209,6 +211,23 @@ pub struct Harness {
     pub image: String,
     pub run: Arc<dyn Runner>,
     pub empty_git_config: PathBuf,
+    /// mvm's root for `run` (MVM_HOME, else HOME/.mvm).
+    pub mvm_root: PathBuf,
+}
+
+#[cfg(unix)]
+impl Harness {
+    /// How a session's machine named `name` waits for its attached run on
+    /// this host's flavor, as `MvmBackend` picks it.
+    pub fn launch(&self, name: &str) -> Launch {
+        match Flavor::native() {
+            Flavor::Hvf => Launch::PollPs,
+            Flavor::Firecracker => Launch::AttachLine {
+                registry: self.mvm_root.join("share").join("vm-names.json"),
+                vm_dir: self.mvm_root.join("vms").join(name),
+            },
+        }
+    }
 }
 
 pub fn limits() -> ExecOptions {
@@ -239,7 +258,17 @@ fn probe() -> Result<Harness, String> {
     fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
     let empty_git_config = scratch.join("empty.gitconfig");
     fs::write(&empty_git_config, "").map_err(|e| e.to_string())?;
-    let runner = patched_runner(mvmctl.clone(), empty_git_config.clone(), &env, &RealHost)?;
+    // HVF: the patched supervisor. Firecracker: /dev/kvm and the
+    // environment a session gives mvmctl (sudo shim, no standby pool).
+    let runner = match Flavor::native() {
+        Flavor::Hvf => patched_runner(mvmctl.clone(), empty_git_config.clone(), &env, &RealHost)?,
+        Flavor::Firecracker => {
+            rts::backend::kvm::check_kvm(Path::new(rts::backend::kvm::KVM_DEVICE))?;
+            let extra_env = MvmBackend::mvmctl_environment(Flavor::Firecracker, &env, None, &scratch.join("sudo-shim"))?;
+            SpawnRunner { mvmctl: mvmctl.clone(), empty_git_config: empty_git_config.clone(), extra_env, remove_env: Vec::new() }
+        }
+    };
+    let mvm_root = rts::session::mvm_root(&env)?;
     if !mvmctl.exists() {
         return Err(format!("mvmctl not found at {} (set RTS_MVMCTL)", mvmctl.display()));
     }
@@ -249,7 +278,7 @@ fn probe() -> Result<Harness, String> {
         return Err(format!("mvmctl doctor failed: {}", String::from_utf8_lossy(&r.stderr).trim()));
     }
     let image = std::env::var("RTS_IMAGE").unwrap_or_else(|_| default_image().into());
-    Ok(Harness { mvmctl, image, run, empty_git_config })
+    Ok(Harness { mvmctl, image, run, empty_git_config, mvm_root })
 }
 
 /// Ignored tests run only by explicit request, so missing prerequisites must fail
@@ -305,7 +334,7 @@ impl std::ops::Deref for Machine {
 #[cfg(unix)]
 pub fn fresh_machine(h: &Harness) -> Machine {
     let name = format!("rts-{}", random_hex(6));
-    let m = Machine(MvmSandbox::new(&name, Box::new(h.run.clone())).unwrap());
+    let m = Machine(MvmSandbox::new(&name, Box::new(h.run.clone())).unwrap().with_launch(h.launch(&name)));
     m.create(&CreateSpec { name: &name, image: &h.image, memory_mib: 512, cpus: 1, egress: None }).expect("machine create");
     initialize_guest_storage(&m.0).expect("guest input/output storage");
     m
@@ -328,7 +357,7 @@ pub fn fresh_network_machine(h: &Harness, allow: &[&str]) -> (Machine, Plan, Pat
     let hosts = plan.allow_hosts();
     let dir = tempdir("net");
     let name = format!("rts-{}", random_hex(6));
-    let m = Machine(MvmSandbox::new(&name, Box::new(h.run.clone())).unwrap());
+    let m = Machine(MvmSandbox::new(&name, Box::new(h.run.clone())).unwrap().with_launch(h.launch(&name)));
     let egress = Egress { allow_hosts: &hosts, attach_log: &dir.join("mvm-attach.log"), session_hours: NETWORK_TEST_HOURS };
     m.create(&CreateSpec { name: &name, image: &h.image, memory_mib: 512, cpus: 1, egress: Some(egress) }).expect("network machine create");
     initialize_guest_storage(&m.0).expect("guest input/output storage");
@@ -573,6 +602,11 @@ mod tests {
             .output().unwrap();
         assert!(!output.status.success(), "an explicitly requested real-VM test passed without running: {}", String::from_utf8_lossy(&output.stdout));
         let diagnostic = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        assert!(diagnostic.contains(SUPERVISOR_FIX_VERSION), "{diagnostic}");
+        // HVF refuses on the supervisor first; Firecracker has none, so on the mvmctl.
+        let want = match Flavor::native() {
+            Flavor::Hvf => SUPERVISOR_FIX_VERSION.to_string(),
+            Flavor::Firecracker => "/nonexistent-rts-mvmctl".to_string(),
+        };
+        assert!(diagnostic.contains(&want), "{diagnostic}");
     }
 }
