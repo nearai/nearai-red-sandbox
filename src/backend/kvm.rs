@@ -100,12 +100,86 @@ pub fn firecracker_environment(
         .filter(|v| !v.is_empty())
         .unwrap_or("/usr/local/bin:/usr/bin:/bin");
     result.insert("PATH".into(), format!("{}:{inherited}", shim_dir.display()));
+    if let Ok(root) = crate::session::mvm_root(env) {
+        result.insert("MVM_HOME".into(), root.to_string_lossy().into_owned());
+    }
     // mvm 0.28 keeps a standby pool by default: a detached `pool refill` and
     // idle Firecracker processes that outlive `machine rm`. A sandbox session
     // must leave nothing running, so turn both off.
     result.insert("MVM_RESIDENCY".into(), "cold".into());
     result.insert("MVM_FC_IDLE_POOL".into(), "0".into());
+    // Its host agent outlives the session by design and exits on its own
+    // once it has had no VM for this long (mvm-hostd host_agent_idle,
+    // default 300s); teardown waits for that (`wait_for_host_agents`).
+    result.insert(
+        "MVM_HOST_AGENT_IDLE_TIMEOUT".into(),
+        HOST_AGENT_IDLE_SECS.to_string(),
+    );
     result
+}
+
+/// `MVM_HOST_AGENT_IDLE_TIMEOUT` for rts's mvmctl: seconds the host agent
+/// lingers after its last VM.
+pub const HOST_AGENT_IDLE_SECS: u64 = 10;
+/// How long teardown waits for the host agent past its idle timeout.
+pub const HOST_AGENT_GRACE: Duration = Duration::from_secs(HOST_AGENT_IDLE_SECS + 10);
+
+/// The `mvm-host-agent` and `mvm-signer-helper` processes under
+/// `proc_root` (`/proc`) whose environment has `MVM_HOME` equal to
+/// `mvm_root`: the agent tree serving every VM under that root.
+pub fn host_agents(proc_root: &Path, mvm_root: &Path) -> Vec<u32> {
+    let Ok(dir) = fs::read_dir(proc_root) else {
+        return Vec::new();
+    };
+    let mut pids: Vec<u32> = dir
+        .flatten()
+        .filter_map(|entry| {
+            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            let exe = fs::read_link(entry.path().join("exe")).ok()?;
+            let exe = exe.to_str()?;
+            let exe = exe.strip_suffix(" (deleted)").unwrap_or(exe);
+            let name = Path::new(exe).file_name()?.to_str()?;
+            if !matches!(name, "mvm-host-agent" | "mvm-signer-helper") {
+                return None;
+            }
+            let environ = fs::read(entry.path().join("environ")).ok()?;
+            environ
+                .split(|&b| b == 0)
+                .filter_map(|kv| std::str::from_utf8(kv).ok()?.strip_prefix("MVM_HOME="))
+                .any(|home| Path::new(home) == mvm_root)
+                .then_some(pid)
+        })
+        .collect();
+    pids.sort_unstable();
+    pids
+}
+
+/// Wait up to `grace` for `mvm_root`'s host agent tree to exit on its own
+/// (it holds no session secrets once its VMs are gone). It is shared by
+/// every session under `mvm_root`, so it is never killed: if it is still
+/// running, one line is logged and false returned.
+pub fn wait_for_host_agents(
+    proc_root: &Path,
+    mvm_root: &Path,
+    grace: Duration,
+    log: &mut dyn FnMut(&str),
+) -> bool {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        let pids = host_agents(proc_root, mvm_root);
+        if pids.is_empty() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            log(&format!(
+                "teardown: mvm host agent pid(s) {pids:?} still running {}s after the machine (MVM_HOST_AGENT_IDLE_TIMEOUT={HOST_AGENT_IDLE_SECS}); not killed: it serves every session under {}",
+                grace.as_secs(),
+                mvm_root.display()
+            ));
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// The VMM `pid` runs as `uid`, and `uid` is not root.
@@ -376,16 +450,33 @@ mod tests {
             ("SECRET".into(), "x".into()),
         ];
         let e = firecracker_environment(&env, Path::new("/rt/bin"));
-        assert_eq!(e.len(), 5, "{e:?}");
-        // No standby pool, refill or idle VMM may outlive a session.
+        assert_eq!(e.len(), 6, "{e:?}");
+        // No standby pool, refill or idle VMM may outlive a session, and
+        // the host agent exits HOST_AGENT_IDLE_SECS after its last VM.
         assert_eq!(
             (e["MVM_RESIDENCY"].as_str(), e["MVM_FC_IDLE_POOL"].as_str()),
             ("cold", "0")
         );
+        assert_eq!(e["MVM_HOST_AGENT_IDLE_TIMEOUT"], "10");
         assert_eq!(e["PATH"], "/rt/bin:/usr/bin:/bin");
         assert_eq!((e["HOME"].as_str(), e["MVM_HOME"].as_str()), ("/h", "/m"));
         let bare = firecracker_environment(&[], Path::new("/rt/bin"));
         assert_eq!(bare["PATH"], "/rt/bin:/usr/local/bin:/usr/bin:/bin");
+        assert!(!bare.contains_key("MVM_HOME"));
+        // mvm's own default root, made explicit so the host agent can be
+        // told apart by it; an empty MVM_HOME counts as unset.
+        for env in [
+            vec![("HOME".to_string(), "/h".to_string())],
+            vec![
+                ("HOME".into(), "/h".into()),
+                ("MVM_HOME".into(), String::new()),
+            ],
+        ] {
+            assert_eq!(
+                firecracker_environment(&env, Path::new("/rt/bin"))["MVM_HOME"],
+                "/h/.mvm"
+            );
+        }
     }
 
     struct Ps(&'static str, i32);
@@ -574,5 +665,90 @@ mod tests {
                 ],
             }]
         );
+    }
+
+    /// A `/proc/<pid>` with `exe` linking to `exe` and `environ` holding `env`.
+    fn fake_proc(root: &Path, pid: u32, exe: &str, env: &[&str]) {
+        let p = root.join(pid.to_string());
+        fs::create_dir_all(&p).unwrap();
+        std::os::unix::fs::symlink(exe, p.join("exe")).unwrap();
+        let mut environ = env.join("\0").into_bytes();
+        environ.push(0);
+        fs::write(p.join("environ"), environ).unwrap();
+    }
+
+    #[test]
+    fn host_agents_are_found_by_their_mvm_home() {
+        let d = tempfile::tempdir().unwrap();
+        let bin = "/home/rts/.local/mvm/v0.28.0-rts.2";
+        fake_proc(
+            d.path(),
+            29373,
+            &format!("{bin}/mvm-host-agent"),
+            &["HOME=/home/rts", "MVM_HOME=/m/a"],
+        );
+        fake_proc(
+            d.path(),
+            29376,
+            &format!("{bin}/mvm-host-agent"),
+            &["MVM_HOME=/m/a"],
+        );
+        fake_proc(
+            d.path(),
+            29380,
+            &format!("{bin}/mvm-signer-helper"),
+            &["MVM_HOME=/m/a"],
+        );
+        // Another MVM_HOME's agent, a prefix of ours, and another program.
+        fake_proc(
+            d.path(),
+            28594,
+            &format!("{bin}/mvm-host-agent"),
+            &["MVM_HOME=/m/b"],
+        );
+        fake_proc(
+            d.path(),
+            28595,
+            &format!("{bin}/mvm-host-agent"),
+            &["MVM_HOME=/m/a2"],
+        );
+        fake_proc(d.path(), 30000, "/usr/bin/bash", &["MVM_HOME=/m/a"]);
+        assert_eq!(
+            host_agents(d.path(), Path::new("/m/a")),
+            [29373, 29376, 29380]
+        );
+        assert_eq!(
+            host_agents(d.path(), Path::new("/m/a/")),
+            [29373, 29376, 29380]
+        );
+        assert!(host_agents(d.path(), Path::new("/m/c")).is_empty());
+    }
+
+    #[test]
+    fn teardown_waits_for_the_idle_agent_then_reports_it_and_never_kills() {
+        let d = tempfile::tempdir().unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        assert!(wait_for_host_agents(
+            d.path(),
+            Path::new("/m/a"),
+            Duration::from_millis(50),
+            &mut |l| lines.push(l.into())
+        ));
+        assert!(lines.is_empty(), "{lines:?}");
+        fake_proc(d.path(), 29373, "/x/mvm-host-agent", &["MVM_HOME=/m/a"]);
+        let t = std::time::Instant::now();
+        assert!(!wait_for_host_agents(
+            d.path(),
+            Path::new("/m/a"),
+            Duration::from_millis(300),
+            &mut |l| lines.push(l.into())
+        ));
+        assert!(t.elapsed() >= Duration::from_millis(300));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("29373") && lines[0].contains("MVM_HOST_AGENT_IDLE_TIMEOUT"),
+            "{lines:?}"
+        );
+        assert!(d.path().join("29373").exists());
     }
 }

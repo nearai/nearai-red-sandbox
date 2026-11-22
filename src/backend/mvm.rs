@@ -473,6 +473,13 @@ impl Machine for MvmMachine {
             )),
             Err(e) => log(&format!("teardown: NETWORK AUDIT FAILED: {e}")),
         }
+        if self.flavor == Flavor::Firecracker
+            && let Ok(root) = session::mvm_root(&self.env)
+        {
+            kvm::wait_for_host_agents(Path::new("/proc"), &root, kvm::HOST_AGENT_GRACE, &mut |l| {
+                log(l)
+            });
+        }
     }
 }
 
