@@ -68,7 +68,7 @@ fn prerequisites() -> (PathBuf, String) {
     let home = std::env::var("HOME").unwrap_or_default();
     let mvmctl = std::env::var_os("RTS_MVMCTL")
         .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(&home).join(".local/mvm/v0.22.0/mvmctl"));
+        .unwrap_or_else(|| rts::install::mvm_dir(Path::new(&home)).join("mvmctl"));
     assert!(
         mvmctl.is_file(),
         "[contain] mvmctl not found at {} (set RTS_MVMCTL)",

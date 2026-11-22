@@ -44,6 +44,14 @@ pub struct BridgeOptions {
     pub cwd: Option<String>,
     #[serde(default)]
     pub mvm_home: Option<String>,
+    /// mvm's root for the session (`session::mvm_root` of its env): set as
+    /// MVM_HOME, so a session with an MVM_HOME finds its machine.
+    #[serde(default)]
+    pub mvm_root: Option<PathBuf>,
+    /// Firecracker: the session's sudo shim directory, first on PATH as
+    /// for the session's own mvmctl.
+    #[serde(default)]
+    pub sudo_shim: Option<PathBuf>,
     /// Network session: `shell` runs under the guest proxy environment.
     #[serde(default)]
     pub proxy: bool,
@@ -183,10 +191,13 @@ pub fn run(tool: &str) -> Outcome {
     if let Some(vm) = &o.hyperv_vm_id {
         return run_hyperv(tool, vm, o, &req.input, leak);
     }
-    let mut extra_env = HashMap::new();
-    if let Some(h) = &o.mvm_home {
-        extra_env.insert("HOME".to_string(), h.clone());
-    }
+    #[cfg(unix)]
+    let extra_env = match mvmctl_env(o, crate::backend::mvm::Flavor::native(), std::env::var("PATH").ok().as_deref()) {
+        Ok(e) => e,
+        Err(e) => return Outcome::fail(EXIT_BAD_REQUEST, e),
+    };
+    #[cfg(not(unix))]
+    let extra_env: HashMap<String, String> = o.mvm_home.iter().map(|h| ("HOME".to_string(), h.clone())).collect();
     let runner = SpawnRunner { mvmctl: o.mvmctl.clone(), empty_git_config: o.empty_git_config.clone(), extra_env, remove_env: Vec::new() };
     let sb = match MvmSandbox::new(&o.machine, Box::new(runner)) {
         Ok(sb) => sb.with_state(StateDir(o.state_dir.clone())),
@@ -196,6 +207,32 @@ pub fn run(tool: &str) -> Outcome {
         eprintln!("rts: RTS_TEST_LEAK=shell is set; shell runs ON THE HOST (leak check only)");
     }
     call(tool, &sb, o, &req.input, leak)
+}
+
+/// The environment for the tool's mvmctl. HVF: HOME from `mvmHome` and
+/// MVM_HOME from `mvmRoot` (each only if given). Firecracker: what the
+/// session's own mvmctl gets (`kvm::firecracker_environment`: no standby
+/// pool, the host agent's idle timeout, the session's sudo shim first on
+/// `path`), refused without the shim.
+#[cfg(unix)]
+pub(crate) fn mvmctl_env(o: &BridgeOptions, flavor: crate::backend::mvm::Flavor, path: Option<&str>) -> Result<HashMap<String, String>, String> {
+    let mut base: Vec<(String, String)> = Vec::new();
+    if let Some(h) = &o.mvm_home {
+        base.push(("HOME".into(), h.clone()));
+    }
+    if let Some(r) = &o.mvm_root {
+        base.push(("MVM_HOME".into(), r.to_string_lossy().into_owned()));
+    }
+    match flavor {
+        crate::backend::mvm::Flavor::Hvf => Ok(base.into_iter().collect()),
+        crate::backend::mvm::Flavor::Firecracker => {
+            let shim: &std::path::Path = o.sudo_shim.as_deref().ok_or("a Firecracker tool call needs bridge.sudoShim (the session's sudo shim)")?;
+            if let Some(p) = path {
+                base.push(("PATH".into(), p.into()));
+            }
+            Ok(crate::backend::kvm::firecracker_environment(&base, shim))
+        }
+    }
 }
 
 /// A tool call on a Windows session: hvsocket to the VM, under the
@@ -249,6 +286,37 @@ mod tests {
 
     fn parse(v: Value) -> Result<Request, String> {
         parse_request(v.to_string().as_bytes())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_macos_app_keeps_its_mvm_root_and_firecracker_gets_the_sessions_environment() {
+        use crate::backend::mvm::Flavor;
+        use std::collections::HashMap;
+        let as_env = |m: &HashMap<String, String>| -> Vec<(String, String)> { m.iter().map(|(k, v)| (k.clone(), v.clone())).collect() };
+        // The macOS app's shape: mvmHome is the user's HOME, no MVM_HOME.
+        let app = parse(request(json!({ "mvmHome": "/Users/op", "mvmRoot": "/Users/op/.mvm", "sudoShim": "/rt/sudo-shim" }))).unwrap();
+        let hvf = mvmctl_env(&app.options, Flavor::Hvf, Some("/usr/bin")).unwrap();
+        assert_eq!(hvf, HashMap::from([("HOME".to_string(), "/Users/op".to_string()), ("MVM_HOME".to_string(), "/Users/op/.mvm".to_string())]));
+        // Before this, the bridge passed HOME alone; mvmctl's root is the same.
+        let before = [("HOME".to_string(), "/Users/op".to_string())];
+        assert_eq!(crate::session::mvm_root(&as_env(&hvf)).unwrap(), crate::session::mvm_root(&before).unwrap());
+        // Options from a launcher without mvmRoot: exactly HOME, as before.
+        let old = parse(request(json!({ "mvmHome": "/Users/op" }))).unwrap();
+        assert_eq!(mvmctl_env(&old.options, Flavor::Hvf, None).unwrap(), HashMap::from(before.clone()));
+        // Firecracker: what the session's own mvmctl gets.
+        let fc_req = parse(request(json!({ "mvmHome": "/home/op", "mvmRoot": "/p/mvm", "sudoShim": "/rt/sudo-shim" }))).unwrap();
+        let fc = mvmctl_env(&fc_req.options, Flavor::Firecracker, Some("/usr/bin:/bin")).unwrap();
+        let session = crate::backend::kvm::firecracker_environment(
+            &[("HOME".into(), "/home/op".into()), ("MVM_HOME".into(), "/p/mvm".into()), ("PATH".into(), "/usr/bin:/bin".into())],
+            std::path::Path::new("/rt/sudo-shim"),
+        );
+        assert_eq!(fc, session);
+        assert_eq!((fc["MVM_RESIDENCY"].as_str(), fc["MVM_FC_IDLE_POOL"].as_str(), fc["MVM_HOST_AGENT_IDLE_TIMEOUT"].as_str()), ("cold", "0", "10"));
+        assert_eq!(fc["PATH"], "/rt/sudo-shim:/usr/bin:/bin");
+        // No shim to run behind: refused, not run with a plain sudo.
+        let e = mvmctl_env(&old.options, Flavor::Firecracker, None).unwrap_err();
+        assert!(e.contains("sudoShim"), "{e}");
     }
 
     #[test]

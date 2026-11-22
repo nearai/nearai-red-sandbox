@@ -35,22 +35,22 @@ fn large_stdout_is_capped_in_the_guest_with_the_full_size_reported() {
 #[ignore = "real VM"]
 fn the_guest_has_no_network() {
     let m = fresh_guest();
-    // Both tools must exist, or their failure below proves nothing.
+    // wget must exist, or its failure below proves nothing.
     let tools = m
-        .exec(
-            &sv(&["sh", "-c", "command -v ip && command -v wget"]),
-            &limits(),
-        )
+        .exec(&sv(&["sh", "-c", "command -v wget"]), &limits())
         .unwrap();
     assert_eq!(
         tools.exit_code,
         0,
-        "the guest lacks ip or wget: {}",
+        "the guest lacks wget: {}",
         String::from_utf8_lossy(&tools.stdout)
     );
-    let links = m.exec(&sv(&["ip", "-o", "link"]), &limits()).unwrap();
+    // The kernel's interface list, from sysfs: `ip link` needs a netlink
+    // socket, which the Firecracker guest's exec does not get.
+    let links = m.exec(&sv(&["ls", "-1", "/sys/class/net"]), &limits()).unwrap();
+    assert_eq!(links.exit_code, 0, "{}", String::from_utf8_lossy(&links.stderr));
     let text = String::from_utf8_lossy(&links.stdout);
-    let names: Vec<&str> = text.lines().filter_map(|l| l.split(':').nth(1)).map(str::trim).collect();
+    let names: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     assert_eq!(names, ["lo"]);
     let w = m.exec(&sv(&["wget", "-q", "-T", "5", "-O-", "http://1.1.1.1"]), &limits()).unwrap();
     assert_ne!(w.exit_code, 0);
