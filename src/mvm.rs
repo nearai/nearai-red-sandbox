@@ -232,6 +232,17 @@ fn ps_names(text: &str) -> Vec<String> {
 
 /// Whether `machine ps` lists `name` as running: a line whose first field
 /// is the name and which says `running`.
+/// Whether `log`, from byte `offset` on, has a line starting with `prefix`.
+fn log_has_line_from(log: &Path, offset: u64, prefix: &str) -> bool {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut f) = File::open(log) else { return false };
+    let mut text = String::new();
+    if f.seek(SeekFrom::Start(offset)).is_err() || f.take(1 << 20).read_to_string(&mut text).is_err() {
+        return false;
+    }
+    text.lines().any(|l| l.starts_with(prefix))
+}
+
 fn ps_running(text: &str, name: &str) -> bool {
     text.lines().any(|l| l.split_whitespace().next() == Some(name) && l.contains("running"))
 }
@@ -302,6 +313,61 @@ pub struct MvmSandbox {
     /// The attached `machine run` of a network machine, held from spawn
     /// until `remove` terminates it.
     attach: Mutex<Option<Box<dyn Attached>>>,
+    launch: Launch,
+}
+
+/// How create waits for a network machine's attached `machine run` to boot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Launch {
+    /// Poll `machine ps` until it shows the machine running (mvm 0.22, HVF).
+    #[default]
+    PollPs,
+    /// mvm 0.28 (Firecracker): a `machine ps` between run's start and its
+    /// TTL step makes run fail ("machine is not registered") and exit, so
+    /// wait for run's own `attached to machine <name>;` line, then one
+    /// `machine ps`, the TTL read back from `registry` (mvm's
+    /// `share/vm-names.json`; the entry's `vm_dir` must be `vm_dir`), and
+    /// the run still alive.
+    AttachLine { registry: PathBuf, vm_dir: PathBuf },
+}
+
+/// The keys of a `vm-names.json` entry as mvm 0.28.0-rts.2 writes them. A
+/// registry with any other shape is read as "no TTL".
+pub(crate) const REGISTRY_ENTRY_KEYS: [&str; 11] = [
+    "vm_dir", "network", "guest_ip", "slot_index", "registered_at", "expires_at",
+    "auto_resume", "paused", "readiness", "last_readiness_change_at", "last_active",
+];
+
+/// The TTL mvm recorded for `name` in `registry_text` (`vm-names.json`),
+/// read strictly: `{"vms": {...}}` and nothing else at the top, an entry
+/// with exactly [`REGISTRY_ENTRY_KEYS`], `vm_dir` equal to `vm_dir`, and an
+/// `expires_at` of the form `YYYY-MM-DDTHH:MM:SSZ` after `now` and at most
+/// `session_hours` (plus a minute of clock slack) from it.
+pub(crate) fn registry_expiry(registry_text: &str, name: &str, vm_dir: &Path, now: chrono::DateTime<chrono::Utc>, session_hours: u32) -> std::result::Result<chrono::DateTime<chrono::Utc>, String> {
+    let no_ttl = |why: String| format!("no TTL backstop recorded for {name}: {why}");
+    let v: serde_json::Value = serde_json::from_str(registry_text).map_err(|e| no_ttl(format!("the mvm registry is not JSON: {e}")))?;
+    let top = v.as_object().filter(|o| o.len() == 1).ok_or_else(|| no_ttl("the mvm registry is not {\"vms\": {...}}".into()))?;
+    let entry = top.get("vms").and_then(|v| v.as_object()).ok_or_else(|| no_ttl("the mvm registry has no vms object".into()))?
+        .get(name).and_then(|e| e.as_object()).ok_or_else(|| no_ttl("the machine is not in the mvm registry".into()))?;
+    let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+    let mut known = REGISTRY_ENTRY_KEYS.to_vec();
+    keys.sort_unstable();
+    known.sort_unstable();
+    if keys != known {
+        return Err(no_ttl(format!("the registry entry has keys {keys:?}, not mvm 0.28's {known:?}")));
+    }
+    if entry.get("vm_dir").and_then(|d| d.as_str()).map(Path::new) != Some(vm_dir) {
+        return Err(no_ttl(format!("the registry entry's vm_dir is not {}", vm_dir.display())));
+    }
+    let raw = entry.get("expires_at").and_then(|e| e.as_str()).ok_or_else(|| no_ttl("expires_at is not a timestamp".into()))?;
+    let expires = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%SZ")
+        .map_err(|_| no_ttl(format!("expires_at {raw:?} is not YYYY-MM-DDTHH:MM:SSZ")))?
+        .and_utc();
+    let latest = now + chrono::Duration::hours(i64::from(session_hours)) + chrono::Duration::minutes(1);
+    if expires <= now || expires > latest {
+        return Err(no_ttl(format!("expires_at {raw} is not within {session_hours}h from now")));
+    }
+    Ok(expires)
 }
 
 impl MvmSandbox {
@@ -309,7 +375,7 @@ impl MvmSandbox {
         if !is_machine_name(name) {
             return Err(Error::Other(format!("machine name must match rts-<12 hex chars>: {name:?}")));
         }
-        Ok(Self { name: name.into(), run, state: None, dead: Mutex::new(None), serial: Mutex::new(()), copy_limits: CopyLimits::default(), attach: Mutex::new(None) })
+        Ok(Self { name: name.into(), run, state: None, dead: Mutex::new(None), serial: Mutex::new(()), copy_limits: CopyLimits::default(), attach: Mutex::new(None), launch: Launch::default() })
     }
 
     /// Share the exec lock and the unavailable marker through a directory.
@@ -320,6 +386,11 @@ impl MvmSandbox {
 
     pub fn with_copy_limits(mut self, l: CopyLimits) -> Self {
         self.copy_limits = l;
+        self
+    }
+
+    pub fn with_launch(mut self, l: Launch) -> Self {
+        self.launch = l;
         self
     }
 
@@ -336,9 +407,62 @@ impl MvmSandbox {
         Some(format!("network-lost: mvmctl machine run exited ({status})"))
     }
 
-    /// Start the attached `machine run` (once more if it exits before
-    /// boot) and wait until `machine ps` shows the machine running.
+    /// Start the attached `machine run` and wait for it, as `launch` says.
     fn attached_start(&self, log: &Path, session_hours: u32) -> Result<()> {
+        match &self.launch {
+            Launch::PollPs => self.attached_start_poll_ps(log, session_hours),
+            Launch::AttachLine { registry, vm_dir } => self.attached_start_line(log, session_hours, registry, vm_dir),
+        }
+    }
+
+    /// [`Launch::AttachLine`]: start the attached `machine run` (once more
+    /// if it exits before printing its attached line), never polling
+    /// `machine ps` meanwhile; then confirm once, read the TTL back, and
+    /// require the run still alive.
+    fn attached_start_line(&self, log: &Path, session_hours: u32, registry: &Path, vm_dir: &Path) -> Result<()> {
+        let ttl = attach_ttl(session_hours);
+        let argv = sv(&["machine", "run", "--name", &self.name, "--ttl", &ttl]);
+        let refused = || Error::Other(format!("machine run exited before boot (see {})", log.display()));
+        let marker = format!("attached to machine {};", self.name);
+        for _ in 0..2 {
+            // Only what this attempt appends counts.
+            let offset = fs::metadata(log).map(|m| m.len()).unwrap_or(0);
+            let a = self.run.attach(&argv, log).map_err(|e| Error::Other(format!("machine run failed to start: {e} (see {})", log.display())))?;
+            *self.attach.lock().unwrap() = Some(a);
+            let deadline = Instant::now() + CONTROL_TIMEOUT;
+            let attached = loop {
+                if log_has_line_from(log, offset, &marker) {
+                    break true;
+                }
+                if self.attach.lock().unwrap().as_mut().and_then(|a| a.exited()).is_some() {
+                    break false;
+                }
+                if Instant::now() >= deadline {
+                    return Err(refused());
+                }
+                thread::sleep(BOOT_POLL);
+            };
+            if !attached {
+                continue; // exited before attaching: start it once more
+            }
+            let ps = self.control(&sv(&["machine", "ps"]), "machine ps")?;
+            if !ps_running(&String::from_utf8_lossy(&ps.stdout), &self.name) {
+                return Err(Error::Other(format!("machine run attached, but machine ps does not show {} running (see {})", self.name, log.display())));
+            }
+            let text = fs::read_to_string(registry).map_err(|e| Error::Other(format!("no TTL backstop recorded for {}: reading {}: {e}", self.name, registry.display())))?;
+            registry_expiry(&text, &self.name, vm_dir, chrono::Utc::now(), session_hours).map_err(Error::Other)?;
+            if let Some(status) = self.attach.lock().unwrap().as_mut().and_then(|a| a.exited()) {
+                return Err(Error::Other(format!("machine run exited ({status}) after it attached (see {})", log.display())));
+            }
+            return Ok(());
+        }
+        Err(refused())
+    }
+
+    /// [`Launch::PollPs`]: start the attached `machine run` (once more if
+    /// it exits before boot) and wait until `machine ps` shows the machine
+    /// running.
+    fn attached_start_poll_ps(&self, log: &Path, session_hours: u32) -> Result<()> {
         let ttl = attach_ttl(session_hours);
         let argv = sv(&["machine", "run", "--name", &self.name, "--ttl", &ttl]);
         let refused = || Error::Other(format!("machine run exited before boot (see {})", log.display()));
@@ -517,6 +641,7 @@ mod tests {
     use std::sync::Arc;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::io::Write;
     use crate::sandbox::Egress;
 
     const NAME: &str = "rts-0123456789ab";
@@ -604,6 +729,8 @@ mod tests {
     struct AttachFake {
         inner: Fake,
         attaches: Attaches,
+        /// Appended to the log at each attach, as mvmctl prints it.
+        script: Option<String>,
         exit_at_once: bool,
         exited_flag: Arc<AtomicBool>,
         terminated: Arc<AtomicBool>,
@@ -615,6 +742,9 @@ mod tests {
         }
         fn attach(&self, argv: &[String], log: &Path) -> io::Result<Box<dyn Attached>> {
             self.attaches.lock().unwrap().push((argv.to_vec(), log.to_path_buf()));
+            if let Some(lines) = &self.script {
+                fs::OpenOptions::new().append(true).create(true).open(log)?.write_all(lines.as_bytes())?;
+            }
             let flag = if self.exit_at_once { Arc::new(AtomicBool::new(true)) } else { self.exited_flag.clone() };
             Ok(Box::new(FakeAttached {
                 pid: 4242,
@@ -642,6 +772,7 @@ mod tests {
         let f = AttachFake {
             inner: Fake { calls, reply: Box::new(reply) },
             attaches: h.attaches.clone(),
+            script: None,
             exit_at_once,
             exited_flag: h.exited_flag.clone(),
             terminated: h.terminated.clone(),
@@ -674,6 +805,162 @@ mod tests {
         }
         assert_eq!(sb.attach_pid(), Some(4242));
         assert_eq!(sb.network_lost(), None);
+    }
+
+    /// `vm-names.json` as mvm 0.28.0-rts.2 wrote it on a Linux host during
+    /// `machine run --name rts-0123456789ab --ttl 1h`. Its shape is mvm's,
+    /// not a contract: a bump that changes it must fail these tests.
+    const VM_NAMES_CAPTURED: &str = include_str!("../tests/fixtures/mvm-0.28/vm-names.json");
+    const CAPTURED_VM_DIR: &str = "/home/rts/.mvm-live3/vms/rts-0123456789ab";
+
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn the_captured_registry_gives_the_ttl_and_pins_its_shape() {
+        let now = at("2026-11-22T07:08:20Z");
+        let e = registry_expiry(VM_NAMES_CAPTURED, NAME, Path::new(CAPTURED_VM_DIR), now, 1).unwrap();
+        assert_eq!(e, at("2026-11-22T08:08:13Z"));
+        // The captured entry's exact key set; any other shape is no TTL.
+        let v: serde_json::Value = serde_json::from_str(VM_NAMES_CAPTURED).unwrap();
+        let mut keys: Vec<&str> = v["vms"][NAME].as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut known = REGISTRY_ENTRY_KEYS.to_vec();
+        known.sort_unstable();
+        assert_eq!(keys, known);
+    }
+
+    #[test]
+    fn anything_but_a_known_future_ttl_for_this_machine_is_refused() {
+        let now = at("2026-11-22T07:08:20Z");
+        let ok = |t: &str| registry_expiry(t, NAME, Path::new(CAPTURED_VM_DIR), now, 1);
+        let edit = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut v: serde_json::Value = serde_json::from_str(VM_NAMES_CAPTURED).unwrap();
+            f(&mut v);
+            v.to_string()
+        };
+        let cases: Vec<(&str, String)> = vec![
+            ("no entry", edit(&|v| v["vms"] = serde_json::json!({}))),
+            ("null expiry", edit(&|v| v["vms"][NAME]["expires_at"] = serde_json::Value::Null)),
+            ("numeric expiry", edit(&|v| v["vms"][NAME]["expires_at"] = 1.into())),
+            ("offset, not Z", edit(&|v| v["vms"][NAME]["expires_at"] = "2026-11-22T09:08:13+01:00".into())),
+            ("garbage", edit(&|v| v["vms"][NAME]["expires_at"] = "soon".into())),
+            ("past", edit(&|v| v["vms"][NAME]["expires_at"] = "2026-11-22T07:08:19Z".into())),
+            ("beyond the session", edit(&|v| v["vms"][NAME]["expires_at"] = "2026-11-22T08:30:00Z".into())),
+            ("other vm dir", edit(&|v| v["vms"][NAME]["vm_dir"] = "/elsewhere/vms/rts-0123456789ab".into())),
+            ("unknown key", edit(&|v| v["vms"][NAME]["ttl_policy"] = "x".into())),
+            ("missing key", edit(&|v| { v["vms"][NAME].as_object_mut().unwrap().remove("readiness"); })),
+            ("extra top level", edit(&|v| v["version"] = 2.into())),
+            ("not json", "{".into()),
+        ];
+        for (what, text) in cases {
+            let e = ok(&text).expect_err(what);
+            assert!(e.contains("TTL"), "{what}: {e}");
+        }
+        assert!(ok(VM_NAMES_CAPTURED).is_ok());
+    }
+
+    /// The Firecracker launch: a fake attach that writes mvm 0.28's lines
+    /// to the log and a registry with this machine's TTL.
+    struct LaunchRig {
+        dir: tempfile::TempDir,
+        lines: String,
+        log: PathBuf,
+        registry: PathBuf,
+        vm_dir: PathBuf,
+    }
+    impl LaunchRig {
+        fn new(lines: &str, expires_in: Option<chrono::Duration>) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("mvm-attach.log");
+            // What an earlier attempt left: never this attempt's line.
+            fs::write(&log, "attached to machine rts-0123456789ab; from before\n").unwrap();
+            let vm_dir = dir.path().join("vms").join(NAME);
+            let registry = dir.path().join("share/vm-names.json");
+            fs::create_dir_all(registry.parent().unwrap()).unwrap();
+            let mut v: serde_json::Value = serde_json::from_str(VM_NAMES_CAPTURED).unwrap();
+            v["vms"][NAME]["vm_dir"] = vm_dir.display().to_string().into();
+            v["vms"][NAME]["expires_at"] = match expires_in {
+                Some(d) => (chrono::Utc::now() + d).format("%Y-%m-%dT%H:%M:%SZ").to_string().into(),
+                None => serde_json::Value::Null,
+            };
+            fs::write(&registry, v.to_string()).unwrap();
+            LaunchRig { dir, lines: lines.into(), log, registry, vm_dir }
+        }
+        fn sandbox(&self, mut f: Box<AttachFake>) -> MvmSandbox {
+            f.script = Some(self.lines.clone());
+            MvmSandbox::new(NAME, f).unwrap().with_launch(Launch::AttachLine { registry: self.registry.clone(), vm_dir: self.vm_dir.clone() })
+        }
+        fn spec<'a>(&'a self, hosts: &'a [crate::network::AllowHost]) -> CreateSpec<'a> {
+            CreateSpec { name: NAME, image: IMAGE, memory_mib: 2048, cpus: 2, egress: Some(Egress { allow_hosts: hosts, attach_log: &self.log, session_hours: 1 }) }
+        }
+    }
+    const ATTACHED: &str = "started machine rts-0123456789ab\nattached to machine rts-0123456789ab; press Ctrl-C to detach (it keeps running)\n";
+
+    #[test]
+    fn a_firecracker_launch_waits_for_the_attached_line_never_polling_ps_first() {
+        let hosts = crate::network::test_allow_hosts(&["198.51.100.7:443"]);
+        let r = LaunchRig::new(ATTACHED, Some(chrono::Duration::minutes(59)));
+        let (f, h) = fake_with_attach(false, running_ps);
+        let sb = r.sandbox(f);
+        sb.create(&r.spec(&hosts)).unwrap();
+        let calls = argvs(&h.calls);
+        let ps: Vec<usize> = calls.iter().enumerate().filter(|(_, a)| a[1] == "ps").map(|(i, _)| i).collect();
+        // Exactly one `machine ps`, after the attach was started.
+        assert_eq!(ps.len(), 1, "{calls:?}");
+        assert_eq!(h.attaches.lock().unwrap().len(), 1);
+        assert_eq!(sb.network_lost(), None);
+        drop(r.dir);
+    }
+
+    #[test]
+    fn a_firecracker_launch_without_a_ttl_or_the_attached_line_is_refused() {
+        let hosts = crate::network::test_allow_hosts(&["198.51.100.7:443"]);
+        // The run attached, but the registry holds no TTL: no backstop, no session.
+        let r = LaunchRig::new(ATTACHED, None);
+        let (f, _h) = fake_with_attach(false, running_ps);
+        let e = r.sandbox(f).create(&r.spec(&hosts)).unwrap_err().to_string();
+        assert!(e.contains("TTL"), "{e}");
+        // The race's signature: started, then the TTL error, then exit; twice.
+        let raced = "started machine rts-0123456789ab\nError: machine \"rts-0123456789ab\" is not registered\n";
+        let r = LaunchRig::new(raced, Some(chrono::Duration::minutes(59)));
+        let (f, h) = fake_with_attach(true, running_ps);
+        let e = r.sandbox(f).create(&r.spec(&hosts)).unwrap_err().to_string();
+        assert!(e.contains("exited before boot"), "{e}");
+        assert_eq!(h.attaches.lock().unwrap().len(), 2, "retried once");
+        assert!(!argvs(&h.calls).iter().any(|a| a[1] == "ps"), "polled ps during the launch");
+        // A line for another machine, or the name as a prefix, is not ours.
+        for other in ["attached to machine rts-0123456789abc; x\n", "attached to machine rts-000000000000; x\n"] {
+            let r = LaunchRig::new(other, Some(chrono::Duration::minutes(59)));
+            let (f, _h) = fake_with_attach(true, running_ps);
+            let e = r.sandbox(f).create(&r.spec(&hosts)).unwrap_err().to_string();
+            assert!(e.contains("exited before boot"), "{other}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_firecracker_run_that_exits_after_the_confirm_is_refused() {
+        let hosts = crate::network::test_allow_hosts(&["198.51.100.7:443"]);
+        let r = LaunchRig::new(ATTACHED, Some(chrono::Duration::minutes(59)));
+        let exited = Arc::new(AtomicBool::new(false));
+        let flag = exited.clone();
+        // `machine ps` is the confirm; the run exits right after it.
+        let (mut f, _h) = fake_with_attach(false, move |a| {
+            if a[1] == "ps" {
+                flag.store(true, Ordering::SeqCst);
+            }
+            running_ps(a)
+        });
+        f.exited_flag = exited;
+        let e = r.sandbox(f).create(&r.spec(&hosts)).unwrap_err().to_string();
+        assert!(e.contains("exited") && e.contains("after"), "{e}");
+    }
+
+    #[test]
+    fn hvf_keeps_polling_machine_ps() {
+        // The default launch is byte-for-byte the mvm 0.22 flow.
+        assert!(matches!(MvmSandbox::new(NAME, fake(|_| out(0, "", "")).0).unwrap().launch, Launch::PollPs));
     }
 
     #[test]

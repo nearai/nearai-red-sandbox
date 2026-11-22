@@ -1190,6 +1190,16 @@ pub fn plugin_options(p: &SessionPaths, cfg: &OperatorConfig, tool_command: &[St
     })
 }
 
+/// The bridge's mvm root (MVM_HOME, else HOME/.mvm, as the session's own
+/// mvmctl resolves it from `env`) and the session's sudo shim directory,
+/// which the backend puts first on a Firecracker mvmctl's PATH.
+pub fn with_mvm_root(plugin_options: &mut Value, env: &[(String, String)], p: &SessionPaths) {
+    if let Ok(root) = mvm_root(env) {
+        plugin_options["bridge"]["mvmRoot"] = json!(root);
+    }
+    plugin_options["bridge"]["sudoShim"] = json!(p.runtime.join("sudo-shim"));
+}
+
 /// Tell `rts tool` how to reach a machine it cannot find by name alone
 /// (a Hyper-V VM, by id).
 pub fn with_tool_target(plugin_options: &mut Value, target: Option<String>) {
@@ -1289,6 +1299,7 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, backend: &dyn Backend, operat
     let nonce = new_nonce();
     let mut plugin_options = plugin_options(p, cfg, &deps.tool_command, &nonce, operator_home);
     with_tool_target(&mut plugin_options, live.sb.tool_target());
+    with_mvm_root(&mut plugin_options, &deps.env, p);
     if let Some(registry) = &live.canaries {
         plugin_options["canaryManifest"] = json!(registry.manifest_path());
     }
@@ -1484,6 +1495,28 @@ mod tests {
         cfg.network = vec!["a.example".into()];
         let o = plugin_options(&p, &cfg, &cmd, &"ab".repeat(12), "/home/op");
         assert_eq!(o["bridge"].get("proxy"), Some(&serde_json::json!(true)));
+    }
+
+    /// trace-commons' macOS Red Team launch (`red_team::spec_for`) passes
+    /// the app's own environment as `LaunchSpec.env`: the user's HOME and no
+    /// MVM_HOME. The bridge must name the same mvm root the session uses.
+    #[test]
+    fn the_bridge_carries_the_sessions_mvm_root_as_the_macos_app_launches_it() {
+        let p = session_paths("0123456789ab", Path::new("/s"), Path::new("/rt"));
+        let app: Vec<(String, String)> = vec![("HOME".into(), "/Users/op".into()), ("PATH".into(), "/usr/bin:/bin".into())];
+        let mut o = serde_json::json!({ "bridge": { "mvmHome": "/Users/op" } });
+        with_mvm_root(&mut o, &app, &p);
+        assert_eq!(o["bridge"]["mvmHome"], "/Users/op");
+        assert_eq!(o["bridge"]["mvmRoot"], "/Users/op/.mvm");
+        assert_eq!(o["bridge"]["sudoShim"], serde_json::json!(p.runtime.join("sudo-shim")));
+        // An embedder's MVM_HOME is the root, whatever HOME is.
+        let mut o = serde_json::json!({ "bridge": {} });
+        with_mvm_root(&mut o, &[("HOME".into(), "/Users/op".into()), ("MVM_HOME".into(), "/p/mvm".into())], &p);
+        assert_eq!(o["bridge"]["mvmRoot"], "/p/mvm");
+        // No root to name: no key, as before.
+        let mut o = serde_json::json!({ "bridge": {} });
+        with_mvm_root(&mut o, &[], &p);
+        assert_eq!(o["bridge"].get("mvmRoot"), None);
     }
 
     #[test]

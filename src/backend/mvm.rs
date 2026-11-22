@@ -11,7 +11,7 @@ use super::kvm;
 use super::{Backend, HostCheck, Machine, Monitor, Pinned};
 use crate::config::OperatorConfig;
 use crate::copy::CopyLimits;
-use crate::mvm::{MvmSandbox, Runner, SpawnRunner};
+use crate::mvm::{Launch, MvmSandbox, Runner, SpawnRunner};
 use crate::network::Plan;
 use crate::sandbox::{
     CopyOutResult, CreateSpec, Exec, ExecOptions, ExecResult, Result as SandboxResult, Sandbox, sv,
@@ -89,12 +89,14 @@ impl Flavor {
         }
     }
 
-    /// The attached `machine run`'s children that carry guest egress. On
-    /// Firecracker the VMM detaches from mvmctl, so only the endpoint.
+    /// The processes that carry guest egress, which teardown kills if any
+    /// outlive the machine. HVF: the attached `machine run`'s children.
+    /// Firecracker: the endpoints mvm started for the VM's state directory
+    /// ([`kvm::firecracker_endpoints`]) and the VMM from `fc.pid`.
     pub fn network_processes(self) -> &'static [&'static str] {
         match self {
             Self::Hvf => &session::NETWORK_PROCESSES,
-            Self::Firecracker => &[session::ENDPOINT],
+            Self::Firecracker => &[session::ENDPOINT, "firecracker"],
         }
     }
 }
@@ -269,7 +271,8 @@ impl Backend for MvmBackend {
         // marks every tool process's view unavailable first, then still exports.
         let sb = MvmSandbox::new(name, Box::new(self.run.clone()))
             .map_err(|e| e.to_string())?
-            .with_copy_limits(CopyLimits::default());
+            .with_copy_limits(CopyLimits::default())
+            .with_launch(self.launch_for(name)?);
         Ok(Box::new(MvmMachine {
             flavor: self.flavor,
             sb,
@@ -277,6 +280,25 @@ impl Backend for MvmBackend {
             env: self.env.clone(),
             network_pids: Mutex::new(Vec::new()),
         }))
+    }
+}
+
+impl MvmBackend {
+    /// How this flavor's network machines wait for their attached run:
+    /// [`Launch::AttachLine`] on Firecracker (mvm 0.28), reading the TTL
+    /// from `<mvm root>/share/vm-names.json`; [`Launch::PollPs`] on HVF.
+    pub(crate) fn launch_for(&self, name: &str) -> Result<Launch, String> {
+        match self.flavor {
+            Flavor::Hvf => Ok(Launch::PollPs),
+            Flavor::Firecracker => {
+                let root = session::mvm_root(&self.env)
+                    .map_err(|e| format!("cannot launch {name}: {e}"))?;
+                Ok(Launch::AttachLine {
+                    registry: root.join("share").join("vm-names.json"),
+                    vm_dir: root.join("vms").join(name),
+                })
+            }
+        }
     }
 }
 
@@ -362,17 +384,51 @@ impl Machine for MvmMachine {
             .sb
             .attach_pid()
             .ok_or("network machine has no attached mvmctl machine run")?;
-        *self.network_pids.lock().unwrap() = session::network_children_of(
-            self.host.as_ref(),
-            attach,
-            self.flavor.network_processes(),
-            self.flavor.name_of(),
-        )?;
+        let pids = match self.flavor {
+            Flavor::Hvf => session::network_children_of(
+                self.host.as_ref(),
+                attach,
+                self.flavor.network_processes(),
+                self.flavor.name_of(),
+            )?,
+            // mvm 0.28 detaches the endpoint from `machine run` (setsid), so
+            // it is found by the state directory it serves, not its parent.
+            Flavor::Firecracker => {
+                let root = session::mvm_root(&self.env)
+                    .map_err(|e| format!("cannot find the network processes: {e}"))?;
+                let mut pids = kvm::firecracker_endpoints(
+                    &kvm::list_processes(Path::new("/proc")),
+                    &root.join("vms").join(&self.sb.name),
+                    kvm::current_uid(),
+                )?;
+                pids.push(self.unprivileged_vmm()?.pid);
+                pids
+            }
+        };
+        *self.network_pids.lock().unwrap() = pids;
         Ok(())
     }
 
     fn network_lost(&self) -> Option<String> {
-        self.sb.network_lost()
+        if let Some(lost) = self.sb.network_lost() {
+            return Some(lost);
+        }
+        // Firecracker's endpoints and VMM are not children of the attached
+        // run, so its exit alone may miss them: each tracked pid must still
+        // name one of them.
+        if self.flavor == Flavor::Firecracker {
+            let names = self.flavor.network_processes();
+            for &pid in self.network_pids.lock().unwrap().iter() {
+                let name = (self.flavor.name_of())(self.host.as_ref(), pid);
+                if !name.as_deref().is_some_and(|n| names.contains(&n)) {
+                    return Some(format!(
+                        "network-lost: egress process {pid} is gone ({})",
+                        name.unwrap_or_else(|| "exited".into())
+                    ));
+                }
+            }
+        }
+        None
     }
 
     fn wait_for_pins(&self, plan: &Plan, clock: &Clock) -> Result<Pinned, String> {
@@ -416,6 +472,13 @@ impl Machine for MvmMachine {
                 network_audit.display()
             )),
             Err(e) => log(&format!("teardown: NETWORK AUDIT FAILED: {e}")),
+        }
+        if self.flavor == Flavor::Firecracker
+            && let Ok(root) = session::mvm_root(&self.env)
+        {
+            kvm::wait_for_host_agents(Path::new("/proc"), &root, kvm::HOST_AGENT_GRACE, &mut |l| {
+                log(l)
+            });
         }
     }
 }
@@ -731,7 +794,35 @@ mod tests {
         );
         assert_eq!(
             Flavor::Firecracker.network_processes(),
-            ["mvm-network-endpoint"]
+            ["mvm-network-endpoint", "firecracker"]
+        );
+    }
+
+    #[test]
+    fn firecracker_machines_wait_for_the_attached_line_and_hvf_ones_poll_ps() {
+        let rec = Rec::new(healthy);
+        let env = vec![("MVM_HOME".to_string(), "/m".to_string())];
+        let fc = fc_backend(&rec, env.clone(), Path::new("/dev/kvm"));
+        assert_eq!(
+            fc.launch_for("rts-0123456789ab").unwrap(),
+            crate::mvm::Launch::AttachLine {
+                registry: "/m/share/vm-names.json".into(),
+                vm_dir: "/m/vms/rts-0123456789ab".into(),
+            }
+        );
+        assert!(
+            fc_backend(&rec, vec![], Path::new("/dev/kvm"))
+                .launch_for("rts-0123456789ab")
+                .is_err()
+        );
+        assert_eq!(
+            backend(
+                &rec,
+                [env, vec![("HOME".to_string(), "/h".to_string())]].concat()
+            )
+            .launch_for("rts-0123456789ab")
+            .unwrap(),
+            crate::mvm::Launch::PollPs
         );
     }
 
@@ -859,6 +950,34 @@ mod tests {
             "readlink /proc/4245/exe" => out(0, "/usr/bin/bash\n"),
             _ => out(1, ""),
         }
+    }
+
+    #[test]
+    fn a_firecracker_machine_whose_egress_process_is_gone_is_network_lost() {
+        let rec = Rec::new(|a| match a.join(" ").as_str() {
+            "readlink /proc/4243/exe" => out(0, "/opt/mvm/mvm-network-endpoint\n"),
+            "readlink /proc/4250/exe" => out(0, "/opt/mvm/firecracker/firecracker\n"),
+            "readlink /proc/4251/exe" => out(0, "/usr/bin/bash\n"),
+            _ => out(1, ""),
+        });
+        let machine = |pids: Vec<u32>| {
+            let sb = MvmSandbox::new("rts-0123456789ab", Box::new(rec.clone())).unwrap();
+            let mut m = MvmMachine::from_parts(sb, rec.clone(), vec![], pids);
+            m.flavor = Flavor::Firecracker;
+            m
+        };
+        assert_eq!(machine(vec![4243, 4250]).network_lost(), None);
+        // Exited (no exe link), or the pid now names another program.
+        for pids in [vec![4243, 4250, 4260], vec![4243, 4251]] {
+            let lost = machine(pids.clone()).network_lost().expect("lost");
+            assert!(lost.starts_with("network-lost:"), "{pids:?}: {lost}");
+        }
+        // HVF keeps the attach as its only signal.
+        let sb = MvmSandbox::new("rts-0123456789ab", Box::new(rec.clone())).unwrap();
+        assert_eq!(
+            MvmMachine::from_parts(sb, rec.clone(), vec![], vec![4260]).network_lost(),
+            None
+        );
     }
 
     #[test]
