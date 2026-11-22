@@ -56,12 +56,16 @@ jobs:
             exit 1
           fi
           { echo "FORK_COMMIT=$commit"; echo "VERSION=$version"; } >> "$GITHUB_ENV"
+          # The fork replaces this checkout next (its composite actions read
+          # the workspace root), so keep this repository's signers aside.
+          cp packaging/mvm/allowed_signers "$RUNNER_TEMP/allowed_signers"
 
+      # The pinned fork commit, at the workspace root as its own release
+      # workflow expects; it replaces this repository's checkout.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: nearai/mvm
           ref: ${{ env.FORK_COMMIT }}
-          path: mvm
           fetch-depth: 1
           persist-credentials: false
 
@@ -69,11 +73,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          head="$(git -C mvm rev-parse HEAD)"
+          head="$(git rev-parse HEAD)"
           [ "$head" = "$FORK_COMMIT" ] || { echo "refusing: checked out $head, not $FORK_COMMIT" >&2; exit 1; }
-          version="$(python3 -c 'import tomllib; print(tomllib.load(open("mvm/Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
           [ "$version" = "$VERSION" ] || { echo "refusing: the fork commit is version $version, fork.lock says $VERSION" >&2; exit 1; }
-          git -C mvm -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$GITHUB_WORKSPACE/packaging/mvm/allowed_signers" verify-commit HEAD
+          git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$RUNNER_TEMP/allowed_signers" verify-commit HEAD
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
@@ -81,17 +85,15 @@ jobs:
           toolchain: 1.100.0
           targets: x86_64-unknown-linux-musl,x86_64-unknown-linux-gnu
 
-      - uses: ./mvm/.github/actions/install-zigbuild
+      - uses: ./.github/actions/install-zigbuild
 
       - name: Build mvmctl
-        working-directory: mvm
         env:
           OPENSSL_STATIC: 1
           OPENSSL_VENDORED: 1
         run: cargo zigbuild --locked --profile release-min --target "${BUILD_TARGET}" --features "${MVMCTL_RELEASE_FEATURES}"
 
       - name: Build per-VM host binaries
-        working-directory: mvm
         env:
           OPENSSL_STATIC: 1
           OPENSSL_VENDORED: 1
@@ -114,7 +116,6 @@ jobs:
           cp "target/${TARGET}/release/libmvm_hostlib.so" "target/${BUILD_TARGET}/release/libmvm_hostlib.so"
 
       - name: Verify the release payloads are statically linked
-        working-directory: mvm
         shell: bash
         run: |
           set -euo pipefail
@@ -132,17 +133,14 @@ jobs:
           done
 
       - name: Smoke test mvmctl
-        working-directory: mvm
         run: |
           "target/${BUILD_TARGET}/release-min/mvmctl" --version
           "target/${BUILD_TARGET}/release-min/mvmctl" --version | grep -qx "mvmctl ${VERSION}"
 
       - name: Build the guest runtime
-        working-directory: mvm
         run: cargo run --locked -p mvmctl -- dev guest-bins --out dist
 
       - name: Stage and package the mvmctl archive
-        working-directory: mvm
         shell: bash
         run: |
           set -euo pipefail
@@ -171,7 +169,6 @@ jobs:
           (cd "$RUNNER_TEMP/artifacts" && sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256")
 
       - name: Collect the guest runtime and the checksum manifest
-        working-directory: mvm
         shell: bash
         run: |
           set -euo pipefail
