@@ -459,7 +459,16 @@ mod tests {
     }
 
     fn status(guest: &mut UnixStream, request: &str) -> String {
-        guest.write_all(request.as_bytes()).unwrap();
+        // A refusal can be sent, and the proxy's end closed, before the whole
+        // request is written (it reads only a bounded head): the write may then
+        // fail with BrokenPipe while the status line is already waiting to be
+        // read. That is the behaviour under test, so only other errors fail.
+        if let Err(e) = guest.write_all(request.as_bytes()) {
+            assert!(
+                matches!(e.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset),
+                "{e}"
+            );
+        }
         let mut line = String::new();
         BufReader::new(guest.try_clone().unwrap())
             .read_line(&mut line)
