@@ -4,5 +4,5 @@
 # must equal `version`. Changing this file changes what rts ships: review it
 # like code.
 repository=nearai/mvm
-commit=017cafa67966226a15fe6d2abcbd896dd36a68d8
-version=0.28.0-rts.2
+commit=b0f99042e7591834b58a0b29a963065429becec1
+version=0.28.0-rts.3

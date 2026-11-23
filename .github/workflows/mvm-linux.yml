@@ -1,16 +1,20 @@
 name: mvm-linux
 
-# Builds the Linux x86_64 mvm release rts installs: the pinned nearai/mvm
-# commit in packaging/mvm/fork.lock (mvmctl, its host helpers and the locked
-# Firecracker in mvmctl-x86_64-unknown-linux-gnu.tar.gz, and the guest
-# runtime), as the fork's own release workflow did. On a signed mvm-v<version>
-# tag, the publish job signs every file with cosign keyless under this
-# workflow's identity, which the fork's binaries trust
-# (mvm_core::release_trust), and publishes the prerelease mvm-v<version>.
+# Builds the Linux mvm release rts installs: the pinned nearai/mvm commit in
+# packaging/mvm/fork.lock, as mvmctl-<arch>-unknown-linux-gnu.tar.gz for
+# x86_64 and aarch64 (mvmctl, its host helpers, the locked Firecracker and
+# libmvm_hostlib.so; the payload is static musl, cross-built with zigbuild as
+# the fork's own release workflow does) and one guest runtime archive that
+# carries both architectures. On a signed mvm-v<version> tag, the publish job
+# signs every file with cosign keyless under this workflow's identity, which
+# the fork's binaries trust (mvm_core::release_trust), and publishes the
+# prerelease mvm-v<version>.
 #
-# Two jobs: build holds no write or signing authority and reads nothing but
-# this repository and the pinned commit; publish holds contents:write and
-# id-token:write and only verifies, signs and uploads what build produced.
+# build (per arch), guest-bins, smoke-aarch64 (the aarch64 payload run on an
+# arm64 runner) and assemble hold no write or signing authority and read
+# nothing but this repository and the pinned commit; publish holds
+# contents:write and id-token:write and only verifies, signs and uploads what
+# assemble produced.
 on:
   pull_request:
     paths:
@@ -28,12 +32,175 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TARGET: x86_64-unknown-linux-gnu
-  BUILD_TARGET: x86_64-unknown-linux-musl
   MVMCTL_RELEASE_FEATURES: host,user,release-artifact-bootstrap,release-channel,embed-host-bins
 
 jobs:
   build:
+    name: build mvmctl (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # target names the archive (the public asset name the fork's
+          # mvmctl requests); build_target is the static musl payload inside.
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            build_target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            build_target: aarch64-unknown-linux-musl
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      ARCH: ${{ matrix.arch }}
+      TARGET: ${{ matrix.target }}
+      BUILD_TARGET: ${{ matrix.build_target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read the pinned fork commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          lock=packaging/mvm/fork.lock
+          get() { grep -E "^$1=" "$lock" | head -1 | cut -d= -f2-; }
+          repo="$(get repository)" commit="$(get commit)" version="$(get version)"
+          [ "$repo" = nearai/mvm ] || { echo "refusing: fork.lock names $repo, not nearai/mvm" >&2; exit 1; }
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "refusing: fork.lock's commit is not a full SHA: $commit" >&2; exit 1; }
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rts\.[0-9]+$ ]] || { echo "refusing: fork.lock's version is malformed: $version" >&2; exit 1; }
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_NAME" != "mvm-v$version" ]; then
+            echo "refusing: tag $GITHUB_REF_NAME is not mvm-v$version from fork.lock" >&2
+            exit 1
+          fi
+          { echo "FORK_COMMIT=$commit"; echo "VERSION=$version"; } >> "$GITHUB_ENV"
+          # The fork replaces this checkout next (its composite actions read
+          # the workspace root), so keep this repository's signers aside.
+          cp packaging/mvm/allowed_signers "$RUNNER_TEMP/allowed_signers"
+
+      # The pinned fork commit, at the workspace root as its own release
+      # workflow expects; it replaces this repository's checkout.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: nearai/mvm
+          ref: ${{ env.FORK_COMMIT }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Require the pinned commit, its version and its signature
+        shell: bash
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          [ "$head" = "$FORK_COMMIT" ] || { echo "refusing: checked out $head, not $FORK_COMMIT" >&2; exit 1; }
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          [ "$version" = "$VERSION" ] || { echo "refusing: the fork commit is version $version, fork.lock says $VERSION" >&2; exit 1; }
+          git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$RUNNER_TEMP/allowed_signers" verify-commit HEAD
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: 1.100.0
+          targets: ${{ matrix.build_target }},${{ matrix.target }}
+
+      - uses: ./.github/actions/install-zigbuild
+
+      - name: Build mvmctl
+        env:
+          OPENSSL_STATIC: 1
+          OPENSSL_VENDORED: 1
+        run: cargo zigbuild --locked --profile release-min --target "${BUILD_TARGET}" --features "${MVMCTL_RELEASE_FEATURES}"
+
+      - name: Build per-VM host binaries
+        env:
+          OPENSSL_STATIC: 1
+          OPENSSL_VENDORED: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo zigbuild --locked --release --target "${BUILD_TARGET}" -p mvm-hostd -p mvm-gpu \
+            --bin mvm-host-agent \
+            --bin mvm-policy-coordinator \
+            --bin mvm-signer-helper \
+            --bin mvm-network-endpoint \
+            --bin mvm-broker \
+            --bin mvm-audit-signer \
+            --bin mvm-mailbox \
+            --bin mvm-actor-holder \
+            --bin mvm-actor-controller \
+            --bin mvm-gpu-endpoint
+          cargo zigbuild --locked --release --target "${TARGET}" -p mvm-hostlib --features mvm-client/release-channel
+          mkdir -p "target/${BUILD_TARGET}/release"
+          cp "target/${TARGET}/release/libmvm_hostlib.so" "target/${BUILD_TARGET}/release/libmvm_hostlib.so"
+
+      - name: Verify the release payloads are statically linked and for this arch
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$ARCH" in x86_64) want="x86-64" ;; aarch64) want="ARM aarch64" ;; esac
+          for binary in \
+            "target/${BUILD_TARGET}/release-min/mvmctl" \
+            "target/${BUILD_TARGET}/release/mvm-host-agent" \
+            "target/${BUILD_TARGET}/release/mvm-policy-coordinator" \
+            "target/${BUILD_TARGET}/release/mvm-signer-helper" \
+            "target/${BUILD_TARGET}/release/mvm-network-endpoint" \
+            "target/${BUILD_TARGET}/release/mvm-broker" \
+            "target/${BUILD_TARGET}/release/mvm-audit-signer"; do
+            description="$(file --brief "${binary}")"
+            echo "${binary}: ${description}"
+            [[ "${description}" == *"statically linked"* ]] || { echo "::error::${binary} is not statically linked" >&2; exit 1; }
+            [[ "${description}" == *"${want}"* ]] || { echo "::error::${binary} is not ${want}" >&2; exit 1; }
+          done
+          description="$(file --brief "target/${BUILD_TARGET}/release/libmvm_hostlib.so")"
+          echo "libmvm_hostlib.so: ${description}"
+          [[ "${description}" == *"${want}"* ]] || { echo "::error::libmvm_hostlib.so is not ${want}" >&2; exit 1; }
+
+      # The aarch64 payload runs in smoke-aarch64, on an arm64 runner.
+      - name: Smoke test mvmctl
+        if: matrix.arch == 'x86_64'
+        run: |
+          "target/${BUILD_TARGET}/release-min/mvmctl" --version
+          "target/${BUILD_TARGET}/release-min/mvmctl" --version | grep -qx "mvmctl ${VERSION}"
+
+      - name: Stage and package the mvmctl archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE_NAME="mvmctl-${TARGET}"
+          mkdir -p "staging/${ARCHIVE_NAME}"
+          cp "target/${BUILD_TARGET}/release-min/mvmctl" "staging/${ARCHIVE_NAME}/"
+          for hostbin in mvm-host-agent mvm-policy-coordinator mvm-signer-helper mvm-network-endpoint \
+            mvm-broker mvm-audit-signer mvm-mailbox mvm-actor-holder mvm-actor-controller mvm-gpu-endpoint; do
+            cp "target/${BUILD_TARGET}/release/${hostbin}" "staging/${ARCHIVE_NAME}/"
+          done
+          scripts/release/stage-firecracker.sh "${ARCH}" "staging/${ARCHIVE_NAME}/firecracker"
+          cp "target/${BUILD_TARGET}/release/libmvm_hostlib.so" "staging/${ARCHIVE_NAME}/"
+          cp -r assets "staging/${ARCHIVE_NAME}/" 2>/dev/null || true
+          cp README.md LICENSE "staging/${ARCHIVE_NAME}/"
+          cp crates/deps/mvm-macho-sign/LICENSE "staging/${ARCHIVE_NAME}/LICENSE-MPL-2.0.txt"
+          printf '%s\n' \
+            'This release contains mvm-macho-sign, modified MPL-2.0 Covered Software adapted from apple-codesign 0.29.0, Copyright Gregory Szorc.' \
+            'LICENSE-MPL-2.0.txt governs those files, not Apache-2.0 alone.' \
+            'Corresponding source, including modifications, is available under MPL-2.0 at:' \
+            "https://github.com/nearai/mvm/tree/${FORK_COMMIT}/crates/deps/mvm-macho-sign" \
+            > "staging/${ARCHIVE_NAME}/THIRD_PARTY_NOTICES.txt"
+          cargo run --locked --package xtask --features man -- emit-backend-components-tsv > "staging/${ARCHIVE_NAME}/components.tsv"
+          test -s "staging/${ARCHIVE_NAME}/components.tsv"
+          mkdir -p "$RUNNER_TEMP/artifacts"
+          tar -C staging -czf "$RUNNER_TEMP/artifacts/${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+          (cd "$RUNNER_TEMP/artifacts" && sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mvm-linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/artifacts
+          retention-days: 7
+          if-no-files-found: error
+
+  # One guest runtime archive for both architectures (its manifest lists an
+  # x86_64 and an aarch64 assembly).
+  guest-bins:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:
@@ -87,100 +254,85 @@ jobs:
 
       - uses: ./.github/actions/install-zigbuild
 
-      - name: Build mvmctl
-        env:
-          OPENSSL_STATIC: 1
-          OPENSSL_VENDORED: 1
-        run: cargo zigbuild --locked --profile release-min --target "${BUILD_TARGET}" --features "${MVMCTL_RELEASE_FEATURES}"
-
-      - name: Build per-VM host binaries
-        env:
-          OPENSSL_STATIC: 1
-          OPENSSL_VENDORED: 1
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo zigbuild --locked --release --target "${BUILD_TARGET}" -p mvm-hostd -p mvm-gpu \
-            --bin mvm-host-agent \
-            --bin mvm-policy-coordinator \
-            --bin mvm-signer-helper \
-            --bin mvm-network-endpoint \
-            --bin mvm-broker \
-            --bin mvm-audit-signer \
-            --bin mvm-mailbox \
-            --bin mvm-actor-holder \
-            --bin mvm-actor-controller \
-            --bin mvm-gpu-endpoint
-          cargo zigbuild --locked --release --target "${TARGET}" -p mvm-hostlib --features mvm-client/release-channel
-          mkdir -p "target/${BUILD_TARGET}/release"
-          cp "target/${TARGET}/release/libmvm_hostlib.so" "target/${BUILD_TARGET}/release/libmvm_hostlib.so"
-
-      - name: Verify the release payloads are statically linked
-        shell: bash
-        run: |
-          set -euo pipefail
-          for binary in \
-            "target/${BUILD_TARGET}/release-min/mvmctl" \
-            "target/${BUILD_TARGET}/release/mvm-host-agent" \
-            "target/${BUILD_TARGET}/release/mvm-policy-coordinator" \
-            "target/${BUILD_TARGET}/release/mvm-signer-helper" \
-            "target/${BUILD_TARGET}/release/mvm-network-endpoint" \
-            "target/${BUILD_TARGET}/release/mvm-broker" \
-            "target/${BUILD_TARGET}/release/mvm-audit-signer"; do
-            description="$(file --brief "${binary}")"
-            echo "${binary}: ${description}"
-            [[ "${description}" == *"statically linked"* ]] || { echo "::error::${binary} is not statically linked" >&2; exit 1; }
-          done
-
-      - name: Smoke test mvmctl
-        run: |
-          "target/${BUILD_TARGET}/release-min/mvmctl" --version
-          "target/${BUILD_TARGET}/release-min/mvmctl" --version | grep -qx "mvmctl ${VERSION}"
-
       - name: Build the guest runtime
         run: cargo run --locked -p mvmctl -- dev guest-bins --out dist
 
-      - name: Stage and package the mvmctl archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          ARCHIVE_NAME="mvmctl-${TARGET}"
-          mkdir -p "staging/${ARCHIVE_NAME}"
-          cp "target/${BUILD_TARGET}/release-min/mvmctl" "staging/${ARCHIVE_NAME}/"
-          for hostbin in mvm-host-agent mvm-policy-coordinator mvm-signer-helper mvm-network-endpoint \
-            mvm-broker mvm-audit-signer mvm-mailbox mvm-actor-holder mvm-actor-controller mvm-gpu-endpoint; do
-            cp "target/${BUILD_TARGET}/release/${hostbin}" "staging/${ARCHIVE_NAME}/"
-          done
-          scripts/release/stage-firecracker.sh x86_64 "staging/${ARCHIVE_NAME}/firecracker"
-          cp "target/${BUILD_TARGET}/release/libmvm_hostlib.so" "staging/${ARCHIVE_NAME}/"
-          cp -r assets "staging/${ARCHIVE_NAME}/" 2>/dev/null || true
-          cp README.md LICENSE "staging/${ARCHIVE_NAME}/"
-          cp crates/deps/mvm-macho-sign/LICENSE "staging/${ARCHIVE_NAME}/LICENSE-MPL-2.0.txt"
-          printf '%s\n' \
-            'This release contains mvm-macho-sign, modified MPL-2.0 Covered Software adapted from apple-codesign 0.29.0, Copyright Gregory Szorc.' \
-            'LICENSE-MPL-2.0.txt governs those files, not Apache-2.0 alone.' \
-            'Corresponding source, including modifications, is available under MPL-2.0 at:' \
-            "https://github.com/nearai/mvm/tree/${FORK_COMMIT}/crates/deps/mvm-macho-sign" \
-            > "staging/${ARCHIVE_NAME}/THIRD_PARTY_NOTICES.txt"
-          cargo run --locked --package xtask --features man -- emit-backend-components-tsv > "staging/${ARCHIVE_NAME}/components.tsv"
-          test -s "staging/${ARCHIVE_NAME}/components.tsv"
-          mkdir -p "$RUNNER_TEMP/artifacts"
-          tar -C staging -czf "$RUNNER_TEMP/artifacts/${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
-          (cd "$RUNNER_TEMP/artifacts" && sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256")
-
-      - name: Collect the guest runtime and the checksum manifest
+      - name: Collect the guest runtime
         shell: bash
         run: |
           set -euo pipefail
           runtime="mvm-guest-bins-v${VERSION}.tar.gz"
           test -f "dist/${runtime}" && test -f "dist/${runtime}.sha256"
           (cd dist && sha256sum --check "${runtime}.sha256")
+          tar -xOzf "dist/${runtime}" manifest.json | python3 -c 'import json, sys; a = json.load(sys.stdin)["assemblies"]; assert sorted(a) == ["aarch64", "x86_64"], a'
+          mkdir -p "$RUNNER_TEMP/artifacts"
           cp "dist/${runtime}" "dist/${runtime}.sha256" "$RUNNER_TEMP/artifacts/"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mvm-linux-guest
+          path: ${{ runner.temp }}/artifacts
+          retention-days: 7
+          if-no-files-found: error
+
+  # The aarch64 build is cross-compiled; run it where it is native.
+  smoke-aarch64:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mvm-linux-aarch64
+          path: ${{ runner.temp }}/aarch64
+      - name: Run the aarch64 payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(grep -E '^version=' packaging/mvm/fork.lock | head -1 | cut -d= -f2-)"
+          cd "$RUNNER_TEMP/aarch64"
+          sha256sum --check mvmctl-aarch64-unknown-linux-gnu.tar.gz.sha256
+          tar -xzf mvmctl-aarch64-unknown-linux-gnu.tar.gz
+          d=mvmctl-aarch64-unknown-linux-gnu
+          uname -m
+          file --brief "$d/mvmctl"
+          "$d/mvmctl" --version
+          "$d/mvmctl" --version | grep -qx "mvmctl ${version}"
+          "$d/firecracker/firecracker" --version
+
+  # Joins the per-arch archives and the guest runtime into the one artifact
+  # publish verifies, signs and uploads.
+  assemble:
+    needs: [build, guest-bins, smoke-aarch64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: mvm-linux-*
+          path: ${{ runner.temp }}/artifacts
+          merge-multiple: true
+      - name: Check every file and write the checksum manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          get() { grep -E "^$1=" packaging/mvm/fork.lock | head -1 | cut -d= -f2-; }
+          version="$(get version)" commit="$(get commit)"
           cd "$RUNNER_TEMP/artifacts"
+          for f in mvmctl-x86_64-unknown-linux-gnu.tar.gz mvmctl-aarch64-unknown-linux-gnu.tar.gz "mvm-guest-bins-v${version}.tar.gz"; do
+            [ -f "$f" ] && [ -f "$f.sha256" ] || { echo "refusing: $f or its .sha256 is missing" >&2; exit 1; }
+            sha256sum --check "$f.sha256"
+          done
           cat ./*.sha256 > checksums-sha256.txt
           cat checksums-sha256.txt
-          echo "$FORK_COMMIT" > fork-commit.txt
-
+          echo "$commit" > fork-commit.txt
+          ls -l
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mvm-linux
@@ -189,7 +341,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: assemble
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/mvm-v')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -237,7 +389,7 @@ jobs:
           cd "$out"
           sha256sum --check checksums-sha256.txt
           version="${GITHUB_REF_NAME#mvm-v}"
-          for f in mvmctl-x86_64-unknown-linux-gnu.tar.gz "mvm-guest-bins-v${version}.tar.gz" checksums-sha256.txt fork-commit.txt; do
+          for f in mvmctl-x86_64-unknown-linux-gnu.tar.gz mvmctl-aarch64-unknown-linux-gnu.tar.gz "mvm-guest-bins-v${version}.tar.gz" checksums-sha256.txt fork-commit.txt; do
             [ -f "$f" ] || { echo "refusing: $f is missing from the build" >&2; exit 1; }
           done
           ls -l
@@ -287,5 +439,5 @@ jobs:
             --verify-tag \
             --prerelease \
             --latest=false \
-            --title "mvm ${GITHUB_REF_NAME#mvm-v} for rts (Linux x86_64)" \
-            --notes "The Linux x86_64 mvm build rts installs: nearai/mvm ${commit} (packaging/mvm/fork.lock), built and signed by .github/workflows/mvm-linux.yml with cosign keyless; that identity at this tag is what the build's own mvmctl trusts. checksums-sha256.txt lists every file. Not an rts release."
+            --title "mvm ${GITHUB_REF_NAME#mvm-v} for rts (Linux x86_64 and aarch64)" \
+            --notes "The Linux mvm builds rts installs (x86_64 and aarch64): nearai/mvm ${commit} (packaging/mvm/fork.lock), built and signed by .github/workflows/mvm-linux.yml with cosign keyless; that identity at this tag is what the build's own mvmctl trusts. checksums-sha256.txt lists every file. Not an rts release."
