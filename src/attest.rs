@@ -1282,7 +1282,8 @@ mod tests {
     /// 2026-10-29: the gateway (dstack-0.5.12) and the abliterated DeepSeek
     /// model entry (dstack-nvidia-0.5.11). 2026-11-20, verified by rts under
     /// mr-config-only: the redeployed gateway (dstack-0.5.12) and both
-    /// model entries (dstack-nvidia-0.5.11, gpu04 and gpu02).
+    /// model entries (dstack-nvidia-0.5.11, gpu04 and gpu02). 2026-11-23:
+    /// the updated gateway and Qwen on dstack-nvidia-0.5.12 (gpu13).
     #[test]
     fn the_committed_policy_pins_the_production_composes() {
         let policy = load_policy(POLICY_JSON).unwrap();
@@ -1292,18 +1293,21 @@ mod tests {
             "53cd435edbc129f848ed0ddce301f7f192446fe39683713a38537820bea7e1fb",
             "e3902667a26282dd8b4015a901848c521b20243a155a457148f88acf48a45959",
             "edabf8039210336d90fe966dfc4e48216551dfd8b05d54e96d3f3f0e0da850d4",
+            "1787a4af87eaf4bb139b555c3148ea6cffb01442b9fd7db4304e23b24f4db993",
+            "e4b83d924284eece9b972d8e18bd88dac4dd529031b00311ef5044eaa60ba8d9",
         ] {
             assert!(
                 policy.compose_hashes.contains(&report::hex32(h).unwrap()),
                 "{h} is not pinned"
             );
         }
-        assert_eq!(policy.compose_hashes.len(), 5);
+        assert_eq!(policy.compose_hashes.len(), 7);
     }
 
     /// The staging compose hashes measured on 2026-11-20 and verified by rts
     /// under mr-config-only: the staging gateway (dstack-0.5.15) and the
-    /// same two model entries production serves.
+    /// same two model entries production serves. 2026-11-23: the updated
+    /// staging gateway and the same Qwen envelope as production.
     #[test]
     fn the_committed_staging_policy_pins_the_staging_composes() {
         let policy = load_policy(POLICY_STAGING_JSON).unwrap();
@@ -1311,13 +1315,15 @@ mod tests {
             "10d29b736472383a011211c5c882d85d5dd53c8d4242d9d872c64a6097bdf441",
             "e3902667a26282dd8b4015a901848c521b20243a155a457148f88acf48a45959",
             "edabf8039210336d90fe966dfc4e48216551dfd8b05d54e96d3f3f0e0da850d4",
+            "85c10cc2c733cfd49e3e780384abfa53415d3f63c85a19e8350cfb08ce40c5f7",
+            "e4b83d924284eece9b972d8e18bd88dac4dd529031b00311ef5044eaa60ba8d9",
         ] {
             assert!(
                 policy.compose_hashes.contains(&report::hex32(h).unwrap()),
                 "{h} is not pinned"
             );
         }
-        assert_eq!(policy.compose_hashes.len(), 3);
+        assert_eq!(policy.compose_hashes.len(), 5);
     }
 
     const STAGING_RECORDED_AT: u64 = 1_795_182_609;
