@@ -24,6 +24,16 @@
       "sha256": "edabf8039210336d90fe966dfc4e48216551dfd8b05d54e96d3f3f0e0da850d4",
       "recorded": "2026-11-20",
       "source": "NEAR AI production cloud-api.near.ai: model_attestations[1] for deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated, info.app_name dstack-nvidia-0.5.11 (mr-config-only, verified by rts)"
+    },
+    {
+      "sha256": "1787a4af87eaf4bb139b555c3148ea6cffb01442b9fd7db4304e23b24f4db993",
+      "recorded": "2026-11-23",
+      "source": "NEAR AI production cloud-api.near.ai: gateway_attestation, info.app_name dstack-0.5.12 (mr-config-only, verified by rts)"
+    },
+    {
+      "sha256": "e4b83d924284eece9b972d8e18bd88dac4dd529031b00311ef5044eaa60ba8d9",
+      "recorded": "2026-11-23",
+      "source": "NEAR AI production cloud-api.near.ai: model_attestations[0] for Qwen/Qwen3.8-27B-abliterated, info.app_name dstack-nvidia-0.5.12 (mr-config-only, verified by rts)"
     }
   ]
 }

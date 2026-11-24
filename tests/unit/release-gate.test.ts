@@ -316,3 +316,15 @@ describe("the tap step", () => {
     expect(step).toContain('grep -qF "sha256 \\"$SHA\\""')
   })
 })
+
+test("the strict live attestation check gates the standalone release", () => {
+  const wf = readFileSync(join(ROOT, ".github", "workflows", "release.yml"), "utf8")
+  const check = wf.indexOf("- name: Verify live NEAR AI attestation against the bundled policies")
+  expect(check).toBeGreaterThan(wf.indexOf("- name: Build rts"))
+  expect(check).toBeLessThan(wf.indexOf("- name: Build the patched supervisor"))
+  const step = wf.slice(check, wf.indexOf("- name: Build the patched supervisor"))
+  expect(step).toContain("RTS_LIVE_COMPOSE_POLICY: pinned")
+  expect(step).toContain("for environment in production staging")
+  expect(step).toContain("cargo test --locked --test live_attest -- --ignored --test-threads=1")
+  expect(wf.split("\n  publish:")[1]).toContain("needs: [build, build-windows, build-linux]")
+})

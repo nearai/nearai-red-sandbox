@@ -164,6 +164,16 @@ jobs:
           RTS_UPDATE_PUBLIC_KEY_HEX: ${{ vars.RTS_UPDATE_PUBLIC_KEY_HEX }}
         run: cargo build --release --locked
 
+      - name: Verify live NEAR AI attestation against the bundled policies
+        env:
+          RTS_LIVE_COMPOSE_POLICY: pinned
+        run: |
+          set -euo pipefail
+          for environment in production staging; do
+            RTS_LIVE_NEAR_ENVIRONMENT="$environment" \
+              cargo test --locked --test live_attest -- --ignored --test-threads=1
+          done
+
       - name: Build the patched supervisor
         run: bash scripts/build-patched-mvm-supervisor.sh --install-dir "$RUNNER_TEMP/supervisor"
 
