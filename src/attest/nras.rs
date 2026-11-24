@@ -6,6 +6,7 @@
 //! expired, and its overall result is the JSON boolean `true`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -19,6 +20,9 @@ pub const NRAS_JWKS_URL: &str = "https://nras.attestation.nvidia.com/.well-known
 
 /// The claim carrying NRAS's overall verdict.
 const OVERALL_CLAIM: &str = "x-nvidia-overall-att-result";
+
+/// Maximum delay before we recheck a live, signed verdict's time window.
+const MAX_NBF_WAIT_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct GpuVerdict {
@@ -91,12 +95,19 @@ fn jwks_point(jwks: &[u8], kid: &str) -> Result<Vec<u8>, String> {
 
 /// Verifies `alg == "ES384"`, finds the JWKS key with the token's `kid` (`kty EC`, `crv P-384`),
 /// verifies the 96-byte fixed signature over `header.payload` against `04 || x || y`,
-/// and requires `exp > now_unix`. Returns the kid and the claims.
+/// and requires `exp > now_unix` and `nbf <= now_unix` when present.
+/// Returns the kid and claims at the supplied time without waiting.
 pub fn verify_es384_jwt(
     token: &str,
     jwks: &[u8],
     now_unix: u64,
 ) -> Result<(String, serde_json::Value), String> {
+    let (kid, claims) = authenticate_es384_jwt(token, jwks)?;
+    check_time(&claims, now_unix).map_err(TimeError::message)?;
+    Ok((kid, claims))
+}
+
+fn authenticate_es384_jwt(token: &str, jwks: &[u8]) -> Result<(String, Value), String> {
     let parts: Vec<&str> = token.split('.').collect();
     let [h, c, s] = parts[..] else {
         return Err("NRAS token: not three dot-separated parts".into());
@@ -125,17 +136,59 @@ pub fn verify_es384_jwt(
         .verify(signed.as_bytes(), &sig)
         .map_err(|_| format!("NRAS token: signature does not verify under kid {kid:?}"))?;
     let claims = json_object(&b64(c, "payload")?, "payload")?;
-    match claims.get("exp").map(Value::as_u64) {
-        Some(Some(exp)) if exp > now_unix => {}
-        Some(Some(_)) => return Err("NRAS token: expired (exp has passed)".into()),
-        _ => return Err("NRAS token: exp is missing or not a non-negative integer".into()),
-    }
-    match claims.get("nbf").map(Value::as_u64) {
-        None => {}
-        Some(Some(nbf)) if nbf <= now_unix => {}
-        Some(_) => return Err("NRAS token: nbf is in the future or not an integer".into()),
-    }
     Ok((kid, Value::Object(claims)))
+}
+
+enum TimeError {
+    ExpMissingOrMalformed,
+    Expired,
+    NbfMalformed,
+    NotYetValid { nbf: u64, now: u64 },
+}
+
+impl TimeError {
+    fn message(self) -> String {
+        match self {
+            Self::ExpMissingOrMalformed => {
+                "NRAS token: exp is missing or not a non-negative integer".into()
+            }
+            Self::Expired => "NRAS token: expired (exp has passed)".into(),
+            Self::NbfMalformed => "NRAS token: nbf is not a non-negative integer".into(),
+            Self::NotYetValid { nbf, now } => {
+                format!("NRAS token: nbf is in the future (nbf={nbf}, now={now})")
+            }
+        }
+    }
+}
+
+fn check_time(claims: &Value, now: u64) -> Result<(), TimeError> {
+    let exp = claims
+        .get("exp")
+        .and_then(Value::as_u64)
+        .ok_or(TimeError::ExpMissingOrMalformed)?;
+    if exp <= now {
+        return Err(TimeError::Expired);
+    }
+    if let Some(nbf) = claims.get("nbf") {
+        let nbf = nbf.as_u64().ok_or(TimeError::NbfMalformed)?;
+        if nbf > now {
+            return Err(TimeError::NotYetValid { nbf, now });
+        }
+    }
+    Ok(())
+}
+
+fn check_live_time(claims: &Value, clock: &dyn Clock) -> Result<(), TimeError> {
+    match check_time(claims, clock.now_unix()) {
+        Err(TimeError::NotYetValid { nbf, now })
+            if nbf - now <= MAX_NBF_WAIT_SECONDS
+                && clock.wait_for_time_advance(Duration::from_secs(nbf - now)) =>
+        {
+            // Recheck against the actual wall clock, including expiration.
+            check_time(claims, clock.now_unix())
+        }
+        result => result,
+    }
 }
 
 pub trait GpuVerifier: Send + Sync {
@@ -185,7 +238,8 @@ impl GpuVerifier for NrasGpuVerifier {
         if jwks.status != 200 {
             return Err(format!("NRAS JWKS returned status {}", jwks.status));
         }
-        let (kid, claims) = verify_es384_jwt(token, &jwks.body, self.clock.now_unix())?;
+        let (kid, claims) = authenticate_es384_jwt(token, &jwks.body)?;
+        check_live_time(&claims, self.clock.as_ref()).map_err(TimeError::message)?;
         if claims.get(OVERALL_CLAIM) != Some(&Value::Bool(true)) {
             return Err(format!("NRAS verdict: {OVERALL_CLAIM} is not true"));
         }
@@ -198,13 +252,15 @@ mod tests {
     use super::{
         GpuVerdict, GpuVerifier, NRAS_ATTEST_URL, NRAS_JWKS_URL, NrasGpuVerifier, verify_es384_jwt,
     };
-    use crate::attest::http::{FakeHttp, FixedClock, HttpResponse};
+    use crate::attest::http::{Clock, FakeHttp, FixedClock, HttpResponse};
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ring::rand::SystemRandom;
     use ring::signature::{ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
     use serde_json::{Value, json};
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     const A: &[u8] = include_bytes!("../../tests/fixtures/nras/p384-a.pk8");
     const B: &[u8] = include_bytes!("../../tests/fixtures/nras/p384-b.pk8");
@@ -335,6 +391,24 @@ mod tests {
     }
 
     #[test]
+    fn strict_verification_distinguishes_future_and_malformed_nbf() {
+        let a = key(A);
+        let jwks = jwks("k1", &a);
+        let mut c = claims(true);
+        c["nbf"] = json!(NOW + 2);
+        let t = token(&a, header(), c.clone());
+        let e = verify_es384_jwt(&t, &jwks, NOW).unwrap_err();
+        assert!(e.contains(&format!("nbf={}", NOW + 2)), "{e}");
+        assert!(e.contains(&format!("now={NOW}")), "{e}");
+        assert!(verify_es384_jwt(&t, &jwks, NOW + 2).is_ok());
+
+        c["nbf"] = json!("future");
+        let t = token(&a, header(), c);
+        let e = verify_es384_jwt(&t, &jwks, NOW).unwrap_err();
+        assert_eq!(e, "NRAS token: nbf is not a non-negative integer");
+    }
+
+    #[test]
     fn a_jwks_key_on_another_curve_is_refused() {
         let a = key(A);
         let t = token(&a, header(), claims(true));
@@ -378,6 +452,97 @@ mod tests {
             clock: Arc::new(FixedClock(NOW)),
         };
         (http, v)
+    }
+
+    struct WaitClock {
+        now: AtomicU64,
+        after_wait: u64,
+        waits: Mutex<Vec<Duration>>,
+    }
+
+    impl WaitClock {
+        fn at(after_wait: u64) -> Self {
+            Self {
+                now: AtomicU64::new(NOW),
+                after_wait,
+                waits: Mutex::default(),
+            }
+        }
+    }
+
+    impl Clock for WaitClock {
+        fn now_unix(&self) -> u64 {
+            self.now.load(Ordering::Relaxed)
+        }
+
+        fn wait_for_time_advance(&self, delay: Duration) -> bool {
+            self.waits.lock().unwrap().push(delay);
+            self.now.store(self.after_wait, Ordering::Relaxed);
+            true
+        }
+    }
+
+    fn timed_verifier(c: Value, signer: &[u8], clock: Arc<dyn Clock>) -> NrasGpuVerifier {
+        let http = FakeHttp::new();
+        let t = token(&key(signer), header(), c);
+        http.route(
+            "POST",
+            NRAS_ATTEST_URL,
+            ok(serde_json::to_vec(&json!([["JWT", t]])).unwrap()),
+        );
+        http.route("GET", NRAS_JWKS_URL, ok(jwks("k1", &key(A))));
+        NrasGpuVerifier { http, clock }
+    }
+
+    #[test]
+    fn a_near_future_verdict_requires_the_clock_to_enter_its_validity_window() {
+        let mut c = claims(true);
+        c["nbf"] = json!(NOW + 2);
+        c["exp"] = json!(NOW + 3);
+        for (after_wait, refusal) in [
+            (NOW + 2, None),
+            (
+                NOW + 1,
+                Some(format!(
+                    "nbf is in the future (nbf={}, now={})",
+                    NOW + 2,
+                    NOW + 1
+                )),
+            ),
+            (NOW + 3, Some("expired".into())),
+        ] {
+            let clock = Arc::new(WaitClock::at(after_wait));
+            let v = timed_verifier(c.clone(), A, clock.clone());
+            let result = v.verify(&payload(), &nonce());
+            if let Some(expected) = refusal {
+                let error = result.unwrap_err();
+                assert!(error.contains(&expected), "{error}");
+            } else {
+                assert!(result.unwrap().overall);
+            }
+            assert_eq!(*clock.waits.lock().unwrap(), [Duration::from_secs(2)]);
+        }
+
+        let v = timed_verifier(c, A, Arc::new(FixedClock(NOW)));
+        let error = v.verify(&payload(), &nonce()).unwrap_err();
+        assert!(error.contains("nbf is in the future"), "{error}");
+    }
+
+    #[test]
+    fn invalid_or_far_future_verdicts_never_wait() {
+        for (nbf, signer, expected) in [
+            (json!(NOW + 2), B, "signature does not verify"),
+            (json!("future"), A, "nbf is not a non-negative integer"),
+            (json!(NOW + 6), A, "nbf is in the future"),
+        ] {
+            let mut c = claims(true);
+            c["nbf"] = nbf;
+            let clock = Arc::new(WaitClock::at(NOW + 60));
+            let v = timed_verifier(c, signer, clock.clone());
+            let error = v.verify(&payload(), &nonce()).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert!(clock.waits.lock().unwrap().is_empty());
+        }
     }
 
     #[test]

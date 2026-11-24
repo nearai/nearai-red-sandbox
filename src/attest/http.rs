@@ -101,6 +101,12 @@ impl Http for BlockingHttp {
 
 pub trait Clock: Send + Sync {
     fn now_unix(&self) -> u64;
+
+    /// Wait for the wall clock to advance on a live run. Fixed clocks
+    /// used for replay decline without sleeping or advancing time.
+    fn wait_for_time_advance(&self, _delay: Duration) -> bool {
+        false
+    }
 }
 
 pub struct SystemClock;
@@ -112,6 +118,11 @@ impl Clock for SystemClock {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+
+    fn wait_for_time_advance(&self, delay: Duration) -> bool {
+        std::thread::sleep(delay);
+        true
     }
 }
 
