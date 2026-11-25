@@ -354,7 +354,13 @@ Model (`rules:model-v1`):
 C1-C4 and G1/M1 against. Every such baseline is tried, and the entry is
 endorsed if any one of them leaves no unverified change. So a held compose
 merged verbatim into the baselines is signed by the next run, whichever
-baseline file sorts first.
+baseline file sorts first. Digests are compared by position: G1/M1 make
+the blinded files equal, so candidate and baseline digests pair up in
+order. A digest that differs from the baseline's at its position is a
+change even when the baseline holds that digest elsewhere, and it must be
+the only digest of an uncommented `image:` line. A change on any other
+line (an environment variable such as `DSTACK_CONTAINER_IMAGE_ID`, a
+comment) holds the entry.
 
 Whether `nearaidev/cloud-api` and `nearaidev/cvm-ingress` images carry cosign
 signatures has not been checked. That is the first task of the plan. If they

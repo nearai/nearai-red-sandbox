@@ -435,6 +435,52 @@ def test_a_digest_outside_an_image_line_must_not_change(tmp_path):
     assert hold["diff"] == [f"digest changed outside an image: line: sha256:{'2' * 64}"]
 
 
+F571 = (REPO / "opencode" / "attestation-baselines" / "production" / "gateway" /
+        "f571e5dafe8f96baf116a271b4be9cba228b447dd6ebe502bbda81ede7bcc7ce.json").read_text()
+
+
+def test_a_reviewed_digest_moved_onto_a_non_image_line_is_held(tmp_path):
+    # Only DSTACK_CONTAINER_IMAGE_ID changes, to alpine's digest, which the
+    # baseline already holds elsewhere. Digests compare by position, not as sets.
+    vpc = "sha256:45f859504c7a66ea562e3230b7a3b482912bdd93f3930d1bb1c2f46e8d84f8f0"
+    alpine = "sha256:4b7ce07002c69e8f3d704a9c5d6fd3053be500b7f1c69fc0d80990c2ad8dd412"
+    line = f"- DSTACK_CONTAINER_IMAGE_ID=nearaidev/dstack-vpc@{vpc}"
+    assert F571.count(line) == 1 and alpine in F571
+    cand = F571.replace(line, f"- DSTACK_CONTAINER_IMAGE_ID=nearaidev/dstack-vpc@{alpine}")
+    assert bd.rules.evaluate(cand, "gateway", [F571]).passed
+    base = {sha(F571): F571}
+    for cosign in (None, str(_fake_cosign(tmp_path, 0)[0])):
+        o = bd.endorse(cand, "gateway", base, NOW, cosign, {})
+        assert o.entry is None
+        assert o.hold["failures"] == ["G2"]
+        assert o.hold["diff"] == [f"digest changed outside an image: line: {alpine}"]
+
+
+def test_two_same_repo_image_digests_swapped_are_held_without_cosign(tmp_path):
+    obj = json.loads(GW)
+    ingress = "nearaidev/cvm-ingress@sha256:9e9aacb7866a06aa6959fe1c6064f4c3ed62609af35e955df1b95e7325578435"
+    api = "nearaidev/cloud-api@sha256:d996bb08f36f0cc913ed7763f7c42bf4124e386a679e397a9acd8a3e69f3a704"
+    other = "nearaidev/cloud-api@sha256:" + "c" * 64
+    assert obj["docker_compose_file"].count(ingress) == 1 and obj["docker_compose_file"].count(api) == 1
+    obj["docker_compose_file"] = obj["docker_compose_file"].replace(ingress, other)
+    base_raw = json.dumps(obj)
+    obj["docker_compose_file"] = (obj["docker_compose_file"].replace(api, "\0")
+                                  .replace(other, api).replace("\0", other))
+    cand = json.dumps(obj)
+    assert cand != base_raw and bd.rules.evaluate(cand, "gateway", [base_raw]).passed
+    base = {sha(base_raw): base_raw}
+
+    o = bd.endorse(cand, "gateway", base, NOW, None, {})
+    assert o.entry is None and o.hold["failures"] == ["G2"]
+    assert sorted(o.hold["diff"]) == sorted([f"cosign was not run: {other}", f"cosign was not run: {api}"])
+
+    # Both re-pointed image lines verified under the gateway identity: endorsed.
+    ok, log = _fake_cosign(tmp_path, 0)
+    o = bd.endorse(cand, "gateway", base, NOW, str(ok), {})
+    assert o.hold is None and o.entry["sha256"] == sha(cand)
+    assert sorted(l.rsplit(" ", 1)[1] for l in log.read_text().splitlines()) == sorted([api, other])
+
+
 def test_a_changed_third_party_gateway_digest_is_held(tmp_path):
     cand = _gateway_with("alpine", "d" * 64)
     base = baselines(tmp_path, production_gateway=[GW])

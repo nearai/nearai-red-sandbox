@@ -224,16 +224,34 @@ def run_cosign(cosign: str, identity: str, ref: str) -> tuple[bool, str]:
 
 def _provenance(cand_file: str, base_file: str, role: str, cosign: str | None, cache: dict) -> list[str]:
     """G2/M2: why the digests that differ from this baseline are not
-    provenance-verified; empty when every one of them is."""
-    have = {(r.repo, r.digest) for r in rules.image_refs(base_file)}
-    changed = sorted({(r.repo, r.digest) for r in rules.image_refs(cand_file)} - have)
+    provenance-verified; empty when every one of them is.
+
+    Digests are compared by position, not as sets: G1/M1 passed, so the
+    digest-blinded files are equal (up to the INSTANCE_LABEL value, which holds
+    no digest) and their lines and digests pair up in order. A digest that
+    differs from the baseline's at the same position must be the one digest of
+    an uncommented image: line, and that (repo, digest) must pass cosign below,
+    even when the baseline holds the same digest somewhere else."""
     diff = []
-    # digest_blind blinds every @sha256: in the file, not only image: lines.
-    # A digest the baseline lacks must belong to an image reference checked below.
-    new_digests = set(_ANY_DIGEST.findall(cand_file)) - set(_ANY_DIGEST.findall(base_file))
-    for d in sorted(new_digests - {digest for _, digest in changed}):
-        diff.append(f"digest changed outside an image: line: {d}")
-    for repo, digest in changed:
+    changed = set()
+    cand_lines, base_lines = cand_file.split("\n"), base_file.split("\n")
+    if len(cand_lines) != len(base_lines):
+        return ["docker_compose_file lines do not pair up with the baseline's"]
+    for cl, bl in zip(cand_lines, base_lines):
+        cds, bds = _ANY_DIGEST.findall(cl), _ANY_DIGEST.findall(bl)
+        if cds == bds:
+            continue
+        if len(cds) != len(bds):
+            diff.append(f"digests do not pair up with the baseline's on line: {cl[:200]}")
+            continue
+        refs = rules.image_refs(cl)
+        if len(refs) == 1 and refs[0].digest is not None and cds == [refs[0].digest]:
+            changed.add((refs[0].repo, refs[0].digest))
+            continue
+        for cd, bd_ in zip(cds, bds):
+            if cd != bd_:
+                diff.append(f"digest changed outside an image: line: {cd}")
+    for repo, digest in sorted(changed):
         ref = f"{repo}@{digest}"
         if role == "gateway" and repo.startswith("nearaidev/"):
             identity = GATEWAY_IDENTITY
