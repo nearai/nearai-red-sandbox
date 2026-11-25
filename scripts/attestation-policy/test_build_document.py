@@ -608,6 +608,59 @@ def test_an_asset_newer_than_the_log_is_kept(tmp_path):
     assert [e["sha256"] for e in json.loads((out / "document.json").read_text())["entries"]] == [B64]
 
 
+def test_a_proposal_built_on_an_unverified_asset_converges_on_the_logged_document(tmp_path):
+    # A partial upload: the new document landed and its signature did not. evaluate
+    # does not verify, so it proposes on top of that orphan; sign drops the
+    # unverified asset (no --current) and builds on the log. The orphan's extra
+    # entry has no candidate, so it is dropped with a warning, not refused: the
+    # next run, on the repaired asset, proposes it again from evidence.
+    base = baselines(tmp_path, production_model=[E390])
+    orphan_only = entry("gateway", "exact", B64)
+    kept = entry("model", "exact", A64)
+    orphan = current_doc(tmp_path, NOW_UNIX - 60, [kept, orphan_only], name="orphan.json")
+    logged = _logged(tmp_path, NOW_UNIX - HOUR, [kept])
+    (tmp_path / "evidence").mkdir()
+    r, out = propose(tmp_path, base, [], current=orphan)
+    assert r.returncode == 0, r.stdout + r.stderr
+    prop = out / "proposed.json"
+    assert orphan_only in json.loads(prop.read_text())["entries"]
+
+    r2 = run("reproduce", "--environment", "production", "--candidates", out / "candidates",
+             "--proposed", prop, "--logged", logged, "--baselines", base, "--now", NOW,
+             "--out", tmp_path / "signed")
+    assert r2.returncode == 0, r2.stdout + r2.stderr
+    assert "::warning::" in r2.stdout and B64 in r2.stdout
+    doc = json.loads((tmp_path / "signed" / "document.json").read_text())
+    assert doc["entries"] == [kept]
+    assert doc["version"] == NOW_UNIX
+
+
+def test_on_the_logged_base_a_proposed_entry_from_a_candidate_still_must_reproduce(tmp_path):
+    # Dropping unreproduced proposals is only for entries carried from evaluate's
+    # base. One that names a candidate in the artifact and fails the rules here
+    # is a divergence, and refuses as before.
+    base = baselines(tmp_path, production_model=[E390])
+    logged = _logged(tmp_path, NOW_UNIX - HOUR)
+    cands = candidates(tmp_path, AE66)  # C1, C4, M1 against e390
+    prop = proposed(tmp_path, [entry("model", "exact", sha(AE66))])
+    r, out = reproduce(tmp_path, base, cands, prop, extra=["--logged", logged])
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert sha(AE66) in r.stderr
+    assert not (out / "document.json").exists()
+
+
+def test_with_a_verified_asset_an_unreproduced_proposal_still_refuses(tmp_path):
+    # The asset verified (--current given), so evaluate and sign share a base:
+    # an entry sign cannot reproduce is a divergence even if the log is older.
+    base = baselines(tmp_path, production_model=[E390])
+    cur = current_doc(tmp_path, NOW_UNIX - HOUR)
+    logged = _logged(tmp_path, NOW_UNIX - 2 * HOUR)
+    prop = proposed(tmp_path, [entry("gateway", "exact", B64)])
+    r, out = reproduce(tmp_path, base, candidates(tmp_path), prop, current=cur, extra=["--logged", logged])
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert B64 in r.stderr
+
+
 def test_a_logged_document_for_another_environment_refuses(tmp_path):
     logged = current_doc(tmp_path, NOW_UNIX - HOUR, environment="staging", name="logged.json")
     r, _ = reproduce(tmp_path, baselines(tmp_path), candidates(tmp_path), proposed(tmp_path, []),

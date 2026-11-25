@@ -16,9 +16,10 @@
 #   compose.
 # - sign (ubuntu-24.04, environment attestation-policy, contents: write)
 #   trusts only the raw composes in that artifact. It downloads and verifies
-#   the current documents itself, and those at the head of
-#   attestation-policy-log, building on the logged one when the release asset
-#   is missing or older. It unions the reviewed revocations in
+#   the documents at the head of attestation-policy-log and the current
+#   release assets itself, building on the logged one when the release asset
+#   is missing or older, or (a partly finished upload) only half there or not
+#   verifying. It unions the reviewed revocations in
 #   opencode/attestation-baselines/<env>/revoked.json, recomputes every entry with
 #   scripts/attestation-policy/build_document.py reproduce (hashes, rules for
 #   both roles, cosign for changed nearaidev/* digests), refuses if the
@@ -138,7 +139,7 @@ jobs:
             python3 -I scripts/attestation-policy/build_document.py propose \
               --environment "$environment" \
               --evidence "$RUNNER_TEMP/evidence/$environment" \
-              "${current[@]}" \
+              ${current[@]+"${current[@]}"} \
               --baselines opencode/attestation-baselines \
               --now "$now" \
               --out "$RUNNER_TEMP/proposal/$environment" \
@@ -225,51 +226,13 @@ jobs:
           fi
           openssl version
 
-      # The release assets are not trusted: a current document is carried
-      # forward only if one of the compiled-in keys signed it.
-      - name: Download and verify the current documents
-        env:
-          KEYS: ${{ vars.RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX }}
-        run: |
-          set -euo pipefail
-          w="$RUNNER_TEMP/verify"
-          mkdir -p "$w" "$RUNNER_TEMP/current"
-          fetch() {
-            curl -sS -L --max-filesize "$2" -o "$3" -w '%{http_code}' "$1"
-          }
-          verify() {
-            python3 -I -c 'import base64, sys; sys.stdout.buffer.write(base64.b64decode(open(sys.argv[1], "rb").read().rstrip(b"\n"), validate=True))' "$2" > "$w/sig.bin"
-            local k
-            for k in ${KEYS//,/ }; do
-              python3 -I -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))' "302a300506032b6570032100$k" > "$w/pub.der"
-              openssl pkey -pubin -inform DER -in "$w/pub.der" -out "$w/pub.pem"
-              if openssl pkeyutl -verify -pubin -inkey "$w/pub.pem" -rawin -in "$1" -sigfile "$w/sig.bin" >/dev/null 2>&1; then
-                return 0
-              fi
-            done
-            return 1
-          }
-          for environment in production staging; do
-            doc="$RUNNER_TEMP/current/$environment.json"
-            doc_status=$(fetch "$FEED_BASE/$environment.json" 262144 "$doc")
-            sig_status=$(fetch "$FEED_BASE/$environment.json.sig" 1024 "$doc.sig")
-            if [ "$doc_status" = 404 ] && [ "$sig_status" = 404 ]; then
-              rm -f "$doc" "$doc.sig"
-              echo "no current $environment document"
-            elif [ "$doc_status" = 200 ] && [ "$sig_status" = 200 ]; then
-              verify "$doc" "$doc.sig" || { echo "refusing: the current $environment document does not verify with any compiled-in key" >&2; exit 1; }
-              echo "current $environment document verified"
-            else
-              echo "refusing: $environment.json answered $doc_status and $environment.json.sig answered $sig_status" >&2
-              exit 1
-            fi
-          done
-
       # The head of attestation-policy-log bounds the release asset from below:
-      # reproduce builds on the logged document when the asset is missing or
-      # older, so deleting the assets or swapping an older signed pair back in
-      # cannot drop revocations. A failed fetch refuses (set -e); a file absent
-      # from the branch means nothing has been published for that environment.
+      # reproduce builds on the logged document when the asset is missing,
+      # older or unverifiable, so deleting the assets, swapping an older signed
+      # pair back in or a partly finished upload cannot drop revocations. A
+      # failed fetch refuses (set -e); a file absent from the branch means
+      # nothing has been published for that environment. It runs before the
+      # current-documents step, which falls back to what it verified.
       - name: Download and verify the logged documents
         env:
           KEYS: ${{ vars.RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX }}
@@ -310,6 +273,68 @@ jobs:
             fi
           done
 
+      # The release assets are not trusted: a current document is carried
+      # forward only if one of the compiled-in keys signed it. A partly
+      # finished upload (one asset 404, or a new document beside the old
+      # signature, so the pair does not verify) is not a reason to stop
+      # publishing: when the log holds a verified document, the assets are
+      # dropped with a warning, reproduce builds on the logged document and
+      # this run republishes, repairing them. Without a logged document, and
+      # for any status other than 200 or 404, it refuses.
+      # scripts/attestation-policy/test_workflow.py runs this step.
+      - name: Download and verify the current documents
+        env:
+          KEYS: ${{ vars.RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX }}
+        run: |
+          set -euo pipefail
+          w="$RUNNER_TEMP/verify"
+          mkdir -p "$w" "$RUNNER_TEMP/current"
+          fetch() {
+            curl -sS -L --max-filesize "$2" -o "$3" -w '%{http_code}' "$1"
+          }
+          verify() {
+            python3 -I -c 'import base64, sys; sys.stdout.buffer.write(base64.b64decode(open(sys.argv[1], "rb").read().rstrip(b"\n"), validate=True))' "$2" > "$w/sig.bin"
+            local k
+            for k in ${KEYS//,/ }; do
+              python3 -I -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))' "302a300506032b6570032100$k" > "$w/pub.der"
+              openssl pkey -pubin -inform DER -in "$w/pub.der" -out "$w/pub.pem"
+              if openssl pkeyutl -verify -pubin -inkey "$w/pub.pem" -rawin -in "$1" -sigfile "$w/sig.bin" >/dev/null 2>&1; then
+                return 0
+              fi
+            done
+            return 1
+          }
+          for environment in production staging; do
+            doc="$RUNNER_TEMP/current/$environment.json"
+            doc_status=$(fetch "$FEED_BASE/$environment.json" 262144 "$doc")
+            sig_status=$(fetch "$FEED_BASE/$environment.json.sig" 1024 "$doc.sig")
+            problem=
+            case "$doc_status $sig_status" in
+              "404 404")
+                rm -f "$doc" "$doc.sig"
+                echo "no current $environment document"
+                continue ;;
+              "200 200")
+                if verify "$doc" "$doc.sig"; then
+                  echo "current $environment document verified"
+                  continue
+                fi
+                problem="the current $environment document does not verify with any compiled-in key" ;;
+              "200 404"|"404 200")
+                problem="$environment.json answered $doc_status and $environment.json.sig answered $sig_status" ;;
+              *)
+                echo "refusing: $environment.json answered $doc_status and $environment.json.sig answered $sig_status" >&2
+                exit 1 ;;
+            esac
+            # Reproduce keys on current/<env>.json: never leave an unverified one.
+            rm -f "$doc" "$doc.sig"
+            if [ ! -f "$RUNNER_TEMP/logged/$environment.json" ]; then
+              echo "refusing: $problem, and attestation-policy-log holds no $environment document to fall back to" >&2
+              exit 1
+            fi
+            echo "::warning::$problem (a partly finished upload?): building on the logged $environment document and republishing to repair the release assets"
+          done
+
       - name: Reproduce
         run: |
           set -euo pipefail
@@ -329,7 +354,7 @@ jobs:
               --environment "$environment" \
               --candidates "$eval_dir/candidates" \
               --proposed "$eval_dir/proposed.json" \
-              "${current[@]}" \
+              ${current[@]+"${current[@]}"} \
               --baselines opencode/attestation-baselines \
               --now "$now" \
               --out "$RUNNER_TEMP/sign/$environment" \
@@ -356,7 +381,8 @@ jobs:
           done
 
       # Document first, then its signature: a client that fetches between the
-      # two sees a mismatch and falls back to its cache.
+      # two sees a mismatch and falls back to its cache. If the job dies between
+      # them, the next run falls back to the logged document and republishes.
       - name: Upload to the attestation-policy release
         env:
           GH_TOKEN: ${{ github.token }}

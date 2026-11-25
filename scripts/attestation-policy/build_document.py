@@ -40,8 +40,11 @@ reviewed <baselines>/<environment>/revoked.json (exact or instance-label-v1
 hashes), which must exist. It never shrinks, and a hash added to it publishes
 at once.
 
---current and --logged are omitted only when no document has been published
-yet. G2 and M2
+--current is omitted when no release asset verified (none published yet, or a
+partly finished upload left an unverifiable pair); --logged when the log holds
+no document. On reproduce with --logged and no --current, a proposed entry
+that names no candidate (carried from an unverified asset evaluate read) is
+dropped with a warning instead of refused; it is never signed. G2 and M2
 run here through --cosign: without it, an entry with a changed digest is never
 endorsed. A changed gateway digest outside nearaidev/ is held (G2), and so is
 a changed model digest outside nearaidev/compose-manager* (M2).
@@ -444,7 +447,18 @@ def cmd_reproduce(a) -> int:
     doc, added, publish = assemble(a.environment, current, new, now_unix, reviewed, from_log)
     data = serialize(doc)
     have = {_key(e) for e in doc["entries"]}
-    missing = []
+    # With no trusted release asset, sign builds on the log while evaluate (which
+    # does not verify) may have built on an unverified one, such as the new
+    # document of a partly finished upload. An entry carried from that base
+    # names no candidate: it is dropped with a warning, and proposed again from
+    # evidence once the asset is repaired. Nothing unreproduced is ever signed.
+    untrusted_base = from_log and a.current is None
+    from_candidates = set(cands)
+    for raw in cands.values():
+        label = rules.instance_label_sha256(raw)
+        if label is not None:
+            from_candidates.add(label)
+    missing, dropped = [], []
     for e in proposed["entries"]:
         try:
             k = _key(e)
@@ -454,7 +468,10 @@ def cmd_reproduce(a) -> int:
         # dropped and held, not a reason to publish nothing.
         # A revoked proposal (evaluate read a rolled-back asset) is dropped.
         if k not in have and k not in held_keys and k[2] not in doc["revoked"]:
-            missing.append(k)
+            (dropped if untrusted_base and k[2] not in from_candidates else missing).append(k)
+    if dropped:
+        print("::warning::proposed entries carried from a base sign did not verify, dropped: "
+              + ", ".join(f"{r} {m} {s}" for r, m, s in dropped))
     if missing:
         raise Refused("proposed entries not reproduced: " + ", ".join(f"{r} {m} {s}" for r, m, s in missing))
 
