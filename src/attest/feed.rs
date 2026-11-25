@@ -647,7 +647,7 @@ mod tests {
     const B64: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const C64: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
-    /// 2026-11-25T00:00:00Z.
+    /// 2025-11-25T00:00:00Z.
     const ISSUED: u64 = 1_764_028_800;
     const DAY: u64 = 86_400;
     const KEY1_HEX: &str = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c";

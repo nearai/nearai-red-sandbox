@@ -674,10 +674,22 @@ def issue(hold: dict, environment: str, repo: str, run_id: str, artifact: str) -
     longest = max((len(m) for m in re.findall(r"~+", diff)), default=0)
     fence = "~" * max(3, longest + 1)
     title = f"Attestation hold: {environment} {role} {short}"
+    failures = [str(f) for f in hold.get("failures") or []]
+    candidate_only = [f for f in failures if f in ("C2", "C3")]
+    warning = ""
+    if candidate_only:
+        warning = f"""
+**It failed {' and '.join(candidate_only)}, which {'check' if len(candidate_only) > 1 else 'checks'} the compose itself:
+merging it into the baselines will not approve it.** The publisher refuses a
+baseline that fails C2 or C3, so such a pull request makes every run refuse
+until it is reverted. It needs a compose from NEAR that passes them, or a
+reviewed change to the rules. (A C3 hold only for a changed `${{VAR:-...}}`
+variable name, with every image still pinned by digest, is the exception.)
+"""
     body = f"""The attestation policy publisher held a {environment} {role} compose.
-
+{warning}
 - Compose sha256: `{sha}`
-- Failed rules: {', '.join(hold.get('failures') or [])}
+- Failed rules: {', '.join(failures)}
 - Closest baseline: `{hold.get('closest')}`
 - Run: {run_url}
 
@@ -689,6 +701,9 @@ Diff against the closest baseline (digests blinded where the rules blind them):
 
 To approve it, open a baseline pull request. Review the compose itself, not
 only this diff: merging makes the next run sign it.
+C2 and C3 holds cannot be cleared by merging into the baselines, because those
+rules check only the candidate (C3's digest pinning; its variable-name check
+compares with the baseline).
 
 ```sh
 git fetch origin main

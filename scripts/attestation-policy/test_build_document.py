@@ -1136,6 +1136,31 @@ def test_issues_name_the_rule_the_diff_and_the_baseline_pr_commands(tmp_path):
     assert "gh pr create" in body and "gh run download" in body
 
 
+@pytest.mark.parametrize("failures,warned", [(["C2"], True), (["C1", "C3"], True), (["C1", "M1"], False)])
+def test_an_issue_says_c2_and_c3_holds_are_not_cleared_by_a_baseline(tmp_path, failures, warned):
+    holds = tmp_path / "holds.json"
+    holds.write_text(json.dumps([{"sha256": A64, "role": "model", "failures": failures,
+                                  "closest": B64, "diff": ["x"]}]))
+    r = run("issues", "--environment", "production", "--holds", holds, "--repo", "nearai/nearai-red-sandbox",
+            "--run-id", "1", "--artifact", "a", "--out", tmp_path / "issues")
+    assert r.returncode == 0, r.stdout + r.stderr
+    body = (tmp_path / "issues" / f"{A64}.md").read_text()
+    # Always said, next to the approval commands.
+    assert "C2 and C3 holds cannot be cleared by merging" in body
+    assert ("merging it into the baselines will not approve it" in body) == warned
+
+
+def test_a_baseline_pr_for_a_c2_or_c3_hold_refuses_the_next_run(tmp_path):
+    # What the issue warns about: the merged baseline makes the run refuse.
+    bad = GW.replace('"dstack-0.5.12"', '"dstack-evil"')
+    assert bad != GW
+    r, out = reproduce(tmp_path, baselines(tmp_path, production_gateway=[GW, bad]),
+                       candidates(tmp_path, bad), proposed(tmp_path, []))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "C2" in r.stderr
+    assert not (out / "document.json").exists()
+
+
 def test_an_issue_body_stays_under_githubs_limit(tmp_path):
     holds = tmp_path / "holds.json"
     holds.write_text(json.dumps([{"sha256": A64, "role": "gateway", "failures": ["G1"], "closest": B64,

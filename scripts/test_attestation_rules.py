@@ -92,6 +92,31 @@ def test_load_baselines_reads_raw_bytes_sorted():
     assert rules.load_baselines(BASELINES, "production", "nonexistent-role") == []
 
 
+@pytest.mark.parametrize("mutation", ["name=dstack-evil", "image tag :latest"])
+def test_load_baselines_refuses_a_baseline_that_fails_c2_or_c3(tmp_path, mutation):
+    # C2 and C3's pinning check only the candidate: a compose held on them
+    # would pass against itself if merged, so such a baseline refuses to load.
+    _, _, make, _ = MUTATIONS[mutation]
+    bad = make()
+    d = tmp_path / "production" / "gateway"
+    d.mkdir(parents=True)
+    (d / f"{rules.compose_sha256(bad)}.json").write_text(bad)
+    with pytest.raises(ValueError, match="C2" if mutation.startswith("name") else "C3"):
+        rules.load_baselines(tmp_path, "production", "gateway")
+    r = subprocess.run([sys.executable, "-I", str(SCRIPT), "--environment", "production", "--role", "gateway",
+                        "--baselines", str(tmp_path), str(d / f"{rules.compose_sha256(bad)}.json")],
+                       capture_output=True, text=True)
+    assert r.returncode not in (0, 3)
+
+
+def test_load_baselines_refuses_an_unparseable_baseline(tmp_path):
+    d = tmp_path / "production" / "model"
+    d.mkdir(parents=True)
+    (d / f"{rules.compose_sha256('[]')}.json").write_text("[]")
+    with pytest.raises(ValueError, match="app_compose"):
+        rules.load_baselines(tmp_path, "production", "model")
+
+
 # --- the spec's validation table ----------------------------------------
 
 @pytest.mark.parametrize("base,cand,role,passed,failures", [

@@ -429,7 +429,12 @@ _SEGMENT = re.compile(r"[a-z][a-z0-9-]*", re.ASCII)
 
 
 def load_baselines(root: Path, environment: str, role: str) -> list[str]:
-    """Raw app_compose of every <root>/<environment>/<role>/<sha256>.json, by name."""
+    """Raw app_compose of every <root>/<environment>/<role>/<sha256>.json, by name.
+
+    A baseline that is not an app_compose, or that fails C2 or C3 against
+    itself, refuses (ValueError): C2 and C3's digest pinning check only the
+    candidate, so a compose held on them would pass against itself once
+    merged into the baselines."""
     if not _SEGMENT.fullmatch(environment) or not _SEGMENT.fullmatch(role):
         raise ValueError(f"bad baseline path segment: {environment!r}/{role!r}")
     d = Path(root) / environment / role
@@ -440,6 +445,13 @@ def load_baselines(root: Path, environment: str, role: str) -> list[str]:
         text = p.read_bytes().decode("utf-8")
         if compose_sha256(text) != p.stem:
             raise ValueError(f"{p}: sha256 of the contents is not the file name")
+        obj = _parse_compose(text)
+        if obj is None:
+            raise ValueError(f"{p}: not an app_compose object")
+        refs = image_refs(obj["docker_compose_file"])
+        failed = [rule for rule, ok in (("C2", _c2(obj)), ("C3", _c3(refs, refs))) if not ok]
+        if failed:
+            raise ValueError(f"{p}: the baseline itself fails {', '.join(failed)}")
         out.append(text)
     return out
 

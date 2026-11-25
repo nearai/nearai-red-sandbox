@@ -108,7 +108,7 @@ format as `latest.json.sig`.
 {
   "schema": 1,
   "environment": "production",
-  "version": 1764028800,
+  "version": 1795564800,
   "issued": "2026-11-25T00:00:00Z",
   "expires": "2026-11-28T00:00:00Z",
   "entries": [
@@ -150,15 +150,18 @@ people and the log. `rts` does not act on them.
 ## `rts` changes
 
 1. `Policy` (`src/attest.rs`) gains a role for each hash and a revoked set.
-   The compiled-in JSON files gain an optional `role` field. Entries without
-   one keep matching any role until they are backfilled, which is one
-   commit: the `source` text already says gateway or model.
+   Every entry in the compiled-in JSON files has a `role`, `gateway` or
+   `model`; an entry without one, or with any other value, or one hash pinned
+   under both roles, refuses to load. The existing entries were backfilled
+   from their `source` text, which already said gateway or model, and a test
+   checks that each entry's role agrees with it.
 2. New `src/attest/feed.rs`: fetch, verify, parse, and merge into `Policy`.
    It caches the last accepted document and its signature in `rts`'s
-   per-user state, next to the update cache (`feed/<environment>.json`,
-   directory created 0700), along with the
-   high-water `version`. The cache is re-verified on every read, so a local
-   edit is refused.
+   per-user state, next to the update cache:
+   `~/.local/share/nearai-red-sandbox/attestation-policy/` (directory 0700,
+   files 0600) holds `<environment>.json`, `<environment>.json.sig` and
+   `<environment>.version`, the high-water `version`. The cache is
+   re-verified on every read, so a local edit is refused.
 3. `check_compose` checks in this order:
    1. Refuse if `sha256(app_compose)` is revoked.
    2. Accept as `pinned` if the exact hash is pinned for this role.
@@ -253,6 +256,17 @@ New workflow `.github/workflows/attestation-policy.yml`:
 3. **Sign** (`sign`). If at least one entry is new, or the current document
    is more than 24 hours old, write the next document. It contains everything
    still in the current document plus the new entries that `sign` reproduced.
+   `sign` refuses, publishing nothing, when the proposed document lists an
+   entry it did not reproduce, with two exceptions that are dropped with a
+   warning instead. First, an entry whose candidate passes C1-C4 and G1/M1
+   here against some baseline under that entry's `match`, but which `sign`'s
+   own G2/M2 did not endorse under that key: `evaluate` and `sign` can get
+   different answers from cosign (an outage, or a digest that verifies
+   pairing the candidate with a different baseline, which changes the
+   `match`), and refusing would also hold back revocations and the refresh.
+   Second, the unverified-asset fallback below. A proposed entry that matches
+   no passing baseline still refuses. Both jobs install the same pinned
+   cosign.
    Sign it with OpenSSL 3 `pkeyutl -sign -rawin` under `umask 077`, verify it
    with the public key, then upload it with `gh release upload --clobber` and
    commit it to the log branch.
@@ -316,12 +330,20 @@ Both roles:
   equal to the baseline. This covers `allowed_envs`, `kms_enabled`,
   `local_key_provider_enabled`, `key_provider_id`, `public_logs`,
   `public_sysinfo`, `no_instance_id`, `secure_time`, `gateway_enabled`,
-  `runner`, `manifest_version`, `port_policy` and `pre_launch_script`.
+  `runner`, `manifest_version`, `port_policy` and, for a gateway,
+  `pre_launch_script`. For a model, C1 requires only that both have
+  `pre_launch_script`: it re-pins the compose-manager image by digest, so M1
+  compares it digest-blind and M2 checks its digests.
 - **C2** `name` matches `^dstack(-nvidia)?-\d+\.\d+\.\d+$`. A change in the
   dstack version is allowed.
 - **C3** Every `image:` reference ends in `@sha256:<64 hex>`. Interpolated
   defaults (`${VAR:-repo@sha256:...}`) count, and must have the same `VAR` and
   repository as the baseline.
+
+C2 and C3's digest pinning look only at the candidate, so merging a compose
+held on them into the baselines would not clear the hold. A baseline that
+fails C2, or C3 against itself, refuses to load, and the run publishes
+nothing until it is fixed.
 - **C4** The set of image repositories equals the baseline's. A new
   repository holds the entry.
 
@@ -342,6 +364,18 @@ Model (`rules:model-v1`):
   `digest-blind(pre_launch_script)`.
 - **M2** Each changed `nearaidev/compose-manager*` digest verifies with
   `cosign verify --certificate-identity-regexp 'https://github.com/nearai/compose-manager/.github/workflows/.*'`.
+  That includes a re-pin in `pre_launch_script`, whose launcher lines name
+  the compose-manager digest twice (`printf 'COMPOSE_MANAGER_IMAGE=%s\n'
+  'nearaidev/compose-manager@sha256:...'` and `echo "[pre_launch] Re-pinned
+  ... nearaidev/compose-manager@sha256:..."`). Its lines and digests pair up
+  by position, as in `docker_compose_file` (equal line counts and equal
+  digest counts per line, else held). A digest that differs at its position
+  passes only when it is written exactly `nearaidev/compose-manager@sha256:<hex>`
+  in both scripts (not `nearaidev/compose-manager-otelcol`, nor any longer
+  reference ending in `compose-manager`), every changed position carries the
+  same new digest, every `nearaidev/compose-manager@sha256:` reference in the
+  candidate script carries it, and that digest verifies with cosign as
+  above. Any other change to `pre_launch_script` holds the entry.
   This is the same anchor the launcher uses. Since the launcher already
   trusts that identity at runtime, this check adds nothing to the TEE's
   guarantee. What it adds is that we notice an unsigned digest.
@@ -359,8 +393,17 @@ the blinded files equal, so candidate and baseline digests pair up in
 order. A digest that differs from the baseline's at its position is a
 change even when the baseline holds that digest elsewhere, and it must be
 the only digest of an uncommented `image:` line. A change on any other
-line (an environment variable such as `DSTACK_CONTAINER_IMAGE_ID`, a
-comment) holds the entry.
+line (an environment variable, a comment) holds the entry, with one
+exception for a line that copies an image's digest, such as the production
+gateway's `- DSTACK_CONTAINER_IMAGE_ID=nearaidev/dstack-vpc@sha256:<d>` next
+to `image: nearaidev/dstack-vpc@sha256:<d>`. Such a line passes only if it is
+uncommented and holds exactly one digest, written `<repo>@sha256:<new>`; the
+baseline's line held `<repo>@sha256:<old>` at that position, where `<old>` is
+the digest of an uncommented `image:` line of the same `<repo>` in the
+baseline; and an `image:` line of `<repo>` in the candidate changed to
+`<new>`, so `<repo>@<new>` goes through G2/M2. A digest moved onto that line
+from another repository, or a line changed without its `image:` line, is
+held.
 
 Whether `nearaidev/cloud-api` and `nearaidev/cvm-ingress` images carry cosign
 signatures has not been checked. That is the first task of the plan. If they
@@ -470,7 +513,13 @@ Publisher (Python, next to `scripts/test_refresh_attestation_policy.py`):
 - The validation table reproduces: each real pair gets the result and the
   rule IDs listed there.
 - `sign` refuses an artifact whose proposed document lists an entry it
-  cannot reproduce from the raw `app_compose`.
+  cannot reproduce from the raw `app_compose`, and drops (publishing the
+  rest) one it could have endorsed had cosign answered as it did in
+  `evaluate`.
+- A real compose-manager bump (image line and both `pre_launch_script` lines)
+  and a real `dstack-vpc` bump (image line and `DSTACK_CONTAINER_IMAGE_ID`)
+  are endorsed with cosign and held without it; partial or mismatched bumps
+  are held.
 - A digest-only change passes. The same change plus one `allowed_envs` entry
   holds.
 - The signed document round-trips through the `rts` verifier, with a fixture
