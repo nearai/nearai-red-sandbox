@@ -1376,6 +1376,105 @@ mod tests {
         );
     }
 
+    /// After a yes at the prompt, the launch attests again from scratch: a
+    /// second report under a fresh nonce, with the GPU verifier run on the
+    /// now-trusted entry, not a reuse of the first report.
+    #[test]
+    fn a_yes_at_the_prompt_attests_again_in_full_under_a_fresh_nonce() {
+        use crate::attest::prompt::{Ask, attest_with_consent};
+        use crate::inference::NearEnvironment;
+
+        struct Yes(usize);
+        impl Ask for Yes {
+            fn ask(&mut self, _text: &str) -> Option<String> {
+                self.0 += 1;
+                Some("y\n".into())
+            }
+        }
+
+        // Both passes see the same unlisted model build; each report binds
+        // its own nonce and has its own quote bytes.
+        let http = FakeHttp::new();
+        let mut quotes = HashMap::new();
+        for n in 1u8..=2 {
+            let nonce = [n; 32];
+            let mut case = for_model(redeployed_model(Case::good(nonce)), "m");
+            let (gw_q, m0_q) = (format!("gw-m-{n}"), format!("m0-m-{n}"));
+            case.report["gateway_attestation"]["intel_quote"] = hex::encode(&gw_q).into();
+            case.report["model_attestations"][0]["intel_quote"] = hex::encode(&m0_q).into();
+            http.route(
+                "GET",
+                &report_url(BASE, "m", &nonce),
+                HttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: serde_json::to_vec(&case.report).unwrap(),
+                },
+            );
+            quotes.insert(gw_q.into_bytes(), Ok(case.gw.clone()));
+            quotes.insert(m0_q.into_bytes(), Ok(case.m0.clone()));
+        }
+        let quotes = Arc::new(FakeQuotes(quotes));
+        let gpu = Arc::new(FakeGpu {
+            result: Case::good([1; 32]).gpu,
+            seen: Mutex::new(vec![]),
+        });
+        // One counter across every Attestor the closure builds.
+        let nonce = counter_nonce();
+        let base_policy = Case::good([1; 32]).policy;
+        let home = tempfile::tempdir().unwrap();
+        let mut ask = Yes(0);
+        let out = attest_with_consent(
+            NearEnvironment::Production,
+            &AttestOptions::default(),
+            (true, true),
+            true,
+            Some(home.path()),
+            1_795_608_000,
+            &mut ask,
+            |trusted| {
+                let mut policy = base_policy.clone();
+                policy.user_trusted = trusted.clone();
+                Attestor {
+                    http: http.clone(),
+                    clock: Arc::new(FixedClock(1_800_000_000)),
+                    quotes: quotes.clone(),
+                    gpus: gpu.clone(),
+                    base_url: BASE.into(),
+                    key: Some(DUMMY_KEY.to_string().into()),
+                    models: vec!["m".into()],
+                    options: AttestOptions::default(),
+                    policy,
+                    continuity: Continuity::default(),
+                    nonce: nonce.clone(),
+                }
+                .attest_for_launch()
+            },
+        );
+        assert_eq!(ask.0, 1, "one prompt");
+        assert_eq!(
+            http.calls(),
+            vec![
+                format!("GET {}", report_url(BASE, "m", &[1; 32])),
+                format!("GET {}", report_url(BASE, "m", &[2; 32])),
+            ],
+            "a second report, under a different nonce"
+        );
+        // The first pass stopped at the compose check; the GPU verdict ran
+        // only on the second, under its nonce.
+        assert_eq!(
+            *gpu.seen.lock().unwrap(),
+            vec![(PAYLOAD.to_string(), hex::encode([2u8; 32]))]
+        );
+        let a = out.unwrap();
+        let entry = &a.evidence[0]["entries"][1];
+        assert_eq!(entry["compose_acceptance"], "user-trusted");
+        assert_eq!(
+            entry["compose_hash"],
+            hex::encode(sha(&[OTHER_COMPOSE.as_bytes()]))
+        );
+    }
+
     /// Continuity vouches only for a key already attested for this model.
     #[test]
     fn continuity_does_not_vouch_for_a_new_key_or_another_models_key() {

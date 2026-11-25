@@ -99,7 +99,9 @@ Gateway's live-attestation release gate can stop blocking on production pins
 
 Shown only when all of these hold: the failure is `ComposeNotTrusted`, the
 compose policy is `Pinned`, the environment is production, and stdin and
-stderr are both terminals. The progress display is paused while it shows.
+stderr are both terminals. The prompt also requires a verified feed document
+in force for the launch, because without it revocations cannot be checked.
+The progress display is paused while it shows.
 Anything but `y` or `yes` (case-insensitive) refuses. At most three prompts
 per launch, then refuse, so a gateway flapping between builds cannot loop.
 

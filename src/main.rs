@@ -451,23 +451,41 @@ fn trust_command(command: &TrustCommand) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        TrustCommand::Forget(prefix) => match attest::trusted::forget(&home, prefix) {
-            Ok(removed) => {
-                for e in removed {
-                    println!(
-                        "forgot {} {} {}",
-                        attest::trusted::env_name(e.environment),
-                        e.role.as_str(),
-                        hex::encode(e.sha256)
-                    );
+        TrustCommand::Forget(prefix) => match forget_output(attest::trusted::forget(&home, prefix))
+        {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
                 }
                 ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("[rts] {e}");
+            Err(line) => {
+                eprintln!("{line}");
                 ExitCode::FAILURE
             }
         },
+    }
+}
+
+/// What `rts trust forget` prints: its stdout lines, or its one stderr line.
+/// An error can be the store's load warning, which quotes the file, so it
+/// goes through the same filter as the launch's warning.
+fn forget_output(
+    result: Result<Vec<attest::trusted::TrustedEntry>, String>,
+) -> Result<Vec<String>, String> {
+    match result {
+        Ok(removed) => Ok(removed
+            .iter()
+            .map(|e| {
+                format!(
+                    "forgot {} {} {}",
+                    attest::trusted::env_name(e.environment),
+                    e.role.as_str(),
+                    hex::encode(e.sha256)
+                )
+            })
+            .collect()),
+        Err(e) => Err(attest::prompt::store_warning_line(&e)),
     }
 }
 
@@ -557,6 +575,29 @@ mod tests {
             allow_unattested_provider: true,
             ..Default::default()
         }
+    }
+
+    /// `rts trust forget` on an ignored store prints the load warning, which
+    /// quotes the file; no ESC from it may reach the terminal.
+    #[test]
+    fn trust_forget_prints_a_hostile_store_warning_without_escapes() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join(attest::trusted::FILE);
+        std::fs::write(&path, r#"{"version":1,"entries":[],"\u001b[2J":1}"#).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let result = attest::trusted::forget(d.path(), "abcdabcd");
+        assert!(
+            result.as_ref().is_err_and(|e| e.contains('\x1b')),
+            "the probe reaches serde's text: {result:?}"
+        );
+        let line = forget_output(result).unwrap_err();
+        assert!(line.starts_with("[rts] ignoring "), "{line}");
+        assert!(!line.contains('\x1b'), "{line:?}");
+        assert!(line.bytes().all(|b| (0x20..=0x7e).contains(&b)), "{line:?}");
     }
 
     #[test]

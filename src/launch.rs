@@ -463,6 +463,9 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                         near,
                         &attest_options,
                         ttys,
+                        // Asking needs a verified feed document in force, so
+                        // a revoked build is never offered.
+                        feed_doc.is_some(),
                         feed_home.as_deref(),
                         unix_now(),
                         &mut attest::prompt::TerminalAsk,

@@ -12,17 +12,21 @@ use crate::inference::NearEnvironment;
 pub const MAX_PROMPTS: usize = 3;
 
 /// The prompt is shown only in production, under `--compose-policy pinned`,
-/// with stdin and stderr both terminals.
+/// with stdin and stderr both terminals, and with a verified feed document
+/// in force for this launch: without one a revoked build cannot be ruled
+/// out. Stored trust is honoured either way; only asking needs the feed.
 pub fn eligible(
     near: NearEnvironment,
     options: &AttestOptions,
     stdin_tty: bool,
     stderr_tty: bool,
+    feed_in_force: bool,
 ) -> bool {
     near == NearEnvironment::Production
         && options.compose_policy == ComposePolicy::Pinned
         && stdin_tty
         && stderr_tty
+        && feed_in_force
 }
 
 /// `y` or `yes`, any case, surrounding whitespace ignored.
@@ -77,7 +81,7 @@ fn short(hash: &[u8; 32]) -> String {
 pub fn prompt_text(nt: &NotTrusted) -> String {
     let first = match nt.role {
         Role::Gateway => "NEAR AI moved its production gateway to a new build.".to_string(),
-        Role::Model => format!("NEAR AI moved {} to a new build.", nt.model),
+        Role::Model => format!("NEAR AI moved {} to a new build.", printable(&nt.model, 64)),
     };
     // Only checks that have run when the prompt appears: the GPU verdict
     // runs in the full re-attestation after a yes.
@@ -98,11 +102,13 @@ pub fn prompt_text(nt: &NotTrusted) -> String {
 }
 
 /// The line a launch prints for each build it relies on because the user
-/// trusts it. `trusted_at` comes from the store file, so it is filtered too.
+/// trusts it. `trusted_at` comes from the store file and the model ID from
+/// the session config (checked only for being non-empty), so both are
+/// filtered too.
 pub fn trusted_line(model: &str, role: Role, hash: &[u8; 32], trusted_at: &str) -> String {
     let what = match role {
         Role::Gateway => "gateway".to_string(),
-        Role::Model => model.to_string(),
+        Role::Model => printable(model, 64),
     };
     format!(
         "[rts] NEAR AI {what} build {}: you trusted it on {}",
@@ -170,6 +176,7 @@ impl Ask for TerminalAsk {
         // Writes straight to stderr: the progress lock is held while paused,
         // so nothing here may go through `brand::progress`.
         let read = || {
+            discard_type_ahead();
             let mut err = std::io::stderr().lock();
             let _ = write!(err, "\n{text} ");
             let _ = err.flush();
@@ -187,15 +194,58 @@ impl Ask for TerminalAsk {
     }
 }
 
+/// Discards terminal input typed before the prompt appears, so a line typed
+/// earlier in the launch cannot answer it. Errors are ignored: this runs
+/// only with stdin a terminal, and if it fails the prompt still reads the
+/// next line as before.
+fn discard_type_ahead() {
+    #[cfg(unix)]
+    // SAFETY: tcflush on fd 0 only drops queued input; it touches no memory.
+    unsafe {
+        libc::tcflush(0, libc::TCIFLUSH);
+    }
+    #[cfg(windows)]
+    // SAFETY: as `brand::splash`'s console reset: flushes the console input
+    // buffer of the process's own stdin handle.
+    unsafe {
+        use windows_sys::Win32::System::Console::{
+            FlushConsoleInputBuffer, GetStdHandle, STD_INPUT_HANDLE,
+        };
+        FlushConsoleInputBuffer(GetStdHandle(STD_INPUT_HANDLE));
+    }
+}
+
+/// One `[rts]` line of the launch, through the launch progress.
+fn say(line: &str) {
+    #[cfg(test)]
+    SAID.with(|s| s.borrow_mut().push(line.to_string()));
+    crate::brand::progress::message(line);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every line [`say`] printed on this thread, for tests.
+    static SAID: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The lines [`say`] printed on this thread since the last call.
+#[cfg(test)]
+pub(crate) fn said_take() -> Vec<String> {
+    SAID.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
 /// Attests, and on a compose nothing trusts asks the user (when
 /// [`eligible`], at most [`MAX_PROMPTS`] times, and only with a `home` to
 /// save to). A yes saves the build and attests again from scratch: the
 /// refusal came before the GPU verdict and before later entries were
 /// checked, so only the new attestation's result is returned.
+/// `feed_in_force` is whether this launch has a verified feed document.
+#[allow(clippy::too_many_arguments)]
 pub fn attest_with_consent(
     near: NearEnvironment,
     options: &AttestOptions,
     ttys: (bool, bool),
+    feed_in_force: bool,
     home: Option<&Path>,
     now: u64,
     ask: &mut dyn Ask,
@@ -203,14 +253,14 @@ pub fn attest_with_consent(
 ) -> Result<Attested, AttestationFailure> {
     let (mut store, warning) = trusted::load(home);
     if let Some(w) = warning {
-        crate::brand::progress::message(&store_warning_line(&w));
+        say(&store_warning_line(&w));
     }
     let mut prompts = 0;
     loop {
         match attest(&store.for_environment(near)) {
             Ok(attested) => {
                 for line in trusted_lines(&attested, &store, near) {
-                    crate::brand::progress::message(&line);
+                    say(&line);
                 }
                 return Ok(attested);
             }
@@ -218,7 +268,8 @@ pub fn attest_with_consent(
                 let Some(home) = home else {
                     return Err(AttestationFailure::ComposeNotTrusted(nt));
                 };
-                if !eligible(near, options, ttys.0, ttys.1) || prompts >= MAX_PROMPTS {
+                if !eligible(near, options, ttys.0, ttys.1, feed_in_force) || prompts >= MAX_PROMPTS
+                {
                     return Err(AttestationFailure::ComposeNotTrusted(nt));
                 }
                 prompts += 1;
@@ -326,6 +377,17 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
         ask: &mut ScriptedAsk,
         results: Vec<Outcome>,
     ) -> (Outcome, Vec<TrustedMap>, trusted::TrustedComposes) {
+        run_feed(ttys, true, with_home, ask, results)
+    }
+
+    /// [`run`], with or without a verified feed document in force.
+    fn run_feed(
+        ttys: (bool, bool),
+        feed_in_force: bool,
+        with_home: bool,
+        ask: &mut ScriptedAsk,
+        results: Vec<Outcome>,
+    ) -> (Outcome, Vec<TrustedMap>, trusted::TrustedComposes) {
         let d = tempfile::tempdir().unwrap();
         let home = with_home.then(|| d.path());
         let mut results: Results = results.into();
@@ -334,6 +396,7 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
             NearEnvironment::Production,
             &AttestOptions::default(),
             ttys,
+            feed_in_force,
             home,
             NOW,
             ask,
@@ -439,6 +502,30 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
     }
 
     #[test]
+    fn a_hostile_model_name_cannot_rewrite_the_prompt_or_the_trusted_line() {
+        let long = "M".repeat(200);
+        let mut nt = model_nt(7);
+        nt.model = format!("\x1b[2Jevil\rmodel\n{long}");
+        let text = prompt_text(&nt);
+        assert!(!text.contains('\x1b') && !text.contains('\r'), "{text:?}");
+        assert_eq!(text.lines().count(), EXPECTED_GATEWAY.lines().count());
+        let first = text.lines().next().unwrap();
+        let shown = first
+            .strip_prefix("NEAR AI moved ")
+            .and_then(|f| f.strip_suffix(" to a new build."))
+            .unwrap();
+        assert!(shown.starts_with("[2Jevilmodel"), "{shown}");
+        assert_eq!(shown.chars().count(), 64, "{shown}");
+
+        let line = trusted_line(&nt.model, Role::Model, &[1; 32], "2026-11-25");
+        assert!(!line.contains('\x1b') && !line.contains('\r') && !line.contains('\n'));
+        assert!(
+            line.starts_with(&format!("[rts] NEAR AI {shown} build ")),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn the_compare_url_uses_the_first_12_hex_characters() {
         assert_eq!(
             compare_url(&hash(GW_HASH)),
@@ -463,11 +550,100 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
             compose_policy: ComposePolicy::MrConfigOnly,
             ..AttestOptions::default()
         };
-        assert!(eligible(NearEnvironment::Production, &pinned, true, true));
-        assert!(!eligible(NearEnvironment::Production, &pinned, false, true));
-        assert!(!eligible(NearEnvironment::Production, &pinned, true, false));
-        assert!(!eligible(NearEnvironment::Staging, &pinned, true, true));
-        assert!(!eligible(NearEnvironment::Production, &mr, true, true));
+        assert!(eligible(
+            NearEnvironment::Production,
+            &pinned,
+            true,
+            true,
+            true
+        ));
+        assert!(!eligible(
+            NearEnvironment::Production,
+            &pinned,
+            false,
+            true,
+            true
+        ));
+        assert!(!eligible(
+            NearEnvironment::Production,
+            &pinned,
+            true,
+            false,
+            true
+        ));
+        assert!(!eligible(
+            NearEnvironment::Staging,
+            &pinned,
+            true,
+            true,
+            true
+        ));
+        assert!(!eligible(
+            NearEnvironment::Production,
+            &mr,
+            true,
+            true,
+            true
+        ));
+    }
+
+    /// Without a verified feed document a revoked build cannot be told
+    /// apart, so the user is never asked.
+    #[test]
+    fn not_eligible_without_a_feed_document() {
+        let pinned = AttestOptions::default();
+        assert!(!eligible(
+            NearEnvironment::Production,
+            &pinned,
+            true,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn nothing_is_asked_without_a_feed_document() {
+        let mut ask = ScriptedAsk::default();
+        let (out, maps, store) =
+            run_feed((true, true), false, true, &mut ask, vec![not_trusted(gw())]);
+        match out {
+            Err(AttestationFailure::ComposeNotTrusted(nt)) => assert_eq!(nt, gw()),
+            other => panic!("expected the refusal as is, got {other:?}"),
+        }
+        assert!(ask.shown.is_empty());
+        assert_eq!(maps.len(), 1);
+        assert!(store.entries.is_empty());
+    }
+
+    /// The launch's own warning about a hostile store reaches the terminal
+    /// filtered, through [`store_warning_line`].
+    #[test]
+    fn the_launch_prints_a_hostile_store_warning_without_escapes() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join(trusted::FILE);
+        std::fs::write(&path, r#"{"version":1,"entries":[],"\u001b[2J":1}"#).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        said_take();
+        let out = attest_with_consent(
+            NearEnvironment::Production,
+            &AttestOptions::default(),
+            (true, true),
+            true,
+            Some(d.path()),
+            NOW,
+            &mut ScriptedAsk::default(),
+            |_| Ok(Attested::default()),
+        );
+        assert!(out.is_ok());
+        let said = said_take();
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].starts_with("[rts] ignoring "), "{said:?}");
+        assert!(said[0].contains("unknown field `[2J`"), "{said:?}");
+        assert!(!said[0].contains('\x1b'), "{said:?}");
     }
 
     #[test]
@@ -640,6 +816,7 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
             NearEnvironment::Production,
             &AttestOptions::default(),
             (true, true),
+            true,
             Some(&home),
             NOW,
             &mut ask,

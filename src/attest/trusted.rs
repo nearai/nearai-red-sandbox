@@ -1,6 +1,7 @@
 //! The user's own trusted compose hashes: an owner-only JSON file in the
-//! rts home. A build lands here only after the user typed its hash at a
-//! launch prompt; `Policy::user_trusted` is built from it.
+//! rts home. A build lands here only after the user answered `y` or `yes`
+//! at the launch prompt that showed it; `Policy::user_trusted` is built
+//! from it.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -177,9 +178,16 @@ fn write(home: &Path, entries: &[TrustedEntry]) -> Result<(), String> {
     let json = serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?;
     fs::create_private_dir_all(home).map_err(|e| format!("create {}: {e}", home.display()))?;
     let path = home.join(FILE);
-    let tmp = home.join(format!("{FILE}.tmp"));
+    // A name of its own, created new: two launches saving at once never
+    // share (or truncate) one temp file, and an existing path, a link
+    // included, is refused rather than followed. The last rename wins.
+    let tmp = home.join(format!(
+        ".{FILE}.{}.{}.tmp",
+        std::process::id(),
+        crate::protocol::random_hex(8)
+    ));
     let result = (|| -> std::io::Result<()> {
-        let mut f = fs::open_private(&tmp, Create::Truncate)?;
+        let mut f = fs::open_private(&tmp, Create::New)?;
         fs::restrict_file(&f)?;
         f.write_all(&json)?;
         f.sync_all()?;
@@ -239,7 +247,6 @@ pub fn forget(home: &Path, prefix: &str) -> Result<Vec<TrustedEntry>, String> {
     }
 }
 
-/// `YYYY-MM-DD` of a Unix time, in UTC.
 /// One line per trusted build for `rts trust list`. The store file is
 /// untrusted text, so the app name and date go through the launch prompt's
 /// sanitizer.
@@ -263,6 +270,7 @@ pub fn list_lines(store: &TrustedComposes) -> Vec<String> {
         .collect()
 }
 
+/// `YYYY-MM-DD` of a Unix time, in UTC.
 pub fn today_utc(unix: u64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(unix as i64, 0)
         .map(|d| d.format("%Y-%m-%d").to_string())
@@ -353,6 +361,49 @@ mod tests {
         let (got, _) = load(Some(d.path()));
         assert_eq!(got.entries.len(), 1);
         assert_eq!(got.entries[0].trusted_at, "2026-11-25");
+    }
+
+    /// Two launches saving at once: each save succeeds and the file stays
+    /// valid. One of the two entries may be lost; neither save may fail.
+    #[test]
+    fn racing_adds_both_succeed_and_the_store_parses() {
+        let d = tempfile::tempdir().unwrap();
+        for round in 0..20u8 {
+            let barrier = std::sync::Barrier::new(2);
+            let results: Vec<Result<(), String>> = std::thread::scope(|s| {
+                let handles: Vec<_> = [1u8, 2]
+                    .into_iter()
+                    .map(|b| {
+                        let (barrier, home) = (&barrier, d.path());
+                        s.spawn(move || {
+                            barrier.wait();
+                            add(
+                                home,
+                                entry(
+                                    NearEnvironment::Production,
+                                    Role::Model,
+                                    round.wrapping_mul(2).wrapping_add(b),
+                                    "2026-11-25",
+                                ),
+                            )
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for r in results {
+                r.unwrap_or_else(|e| panic!("round {round}: {e}"));
+            }
+            let (got, warn) = load(Some(d.path()));
+            assert_eq!(warn, None, "round {round}");
+            assert!(!got.entries.is_empty(), "round {round}");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != FILE)
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]
