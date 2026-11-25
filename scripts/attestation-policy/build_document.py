@@ -14,21 +14,34 @@ publisher". Stdlib only; run with `python3 -I`. The workflow
                candidates/: it hashes each one, runs the rules for both roles
                against the baselines and cosign, assembles the next document
                from the current one and what it reproduced, and refuses (exit
-               1) if proposed.json lists any entry it did not reproduce. It
-               writes OUT/document.json only when there is something to
-               publish (a new entry, no current document, or a current
-               document over 24 hours old), and OUT/holds.json for entries
-               cosign refused.
+               1) if proposed.json lists any entry it did not reproduce and
+               has not revoked. It writes OUT/document.json only when there
+               is something to publish (a new entry, a new revocation or
+               dropped entry, no current document, a base taken from the
+               log, or a current document over 24 hours old), and
+               OUT/holds.json for entries cosign refused.
     issues     writes one hold issue (title and Markdown body) per hold.
 
     build_document.py propose --environment E --evidence DIR [--current CUR.json]
-        --baselines DIR --now YYYY-MM-DDTHH:MM:SSZ --out DIR [--cosign PATH]
+        [--logged LOGGED.json] --baselines DIR --now YYYY-MM-DDTHH:MM:SSZ --out DIR
+        [--cosign PATH]
     build_document.py reproduce --environment E --candidates DIR --proposed P.json
-        [--current CUR.json] --baselines DIR --now ... --out DIR [--cosign PATH]
+        [--current CUR.json] [--logged LOGGED.json] --baselines DIR --now ...
+        --out DIR [--cosign PATH]
     build_document.py issues --environment E --holds H.json --repo OWNER/NAME
         --run-id ID --artifact NAME --out DIR
 
---current is omitted only when no document has been published yet. G2 and M2
+Both take --logged LOGGED.json, the verified document at the head of the
+attestation-policy-log branch. When the release asset (--current) is missing
+or has a lower version, they build on the logged document instead and publish
+at once, so deleting the asset or swapping an older signed pair back in cannot
+drop entries from `revoked`. `revoked` is the base document's list plus the
+reviewed <baselines>/<environment>/revoked.json (exact or instance-label-v1
+hashes), which must exist. It never shrinks, and a hash added to it publishes
+at once.
+
+--current and --logged are omitted only when no document has been published
+yet. G2 and M2
 run here through --cosign: without it, an entry with a changed digest is never
 endorsed. A changed gateway digest outside nearaidev/ is held (G2), and so is
 a changed model digest outside nearaidev/compose-manager* (M2).
@@ -141,14 +154,41 @@ def load_current(path: Path | None, environment: str) -> dict | None:
     return doc
 
 
-def already_covered(raw: str, current: dict | None) -> bool:
-    """The compose is revoked, or the current document endorses it as is."""
+def load_reviewed_revocations(root: Path, environment: str) -> list:
+    """<root>/<environment>/revoked.json: the reviewed list of revoked exact or
+    instance-label-v1 hashes. It must exist; a hash is never removed from it."""
+    path = Path(root) / environment / "revoked.json"
+    try:
+        hashes = json.loads(path.read_bytes().decode("utf-8"))
+    except (OSError, ValueError) as e:
+        raise Refused(f"{path}: {e}")
+    if not isinstance(hashes, list) or not all(_hex64(h) for h in hashes):
+        raise Refused(f"{path}: not a list of 64 lowercase hex digests")
+    if len(set(hashes)) != len(hashes):
+        raise Refused(f"{path}: lists a hash twice")
+    return hashes
+
+
+def base_document(current: dict | None, logged: dict | None) -> tuple[dict | None, bool]:
+    """The document to build on, and whether it came from the log. The release
+    asset is used only when its version is at least the logged one: a missing
+    or older asset (deleted, or an older signed pair swapped back) falls back to
+    the head of attestation-policy-log."""
+    if logged is not None and (current is None or current["version"] < logged["version"]):
+        return logged, True
+    return current, False
+
+
+def already_covered(raw: str, current: dict | None, revoked=()) -> bool:
+    """The compose is revoked by exact or instance-label-v1 hash, or the current
+    document endorses it as is."""
+    exact = rules.compose_sha256(raw)
+    label = rules.instance_label_sha256(raw)
+    revoked = set(revoked) | set(current["revoked"] if current else ())
+    if exact in revoked or (label is not None and label in revoked):
+        return True
     if current is None:
         return False
-    exact = rules.compose_sha256(raw)
-    if exact in current["revoked"]:
-        return True
-    label = rules.instance_label_sha256(raw)
     have = {(e["match"], e["sha256"]) for e in current["entries"]}
     return (rules.MATCH_EXACT, exact) in have or (label is not None and (rules.MATCH_INSTANCE_LABEL, label) in have)
 
@@ -235,13 +275,22 @@ def load_all_baselines(root: Path, environment: str) -> dict:
 
 # --- the next document ---------------------------------------------------
 
-def assemble(environment: str, current: dict | None, new_entries: list, now_unix: int) -> tuple[dict, int, bool]:
+def assemble(environment: str, current: dict | None, new_entries: list, now_unix: int,
+             reviewed_revoked=(), force: bool = False) -> tuple[dict, int, bool]:
     """The next document, how many entries it adds, and whether it is worth
-    publishing. Entries whose sha256 is revoked are dropped."""
+    publishing. revoked is the current document's list plus reviewed_revoked
+    (revoked.json), so it never shrinks. Entries whose sha256 is revoked are
+    dropped. A grown revoked list, a dropped entry or force publishes at once."""
     revoked = list(current["revoked"]) if current else []
+    carried = len(revoked)
+    for h in reviewed_revoked:
+        if h not in revoked:
+            revoked.append(h)
     if current is not None and now_unix < current["version"]:
         raise Refused(f"now ({now_unix}) is before the current document's version {current['version']}")
-    entries = [e for e in (current["entries"] if current else []) if e["sha256"] not in revoked]
+    prior = current["entries"] if current else []
+    entries = [e for e in prior if e["sha256"] not in revoked]
+    changed = force or len(revoked) > carried or len(entries) < len(prior)
     roles = {}
     for e in entries:
         roles.setdefault((e["match"], e["sha256"]), set()).add(e["role"])
@@ -266,7 +315,7 @@ def assemble(environment: str, current: dict | None, new_entries: list, now_unix
         "revoked": revoked,
     }
     stale = current is None or now_unix - parse_time(current["issued"]) > REPUBLISH_AFTER_SECS
-    return doc, added, (added > 0 or stale)
+    return doc, added, (added > 0 or stale or changed)
 
 
 def serialize(doc: dict) -> bytes:
@@ -309,14 +358,16 @@ def collect(evidence: Path, environment: str) -> dict:
 
 def cmd_propose(a) -> int:
     now_unix = parse_time(a.now)
-    current = load_current(a.current, a.environment)
+    current, from_log = base_document(load_current(a.current, a.environment),
+                                      load_current(a.logged, a.environment))
+    reviewed = load_reviewed_revocations(a.baselines, a.environment)
     baselines = load_all_baselines(a.baselines, a.environment)
     found = collect(a.evidence, a.environment)
     out = Path(a.out)
     (out / "candidates").mkdir(parents=True, exist_ok=True)
     new, holds, cache = [], [], {}
     for sha, (role, raw) in found.items():
-        if already_covered(raw, current):
+        if already_covered(raw, current, reviewed):
             continue
         _write(out / "candidates" / f"{sha}.json", raw.encode("utf-8"))
         o = endorse(raw, role, baselines[role], a.now, a.cosign, cache)
@@ -324,7 +375,7 @@ def cmd_propose(a) -> int:
             new.append(o.entry)
         else:
             holds.append(o.hold)
-    doc, added, _ = assemble(a.environment, current, new, now_unix)
+    doc, added, _ = assemble(a.environment, current, new, now_unix, reviewed, from_log)
     _write(out / "proposed.json", serialize(doc))
     _write_json(out / "holds.json", holds)
     print(f"proposed {added} new entries ({len(doc['entries'])} in all), {len(holds)} held, "
@@ -355,7 +406,12 @@ def read_candidates(d: Path) -> dict:
 
 def cmd_reproduce(a) -> int:
     now_unix = parse_time(a.now)
-    current = load_current(a.current, a.environment)
+    current, from_log = base_document(load_current(a.current, a.environment),
+                                      load_current(a.logged, a.environment))
+    if from_log:
+        print(f"the release asset is missing or older than the logged version {current['version']}: "
+              "building on the logged document")
+    reviewed = load_reviewed_revocations(a.baselines, a.environment)
     try:
         proposed = json.loads(Path(a.proposed).read_bytes().decode("utf-8"))
     except (OSError, ValueError) as e:
@@ -368,7 +424,7 @@ def cmd_reproduce(a) -> int:
 
     new, holds, cache, held_keys = [], [], {}, set()
     for sha, raw in cands.items():
-        if already_covered(raw, current):
+        if already_covered(raw, current, reviewed):
             continue
         # The role is not taken from evaluate: a compose is endorsed for the
         # role whose rules it passes, and refused if it passes both.
@@ -385,7 +441,7 @@ def cmd_reproduce(a) -> int:
             holds.append(o.hold)
             held_keys.add(o.held_key)
 
-    doc, added, publish = assemble(a.environment, current, new, now_unix)
+    doc, added, publish = assemble(a.environment, current, new, now_unix, reviewed, from_log)
     data = serialize(doc)
     have = {_key(e) for e in doc["entries"]}
     missing = []
@@ -396,7 +452,8 @@ def cmd_reproduce(a) -> int:
             raise Refused(f"proposed entry {e!r} is malformed")
         # Passed the rules here but not G2/M2 (cosign refused or unreachable):
         # dropped and held, not a reason to publish nothing.
-        if k not in have and k not in held_keys:
+        # A revoked proposal (evaluate read a rolled-back asset) is dropped.
+        if k not in have and k not in held_keys and k[2] not in doc["revoked"]:
             missing.append(k)
     if missing:
         raise Refused("proposed entries not reproduced: " + ", ".join(f"{r} {m} {s}" for r, m, s in missing))
@@ -484,6 +541,8 @@ def main(argv=None) -> int:
         p = sub.add_parser(name)
         p.add_argument("--environment", required=True, choices=rules.ENVIRONMENTS)
         p.add_argument("--current", type=Path, help="the published document; omit only when none exists")
+        p.add_argument("--logged", type=Path,
+                       help="the verified document at the head of attestation-policy-log; omit only when none exists")
         p.add_argument("--baselines", type=Path, required=True)
         p.add_argument("--now", required=True, help="YYYY-MM-DDTHH:MM:SSZ")
         p.add_argument("--out", type=Path, required=True)

@@ -16,7 +16,10 @@
 #   compose.
 # - sign (ubuntu-24.04, environment attestation-policy, contents: write)
 #   trusts only the raw composes in that artifact. It downloads and verifies
-#   the current documents itself, recomputes every entry with
+#   the current documents itself, and those at the head of
+#   attestation-policy-log, building on the logged one when the release asset
+#   is missing or older. It unions the reviewed revocations in
+#   opencode/attestation-baselines/<env>/revoked.json, recomputes every entry with
 #   scripts/attestation-policy/build_document.py reproduce (hashes, rules for
 #   both roles, cosign for changed nearaidev/* digests), refuses if the
 #   proposal lists anything it did not reproduce, signs with
@@ -26,6 +29,9 @@
 #
 # A held compose is approved only by merging a reviewed pull request that adds
 # it to opencode/attestation-baselines/; that push triggers a run that signs it.
+# A hash is revoked the same way: a reviewed pull request adds it (exact or
+# instance-label-v1) to opencode/attestation-baselines/<env>/revoked.json, and
+# the run that push triggers publishes a document without it.
 #
 # Configuration:
 # - Repository variable RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX: the keys
@@ -259,6 +265,51 @@ jobs:
             fi
           done
 
+      # The head of attestation-policy-log bounds the release asset from below:
+      # reproduce builds on the logged document when the asset is missing or
+      # older, so deleting the assets or swapping an older signed pair back in
+      # cannot drop revocations. A failed fetch refuses (set -e); a file absent
+      # from the branch means nothing has been published for that environment.
+      - name: Download and verify the logged documents
+        env:
+          KEYS: ${{ vars.RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX }}
+        run: |
+          set -euo pipefail
+          w="$RUNNER_TEMP/verify"
+          mkdir -p "$w" "$RUNNER_TEMP/logged"
+          verify() {
+            python3 -I -c 'import base64, sys; sys.stdout.buffer.write(base64.b64decode(open(sys.argv[1], "rb").read().rstrip(b"\n"), validate=True))' "$2" > "$w/sig.bin"
+            local k
+            for k in ${KEYS//,/ }; do
+              python3 -I -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))' "302a300506032b6570032100$k" > "$w/pub.der"
+              openssl pkey -pubin -inform DER -in "$w/pub.der" -out "$w/pub.pem"
+              if openssl pkeyutl -verify -pubin -inkey "$w/pub.pem" -rawin -in "$1" -sigfile "$w/sig.bin" >/dev/null 2>&1; then
+                return 0
+              fi
+            done
+            return 1
+          }
+          git fetch --no-tags --depth=1 origin attestation-policy-log
+          log=$(git rev-parse FETCH_HEAD)
+          echo "attestation-policy-log head $log"
+          for environment in production staging; do
+            doc="$RUNNER_TEMP/logged/$environment.json"
+            has_doc=0; has_sig=0
+            git cat-file -e "$log:$environment.json" 2>/dev/null && has_doc=1
+            git cat-file -e "$log:$environment.json.sig" 2>/dev/null && has_sig=1
+            if [ "$has_doc" = 0 ] && [ "$has_sig" = 0 ]; then
+              echo "no logged $environment document"
+            elif [ "$has_doc" = 1 ] && [ "$has_sig" = 1 ]; then
+              git show "$log:$environment.json" > "$doc"
+              git show "$log:$environment.json.sig" > "$doc.sig"
+              verify "$doc" "$doc.sig" || { echo "refusing: the logged $environment document does not verify with any compiled-in key" >&2; exit 1; }
+              echo "logged $environment document verified"
+            else
+              echo "refusing: attestation-policy-log holds only one of $environment.json and $environment.json.sig" >&2
+              exit 1
+            fi
+          done
+
       - name: Reproduce
         run: |
           set -euo pipefail
@@ -270,6 +321,9 @@ jobs:
             current=()
             if [ -f "$RUNNER_TEMP/current/$environment.json" ]; then
               current=(--current "$RUNNER_TEMP/current/$environment.json")
+            fi
+            if [ -f "$RUNNER_TEMP/logged/$environment.json" ]; then
+              current+=(--logged "$RUNNER_TEMP/logged/$environment.json")
             fi
             python3 -I scripts/attestation-policy/build_document.py reproduce \
               --environment "$environment" \

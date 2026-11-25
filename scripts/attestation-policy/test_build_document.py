@@ -47,8 +47,9 @@ def rfc3339(t):
     return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def baselines(tmp_path, **sets):
-    """A baselines tree: sets maps 'production_model' to a list of raw composes."""
+def baselines(tmp_path, revoked=(), **sets):
+    """A baselines tree: sets maps 'production_model' to a list of raw composes.
+    revoked is the reviewed production revoked.json (staging's is empty)."""
     root = tmp_path / "baselines"
     for key, raws in sets.items():
         env, role = key.split("_")
@@ -56,11 +57,13 @@ def baselines(tmp_path, **sets):
         d.mkdir(parents=True)
         for r in raws:
             (d / f"{sha(r)}.json").write_bytes(r.encode())
-    root.mkdir(exist_ok=True)
+    for env, hashes in (("production", list(revoked)), ("staging", [])):
+        (root / env).mkdir(parents=True, exist_ok=True)
+        (root / env / "revoked.json").write_text(json.dumps(hashes) + "\n")
     return root
 
 
-def current_doc(tmp_path, issued, entries=(), revoked=(), environment="production"):
+def current_doc(tmp_path, issued, entries=(), revoked=(), environment="production", name="current.json"):
     doc = {
         "schema": 1,
         "environment": environment,
@@ -70,7 +73,7 @@ def current_doc(tmp_path, issued, entries=(), revoked=(), environment="productio
         "entries": list(entries),
         "revoked": list(revoked),
     }
-    p = tmp_path / "current.json"
+    p = tmp_path / name
     p.write_text(json.dumps(doc, indent=2) + "\n")
     return p
 
@@ -481,6 +484,136 @@ def test_a_revoked_candidate_is_not_endorsed(tmp_path):
     r, out = reproduce(tmp_path, base, candidates(tmp_path, EDAB), proposed(tmp_path, []), current=cur)
     assert r.returncode == 0, r.stdout + r.stderr
     assert json.loads((out / "document.json").read_text())["entries"] == []
+
+
+# --- reviewed revocations (revoked.json) and the log floor -------------------
+
+@pytest.mark.parametrize("match,h", [("exact", A64), ("instance-label-v1", LABEL_SHA)])
+def test_a_reviewed_revocation_drops_the_entry_and_forces_a_publish(tmp_path, match, h):
+    # The current document is an hour old: without the revocation there is nothing to publish.
+    keep = entry("gateway", "exact", B64)
+    cur = current_doc(tmp_path, NOW_UNIX - HOUR, [entry("model", match, h), keep])
+    r, out = reproduce(tmp_path, baselines(tmp_path, revoked=[h]), candidates(tmp_path),
+                       proposed(tmp_path, [keep]), current=cur)
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads((out / "document.json").read_text())
+    assert doc["entries"] == [keep]
+    assert doc["revoked"] == [h]
+    assert doc["version"] == NOW_UNIX
+
+
+def test_revocations_are_the_union_of_the_document_and_revoked_json(tmp_path):
+    cur = current_doc(tmp_path, NOW_UNIX - HOUR, revoked=[A64])
+    r, out = reproduce(tmp_path, baselines(tmp_path, revoked=[B64]), candidates(tmp_path),
+                       proposed(tmp_path, []), current=cur)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads((out / "document.json").read_text())["revoked"] == [A64, B64]
+
+
+def test_an_already_carried_revocation_does_not_force_a_publish(tmp_path):
+    cur = current_doc(tmp_path, NOW_UNIX - HOUR, revoked=[A64])
+    r, out = reproduce(tmp_path, baselines(tmp_path, revoked=[A64]), candidates(tmp_path),
+                       proposed(tmp_path, []), current=cur)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "nothing to publish" in r.stdout
+    assert not (out / "document.json").exists()
+
+
+@pytest.mark.parametrize("revoke", ["exact", "label"])
+def test_a_candidate_revoked_in_revoked_json_is_neither_proposed_nor_endorsed(tmp_path, revoke):
+    h = sha(EDAB) if revoke == "exact" else LABEL_SHA
+    base = baselines(tmp_path, revoked=[h], production_model=[E390])
+    r, out = propose(tmp_path, base, [attestation([("model", EDAB)])])
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads((out / "proposed.json").read_text())["entries"] == []
+    r, out = reproduce(tmp_path, base, candidates(tmp_path, EDAB), proposed(tmp_path, []))
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads((out / "document.json").read_text())
+    assert doc["entries"] == [] and doc["revoked"] == [h]
+
+
+def test_reproduce_does_not_refuse_a_proposed_entry_that_is_revoked(tmp_path):
+    # evaluate read a rolled-back asset and proposed a revoked entry: sign drops
+    # it rather than refusing, so the bad asset is replaced.
+    revoked = entry("model", "exact", A64)
+    r, out = reproduce(tmp_path, baselines(tmp_path, revoked=[A64]), candidates(tmp_path),
+                       proposed(tmp_path, [revoked]))
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads((out / "document.json").read_text())
+    assert doc["entries"] == [] and doc["revoked"] == [A64]
+
+
+@pytest.mark.parametrize("content", [None, "{}", f'["{A64}", "{A64}"]', f'["{A64.upper()}"]', '["ab"]'])
+def test_a_missing_or_malformed_revoked_json_refuses(tmp_path, content):
+    base = baselines(tmp_path)
+    f = base / "production" / "revoked.json"
+    if content is None:
+        f.unlink()
+    else:
+        f.write_text(content)
+    r, out = reproduce(tmp_path, base, candidates(tmp_path), proposed(tmp_path, []))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "revoked.json" in r.stderr
+    assert not (out / "document.json").exists()
+
+
+def test_the_repository_has_a_revoked_json_per_environment():
+    for env in ("production", "staging"):
+        hashes = bd.load_reviewed_revocations(REPO / "opencode" / "attestation-baselines", env)
+        assert isinstance(hashes, list)
+
+
+def _logged(tmp_path, issued, entries=(), revoked=()):
+    return current_doc(tmp_path, issued, entries, revoked, name="logged.json")
+
+
+def test_a_missing_asset_falls_back_to_the_logged_document(tmp_path):
+    # Both release assets 404 while the log holds a fresh document: carry the
+    # logged one forward (and its revocations), and publish to repair the asset.
+    prior = entry("gateway", "exact", B64)
+    logged = _logged(tmp_path, NOW_UNIX - HOUR, [prior], revoked=[A64])
+    r, out = reproduce(tmp_path, baselines(tmp_path), candidates(tmp_path), proposed(tmp_path, []),
+                       extra=["--logged", logged])
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads((out / "document.json").read_text())
+    assert doc["entries"] == [prior] and doc["revoked"] == [A64]
+    assert doc["version"] == NOW_UNIX
+
+
+def test_an_asset_older_than_the_log_is_replaced_by_the_logged_document(tmp_path):
+    # Someone swapped an older, validly signed document back into the release.
+    old = current_doc(tmp_path, NOW_UNIX - 5 * HOUR, [entry("model", "exact", A64)])
+    logged = _logged(tmp_path, NOW_UNIX - HOUR, revoked=[A64])
+    r, out = reproduce(tmp_path, baselines(tmp_path), candidates(tmp_path), proposed(tmp_path, []),
+                       current=old, extra=["--logged", logged])
+    assert r.returncode == 0, r.stdout + r.stderr
+    doc = json.loads((out / "document.json").read_text())
+    assert doc["entries"] == [] and doc["revoked"] == [A64]
+
+
+def test_an_asset_newer_than_the_log_is_kept(tmp_path):
+    # The upload succeeded and the log commit did not: the asset is the newer one.
+    newer = current_doc(tmp_path, NOW_UNIX - HOUR, [entry("gateway", "exact", B64)])
+    logged = _logged(tmp_path, NOW_UNIX - 2 * HOUR, [entry("model", "exact", A64)])
+    r, out = reproduce(tmp_path, baselines(tmp_path), candidates(tmp_path), proposed(tmp_path, []),
+                       current=newer, extra=["--logged", logged])
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "nothing to publish" in r.stdout
+    # Once it is stale, the asset's entries are the ones carried forward.
+    newer = current_doc(tmp_path, NOW_UNIX - 25 * HOUR, [entry("gateway", "exact", B64)])
+    logged = _logged(tmp_path, NOW_UNIX - 26 * HOUR, [entry("model", "exact", A64)])
+    r, out = reproduce(tmp_path, baselines(tmp_path), candidates(tmp_path), proposed(tmp_path, []),
+                       current=newer, extra=["--logged", logged])
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert [e["sha256"] for e in json.loads((out / "document.json").read_text())["entries"]] == [B64]
+
+
+def test_a_logged_document_for_another_environment_refuses(tmp_path):
+    logged = current_doc(tmp_path, NOW_UNIX - HOUR, environment="staging", name="logged.json")
+    r, _ = reproduce(tmp_path, baselines(tmp_path), candidates(tmp_path), proposed(tmp_path, []),
+                     extra=["--logged", logged])
+    assert r.returncode == 1
+    assert "environment" in r.stderr
 
 
 def test_reproduce_refuses_a_clock_behind_the_current_version(tmp_path):

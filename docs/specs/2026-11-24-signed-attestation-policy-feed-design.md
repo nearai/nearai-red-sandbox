@@ -264,9 +264,21 @@ New workflow `.github/workflows/attestation-policy.yml`:
    person reviews that diff and merges it or closes it. Merging triggers a run
    that signs the entry.
 
-Entries leave the document only through `revoked` or through a reviewed
-change to the baseline. Old hashes are not removed when a newer build
-appears, because NEAR runs mixed fleets during rollouts.
+Entries leave the document only through `revoked`. Old hashes are not
+removed when a newer build appears, because NEAR runs mixed fleets during
+rollouts.
+
+`revoked` is the base document's list plus the reviewed
+`opencode/attestation-baselines/<environment>/revoked.json`, a list of
+exact or `instance-label-v1` hashes that must exist and is never pruned. The
+next run publishes a document without any entry whose `sha256` is in it, and
+never endorses a candidate whose exact or normalized hash is in it. The base
+document is the release asset, unless the asset is missing or its `version`
+is below that of the verified document at the head of
+`attestation-policy-log`; then the logged document is the base and the run
+publishes at once. So deleting the assets, or swapping an older signed pair
+back in, does not un-revoke a hash. `rts` revokes by exact hash, so a
+revoked `instance-label-v1` hash takes effect by leaving `entries`.
 
 ### Baselines
 
@@ -283,7 +295,9 @@ lists for which we hold the raw `app_compose`. Production pins `e4b83d924284`
 (staging gateways) are not on hand locally. They are captured from a live session before seeding. Changing a
 baseline is a normal pull request, and that review is where a person
 approves a structural change. A baseline is removed in the same pull
-request that revokes its hash.
+request that adds its hash to `revoked.json`, together with the hash of
+every entry endorsed against it that should no longer be admitted: entries
+do not record their baseline, so removing a baseline alone drops nothing.
 
 ### Content rules
 
