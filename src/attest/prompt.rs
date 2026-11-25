@@ -1,7 +1,7 @@
 //! Asking the user, at launch, whether to trust a NEAR AI build that nothing
 //! else trusts, and attesting again in full after a yes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use super::trusted::{self, TrustedComposes, TrustedEntry};
@@ -57,6 +57,17 @@ fn display_app_name(raw: Option<&str>) -> String {
     } else {
         shown
     }
+}
+
+/// Text from the store file (its load warning, which can quote the file's
+/// bytes) as it may reach the terminal: printable ASCII, at most 300 chars.
+pub fn display_store_text(raw: &str) -> String {
+    printable(raw, 300)
+}
+
+/// The store-load warning's terminal line.
+pub fn store_warning_line(warning: &str) -> String {
+    format!("[rts] {}", display_store_text(warning))
 }
 
 fn short(hash: &[u8; 32]) -> String {
@@ -120,6 +131,34 @@ pub fn trusted_lines(
         .collect()
 }
 
+/// The user-trusted builds (model, role, hash) whose lines were printed last
+/// this session, so re-attestation prints them again only when they change.
+#[derive(Debug, Default)]
+pub struct TrustedPrinted(BTreeSet<(String, Role, [u8; 32])>);
+
+impl TrustedPrinted {
+    /// Seeded from the launch attestation, whose lines the launch printed.
+    pub fn from_attested(attested: &Attested) -> Self {
+        Self(attested.user_trusted().into_iter().collect())
+    }
+
+    /// [`trusted_lines`] when `attested`'s user-trusted set differs from the
+    /// one printed last; otherwise none.
+    pub fn changed_lines(
+        &mut self,
+        attested: &Attested,
+        store: &TrustedComposes,
+        near: NearEnvironment,
+    ) -> Vec<String> {
+        let now: BTreeSet<_> = attested.user_trusted().into_iter().collect();
+        if now == self.0 {
+            return vec![];
+        }
+        self.0 = now;
+        trusted_lines(attested, store, near)
+    }
+}
+
 /// Shows a prompt and reads one answer; `None` on EOF or an error.
 pub trait Ask {
     fn ask(&mut self, text: &str) -> Option<String>;
@@ -167,7 +206,7 @@ pub fn attest_with_consent(
 ) -> Result<Attested, AttestationFailure> {
     let (mut store, warning) = trusted::load(home);
     if let Some(w) = warning {
-        crate::brand::progress::message(&format!("[rts] {w}"));
+        crate::brand::progress::message(&store_warning_line(&w));
     }
     let mut prompts = 0;
     loop {
@@ -618,6 +657,93 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
             }
             other => panic!("expected ComposeNotTrusted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_hostile_store_key_cannot_reach_the_terminal_in_the_warning() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join(trusted::FILE);
+        std::fs::write(&path, r#"{"version":1,"entries":[],"\u001b[2J":1}"#).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let (_, warning) = trusted::load(Some(d.path()));
+        let raw = warning.expect("an unknown key is a warning");
+        assert!(
+            raw.contains('\x1b'),
+            "the probe still reaches serde's text: {raw:?}"
+        );
+        let line = store_warning_line(&raw);
+        assert!(line.starts_with("[rts] ignoring "), "{line}");
+        assert!(!line.contains('\x1b'), "{line:?}");
+        assert!(line.contains("unknown field `[2J`"), "{line}");
+        assert!(line.bytes().all(|b| (0x20..=0x7e).contains(&b)), "{line:?}");
+    }
+
+    #[test]
+    fn store_text_is_printable_and_capped_at_300() {
+        assert_eq!(display_store_text("a\x1b\r\nb\u{00e9}c"), "abc");
+        assert_eq!(display_store_text(&"x".repeat(400)), "x".repeat(300));
+    }
+
+    fn trusted_fixture(hashes: &[&str]) -> (Attested, trusted::TrustedComposes) {
+        let entries: Vec<_> = hashes
+            .iter()
+            .map(|h| serde_json::json!({"role": "gateway", "compose_hash": h, "compose_acceptance": "user-trusted"}))
+            .collect();
+        let store = trusted::TrustedComposes {
+            entries: hashes
+                .iter()
+                .map(|h| trusted::TrustedEntry {
+                    environment: NearEnvironment::Production,
+                    role: Role::Gateway,
+                    sha256: hash(h),
+                    app_name: None,
+                    trusted_at: "2026-11-20".into(),
+                })
+                .collect(),
+        };
+        let attested = Attested {
+            evidence: vec![serde_json::json!({"model": "m", "entries": entries})],
+            ..Attested::default()
+        };
+        (attested, store)
+    }
+
+    #[test]
+    fn re_attestation_prints_the_trusted_lines_only_when_the_set_changes() {
+        let other = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let near = NearEnvironment::Production;
+        let (one, store_one) = trusted_fixture(&[GW_HASH]);
+        let (two, store_two) = trusted_fixture(&[GW_HASH, other]);
+        let mut printed = TrustedPrinted::default();
+        let first = printed.changed_lines(&one, &store_one, near);
+        assert_eq!(
+            first,
+            vec!["[rts] NEAR AI gateway build f4a9b480: you trusted it on 2026-11-20".to_string()]
+        );
+        assert!(
+            printed.changed_lines(&one, &store_one, near).is_empty(),
+            "same set twice prints once"
+        );
+        assert_eq!(
+            printed.changed_lines(&two, &store_two, near).len(),
+            2,
+            "a changed set prints again"
+        );
+        assert!(printed.changed_lines(&two, &store_two, near).is_empty());
+        // Seeded from the launch's attestation: the launch already printed it.
+        let mut seeded = TrustedPrinted::from_attested(&one);
+        assert!(seeded.changed_lines(&one, &store_one, near).is_empty());
+        // Going back to none is a change, but prints nothing.
+        assert!(
+            seeded
+                .changed_lines(&Attested::default(), &store_one, near)
+                .is_empty()
+        );
+        assert_eq!(seeded.changed_lines(&one, &store_one, near).len(), 1);
     }
 
     #[test]

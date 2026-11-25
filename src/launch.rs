@@ -489,6 +489,9 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                     // policy: a re-attestation may accept a redeployed build
                     // holding one of them (issue #25). Launch stays pinned.
                     let continuity = attest::Continuity::from_attested(&seed);
+                    // The launch printed its trusted lines; re-attestation
+                    // prints them again only when the set changes.
+                    let printed = Mutex::new(attest::prompt::TrustedPrinted::from_attested(&seed));
                     forwarder::Forwarder::start(forwarder::ForwarderConfig {
                         credentials: Some(credentials.clone()),
                         upstream: near.base_url().into(),
@@ -554,7 +557,11 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                                             "NEAR AI redeployed to a build that is not pinned; accepted because it holds this session's attested signing key: {entry}"
                                         ));
                                     }
-                                    for line in attest::prompt::trusted_lines(&attested, &store, near) {
+                                    let lines = printed
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .changed_lines(&attested, &store, near);
+                                    for line in lines {
                                         brand::progress::message(&line);
                                     }
                                     attested
