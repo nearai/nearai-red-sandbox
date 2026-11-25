@@ -23,7 +23,9 @@
 #   opencode/attestation-baselines/<env>/revoked.json, recomputes every entry with
 #   scripts/attestation-policy/build_document.py reproduce (hashes, rules for
 #   both roles, cosign for changed nearaidev/* digests), refuses if the
-#   proposal lists anything it did not reproduce, signs with
+#   proposal lists anything it did not reproduce (except, when no release
+#   asset verified, entries carried from that asset that name no candidate:
+#   those are dropped with a warning), signs with
 #   scripts/attestation-policy/sign-policy.sh, uploads the document and then
 #   its signature, and commits both to the attestation-policy-log branch with
 #   createCommitOnBranch (a GitHub-signed commit).

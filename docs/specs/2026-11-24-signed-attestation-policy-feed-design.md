@@ -273,11 +273,16 @@ rollouts.
 exact or `instance-label-v1` hashes that must exist and is never pruned. The
 next run publishes a document without any entry whose `sha256` is in it, and
 never endorses a candidate whose exact or normalized hash is in it. The base
-document is the release asset, unless the asset is missing or its `version`
-is below that of the verified document at the head of
-`attestation-policy-log`; then the logged document is the base and the run
-publishes at once. So deleting the assets, or swapping an older signed pair
-back in, does not un-revoke a hash. `rts` revokes by exact hash, so a
+document is the release asset, unless the asset is missing, only one of the
+document and its signature is there, the pair does not verify (a partly
+finished upload), or its `version` is below that of the verified document at
+the head of `attestation-policy-log`; then the logged document is the base and
+the run publishes at once, repairing the assets. With no logged document, a
+half-present or unverifiable pair refuses. So deleting the assets, swapping an
+older signed pair back in, or a failed upload does not un-revoke a hash or
+stop the publisher. In that fallback, `sign` drops (with a warning) proposed
+entries that `evaluate` carried from the unverified asset and that name no
+candidate; the next run proposes them again from evidence. `rts` revokes by exact hash, so a
 revoked `instance-label-v1` hash takes effect by leaving `entries`.
 
 ### Baselines
