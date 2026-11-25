@@ -80,6 +80,25 @@ def test_proposes_only_verified_unpinned_composes(tmp_path):
     assert [c["role"] for c in found] == ["model", "gateway"]
 
 
+def test_user_trusted_evidence_is_proposed(tmp_path):
+    # A user trusted it at launch; no reviewer has: proposed as mr-config-only is.
+    def found(how):
+        doc = {"status": "verified", "evidence": [evidence("q", NEW_GW, how, NEW_MODEL, how)]}
+        a, p = write(tmp_path, doc, policy_with(PINNED))
+        return refresh.candidates(json.loads(a.read_text()), json.loads(p.read_text()), "2026-11-25")
+
+    user_trusted = found("user-trusted")
+    assert [c["sha256"] for c in user_trusted] == [NEW_GW, NEW_MODEL]
+    assert [c["role"] for c in user_trusted] == ["gateway", "model"]
+    # The same proposals, each source naming how rts accepted it.
+    mr_config_only = found("mr-config-only")
+    for u, m in zip(user_trusted, mr_config_only):
+        assert u["source"].endswith("(user-trusted, verified by rts)")
+        assert u["source"].replace("user-trusted", "mr-config-only") == m["source"]
+    strip = lambda cs: [{k: v for k, v in c.items() if k != "source"} for c in cs]
+    assert strip(user_trusted) == strip(mr_config_only)
+
+
 def test_endorsed_composes_are_accepted_not_proposed(tmp_path):
     # The signed feed admitted them: CI's rules reviewed them already.
     doc = {"status": "verified", "evidence": [evidence("q", NEW_GW, "endorsed", NEW_MODEL, "endorsed")]}

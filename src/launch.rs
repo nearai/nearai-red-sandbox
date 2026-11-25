@@ -458,6 +458,7 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                         &cfg.provider.models,
                         attest_options,
                         feed_doc.as_ref(),
+                        &std::collections::BTreeMap::new(),
                     )
                     .map_err(attest::AttestationFailure::Other)?
                     .attest_for_launch()
@@ -520,6 +521,7 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                                         &models,
                                         options,
                                         doc.as_ref(),
+                                        &std::collections::BTreeMap::new(),
                                     )
                                     .map_err(attest::AttestationFailure::Other)?
                                     .with_continuity(continuity.clone())

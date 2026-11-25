@@ -99,6 +99,9 @@ pub struct Policy {
     pub revoked: BTreeSet<[u8; 32]>,
     /// The feed document's `version`, when one was merged.
     pub feed_version: Option<u64>,
+    /// Exact compose hashes the user of this machine trusts, each with its
+    /// role. Checked after pins and endorsements, never over a revocation.
+    pub user_trusted: BTreeMap<[u8; 32], Role>,
 }
 
 /// Production's pinned composes. Compiled in: changing the pinned list needs
@@ -201,6 +204,33 @@ impl Attested {
         }
         out
     }
+
+    /// Entries accepted because the user trusts their compose hash: per
+    /// entry, the model whose report held it, its role and the hash.
+    pub fn user_trusted(&self) -> Vec<(String, Role, [u8; 32])> {
+        let mut out = vec![];
+        for ev in &self.evidence {
+            let model = ev["model"].as_str().unwrap_or("?");
+            for e in ev["entries"].as_array().into_iter().flatten() {
+                if e["compose_acceptance"] != "user-trusted" {
+                    continue;
+                }
+                let role = if e["role"] == "model" {
+                    Role::Model
+                } else {
+                    Role::Gateway
+                };
+                let Some(hash) = e["compose_hash"]
+                    .as_str()
+                    .and_then(|h| report::hex32(h).ok())
+                else {
+                    continue;
+                };
+                out.push((model.to_string(), role, hash));
+            }
+        }
+        out
+    }
 }
 
 /// The signing keys a session attested at launch, under the full policy.
@@ -232,10 +262,30 @@ impl Continuity {
 
 pub type Nonce = Arc<dyn Fn() -> [u8; 32] + Send + Sync>;
 
-/// A launch can recover only an explicit Cloud credential rejection.
+/// A compose that nothing trusts for its role, under `--compose-policy
+/// pinned` without key continuity. Verified for that entry only: its TDX
+/// quote, TCB policy, report_data binding, and that mr_config_id commits to
+/// the compose. Not verified: its GPU evidence, or any later entry, so a
+/// caller that trusts the hash must attest again in full.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotTrusted {
+    /// The model whose report held the entry.
+    pub model: String,
+    pub role: Role,
+    pub hash: [u8; 32],
+    /// The entry's `info.app_name`, when it is a string. NEAR AI's label:
+    /// no quote binds it.
+    pub app_name: Option<String>,
+    /// The refusal's full text, as [`AttestationFailure::message`] returns it.
+    pub message: String,
+}
+
+/// A launch can recover from an explicit Cloud credential rejection, and may
+/// offer to trust a compose that nothing trusts.
 #[derive(Debug)]
 pub enum AttestationFailure {
     CredentialRefused { model: String },
+    ComposeNotTrusted(NotTrusted),
     Other(String),
 }
 
@@ -243,8 +293,54 @@ impl AttestationFailure {
     pub fn message(self) -> String {
         match self {
             Self::CredentialRefused { model } => format!("model {model}: {CREDENTIAL_REFUSED}"),
+            Self::ComposeNotTrusted(nt) => nt.message,
             Self::Other(message) => message,
         }
+    }
+}
+
+/// Why one model's report was refused, before the model is named.
+#[derive(Debug)]
+enum ModelError {
+    /// `message` carries the entry's prefix (`gateway: `,
+    /// `model_attestations[i]: `) and the compose refusal text.
+    NotTrusted {
+        role: Role,
+        hash: [u8; 32],
+        app_name: Option<String>,
+        message: String,
+    },
+    Other(String),
+}
+
+impl ModelError {
+    fn prefixed(self, prefix: &str) -> Self {
+        match self {
+            Self::NotTrusted {
+                role,
+                hash,
+                app_name,
+                message,
+            } => Self::NotTrusted {
+                role,
+                hash,
+                app_name,
+                message: format!("{prefix}{message}"),
+            },
+            Self::Other(message) => Self::Other(format!("{prefix}{message}")),
+        }
+    }
+}
+
+impl From<String> for ModelError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<&str> for ModelError {
+    fn from(message: &str) -> Self {
+        Self::Other(message.to_string())
     }
 }
 
@@ -278,6 +374,8 @@ impl Attestor {
     /// /dev/urandom nonces, with `near`'s API base and pinned policy (one
     /// value, so the two cannot be mixed), and `feed`'s endorsements and
     /// revocations merged in. `feed` must be a document verified for `near`.
+    /// `trusted` is the user-trusted set for `near`, checked after pins and
+    /// endorsements.
     ///
     /// `BlockingHttp` must not run on a Tokio runtime thread: call `attest`
     /// from a plain thread.
@@ -287,6 +385,7 @@ impl Attestor {
         models: &[String],
         options: AttestOptions,
         feed: Option<&feed::FeedDocument>,
+        trusted: &BTreeMap<[u8; 32], Role>,
     ) -> Result<Attestor, String> {
         let mut policy = load_policy(policy_json(near))?;
         if let Some(doc) = feed {
@@ -299,6 +398,7 @@ impl Attestor {
             }
             feed::merge(&mut policy, doc);
         }
+        policy.user_trusted = trusted.clone();
         let http: Arc<dyn Http> = Arc::new(BlockingHttp::new()?);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         Ok(Attestor {
@@ -339,12 +439,25 @@ impl Attestor {
         }
         let mut all = Attested::default();
         for model in &self.models {
-            let attested = self.attest_model(model).map_err(|error| {
-                if error == CREDENTIAL_REFUSED {
+            let attested = self.attest_model(model).map_err(|error| match error {
+                ModelError::NotTrusted {
+                    role,
+                    hash,
+                    app_name,
+                    message,
+                } => AttestationFailure::ComposeNotTrusted(NotTrusted {
+                    model: model.clone(),
+                    role,
+                    hash,
+                    app_name,
+                    message: format!("model {model}: {message}"),
+                }),
+                ModelError::Other(error) if error == CREDENTIAL_REFUSED => {
                     AttestationFailure::CredentialRefused {
                         model: model.clone(),
                     }
-                } else {
+                }
+                ModelError::Other(error) => {
                     AttestationFailure::Other(format!("model {model}: {error}"))
                 }
             })?;
@@ -353,7 +466,7 @@ impl Attestor {
         Ok(all)
     }
 
-    fn attest_model(&self, model: &str) -> Result<Attested, String> {
+    fn attest_model(&self, model: &str) -> Result<Attested, ModelError> {
         let nonce = (self.nonce)();
         let nonce_hex = hex::encode(nonce);
         let url = report::report_url(&self.base_url, model, &nonce);
@@ -365,7 +478,7 @@ impl Attestor {
             if crate::sponsored::rejection(resp.status, &resp.body).is_some() {
                 return Err(CREDENTIAL_REFUSED.into());
             }
-            return Err(format!("attestation report returned HTTP {}", resp.status));
+            return Err(format!("attestation report returned HTTP {}", resp.status).into());
         }
         let raw = std::str::from_utf8(&resp.body)
             .map_err(|_| "attestation report is not UTF-8".to_string())?;
@@ -397,7 +510,7 @@ impl Attestor {
                 .is_ok_and(|k| self.continuity.gateway_keys.contains(&k));
         let mut record = self
             .check_quote(gateway, &nonce, Role::Gateway, gateway_continued)
-            .map_err(|e| format!("gateway: {e}"))?;
+            .map_err(|e| e.prefixed("gateway: "))?;
         // Only after every gateway check passed. NEAR AI production signs
         // receipts with an ed25519 gateway key; any other algorithm pins
         // TLS only and attests no receipt key.
@@ -425,13 +538,14 @@ impl Attestor {
             {
                 return Err(at(format!(
                     "model_name {name:?} is not the requested model {model:?}"
-                )));
+                ))
+                .into());
             }
             let key = report::ed25519_key(entry).map_err(at)?;
             let continued = self.continuity.vouches_for_model(model, &key);
             let mut record = self
                 .check_quote(entry, &nonce, Role::Model, continued)
-                .map_err(at)?;
+                .map_err(|e| e.prefixed(&format!("model_attestations[{i}]: ")))?;
             let payload = entry
                 .nvidia_payload
                 .as_deref()
@@ -441,9 +555,7 @@ impl Attestor {
                 .verify(payload, &nonce_hex)
                 .map_err(|e| at(format!("GPU attestation: {e}")))?;
             if !verdict.overall {
-                return Err(at(
-                    "GPU attestation: NRAS overall verdict is not true".into()
-                ));
+                return Err(at("GPU attestation: NRAS overall verdict is not true".into()).into());
             }
             if let Some(fp) = entry.tls_cert_fingerprint.as_deref() {
                 out.fingerprints.insert(
@@ -480,7 +592,7 @@ impl Attestor {
         nonce: &[u8; 32],
         role: Role,
         continued: bool,
-    ) -> Result<serde_json::Map<String, Value>, String> {
+    ) -> Result<serde_json::Map<String, Value>, ModelError> {
         let quote = hex::decode(&e.intel_quote)
             .map_err(|_| "TDX quote (intel_quote) is not hex".to_string())?;
         let claims = self
@@ -497,7 +609,25 @@ impl Attestor {
             role,
             self.options.compose_policy,
             continued,
-        )?;
+        )
+        .map_err(|err| match err {
+            report::ComposeError::NotTrusted {
+                role,
+                hash,
+                message,
+            } => ModelError::NotTrusted {
+                role,
+                hash,
+                app_name: e
+                    .info
+                    .as_ref()
+                    .and_then(|i| i.get("app_name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                message,
+            },
+            report::ComposeError::Other(message) => ModelError::Other(message),
+        })?;
         let mut m = serde_json::Map::new();
         m.insert("tcb_status".into(), claims.tcb_status.into());
         m.insert("advisory_ids".into(), claims.advisory_ids.into());
@@ -664,6 +794,17 @@ mod tests {
     /// Routes each model's report under its own nonce; quote bytes are per
     /// model (`gw-<model>`, `m0-<model>`) so their claims can differ.
     fn run_cases(models: &[&str], cases: Vec<Case>) -> Run {
+        let (attestor, http, gpu) = attestor_for(models, cases);
+        Run {
+            result: attestor.attest(),
+            http,
+            gpu,
+        }
+    }
+
+    /// The attestor `run_cases` runs, for a test that needs
+    /// `attest_for_launch`'s typed failure.
+    fn attestor_for(models: &[&str], cases: Vec<Case>) -> (Attestor, Arc<FakeHttp>, Arc<FakeGpu>) {
         let http = FakeHttp::new();
         let mut quotes = HashMap::new();
         let first = &cases[0];
@@ -712,11 +853,7 @@ mod tests {
             continuity: first.continuity.clone(),
             nonce: counter_nonce(),
         };
-        Run {
-            result: attestor.attest(),
-            http,
-            gpu,
-        }
+        (attestor, http, gpu)
     }
 
     fn for_model(mut case: Case, model: &str) -> Case {
@@ -752,6 +889,12 @@ mod tests {
 
     fn run_one(case: Case) -> Run {
         run_cases(&["m"], vec![for_model(case, "m")])
+    }
+
+    fn launch_one(case: Case) -> Result<Attested, AttestationFailure> {
+        attestor_for(&["m"], vec![for_model(case, "m")])
+            .0
+            .attest_for_launch()
     }
 
     /// Production serves the report without an API key, so attestation can
@@ -1156,6 +1299,81 @@ mod tests {
         assert!(err.contains("not pinned"), "{err}");
     }
 
+    /// The refusal text of an untrusted compose, captured before the
+    /// refusal was typed; it must not change.
+    const REDEPLOYED_MODEL_REFUSAL: &str = "model m: model_attestations[0]: model compose hash 5a4b769f4996c7d963d4242870b1b3532357e60f144d7105a71a8a183a0f9a25 is not pinned in this NEAR AI environment's policy, opencode/attestation-policy.json or opencode/attestation-policy-staging.json, nor endorsed for that role by the attestation policy feed (pass --compose-policy mr-config-only to accept it, or see scripts/refresh-attestation-policy.py)";
+
+    #[test]
+    fn a_redeployed_model_refusal_text_is_unchanged() {
+        let err = run_one(redeployed_model(Case::good([1; 32])))
+            .result
+            .unwrap_err();
+        assert_eq!(err, REDEPLOYED_MODEL_REFUSAL);
+    }
+
+    #[test]
+    fn a_redeployed_model_fails_as_compose_not_trusted() {
+        let mut case = redeployed_model(Case::good([1; 32]));
+        case.report["model_attestations"][0]["info"]["app_name"] = "dstack-nvidia-0.5.12".into();
+        let failure = launch_one(case).unwrap_err();
+        let AttestationFailure::ComposeNotTrusted(nt) = &failure else {
+            panic!("expected ComposeNotTrusted, got {failure:?}");
+        };
+        assert_eq!(nt.model, "m");
+        assert_eq!(nt.role, Role::Model);
+        assert_eq!(nt.hash, sha(&[OTHER_COMPOSE.as_bytes()]));
+        assert_eq!(nt.app_name.as_deref(), Some("dstack-nvidia-0.5.12"));
+        assert_eq!(nt.message, REDEPLOYED_MODEL_REFUSAL);
+        assert_eq!(failure.message(), REDEPLOYED_MODEL_REFUSAL);
+
+        // Without a string app_name there is none.
+        let failure = launch_one(redeployed_model(Case::good([1; 32]))).unwrap_err();
+        let AttestationFailure::ComposeNotTrusted(nt) = failure else {
+            panic!("expected ComposeNotTrusted, got {failure:?}");
+        };
+        assert_eq!(nt.app_name, None);
+    }
+
+    /// The gateway's refusal carries its own prefix and role.
+    #[test]
+    fn a_redeployed_gateway_fails_as_compose_not_trusted() {
+        let failure = launch_one(redeployed_gateway(Case::good([1; 32]))).unwrap_err();
+        let AttestationFailure::ComposeNotTrusted(nt) = &failure else {
+            panic!("expected ComposeNotTrusted, got {failure:?}");
+        };
+        assert_eq!(nt.role, Role::Gateway);
+        assert_eq!(nt.hash, sha(&[OTHER_COMPOSE.as_bytes()]));
+        assert!(
+            nt.message.starts_with(&format!(
+                "model m: gateway: gateway compose hash {} is not pinned",
+                hex::encode(sha(&[OTHER_COMPOSE.as_bytes()]))
+            )),
+            "{}",
+            nt.message
+        );
+    }
+
+    #[test]
+    fn a_user_trusted_redeploy_attests_and_is_reported() {
+        let hash = sha(&[OTHER_COMPOSE.as_bytes()]);
+        let mut case = redeployed_model(Case::good([1; 32]));
+        case.policy.user_trusted.insert(hash, Role::Model);
+        let a = launch_one(case).unwrap();
+        assert_eq!(
+            a.evidence[0]["entries"][1]["compose_acceptance"],
+            "user-trusted"
+        );
+        assert_eq!(a.user_trusted(), vec![("m".to_string(), Role::Model, hash)]);
+        // Not key continuity: that warning is for a different acceptance.
+        assert!(a.key_continuity().is_empty());
+        assert!(
+            launch_one(Case::good([1; 32]))
+                .unwrap()
+                .user_trusted()
+                .is_empty()
+        );
+    }
+
     /// Continuity vouches only for a key already attested for this model.
     #[test]
     fn continuity_does_not_vouch_for_a_new_key_or_another_models_key() {
@@ -1322,6 +1540,7 @@ mod tests {
             &models,
             AttestOptions::default(),
             Some(&doc),
+            &BTreeMap::new(),
         )
         .unwrap();
         let mut expected = load_policy(POLICY_JSON).unwrap();
@@ -1334,6 +1553,7 @@ mod tests {
             &models,
             AttestOptions::default(),
             Some(&doc),
+            &BTreeMap::new(),
         )
         .err()
         .unwrap();
@@ -1372,11 +1592,49 @@ mod tests {
             (NearEnvironment::Staging, POLICY_STAGING_JSON),
         ] {
             assert_eq!(policy_json(near), json);
-            let a = Attestor::real(near, None, &models, AttestOptions::default(), None).unwrap();
+            let a = Attestor::real(
+                near,
+                None,
+                &models,
+                AttestOptions::default(),
+                None,
+                &BTreeMap::new(),
+            )
+            .unwrap();
             assert_eq!(a.base_url, near.base_url());
             assert_eq!(a.policy, load_policy(json).unwrap());
         }
         assert_ne!(POLICY_JSON, POLICY_STAGING_JSON);
+    }
+
+    /// `Attestor::real` takes the user-trusted set into its policy, after
+    /// the feed, and changes nothing else.
+    #[test]
+    fn the_real_attestor_takes_the_user_trusted_set() {
+        use crate::inference::NearEnvironment;
+        let models = vec!["m".to_string()];
+        let trusted = BTreeMap::from([([0xab; 32], Role::Model), ([0xcd; 32], Role::Gateway)]);
+        let doc = feed::FeedDocument {
+            environment: NearEnvironment::Production,
+            version: 9,
+            issued: 1,
+            expires: 2,
+            entries: vec![(Role::Model, Match::Exact, [0xef; 32])],
+            revoked: BTreeSet::new(),
+        };
+        let a = Attestor::real(
+            NearEnvironment::Production,
+            None,
+            &models,
+            AttestOptions::default(),
+            Some(&doc),
+            &trusted,
+        )
+        .unwrap();
+        let mut expected = load_policy(POLICY_JSON).unwrap();
+        feed::merge(&mut expected, &doc);
+        expected.user_trusted = trusted;
+        assert_eq!(a.policy, expected);
     }
 
     /// Every pin names the environment it was measured in, and no gateway
