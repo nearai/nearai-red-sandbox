@@ -501,6 +501,17 @@ def test_a_dstack_vpc_env_line_changed_without_its_image_line_is_held(tmp_path):
         assert o.hold["diff"] == [f"digest changed outside an image: line: {new}"]
 
 
+def test_a_dstack_vpc_image_bumped_without_its_env_line_is_held(tmp_path):
+    # The image line moves to a verified digest, but DSTACK_CONTAINER_IMAGE_ID
+    # still names the old one: the env line no longer matches the running image.
+    new = "sha256:" + "5" * 64
+    cand = _f571_with(image=new)
+    ok, log = _fake_cosign(tmp_path, 0)
+    o = bd.endorse(cand, "gateway", {sha(F571): F571}, NOW, str(ok), {})
+    assert o.entry is None and o.hold["failures"] == ["G2"]
+    assert o.hold["diff"] == [f"a line copying an image's digest did not follow its image: line: {VPC}@{VPC_OLD}"]
+
+
 def test_a_dstack_vpc_env_line_set_to_another_repos_verified_digest_is_held(tmp_path):
     # dstack-vpc-client is bumped (and verified) to new; the dstack-vpc env
     # line is set to that digest while the dstack-vpc image line keeps its own.

@@ -406,7 +406,9 @@ the digest of an uncommented `image:` line of the same `<repo>` in the
 baseline; and an `image:` line of `<repo>` in the candidate changed to
 `<new>`, so `<repo>@<new>` goes through G2/M2 (a `pre_launch_script`
 re-pin to `<new>` does not count). A digest moved onto that line from another
-repository, or a line changed without its `image:` line, is held.
+repository, or a line changed without its `image:` line, is held. So is the
+reverse: such a line left at `<old>` while every `image:` line of `<repo>`
+moved off `<old>`, since it then names an image the compose no longer runs.
 
 Whether `nearaidev/cloud-api` and `nearaidev/cvm-ingress` images carry cosign
 signatures has not been checked. That is the first task of the plan. If they

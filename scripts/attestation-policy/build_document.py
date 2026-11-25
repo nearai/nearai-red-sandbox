@@ -339,6 +339,8 @@ def _provenance(cand_file: str, base_file: str, role: str, cosign: str | None, c
     One exception: a non-image line that copies an image's digest, such as
     the gateway's `- DSTACK_CONTAINER_IMAGE_ID=nearaidev/dstack-vpc@sha256:...`
     next to `image: nearaidev/dstack-vpc@sha256:...`. See _image_digest_copy.
+    Such a line left unchanged must still name an image: digest of its
+    repository in the candidate, so an image bump carries the copy along.
 
     For a model, cand_script and base_script are the pre_launch_scripts, which
     C1 does not compare: see _script_provenance. Its one new compose-manager
@@ -355,9 +357,17 @@ def _provenance(cand_file: str, base_file: str, role: str, cosign: str | None, c
     cand_lines, base_lines = cand_file.split("\n"), base_file.split("\n")
     if len(cand_lines) != len(base_lines):
         return ["docker_compose_file lines do not pair up with the baseline's"]
+    cand_images = {(r.repo, r.digest) for r in rules.image_refs(cand_file)}
     for cl, bl in zip(cand_lines, base_lines):
         cds, bds = _ANY_DIGEST.findall(cl), _ANY_DIGEST.findall(bl)
         if cds == bds:
+            # An unchanged line that copies an image's digest must still match
+            # an image: line of its repository: a bump of that image must
+            # carry the copy along.
+            same = cds and not rules.image_refs(cl) and _image_digest_copy(cl, bl, base_file)
+            if same and same not in cand_images:
+                diff.append("a line copying an image's digest did not follow its image: line: "
+                            f"{same[0]}@{same[1]}")
             continue
         if len(cds) != len(bds):
             diff.append(f"digests do not pair up with the baseline's on line: {cl[:200]}")
