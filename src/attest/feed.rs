@@ -467,6 +467,33 @@ mod tests {
         }
     }
 
+    /// A small-order key with R = identity and s = 0 satisfies the plain
+    /// verification equation for every message; only verify_strict refuses
+    /// it. Pins that the verifier is strict.
+    #[test]
+    fn refuses_a_small_order_key_that_plain_verify_accepts() {
+        let text = Doc::good().text();
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&identity).unwrap();
+        let mut raw = [0u8; 64];
+        raw[..32].copy_from_slice(&identity);
+        let forged = ed25519_dalek::Signature::from_bytes(&raw);
+        assert!(ed25519_dalek::Verifier::verify(&key, text.as_bytes(), &forged).is_ok());
+
+        let bad = STANDARD.encode(raw).into_bytes();
+        let e = verify_document(
+            text.as_bytes(),
+            &bad,
+            &[identity],
+            NearEnvironment::Production,
+            ISSUED,
+            0,
+        )
+        .unwrap_err();
+        assert!(e.contains("signature"), "{e}");
+    }
+
     /// The order of the Ed25519 group, little-endian.
     const L: [u8; 32] = [
         0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde,
