@@ -536,6 +536,47 @@ def test_a_non_image_line_needs_the_same_repo_on_an_image_line(tmp_path):
     assert o.entry is None and o.hold["diff"] == [f"digest changed outside an image: line: {new}"]
 
 
+def _synthetic_gateway(*lines):
+    return json.dumps({"name": "dstack-0.5.4", "docker_compose_file": "\n".join(lines), "runner": "docker-compose"})
+
+
+_D_OLD, _D_OLD2 = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+_D_NEW, _D_BAD = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+
+
+def _vpc_image(d):
+    return f"    image: {VPC}@{d}"
+
+
+@pytest.mark.parametrize("base_lines, cand_lines, diff", [
+    # Two digests on the line: the copy of the bumped image's digest must not
+    # carry a second changed digest (here evil/x's, whose image line did not
+    # change) past cosign.
+    ([_vpc_image(_D_OLD), f"    image: evil/x@{_D_OLD2}", f"      - X={VPC}@{_D_OLD} Y=evil/x@{_D_OLD2}"],
+     [_vpc_image(_D_NEW), f"    image: evil/x@{_D_OLD2}", f"      - X={VPC}@{_D_NEW} Y=evil/x@{_D_BAD}"],
+     [_D_NEW, _D_BAD]),
+    # The baseline's env line did not equal an image digest of its repository.
+    ([_vpc_image(_D_OLD), f"      - X={VPC}@{_D_OLD2}"],
+     [_vpc_image(_D_NEW), f"      - X={VPC}@{_D_NEW}"],
+     [_D_NEW]),
+    # The env line's reference continues past the digest.
+    ([_vpc_image(_D_OLD), f"      - X={VPC}@{_D_OLD}x"],
+     [_vpc_image(_D_NEW), f"      - X={VPC}@{_D_NEW}x"],
+     [_D_NEW]),
+    # The env line's repository is the tail of a longer, @-joined reference.
+    ([_vpc_image(_D_OLD), f"      - X=foo@{VPC}@{_D_OLD}"],
+     [_vpc_image(_D_NEW), f"      - X=foo@{VPC}@{_D_NEW}"],
+     [_D_NEW]),
+], ids=["two-digests", "baseline-env-not-an-image-digest", "env-suffix", "env-at-prefixed"])
+def test_an_env_line_that_is_not_exactly_one_copied_image_digest_is_held(tmp_path, base_lines, cand_lines, diff):
+    base, cand = _synthetic_gateway(*base_lines), _synthetic_gateway(*cand_lines)
+    assert bd.rules.evaluate(cand, "gateway", [base]).passed  # held by G2, not G1
+    ok, _ = _fake_cosign(tmp_path, 0)  # every reference verifies: not held by cosign
+    o = bd.endorse(cand, "gateway", {sha(base): base}, NOW, str(ok), {})
+    assert o.entry is None and o.hold["failures"] == ["G2"]
+    assert o.hold["diff"] == [f"digest changed outside an image: line: {d}" for d in diff]
+
+
 def test_a_copied_digest_needs_its_image_line_not_the_script_to_change(tmp_path):
     # A model baseline with a non-image line copying compose-manager's digest.
     # The script's re-pin also verifies nearaidev/compose-manager@<new>, but
