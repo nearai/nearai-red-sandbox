@@ -75,16 +75,13 @@ fn short(hash: &[u8; 32]) -> String {
 }
 
 pub fn prompt_text(nt: &NotTrusted) -> String {
-    let (first, checked) = match nt.role {
-        Role::Gateway => (
-            "NEAR AI moved its production gateway to a new build.".to_string(),
-            "TDX quote, TCB status, this launch's nonce, compose hash",
-        ),
-        Role::Model => (
-            format!("NEAR AI moved {} to a new build.", nt.model),
-            "TDX quote, TCB status, this launch's nonce, compose hash, GPU",
-        ),
+    let first = match nt.role {
+        Role::Gateway => "NEAR AI moved its production gateway to a new build.".to_string(),
+        Role::Model => format!("NEAR AI moved {} to a new build.", nt.model),
     };
+    // Only checks that have run when the prompt appears: the GPU verdict
+    // runs in the full re-attestation after a yes.
+    let checked = "TDX quote, TCB status, this launch's nonce, compose hash";
     format!(
         "{first}\n\
          \n  Build    {build}\
@@ -369,15 +366,18 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
     }
 
     #[test]
-    fn the_model_prompt_names_the_model_and_adds_gpu() {
+    fn the_model_prompt_names_the_model() {
         let text = prompt_text(&model_nt(7));
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "NEAR AI moved zai-org/GLM-5 to a new build.");
         assert_eq!(lines[2], "  Build    vllm-glm");
+        // Only checks that have run when the prompt appears: the GPU verdict
+        // runs in the full re-attestation after a yes.
         assert_eq!(
             lines[4],
-            "  Checked  TDX quote, TCB status, this launch's nonce, compose hash, GPU"
+            "  Checked  TDX quote, TCB status, this launch's nonce, compose hash"
         );
+        assert!(!text.contains("GPU"), "{text}");
         assert!(
             text.ends_with("`rts trust forget 07070707`. [y/N]"),
             "{text}"

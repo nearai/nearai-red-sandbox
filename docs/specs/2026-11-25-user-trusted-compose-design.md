@@ -136,8 +136,9 @@ Trust this build on this device? Red Sandbox will use it without asking
 again until you run `rts trust forget f4a9b480`. [y/N]
 ```
 
-For a model build, the first line is `NEAR AI moved <model> to a new build.`
-and `Checked` adds `GPU`.
+For a model build, only the first line changes: `NEAR AI moved <model> to a new build.`
+The prompt lists only checks that have run when it appears; the GPU verdict
+runs in the full re-attestation after a yes.
 
 Each launch that relies on a trusted build (one line, in the launch progress):
 
