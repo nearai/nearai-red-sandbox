@@ -3,13 +3,12 @@
 Date: 2026-11-24
 Status: draft for review. Decided by Zaki on 2026-11-24: a live policy feed
 signed by us, signed automatically by CI when a new build passes content
-rules, and held for a person when it does not. The key layout is proposed,
-not decided.
+rules, and held for a person when it does not. Decided 2026-11-24 after
+review of PR #64: strict rules only (no Tier E), and two compiled-in keys.
 
 Read "Validation against real redeploys" first. With strict rules, every
 real redeploy we have on record would have been held. Only per-instance
-variation is signed without a person. The open decision on rule tiers
-follows from that.
+variation is signed without a person.
 
 ## Problem
 
@@ -83,7 +82,7 @@ event log RTMR) is a separate follow-up. It is outside this spec.
 | Rollback | Every document has a `version` (unix seconds at signing). `rts` stores the highest version it accepted per environment and refuses lower ones. |
 | Revocation | `revoked` hashes in the document override both the feed and the compiled-in lists. |
 | Failure | Fetch or verify failure falls back to the cached document if it has not expired, then to the compiled-in list and key continuity. It never falls back to accepting an unlisted compose. |
-| Keys (proposed) | Separate from the update key. Two public keys compiled in: the CI signing key and an offline recovery key. Either signature is accepted. The alternative is in Open questions. |
+| Keys | Separate from the update key. Two public keys compiled in: the CI signing key and an offline recovery key. Either signature is accepted. |
 | Log | Each published document is committed to a `attestation-policy-log` branch with `createCommitOnBranch` (GitHub-signed, as `scripts/release/bump-tap.sh` does). |
 | Dependencies | None new: `ed25519-dalek`, `reqwest`, `sha2`, `serde_json` and `hex` are already in `Cargo.toml`. CI uses OpenSSL 3 and `cosign`. |
 
@@ -238,11 +237,12 @@ New workflow `.github/workflows/attestation-policy.yml`:
 ### Steps
 
 1. **Collect** (`evaluate`). For each environment, and for the gateway and
-   every model in `rts`'s default allowlist for that environment, call a new
-   headless subcommand:
-   `rts attest --environment <env> --model <id> --compose-policy mr-config-only --json`.
-   It runs the same `Attester` as a launch, with no session or VM, and prints
-   the verified evidence. Each model is sampled 8 times per run, because each
+   every model in `config::DEFAULT_MODELS`, run the existing live test
+   `tests/live_attest.rs` with `RTS_LIVE_NEAR_ENVIRONMENT=<env>`,
+   `RTS_LIVE_COMPOSE_POLICY=mr-config-only` and `RTS_LIVE_RECORD_DIR`. It
+   runs the same `Attestor` as a launch, with no session or VM, and writes
+   `rts`'s own `attestation.json`, the same evidence the release gate
+   checks. No new subcommand. Each model is sampled 8 times per run, because each
    call lands on whichever instances the gateway picks. Only entries that
    passed every check reach step 2.
 2. **Diff** (`evaluate`). Drop hashes already pinned or endorsed. For each
@@ -256,8 +256,9 @@ New workflow `.github/workflows/attestation-policy.yml`:
    commit it to the log branch.
 4. **Hold** (`evaluate`). For each entry that failed a rule, open or update
    one issue per compose hash. The issue names the rule, gives the field-level
-   diff against the closest baseline, and links the run. It also attaches a
-   ready-made pull request that adds the compose to the baselines. A
+   diff against the closest baseline, and links the run. It also includes the
+   commands that open a pull request adding the compose to the baselines
+   (`evaluate` has no write access, so it does not open the PR itself). A
    person reviews that diff and merges it or closes it. Merging triggers a run
    that signs the entry.
 
@@ -358,7 +359,7 @@ changes a reviewer should see.
 The second row is the routine case the rules could safely let through, and
 it leads to the open decision below.
 
-### Open decision: a second rule tier
+### Not adopted: a second rule tier
 
 **Tier E** (environment-only) would auto-sign a candidate whose only
 difference from a baseline, after digest-blinding and normalization, is in
@@ -377,8 +378,8 @@ On the data above, Tier E would have signed row 2 and nothing else. The
 risk is that an environment flag can change behaviour that matters,
 `AUTH_ADMIN_TOKENS_ONLY` itself being an example. Tier E trusts NEAR's
 choice of flag values without a person seeing them, though the change stays
-in the public log. Recommendation: ship strict rules first. Add Tier E only
-if the hold issues show that most holds are flag flips.
+in the public log. Not adopted (2026-11-24): strict rules only. Revisit
+only if the hold issues show that most holds are flag flips.
 
 ## What this guarantees, and what it does not
 
