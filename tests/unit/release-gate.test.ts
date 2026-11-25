@@ -326,5 +326,23 @@ test("the strict live attestation check gates the standalone release", () => {
   expect(step).toContain("RTS_LIVE_COMPOSE_POLICY: pinned")
   expect(step).toContain("for environment in production staging")
   expect(step).toContain("cargo test --locked --test live_attest -- --ignored --test-threads=1")
+  expect(step).toContain("RTS_LIVE_POLICY_FEED: on")
+  expect(step).toContain("RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX: ${{ vars.RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX }}")
   expect(wf.split("\n  publish:")[1]).toContain("needs: [build, build-windows, build-linux]")
+})
+
+test("the policy feed keys are compiled into release builds and checked up front", () => {
+  const wf = readFileSync(join(ROOT, ".github", "workflows", "release.yml"), "utf8")
+  const build = wf.split("- name: Build rts")[1].split("\n      - ")[0]
+  expect(build).toContain("RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX: ${{ vars.RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX }}")
+  // The test gate never sees the feed keys.
+  const gate = wf.split("- name: Test gate")[1].split("\n      - ")[0]
+  expect(gate).not.toContain("RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX")
+  const config = wf.split("release-config:")[1].split("\n  build:")[0]
+  expect(config).toContain("- name: Confirm the attestation policy public keys are configured")
+  const confirm = config.split("- name: Confirm the attestation policy public keys are configured")[1].split("\n      - ")[0]
+  expect(confirm).toContain("if: github.event_name == 'push'")
+  expect(confirm).toContain("RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX: ${{ vars.RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX }}")
+  expect(confirm).toContain("^[0-9a-f]{64}(,[0-9a-f]{64})?$")
+  expect(confirm).toContain("refusing to release: repository variable RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX")
 })

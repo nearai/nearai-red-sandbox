@@ -2,41 +2,49 @@
   "composeHashes": [
     {
       "sha256": "f571e5dafe8f96baf116a271b4be9cba228b447dd6ebe502bbda81ede7bcc7ce",
+      "role": "gateway",
       "recorded": "2026-10-29",
       "source": "NEAR AI production cloud-api.near.ai: gateway_attestation, info.app_name dstack-0.5.12"
     },
     {
       "sha256": "ae66f844658a7aee331dcb9fb59bd40323d71d192d37719e022cc4af8389265b",
+      "role": "model",
       "recorded": "2026-10-29",
       "source": "NEAR AI production cloud-api.near.ai: model_attestations[0] for deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated, info.app_name dstack-nvidia-0.5.11"
     },
     {
       "sha256": "53cd435edbc129f848ed0ddce301f7f192446fe39683713a38537820bea7e1fb",
+      "role": "gateway",
       "recorded": "2026-11-20",
       "source": "NEAR AI production cloud-api.near.ai: gateway_attestation, info.app_name dstack-0.5.12 (mr-config-only, verified by rts)"
     },
     {
       "sha256": "e3902667a26282dd8b4015a901848c521b20243a155a457148f88acf48a45959",
+      "role": "model",
       "recorded": "2026-11-20",
       "source": "NEAR AI production cloud-api.near.ai: model_attestations[0] for deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated, info.app_name dstack-nvidia-0.5.11 (mr-config-only, verified by rts)"
     },
     {
       "sha256": "edabf8039210336d90fe966dfc4e48216551dfd8b05d54e96d3f3f0e0da850d4",
+      "role": "model",
       "recorded": "2026-11-20",
       "source": "NEAR AI production cloud-api.near.ai: model_attestations[1] for deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated, info.app_name dstack-nvidia-0.5.11 (mr-config-only, verified by rts)"
     },
     {
       "sha256": "1787a4af87eaf4bb139b555c3148ea6cffb01442b9fd7db4304e23b24f4db993",
+      "role": "gateway",
       "recorded": "2026-11-23",
       "source": "NEAR AI production cloud-api.near.ai: gateway_attestation, info.app_name dstack-0.5.12 (mr-config-only, verified by rts)"
     },
     {
       "sha256": "e4b83d924284eece9b972d8e18bd88dac4dd529031b00311ef5044eaa60ba8d9",
+      "role": "model",
       "recorded": "2026-11-23",
       "source": "NEAR AI production cloud-api.near.ai: model_attestations[0] for Qwen/Qwen3.8-27B-abliterated, info.app_name dstack-nvidia-0.5.12 (mr-config-only, verified by rts)"
     },
     {
       "sha256": "a1c3d2e1455ea32d3434722f8867398a5e85e0dbd441f81e552a81641a09c424",
+      "role": "gateway",
       "recorded": "2026-11-24",
       "source": "NEAR AI production cloud-api.near.ai: gateway_attestation, info.app_name dstack-0.5.12 (mr-config-only, verified by rts)"
     }

@@ -407,6 +407,34 @@ each printed `app_compose`, then rerun it with `--write` and rebuild. For
 staging, add `--environment staging`; the script refuses evidence whose
 recorded `base_url` belongs to the other environment.
 
+### Attestation policy feed
+
+The pins in `opencode/attestation-policy*.json` are the offline floor: they
+are compiled in and always apply. On top of them, release builds fetch a
+signed policy feed (`<environment>.json` and `.json.sig`, Ed25519) that
+endorses further compose hashes per role (gateway or model) and can revoke
+hashes. A revoked hash is refused even when pinned. The feed never removes a
+pin and is only trusted when its signature verifies against the keys compiled
+into the build. If the fetch fails, rts uses the last verified cached copy,
+and then the compiled-in pins alone.
+
+Each launch prints which policy source is in effect:
+
+- `Attestation policy: feed vN`
+- `Attestation policy: cached feed vN (<reason the fetch was not used>)`
+- `Attestation policy: compiled-in only (<reason>)`
+
+`attestation.json` records `endorsed` as a `compose_acceptance` value, with the
+`compose_match` kind and the `feed_version`. Set
+`RTS_ATTESTATION_POLICY_FEED=off` to skip the feed entirely (no request, no
+cache read) and use the compiled-in pins only. Source builds made without
+`RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX` behave the same way.
+`RTS_LIVE_POLICY_FEED=on` makes the live attestation test load the feed too.
+
+Because the feed endorses new builds, adding pins by hand with
+`scripts/refresh-attestation-policy.py` is no longer the normal path; keep it
+for the offline floor.
+
 The attested inference behavior above describes the default embedded NEAR AI
 path. External providers require an explicit opt-out of required attestation;
 see [provider configuration](opencode/README.md#inference-through-embedded-ironwire).
@@ -431,6 +459,11 @@ verification commands, `--force`, and installation behavior.
 
 Ed25519 update public key:
 `9b4a81b8bd017898c36871c6bd1cb890faf95b6e378e72eb99b9c15841f02ac9`
+
+Ed25519 attestation policy feed public keys (the CI signing key, then the
+offline recovery key): not yet generated. This section is filled in with both
+keys once they exist, and the repository variable
+`RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX` must hold the same two values.
 
 ## <img src="docs/assets/ramp.svg" alt="" height="16"> Project status
 

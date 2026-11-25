@@ -3,7 +3,9 @@
 //! collateral, and its GPU evidence checked through NVIDIA NRAS. Every check
 //! fails closed.
 
+pub mod feed;
 pub mod http;
+pub mod normalize;
 pub mod nras;
 pub mod record;
 pub mod report;
@@ -52,9 +54,51 @@ impl Default for AttestOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Which attested entry a compose belongs to: NEAR AI's gateway or a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Gateway,
+    Model,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Gateway => "gateway",
+            Role::Model => "model",
+        }
+    }
+}
+
+/// How an endorsed hash is compared: over the exact `app_compose` bytes, or
+/// over its `instance-label-v1` normalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Match {
+    Exact,
+    InstanceLabelV1,
+}
+
+impl Match {
+    /// The feed's name for it, recorded as `compose_match`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Match::Exact => "exact",
+            Match::InstanceLabelV1 => "instance-label-v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Policy {
-    pub compose_hashes: BTreeSet<[u8; 32]>,
+    /// Compiled-in pins, each with its role.
+    pub pinned: BTreeMap<[u8; 32], Role>,
+    /// Hashes the signed policy feed endorses.
+    pub endorsed: BTreeMap<(Match, [u8; 32]), Role>,
+    /// Exact compose hashes the feed revokes, pins included.
+    pub revoked: BTreeSet<[u8; 32]>,
+    /// The feed document's `version`, when one was merged.
+    pub feed_version: Option<u64>,
 }
 
 /// Production's pinned composes. Compiled in: changing the pinned list needs
@@ -84,20 +128,32 @@ struct PolicyFile {
 #[allow(dead_code)] // `recorded` and `source` document the entry.
 struct PolicyEntry {
     sha256: String,
+    role: Role,
     recorded: String,
     source: String,
 }
 
+/// Parses a compiled-in policy file into its pins. The feed fields start
+/// empty.
 pub fn load_policy(json: &str) -> Result<Policy, String> {
     let file: PolicyFile =
         serde_json::from_str(json).map_err(|e| format!("attestation-policy.json: {e}"))?;
-    let mut compose_hashes = BTreeSet::new();
+    let mut policy = Policy::default();
     for entry in file.compose_hashes {
         let hash = report::hex32(&entry.sha256)
             .map_err(|e| format!("attestation-policy.json: sha256 {:?}: {e}", entry.sha256))?;
-        compose_hashes.insert(hash);
+        if let Some(other) = policy.pinned.insert(hash, entry.role)
+            && other != entry.role
+        {
+            return Err(format!(
+                "attestation-policy.json: sha256 {} is pinned as both {} and {}",
+                entry.sha256,
+                other.as_str(),
+                entry.role.as_str()
+            ));
+        }
     }
-    Ok(Policy { compose_hashes })
+    Ok(policy)
 }
 
 /// The verified state of a session: gateway TLS fingerprints, per model the
@@ -220,7 +276,8 @@ fn urandom_nonce() -> [u8; 32] {
 impl Attestor {
     /// BlockingHttp, SystemClock, PcsQuoteVerifier, NrasGpuVerifier, and
     /// /dev/urandom nonces, with `near`'s API base and pinned policy (one
-    /// value, so the two cannot be mixed).
+    /// value, so the two cannot be mixed), and `feed`'s endorsements and
+    /// revocations merged in. `feed` must be a document verified for `near`.
     ///
     /// `BlockingHttp` must not run on a Tokio runtime thread: call `attest`
     /// from a plain thread.
@@ -229,7 +286,19 @@ impl Attestor {
         key: Option<HostSecret>,
         models: &[String],
         options: AttestOptions,
+        feed: Option<&feed::FeedDocument>,
     ) -> Result<Attestor, String> {
+        let mut policy = load_policy(policy_json(near))?;
+        if let Some(doc) = feed {
+            if doc.environment != near {
+                return Err(format!(
+                    "the attestation policy feed document is for {}, not {}",
+                    feed::environment_name(doc.environment),
+                    feed::environment_name(near)
+                ));
+            }
+            feed::merge(&mut policy, doc);
+        }
         let http: Arc<dyn Http> = Arc::new(BlockingHttp::new()?);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         Ok(Attestor {
@@ -244,7 +313,7 @@ impl Attestor {
             key,
             models: models.to_vec(),
             options,
-            policy: load_policy(policy_json(near))?,
+            policy,
             continuity: Continuity::default(),
             nonce: Arc::new(urandom_nonce),
         })
@@ -327,7 +396,7 @@ impl Attestor {
             && report::hex32(&gateway.signing_address)
                 .is_ok_and(|k| self.continuity.gateway_keys.contains(&k));
         let mut record = self
-            .check_quote(gateway, &nonce, gateway_continued)
+            .check_quote(gateway, &nonce, Role::Gateway, gateway_continued)
             .map_err(|e| format!("gateway: {e}"))?;
         // Only after every gateway check passed. NEAR AI production signs
         // receipts with an ed25519 gateway key; any other algorithm pins
@@ -360,7 +429,9 @@ impl Attestor {
             }
             let key = report::ed25519_key(entry).map_err(at)?;
             let continued = self.continuity.vouches_for_model(model, &key);
-            let mut record = self.check_quote(entry, &nonce, continued).map_err(at)?;
+            let mut record = self
+                .check_quote(entry, &nonce, Role::Model, continued)
+                .map_err(at)?;
             let payload = entry
                 .nvidia_payload
                 .as_deref()
@@ -400,13 +471,14 @@ impl Attestor {
     }
 
     /// The checks every entry carries: TDX quote, TCB policy, report_data,
-    /// and compose. `continued`: the entry's signing key is in
+    /// and compose for `role`. `continued`: the entry's signing key is in
     /// [`Continuity`]; it counts only once report_data has bound that key.
     /// Returns the entry's evidence record.
     fn check_quote(
         &self,
         e: &Evidence,
         nonce: &[u8; 32],
+        role: Role,
         continued: bool,
     ) -> Result<serde_json::Map<String, Value>, String> {
         let quote = hex::decode(&e.intel_quote)
@@ -418,10 +490,11 @@ impl Attestor {
         let acceptance = tcb_policy(&claims.tcb_status, self.options.allow_tcb_out_of_date)?;
         report::check_report_data(&claims.report_data, e, nonce)?;
         let compose = report::app_compose(e.info.as_ref())?;
-        let (hash, compose_acceptance) = report::check_compose(
+        let (hash, compose_acceptance, compose_match) = report::check_compose(
             &claims.mr_config_id,
             &compose,
             &self.policy,
+            role,
             self.options.compose_policy,
             continued,
         )?;
@@ -437,6 +510,13 @@ impl Attestor {
             "compose_acceptance".into(),
             compose_acceptance.as_str().into(),
         );
+        // The feed document that admitted or checked the entry, and how.
+        if let Some(m_) = compose_match {
+            m.insert("compose_match".into(), m_.as_str().into());
+        }
+        if let Some(v) = self.policy.feed_version {
+            m.insert("feed_version".into(), v.into());
+        }
         Ok(m)
     }
 }
@@ -456,6 +536,7 @@ mod tests {
     const DUMMY_KEY: &str = "rts-dummy-key-never-send-to-a-provider";
     const COMPOSE: &str = "services:\n  model: {}\n";
     const OTHER_COMPOSE: &str = "services:\n  other: {}\n";
+    const GW_COMPOSE: &str = "services:\n  gateway: {}\n";
     const KEY: [u8; 32] = [0x11; 32];
     const FP: [u8; 32] = [0x22; 32];
     const GW_ADDR: [u8; 20] = [0x33; 20];
@@ -534,7 +615,7 @@ mod tests {
                         "signing_address": format!("0x{}", hex::encode(GW_ADDR)),
                         "signing_algo": "ecdsa",
                         "tls_cert_fingerprint": hex::encode(FP),
-                        "info": info(COMPOSE),
+                        "info": info(GW_COMPOSE),
                     },
                     "model_attestations": [{
                         "intel_quote": hex::encode(b"m0"),
@@ -545,7 +626,7 @@ mod tests {
                         "model_name": "m",
                     }],
                 }),
-                gw: claims(sha(&[&GW_ADDR, &FP]), nonce, COMPOSE),
+                gw: claims(sha(&[&GW_ADDR, &FP]), nonce, GW_COMPOSE),
                 m0: claims(KEY, nonce, COMPOSE),
                 status: 200,
                 body: None,
@@ -557,7 +638,11 @@ mod tests {
                 }),
                 options: AttestOptions::default(),
                 policy: Policy {
-                    compose_hashes: BTreeSet::from([sha(&[COMPOSE.as_bytes()])]),
+                    pinned: BTreeMap::from([
+                        (sha(&[COMPOSE.as_bytes()]), Role::Model),
+                        (sha(&[GW_COMPOSE.as_bytes()]), Role::Gateway),
+                    ]),
+                    ..Policy::default()
                 },
                 keyless: false,
                 continuity: Continuity::default(),
@@ -912,7 +997,7 @@ mod tests {
         let gw = case.report["gateway_attestation"].as_object_mut().unwrap();
         gw.insert("signing_address".into(), hex::encode(GW_KEY).into());
         gw.insert("signing_algo".into(), "ed25519".into());
-        case.gw = claims(sha(&[&GW_KEY, &FP]), nonce, COMPOSE);
+        case.gw = claims(sha(&[&GW_KEY, &FP]), nonce, GW_COMPOSE);
         case
     }
 
@@ -961,7 +1046,7 @@ mod tests {
                 "signing_address",
                 Box::new(|c| {
                     // A 31-byte key the quote binds is still refused.
-                    c.gw = claims(sha(&[&[0x55; 31], &FP]), [1; 32], COMPOSE);
+                    c.gw = claims(sha(&[&[0x55; 31], &FP]), [1; 32], GW_COMPOSE);
                     c.report["gateway_attestation"]
                         .as_object_mut()
                         .unwrap()
@@ -999,9 +1084,7 @@ mod tests {
     fn the_overrides_accept_out_of_date_and_unpinned_compose() {
         let mut case = Case::good([1; 32]);
         case.m0.tcb_status = "OutOfDate".into();
-        case.policy = Policy {
-            compose_hashes: BTreeSet::new(),
-        };
+        case.policy = Policy::default();
         case.options = AttestOptions {
             allow_tcb_out_of_date: true,
             compose_policy: ComposePolicy::MrConfigOnly,
@@ -1186,6 +1269,77 @@ mod tests {
         );
     }
 
+    /// An entry the feed admits records `endorsed`, the match used and the
+    /// feed version; every entry checked under a feed records its version.
+    #[test]
+    fn evidence_records_endorsed_with_feed_version_and_match() {
+        let mut case = redeployed_model(Case::good([1; 32]));
+        case.policy.endorsed.insert(
+            (Match::Exact, sha(&[OTHER_COMPOSE.as_bytes()])),
+            Role::Model,
+        );
+        case.policy.feed_version = Some(1_764_028_800);
+        let a = run_one(case).result.unwrap();
+        let entries = &a.evidence[0]["entries"];
+        assert_eq!(entries[1]["compose_acceptance"], "endorsed");
+        assert_eq!(entries[1]["compose_match"], "exact");
+        assert_eq!(entries[1]["feed_version"], 1_764_028_800u64);
+        assert_eq!(
+            entries[1]["compose_hash"],
+            hex::encode(sha(&[OTHER_COMPOSE.as_bytes()]))
+        );
+        assert_eq!(entries[0]["compose_acceptance"], "pinned");
+        assert_eq!(entries[0]["feed_version"], 1_764_028_800u64);
+        assert!(entries[0].get("compose_match").is_none(), "{entries}");
+        // Endorsed is reviewed, not key continuity: the operator is not warned.
+        assert!(a.key_continuity().is_empty());
+
+        // Without a feed, neither field is recorded.
+        let a = run_one(Case::good([1; 32])).result.unwrap();
+        for e in a.evidence[0]["entries"].as_array().unwrap() {
+            assert!(e.get("feed_version").is_none(), "{e}");
+            assert!(e.get("compose_match").is_none(), "{e}");
+        }
+    }
+
+    /// `Attestor::real` merges a verified feed document into the compiled-in
+    /// policy, and refuses one for the other environment.
+    #[test]
+    fn the_real_attestor_merges_the_feed() {
+        use crate::inference::NearEnvironment;
+        let models = vec!["m".to_string()];
+        let doc = feed::FeedDocument {
+            environment: NearEnvironment::Production,
+            version: 9,
+            issued: 1,
+            expires: 2,
+            entries: vec![(Role::Model, Match::InstanceLabelV1, [0xab; 32])],
+            revoked: BTreeSet::from([[0xcd; 32]]),
+        };
+        let a = Attestor::real(
+            NearEnvironment::Production,
+            None,
+            &models,
+            AttestOptions::default(),
+            Some(&doc),
+        )
+        .unwrap();
+        let mut expected = load_policy(POLICY_JSON).unwrap();
+        feed::merge(&mut expected, &doc);
+        assert_eq!(a.policy, expected);
+        assert_eq!(a.policy.feed_version, Some(9));
+        let err = Attestor::real(
+            NearEnvironment::Staging,
+            None,
+            &models,
+            AttestOptions::default(),
+            Some(&doc),
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("production"), "{err}");
+    }
+
     #[test]
     fn mr_config_only_records_its_acceptance() {
         let mut case = redeployed_model(Case::good([1; 32]));
@@ -1218,7 +1372,7 @@ mod tests {
             (NearEnvironment::Staging, POLICY_STAGING_JSON),
         ] {
             assert_eq!(policy_json(near), json);
-            let a = Attestor::real(near, None, &models, AttestOptions::default()).unwrap();
+            let a = Attestor::real(near, None, &models, AttestOptions::default(), None).unwrap();
             assert_eq!(a.base_url, near.base_url());
             assert_eq!(a.policy, load_policy(json).unwrap());
         }
@@ -1244,7 +1398,7 @@ mod tests {
                 })
                 .collect()
         };
-        let pinned = |json: &str| load_policy(json).unwrap().compose_hashes;
+        let pinned = |json: &str| load_policy(json).unwrap().pinned;
         for (json, name, other) in [
             (POLICY_JSON, "production", POLICY_STAGING_JSON),
             (POLICY_STAGING_JSON, "staging", POLICY_JSON),
@@ -1258,7 +1412,7 @@ mod tests {
                 if source.contains("gateway_attestation") {
                     gateways += 1;
                     assert!(
-                        !pinned(other).contains(&report::hex32(&hash).unwrap()),
+                        !pinned(other).contains_key(&report::hex32(&hash).unwrap()),
                         "{name} gateway {hash} is pinned in the other environment too"
                     );
                 }
@@ -1299,11 +1453,11 @@ mod tests {
             "a1c3d2e1455ea32d3434722f8867398a5e85e0dbd441f81e552a81641a09c424",
         ] {
             assert!(
-                policy.compose_hashes.contains(&report::hex32(h).unwrap()),
+                policy.pinned.contains_key(&report::hex32(h).unwrap()),
                 "{h} is not pinned"
             );
         }
-        assert_eq!(policy.compose_hashes.len(), 8);
+        assert_eq!(policy.pinned.len(), 8);
     }
 
     /// The staging compose hashes measured on 2026-11-20 and verified by rts
@@ -1323,11 +1477,11 @@ mod tests {
             "0cf678004e2d5995cd158d4e07af7e6cd014676f9139619805ada9c727d3b688",
         ] {
             assert!(
-                policy.compose_hashes.contains(&report::hex32(h).unwrap()),
+                policy.pinned.contains_key(&report::hex32(h).unwrap()),
                 "{h} is not pinned"
             );
         }
-        assert_eq!(policy.compose_hashes.len(), 6);
+        assert_eq!(policy.pinned.len(), 6);
     }
 
     const STAGING_RECORDED_AT: u64 = 1_795_182_609;
@@ -1494,14 +1648,7 @@ mod tests {
 
     #[test]
     fn the_recorded_production_evidence_is_refused_without_its_pinned_composes() {
-        let e = production_replay(
-            PRODUCTION_RECORDED_AT,
-            Policy {
-                compose_hashes: BTreeSet::new(),
-            },
-            None,
-        )
-        .unwrap_err();
+        let e = production_replay(PRODUCTION_RECORDED_AT, Policy::default(), None).unwrap_err();
         assert!(e.contains("not pinned"), "{e}");
     }
 
@@ -1521,25 +1668,85 @@ mod tests {
         load_policy(POLICY_JSON).unwrap();
         let h = "ab".repeat(32);
         let good = format!(
-            r#"{{"composeHashes":[{{"sha256":"{h}","recorded":"2026-10-28","source":"check 6"}}]}}"#
+            r#"{{"composeHashes":[{{"sha256":"{h}","role":"model","recorded":"2026-10-28","source":"check 6"}}]}}"#
         );
         assert_eq!(
-            load_policy(&good).unwrap().compose_hashes,
-            BTreeSet::from([[0xab; 32]])
+            load_policy(&good).unwrap().pinned,
+            BTreeMap::from([([0xab; 32], Role::Model)])
         );
         for bad in [
-            r#"{"composeHashes":[{"sha256":"zz","recorded":"d","source":"s"}]}"#.to_string(),
+            r#"{"composeHashes":[{"sha256":"zz","role":"model","recorded":"d","source":"s"}]}"#
+                .to_string(),
             format!(
-                r#"{{"composeHashes":[{{"sha256":"{}","recorded":"d","source":"s"}}]}}"#,
+                r#"{{"composeHashes":[{{"sha256":"{}","role":"model","recorded":"d","source":"s"}}]}}"#,
                 "ab".repeat(31)
             ),
             format!(
-                r#"{{"composeHashes":[{{"sha256":"{h}","recorded":"d","source":"s","extra":1}}]}}"#
+                r#"{{"composeHashes":[{{"sha256":"{h}","role":"model","recorded":"d","source":"s","extra":1}}]}}"#
+            ),
+            // One hash pinned under two roles.
+            format!(
+                r#"{{"composeHashes":[{{"sha256":"{h}","role":"model","recorded":"d","source":"s"}},{{"sha256":"{h}","role":"gateway","recorded":"d","source":"s"}}]}}"#
             ),
             r#"{"composeHashes":[],"other":[]}"#.to_string(),
             r#"{}"#.to_string(),
         ] {
             assert!(load_policy(&bad).is_err(), "accepted {bad}");
+        }
+    }
+
+    /// Both compiled-in files load, and each entry's role agrees with the
+    /// report field its `source` names.
+    #[test]
+    fn every_compiled_in_entry_has_a_role() {
+        for json in [POLICY_JSON, POLICY_STAGING_JSON] {
+            let policy = load_policy(json).unwrap();
+            let v: Value = serde_json::from_str(json).unwrap();
+            let entries = v["composeHashes"].as_array().unwrap();
+            assert_eq!(policy.pinned.len(), entries.len());
+            for e in entries {
+                let source = e["source"].as_str().unwrap();
+                let role = e["role"].as_str().unwrap();
+                let expected = match (
+                    source.contains("gateway_attestation"),
+                    source.contains("model_attestations"),
+                ) {
+                    (true, false) => Role::Gateway,
+                    (false, true) => Role::Model,
+                    _ => panic!("source names no single role: {source}"),
+                };
+                assert_eq!(role, expected.as_str(), "{source}");
+                let hash = report::hex32(e["sha256"].as_str().unwrap()).unwrap();
+                assert_eq!(policy.pinned[&hash], expected, "{source}");
+            }
+            assert!(policy.endorsed.is_empty());
+            assert!(policy.revoked.is_empty());
+            assert_eq!(policy.feed_version, None);
+        }
+    }
+
+    #[test]
+    fn an_entry_without_a_role_is_refused() {
+        let h = "ab".repeat(32);
+        let json =
+            format!(r#"{{"composeHashes":[{{"sha256":"{h}","recorded":"d","source":"s"}}]}}"#);
+        assert!(load_policy(&json).is_err());
+    }
+
+    #[test]
+    fn an_unknown_role_is_refused() {
+        let h = "ab".repeat(32);
+        for role in ["proxy", "Gateway", "MODEL", ""] {
+            let json = format!(
+                r#"{{"composeHashes":[{{"sha256":"{h}","role":"{role}","recorded":"d","source":"s"}}]}}"#
+            );
+            assert!(load_policy(&json).is_err(), "accepted role {role:?}");
+        }
+        for role in ["gateway", "model"] {
+            let json = format!(
+                r#"{{"composeHashes":[{{"sha256":"{h}","role":"{role}","recorded":"d","source":"s"}}]}}"#
+            );
+            assert!(load_policy(&json).is_ok(), "refused role {role:?}");
         }
     }
 

@@ -20,7 +20,10 @@ production or the reverse.
 Only entries rts accepted after every check (TDX quote, TCB, report_data,
 mr_config_id == sha256(app_compose), and for models the GPU verdict) but
 without a pin are proposed: compose_acceptance "mr-config-only" or
-"key-continuity". Nothing is fetched from the network. The policy is compiled
+"key-continuity". A compose the signed attestation policy feed admitted
+("endorsed") is already accepted, so it is never proposed, even where a
+re-attestation later accepted it another way. Nothing is fetched from the
+network. The policy is compiled
 into rts, so rebuild after --write. Each candidate's app_compose is printed:
 review it (images, digests, mounts, logging) before pinning, because a pin
 makes every future launch trust that build.
@@ -41,20 +44,22 @@ ENVIRONMENTS = {
     "staging": ("https://cloud-stg-api.near.ai/v1", "attestation-policy-staging.json"),
 }
 UNPINNED = {"mr-config-only", "key-continuity"}
+# Admitted by the signed attestation policy feed: accepted, not a candidate.
+ENDORSED = "endorsed"
 HASH = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _entry(model, report, entry):
-    """(where, info) for an evidence entry, from the report rts verified."""
+    """(role, where, info) for an evidence entry, from the report rts verified."""
     parsed = json.loads(report)
     if entry.get("role") == "gateway":
-        where, info = "gateway_attestation", parsed["gateway_attestation"]["info"]
+        role, where, info = "gateway", "gateway_attestation", parsed["gateway_attestation"]["info"]
     else:
         i = entry.get("index", 0)
-        where, info = f"model_attestations[{i}] for {model}", parsed["model_attestations"][i]["info"]
+        role, where, info = "model", f"model_attestations[{i}] for {model}", parsed["model_attestations"][i]["info"]
     if not isinstance(info, dict):
         raise ValueError(f"{where}: info is not an object")
-    return where, info
+    return role, where, info
 
 
 def policy_path(environment):
@@ -76,7 +81,14 @@ def candidates(doc, policy, today, environment="production"):
         raise ValueError("attestation.json has no verified evidence")
     pinned = {e["sha256"] for e in policy["composeHashes"]}
     batches = [doc["evidence"]] + [r.get("evidence", []) for r in doc.get("reattestations", [])]
-    out, seen = [], set(pinned)
+    endorsed = {
+        entry.get("compose_hash")
+        for batch in batches
+        for ev in batch
+        for entry in ev.get("entries", [])
+        if entry.get("compose_acceptance") == ENDORSED
+    }
+    out, seen = [], set(pinned) | endorsed
     for batch in batches:
         for ev in batch:
             if ev.get("base_url") != base_url:
@@ -93,7 +105,7 @@ def candidates(doc, policy, today, environment="production"):
                 if h in seen:
                     continue
                 try:
-                    where, info = _entry(ev.get("model"), ev.get("report"), entry)
+                    role, where, info = _entry(ev.get("model"), ev.get("report"), entry)
                     # As rts (report.rs app_compose): a JSON string or an object.
                     tcb = info["tcb_info"]
                     if isinstance(tcb, str):
@@ -110,6 +122,7 @@ def candidates(doc, policy, today, environment="production"):
                 app = info.get("app_name", "unknown app_name")
                 out.append({
                     "sha256": h,
+                    "role": role,
                     "recorded": today,
                     "source": f"NEAR AI {environment} {host}: {where}, info.app_name {app} ({how}, verified by rts)",
                     "app_compose": compose,
@@ -133,12 +146,12 @@ def main(argv=None):
         print(f"refresh-attestation-policy: {e}", file=sys.stderr)
         return 1
     if not found:
-        print("no new compose hashes: every verified entry is already pinned")
+        print("no new compose hashes: every verified entry is already pinned or endorsed")
         return 0
     for c in found:
         print(f"== {c['sha256']}\n   {c['source']}\n-- app_compose (review before pinning):\n{c['app_compose']}\n")
     if args.write:
-        policy["composeHashes"].extend({k: c[k] for k in ("sha256", "recorded", "source")} for c in found)
+        policy["composeHashes"].extend({k: c[k] for k in ("sha256", "role", "recorded", "source")} for c in found)
         args.policy.write_text(json.dumps(policy, indent=2) + "\n")
         print(f"appended {len(found)} to {args.policy}; rebuild rts and review the diff", file=sys.stderr)
     return 0

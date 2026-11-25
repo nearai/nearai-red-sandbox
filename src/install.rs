@@ -117,6 +117,12 @@ pub fn update_cache(home: &Path) -> PathBuf {
     under(home, HOME_SHARE).join("update-check.json")
 }
 
+/// The attestation policy feed's cache (`attest::feed`): each environment's
+/// last accepted document, its signature and its version high-water mark.
+pub fn attestation_policy_dir(home: &Path) -> PathBuf {
+    under(home, HOME_SHARE).join("attestation-policy")
+}
+
 pub struct Lookup<'a> {
     /// `env!("CARGO_MANIFEST_DIR")`: the checkout a source build came from.
     pub source: &'a Path,

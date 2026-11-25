@@ -18,6 +18,10 @@
 //!   `config::DEFAULT_MODELS`.
 //! - `RTS_LIVE_NEAR_API_KEY`: sent as the bearer on the report fetch when set.
 //!   Production serves the report without one.
+//! - `RTS_LIVE_POLICY_FEED`: `on` loads the signed attestation policy feed
+//!   as a launch does (fetch bounded to 5 s, cache under `$HOME`, fallback)
+//!   and merges it into the policy. A build without
+//!   `RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX` uses compiled-in pins only.
 //! - `RTS_LIVE_SAVE_DIR`: save every attestation exchange (reports, PCS,
 //!   CRL, NRAS) with the nonces and the time, as `live-run.json`, for the
 //!   offline regression fixture.
@@ -38,7 +42,9 @@ use rts::attest::http::{BlockingHttp, Clock, Http, HttpResponse, SystemClock};
 use rts::attest::nras::NrasGpuVerifier;
 use rts::attest::record::AttestationRecord;
 use rts::attest::tdx::PcsQuoteVerifier;
-use rts::attest::{AttestOptions, Attested, Attestor, ComposePolicy, load_policy, policy_json};
+use rts::attest::{
+    AttestOptions, Attested, Attestor, ComposePolicy, Policy, feed, load_policy, policy_json,
+};
 use rts::forwarder::pin::{PinSet, Rejected, native_roots, pinned_tls, spki_sha256};
 use rts::inference::NearEnvironment;
 use serde_json::{Value, json};
@@ -132,6 +138,25 @@ fn urandom_nonce() -> [u8; 32] {
     n
 }
 
+/// The environment's compiled-in policy, with the feed merged in when
+/// `RTS_LIVE_POLICY_FEED=on`, loaded as a launch loads it.
+fn policy() -> Policy {
+    let mut policy = load_policy(policy_json(environment())).unwrap();
+    if std::env::var("RTS_LIVE_POLICY_FEED").as_deref() == Ok("on") {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (doc, source) = feed::session_feed(home.as_deref(), environment(), now);
+        println!("{}", source.line());
+        if let Some(doc) = doc {
+            feed::merge(&mut policy, &doc);
+        }
+    }
+    policy
+}
+
 /// Attests every model with the real PCS and NRAS, the environment's base
 /// and policy, and `options()` (TCB UpToDate; pinned compose unless
 /// overridden). Returns what verified, the nonces used and the recorder.
@@ -158,7 +183,7 @@ fn attest_live() -> (Result<Attested, String>, Vec<[u8; 32]>, Arc<Recording>) {
         key,
         models: models(),
         options: options(),
-        policy: load_policy(policy_json(environment())).unwrap(),
+        policy: policy(),
         continuity: Default::default(),
         nonce: Arc::new(move || {
             let n = urandom_nonce();

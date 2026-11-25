@@ -2,31 +2,37 @@
   "composeHashes": [
     {
       "sha256": "10d29b736472383a011211c5c882d85d5dd53c8d4242d9d872c64a6097bdf441",
+      "role": "gateway",
       "recorded": "2026-11-20",
       "source": "NEAR AI staging cloud-stg-api.near.ai: gateway_attestation, info.app_name dstack-0.5.15 (mr-config-only, verified by rts)"
     },
     {
       "sha256": "e3902667a26282dd8b4015a901848c521b20243a155a457148f88acf48a45959",
+      "role": "model",
       "recorded": "2026-11-20",
       "source": "NEAR AI staging cloud-stg-api.near.ai: model_attestations[0] for deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated, info.app_name dstack-nvidia-0.5.11 (mr-config-only, verified by rts)"
     },
     {
       "sha256": "edabf8039210336d90fe966dfc4e48216551dfd8b05d54e96d3f3f0e0da850d4",
+      "role": "model",
       "recorded": "2026-11-20",
       "source": "NEAR AI staging cloud-stg-api.near.ai: model_attestations[1] for deepseek-ai/DeepSeek-V4.1-Flash-1017-abliterated, info.app_name dstack-nvidia-0.5.11 (mr-config-only, verified by rts)"
     },
     {
       "sha256": "85c10cc2c733cfd49e3e780384abfa53415d3f63c85a19e8350cfb08ce40c5f7",
+      "role": "gateway",
       "recorded": "2026-11-23",
       "source": "NEAR AI staging cloud-stg-api.near.ai: gateway_attestation, info.app_name dstack-0.5.15 (mr-config-only, verified by rts)"
     },
     {
       "sha256": "e4b83d924284eece9b972d8e18bd88dac4dd529031b00311ef5044eaa60ba8d9",
+      "role": "model",
       "recorded": "2026-11-23",
       "source": "NEAR AI staging cloud-stg-api.near.ai: model_attestations[0] for Qwen/Qwen3.8-27B-abliterated, info.app_name dstack-nvidia-0.5.12 (mr-config-only, verified by rts)"
     },
     {
       "sha256": "0cf678004e2d5995cd158d4e07af7e6cd014676f9139619805ada9c727d3b688",
+      "role": "gateway",
       "recorded": "2026-11-24",
       "source": "NEAR AI staging cloud-stg-api.near.ai: gateway_attestation, info.app_name dstack-0.5.15 (mr-config-only, verified by rts)"
     }

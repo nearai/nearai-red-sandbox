@@ -59,7 +59,7 @@ def write(tmp_path, doc, policy):
 
 
 def policy_with(*hashes):
-    return {"composeHashes": [{"sha256": h, "recorded": "2026-10-29", "source": "s"} for h in hashes]}
+    return {"composeHashes": [{"sha256": h, "role": "model", "recorded": "2026-10-29", "source": "s"} for h in hashes]}
 
 
 def test_proposes_only_verified_unpinned_composes(tmp_path):
@@ -77,6 +77,29 @@ def test_proposes_only_verified_unpinned_composes(tmp_path):
     assert "model_attestations[0] for q" in found[0]["source"]
     assert "dstack-nvidia-0.5.12" in found[0]["source"]
     assert "gateway_attestation" in found[1]["source"] and "dstack-0.5.12" in found[1]["source"]
+    assert [c["role"] for c in found] == ["model", "gateway"]
+
+
+def test_endorsed_composes_are_accepted_not_proposed(tmp_path):
+    # The signed feed admitted them: CI's rules reviewed them already.
+    doc = {"status": "verified", "evidence": [evidence("q", NEW_GW, "endorsed", NEW_MODEL, "endorsed")]}
+    a, p = write(tmp_path, doc, policy_with(PINNED))
+    assert refresh.candidates(json.loads(a.read_text()), json.loads(p.read_text()), "2026-11-24") == []
+    r = subprocess.run([sys.executable, str(SCRIPT), str(a), "--policy", str(p), "--write"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert "already pinned or endorsed" in r.stdout
+    assert [e["sha256"] for e in json.loads(p.read_text())["composeHashes"]] == [PINNED]
+
+
+def test_a_compose_endorsed_in_any_batch_is_not_proposed(tmp_path):
+    # Endorsed at launch, then key continuity after the feed lapsed: still accepted.
+    doc = {
+        "status": "verified",
+        "evidence": [evidence("q", PINNED, "pinned", NEW_MODEL, "key-continuity")],
+        "reattestations": [{"evidence": [evidence("q", PINNED, "pinned", NEW_MODEL, "endorsed")]}],
+    }
+    a, p = write(tmp_path, doc, policy_with(PINNED))
+    assert refresh.candidates(json.loads(a.read_text()), json.loads(p.read_text()), "2026-11-24") == []
 
 
 def test_refuses_a_record_that_did_not_verify(tmp_path):
@@ -93,8 +116,20 @@ def test_write_appends_new_entries_once(tmp_path):
     for _ in range(2):
         r = subprocess.run([sys.executable, str(SCRIPT), str(a), "--policy", str(p), "--write"], capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
-    hashes = [e["sha256"] for e in json.loads(p.read_text())["composeHashes"]]
-    assert hashes == [PINNED, NEW_MODEL]
+    entries = json.loads(p.read_text())["composeHashes"]
+    assert [e["sha256"] for e in entries] == [PINNED, NEW_MODEL]
+    # rts refuses an entry without a role, so --write always writes one.
+    assert [e["role"] for e in entries] == ["model", "model"]
+    assert list(entries[1]) == ["sha256", "role", "recorded", "source"]
+
+
+def test_write_records_the_gateway_role(tmp_path):
+    doc = {"status": "verified", "evidence": [evidence("q", NEW_GW, "mr-config-only", PINNED, "pinned")]}
+    a, p = write(tmp_path, doc, policy_with(PINNED))
+    r = subprocess.run([sys.executable, str(SCRIPT), str(a), "--policy", str(p), "--write"], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    entries = json.loads(p.read_text())["composeHashes"]
+    assert [(e["sha256"], e["role"]) for e in entries] == [(PINNED, "model"), (NEW_GW, "gateway")]
 
 
 def test_dry_run_changes_nothing(tmp_path):
