@@ -13,7 +13,10 @@ JSON string wrapping them (the tests/fixtures/compose-history format). Prints
 the verdict as JSON. Exit 0 on pass, 3 on hold.
 
 Rules here are C1-C4, G1 and M1. G2 and M2 (cosign provenance of changed
-`nearaidev/*` digests) need the network and run in the publisher's sign step.
+`nearaidev/*` digests) need the network and run in build_document.py, in both
+the publisher's jobs. A pass here is not an endorsement: for a model, C1 does
+not compare `pre_launch_script` and M1 compares it digest-blind, so a changed
+digest there is left to M2.
 
 Byte-level semantics that the Rust side (`src/attest/normalize.rs`) must
 reproduce exactly, so both languages produce one hash:
@@ -264,9 +267,13 @@ def _same(a, b) -> bool:
     return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
 
 
-def _c1(cand: dict, base: dict) -> bool:
+def _c1(cand: dict, base: dict, role: str) -> bool:
     keys = (set(cand) | set(base)) - {"docker_compose_file", "name"}
-    return all(k in cand and k in base and _same(cand[k], base[k]) for k in keys)
+    # A model's pre_launch_script re-pins the compose-manager image by digest,
+    # so C1 checks only that both have it: M1 compares it digest-blind, and
+    # build_document's M2 pairs its digests and verifies each changed one.
+    loose = {"pre_launch_script"} if role == "model" else set()
+    return all(k in cand and k in base and (k in loose or _same(cand[k], base[k])) for k in keys)
 
 
 def _c2(cand: dict) -> bool:
@@ -303,7 +310,7 @@ def _failures(cand: dict, base: dict, role: str, cand_file: str, base_file: str)
     cand_refs = image_refs(cand["docker_compose_file"])
     base_refs = image_refs(base["docker_compose_file"])
     out = []
-    if not _c1(cand, base):
+    if not _c1(cand, base, role):
         out.append("C1")
     if not _c2(cand):
         out.append("C2")

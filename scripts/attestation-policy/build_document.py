@@ -51,7 +51,10 @@ that names no candidate (carried from an unverified asset evaluate read) is
 dropped with a warning instead of refused; it is never signed. G2 and M2
 run here through --cosign: without it, an entry with a changed digest is never
 endorsed. A changed gateway digest outside nearaidev/ is held (G2), and so is
-a changed model digest outside nearaidev/compose-manager* (M2).
+a changed model digest outside nearaidev/compose-manager* (M2). A model's
+pre_launch_script may change only by re-pinning every
+nearaidev/compose-manager@sha256: reference in it to one new digest, which
+cosign verifies the same way (M2).
 """
 
 from __future__ import annotations
@@ -106,6 +109,9 @@ _HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _CANDIDATE = re.compile(r"([0-9a-f]{64})\.json", re.ASCII)
 _ANY_DIGEST = re.compile(r"@(sha256:[0-9a-f]{64})", re.ASCII)
 _REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", re.ASCII)
+# Characters that may continue an image reference on either side of a digest.
+_REF_CHAR = re.compile(r"[A-Za-z0-9._/:@-]", re.ASCII)
+COMPOSE_MANAGER = "nearaidev/compose-manager"
 
 
 class Refused(Exception):
@@ -228,7 +234,64 @@ def run_cosign(cosign: str, identity: str, ref: str) -> tuple[bool, str]:
     return p.returncode == 0, lines[-1] if lines else f"exit {p.returncode}"
 
 
-def _provenance(cand_file: str, base_file: str, role: str, cosign: str | None, cache: dict) -> list[str]:
+def _bounded(line: str, m: re.Match, repo: str) -> bool:
+    """The digest match m in line is written exactly as repo@sha256:<hex>:
+    repo is not the tail of a longer reference, and nothing continues it."""
+    start = m.start() - len(repo)
+    if start < 0 or line[start:m.start()] != repo:
+        return False
+    if start > 0 and _REF_CHAR.match(line[start - 1]):
+        return False
+    return m.end() == len(line) or not _REF_CHAR.match(line[m.end()])
+
+
+def _script_provenance(cand_script, base_script) -> tuple[list[str], str | None]:
+    """M2 for a model's pre_launch_script: why its digests that differ from
+    the baseline's are not a compose-manager re-pin, and the new digest.
+
+    Lines and digests pair up by position, as in docker_compose_file. Every
+    changed digest must be written exactly nearaidev/compose-manager@<digest>
+    in both scripts, every changed one must be the same new digest, and once
+    one changes, every nearaidev/compose-manager reference in the candidate
+    script must carry it (the launcher's printf and echo re-pin the same
+    image). The caller verifies that digest with cosign."""
+    if cand_script == base_script:
+        return [], None
+    if not isinstance(cand_script, str) or not isinstance(base_script, str):
+        return ["pre_launch_script differs from the baseline's"], None
+    if rules.digest_blind(cand_script) != rules.digest_blind(base_script):
+        return ["pre_launch_script differs from the baseline's outside its digests"], None
+    cand_lines, base_lines = cand_script.split("\n"), base_script.split("\n")
+    if len(cand_lines) != len(base_lines):
+        return ["pre_launch_script lines do not pair up with the baseline's"], None
+    diff, new = [], set()
+    for cl, bl in zip(cand_lines, base_lines):
+        cms, bms = list(_ANY_DIGEST.finditer(cl)), list(_ANY_DIGEST.finditer(bl))
+        if len(cms) != len(bms):
+            diff.append(f"pre_launch_script digests do not pair up with the baseline's on line: {cl[:200]}")
+            continue
+        for cm, bm in zip(cms, bms):
+            if cm.group(1) == bm.group(1):
+                continue
+            if _bounded(cl, cm, COMPOSE_MANAGER) and _bounded(bl, bm, COMPOSE_MANAGER):
+                new.add(cm.group(1))
+            else:
+                diff.append(f"pre_launch_script digest changed outside {COMPOSE_MANAGER}@: {cm.group(1)}")
+    if diff or not new:
+        return diff, None
+    if len(new) > 1:
+        return [f"pre_launch_script re-pins {COMPOSE_MANAGER} to more than one digest: "
+                + ", ".join(sorted(new))], None
+    (digest,) = new
+    for line in cand_lines:
+        for m in _ANY_DIGEST.finditer(line):
+            if _bounded(line, m, COMPOSE_MANAGER) and m.group(1) != digest:
+                return [f"pre_launch_script re-pins only some {COMPOSE_MANAGER} references to {digest}"], None
+    return [], digest
+
+
+def _provenance(cand_file: str, base_file: str, role: str, cosign: str | None, cache: dict,
+                cand_script=None, base_script=None) -> list[str]:
     """G2/M2: why the digests that differ from this baseline are not
     provenance-verified; empty when every one of them is.
 
@@ -237,9 +300,18 @@ def _provenance(cand_file: str, base_file: str, role: str, cosign: str | None, c
     no digest) and their lines and digests pair up in order. A digest that
     differs from the baseline's at the same position must be the one digest of
     an uncommented image: line, and that (repo, digest) must pass cosign below,
-    even when the baseline holds the same digest somewhere else."""
+    even when the baseline holds the same digest somewhere else.
+
+    For a model, cand_script and base_script are the pre_launch_scripts, which
+    C1 does not compare: see _script_provenance. Its one new compose-manager
+    digest goes through cosign here like an image line's."""
     diff = []
     changed = set()
+    if role == "model":
+        script_diff, script_digest = _script_provenance(cand_script, base_script)
+        diff += script_diff
+        if script_digest is not None:
+            changed.add((COMPOSE_MANAGER, script_digest))
     cand_lines, base_lines = cand_file.split("\n"), base_file.split("\n")
     if len(cand_lines) != len(base_lines):
         return ["docker_compose_file lines do not pair up with the baseline's"]
@@ -295,7 +367,8 @@ def endorse(raw: str, role: str, baselines: dict, now: str, cosign: str | None, 
     first = None
     for match, closest in v.passing:
         base = json.loads(baselines[closest])
-        diff = _provenance(cand["docker_compose_file"], base["docker_compose_file"], role, cosign, cache)
+        diff = _provenance(cand["docker_compose_file"], base["docker_compose_file"], role, cosign, cache,
+                           cand.get("pre_launch_script"), base.get("pre_launch_script"))
         if not diff:
             break
         if first is None:

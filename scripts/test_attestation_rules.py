@@ -321,7 +321,7 @@ MUTATIONS = {
     "allowed_envs+FOO": (GW, "gateway", lambda: edit(GW, _mut_add_env), ["C1"]),
     "public_logs=true": (GW, "gateway", lambda: edit(GW, lambda o: o.__setitem__("public_logs", True)), ["C1"]),
     "pre_launch_script+echo": (MODEL, "model", lambda: edit(MODEL, lambda o: o.__setitem__(
-        "pre_launch_script", o["pre_launch_script"] + "\necho pwned\n")), ["C1", "M1"]),
+        "pre_launch_script", o["pre_launch_script"] + "\necho pwned\n")), ["M1"]),
     "name=dstack-evil": (GW, "gateway", lambda: edit(GW, lambda o: o.__setitem__("name", "dstack-evil")), ["C2"]),
     "image tag :latest": (GW, "gateway", lambda: edit_file(GW, replace_once(CLOUD_API, "nearaidev/cloud-api:latest")), ["C3", "G1"]),
     "new repo evil/x@sha256:...": (GW, "gateway", lambda: edit_file(GW, replace_once(CLOUD_API, f"evil/x@sha256:{NEW_DIGEST}")), ["C4", "G1"]),
@@ -335,7 +335,7 @@ MUTATIONS = {
 
 
 @pytest.mark.parametrize("mutation,rule", [
-    ("allowed_envs+FOO", "C1"), ("public_logs=true", "C1"), ("pre_launch_script+echo", "C1"),
+    ("allowed_envs+FOO", "C1"), ("public_logs=true", "C1"), ("pre_launch_script+echo", "M1"),
     ("name=dstack-evil", "C2"), ("image tag :latest", "C3"),
     ("new repo evil/x@sha256:...", "C4"),
     ("gateway: add volume line", "G1"), ("model: GITHUB_REPO changed", "M1"),
@@ -373,6 +373,47 @@ def test_model_digest_change_passes_exact():
         r"(nearaidev/compose-manager@sha256:)[0-9a-f]{64}", r"\g<1>" + NEW_DIGEST, t))
     v = rules.evaluate(s, "model", [raw(MODEL)])
     assert (v.passed, v.match) == (True, "exact")
+
+
+CM_DIGEST = "ae4332fdb0bfccf6410bc153a58d0b72a596a989cbb98fd5b6461fe32e079814"
+
+
+def test_model_compose_manager_bump_in_pre_launch_script_passes_the_rules():
+    # The launcher's re-pin names the compose-manager digest twice in
+    # pre_launch_script. For a model, C1 leaves pre_launch_script to M1, which
+    # compares it digest-blind; build_document's M2 pairs and verifies the
+    # digests.
+    def bump(o):
+        assert o["pre_launch_script"].count(CM_DIGEST) == 2
+        o["pre_launch_script"] = o["pre_launch_script"].replace(CM_DIGEST, NEW_DIGEST)
+        o["docker_compose_file"] = o["docker_compose_file"].replace(CM_DIGEST, NEW_DIGEST)
+    v = rules.evaluate(edit(MODEL, bump), "model", [raw(MODEL)])
+    assert (v.passed, v.match, v.failures) == (True, "exact", [])
+
+
+@pytest.mark.parametrize("value", [None, "absent"])
+def test_model_pre_launch_script_null_or_absent_on_one_side_holds(value):
+    def change(o):
+        if value == "absent":
+            del o["pre_launch_script"]
+        else:
+            o["pre_launch_script"] = value
+    v = rules.evaluate(edit(MODEL, change), "model", [raw(MODEL)])
+    assert not v.passed and "M1" in v.failures
+    # Absent on one side and null on the other: M1 sees None both times, C1
+    # still sees the key missing.
+    nulled = edit(MODEL, lambda o: o.__setitem__("pre_launch_script", None))
+    absent = edit(MODEL, lambda o: o.pop("pre_launch_script"))
+    v = rules.evaluate(absent, "model", [nulled])
+    assert not v.passed and "C1" in v.failures
+
+
+def test_gateway_pre_launch_script_is_still_compared_exactly():
+    script = "#!/bin/sh\necho nearaidev/compose-manager@sha256:{}\n"
+    base = edit(GW, lambda o: o.__setitem__("pre_launch_script", script.format("1" * 64)))
+    cand = edit(GW, lambda o: o.__setitem__("pre_launch_script", script.format("2" * 64)))
+    v = rules.evaluate(cand, "gateway", [base])
+    assert (v.passed, v.failures) == (False, ["C1"])
 
 
 def test_digest_only_change_passes():

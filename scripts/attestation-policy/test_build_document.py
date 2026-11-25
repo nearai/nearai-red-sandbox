@@ -544,8 +544,7 @@ def test_a_held_compose_is_endorsed_once_merged_into_the_baselines(tmp_path, rol
 def test_model_compose_manager_digests_use_the_launcher_anchor(tmp_path):
     (ref,) = {r for r in bd.rules.image_refs(json.loads(E390)["docker_compose_file"])
               if r.repo == "nearaidev/compose-manager"}
-    # Only in docker_compose_file: pre_launch_script also names the digest,
-    # and C1 compares pre_launch_script exactly.
+    # Only in docker_compose_file; the pre_launch_script bump is tested below.
     obj = json.loads(EDAB)
     obj["docker_compose_file"] = obj["docker_compose_file"].replace(ref.digest, "sha256:" + "e" * 64)
     cand = json.dumps(obj)
@@ -664,6 +663,139 @@ def test_evaluate_installs_the_same_cosign_as_sign():
     assert len(steps) == 2, steps
     assert steps[0] == steps[1]
     assert "uses: sigstore/cosign-installer@" in steps[0] and "cosign-release: v" in steps[0]
+
+
+# --- compose-manager bumps in a model's pre_launch_script ---------------------
+
+CM = "nearaidev/compose-manager"
+CM_OLD = "sha256:ae4332fdb0bfccf6410bc153a58d0b72a596a989cbb98fd5b6461fe32e079814"
+CM_NEW = "sha256:" + "e" * 64
+MODEL_ID = "^https://github\\.com/nearai/compose-manager/\\.github/workflows/"
+
+
+def _bump(script=None, compose=CM_NEW, base=E390):
+    """base with the compose-manager digest set to compose in its image line,
+    and pre_launch_script replaced by script(old_script) when given."""
+    obj = json.loads(base)
+    assert obj["docker_compose_file"].count(CM_OLD) == 1
+    obj["docker_compose_file"] = obj["docker_compose_file"].replace(CM_OLD, compose)
+    if script is not None:
+        obj["pre_launch_script"] = script(obj["pre_launch_script"])
+    return json.dumps(obj)
+
+
+def _script_lines(script):
+    """The printf and echo lines of the re-pin, which name the digest."""
+    lines = [l for l in script.split("\n") if CM_OLD in l]
+    assert len(lines) == 2 and lines[0].lstrip().startswith("printf") and lines[1].lstrip().startswith("echo")
+    return lines
+
+
+def _endorse_model(cand, cosign, base=E390):
+    return bd.endorse(cand, "model", {sha(base): base}, NOW, cosign, {})
+
+
+@pytest.mark.parametrize("base", ["E390", "EDAB"])
+def test_a_real_compose_manager_bump_is_endorsed_only_when_cosign_verifies(tmp_path, base):
+    # EDAB against E390 also exercises the instance-label-v1 path.
+    start = {"E390": E390, "EDAB": EDAB}[base]
+    cand = _bump(lambda s: s.replace(CM_OLD, CM_NEW), base=start)
+    assert json.loads(cand)["pre_launch_script"].count(CM_NEW) == 2
+    assert bd.rules.evaluate(cand, "model", [E390]).passed
+
+    ok, log = _fake_cosign(tmp_path, 0)
+    o = _endorse_model(cand, str(ok))
+    assert o.hold is None, o.hold
+    # The image line and both script lines name one ref: cosign runs once.
+    (line,) = log.read_text().splitlines()
+    assert line.endswith(f"{CM}@{CM_NEW}") and f"--certificate-identity-regexp {MODEL_ID} " in line
+
+    (tmp_path / "refusing").mkdir()
+    bad, _ = _fake_cosign(tmp_path / "refusing", 1)
+    for cosign in (None, str(bad)):
+        o = _endorse_model(cand, cosign)
+        assert o.entry is None and o.hold["failures"] == ["M2"]
+
+
+def test_a_script_only_compose_manager_bump_still_goes_through_cosign(tmp_path):
+    # The image line is unchanged; only the script re-pins. Still verified.
+    cand = _bump(lambda s: s.replace(CM_OLD, CM_NEW), compose=CM_OLD)
+    ok, log = _fake_cosign(tmp_path, 0)
+    assert _endorse_model(cand, str(ok)).entry is not None
+    assert log.read_text().splitlines()[0].endswith(f"{CM}@{CM_NEW}")
+    o = _endorse_model(cand, None)
+    assert o.entry is None and o.hold["diff"] == [f"cosign was not run: {CM}@{CM_NEW}"]
+
+
+def _held(cand, tmp_path, base=E390):
+    """cand is held by M2 with a cosign that verifies everything."""
+    ok, _ = _fake_cosign(tmp_path, 0)
+    assert bd.rules.evaluate(cand, "model", [base]).passed
+    o = _endorse_model(cand, str(ok), base)
+    assert o.entry is None and o.hold["failures"] == ["M2"], o
+    return o.hold["diff"]
+
+
+@pytest.mark.parametrize("which", ["printf", "echo"])
+def test_only_one_script_line_bumped_is_held(tmp_path, which):
+    def one(s):
+        printf, echo = _script_lines(s)
+        target = printf if which == "printf" else echo
+        return s.replace(target, target.replace(CM_OLD, CM_NEW))
+    _held(_bump(one), tmp_path)
+
+
+def test_two_different_new_digests_in_the_script_are_held(tmp_path):
+    other = "sha256:" + "f" * 64
+    def two(s):
+        printf, echo = _script_lines(s)
+        return s.replace(printf, printf.replace(CM_OLD, CM_NEW)).replace(echo, echo.replace(CM_OLD, other))
+    _held(_bump(two), tmp_path)
+
+
+@pytest.mark.parametrize("token", [
+    "nearaidev/compose-manager-otelcol@{}",
+    "evilnearaidev/compose-manager@{}",
+    "ghcr.io/nearaidev/compose-manager@{}",
+    "nearaidev/compose-manager@{}0",
+    "other/tool@{}",
+])
+def test_a_script_digest_that_is_not_exactly_compose_manager_is_held(tmp_path, token):
+    # Baseline and candidate both carry the extra line; only its digest changes.
+    old, new = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+    def add(d):
+        return lambda s: s + "\necho " + token.format(d) + "\n"
+    base = _bump(add(old), compose=CM_OLD)
+    assert base != E390
+    cand = _bump(add(new), compose=CM_OLD)
+    diff = _held(cand, tmp_path, base)
+    assert any("pre_launch_script" in d for d in diff), diff
+
+
+@pytest.mark.parametrize("change", ["extra line", "removed line"])
+def test_an_extra_or_removed_script_line_is_held(tmp_path, change):
+    def edit(s):
+        printf, echo = _script_lines(s)
+        s = s.replace(CM_OLD, CM_NEW)
+        echo = echo.replace(CM_OLD, CM_NEW)
+        if change == "extra line":
+            return s.replace(echo, echo + "\n" + echo)
+        return s.replace(echo + "\n", "")
+    cand = _bump(edit)
+    assert not bd.rules.evaluate(cand, "model", [E390]).passed
+    ok, _ = _fake_cosign(tmp_path, 0)
+    o = _endorse_model(cand, str(ok))
+    assert o.entry is None and o.hold["failures"] == ["M1"]
+
+
+def test_script_provenance_pairs_lines_by_itself():
+    # M1 already holds these, but _provenance does not rely on it.
+    base = "a\necho nearaidev/compose-manager@" + CM_OLD + "\n"
+    for cand in ("a\nb\necho nearaidev/compose-manager@" + CM_NEW + "\n",
+                 "b\necho nearaidev/compose-manager@" + CM_NEW + "\n",
+                 "a\necho nearaidev/compose-manager@" + CM_NEW + " nearaidev/compose-manager@" + CM_NEW + "\n"):
+        diff = bd._provenance("", "", "model", None, {}, cand, base)
+        assert diff and not any("cosign was not run" in d for d in diff), (cand, diff)
 
 
 def test_revoked_entries_are_dropped_and_revocations_carried(tmp_path):
