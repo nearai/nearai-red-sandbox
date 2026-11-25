@@ -456,6 +456,86 @@ def test_a_reviewed_digest_moved_onto_a_non_image_line_is_held(tmp_path):
         assert o.hold["diff"] == [f"digest changed outside an image: line: {alpine}"]
 
 
+VPC = "nearaidev/dstack-vpc"
+VPC_OLD = "sha256:45f859504c7a66ea562e3230b7a3b482912bdd93f3930d1bb1c2f46e8d84f8f0"
+VPC_IMAGE = f"    image: {VPC}@{VPC_OLD}"
+VPC_ENV = f"      - DSTACK_CONTAINER_IMAGE_ID={VPC}@{VPC_OLD}"
+
+
+def _f571_with(image=None, env=None):
+    """F571 with the dstack-vpc image line and/or env line digest replaced."""
+    lines = json.loads(F571)["docker_compose_file"].split("\n")
+    assert lines.count(VPC_IMAGE) == 1 and lines.count(VPC_ENV) == 1
+    out = F571
+    if image is not None:
+        out = out.replace(f"image: {VPC}@{VPC_OLD}", f"image: {VPC}@{image}")
+    if env is not None:
+        out = out.replace(f"DSTACK_CONTAINER_IMAGE_ID={VPC}@{VPC_OLD}", f"DSTACK_CONTAINER_IMAGE_ID={VPC}@{env}")
+    assert bd.rules.evaluate(out, "gateway", [F571]).passed
+    return out
+
+
+def test_a_real_dstack_vpc_bump_is_endorsed_only_when_cosign_verifies(tmp_path):
+    new = "sha256:" + "5" * 64
+    cand = _f571_with(image=new, env=new)
+    base = {sha(F571): F571}
+    ok, log = _fake_cosign(tmp_path, 0)
+    o = bd.endorse(cand, "gateway", base, NOW, str(ok), {})
+    assert o.hold is None, o.hold
+    assert o.entry["sha256"] == sha(cand)
+    (line,) = log.read_text().splitlines()
+    assert line.endswith(f"{VPC}@{new}")
+
+    o = bd.endorse(cand, "gateway", base, NOW, None, {})
+    assert o.entry is None and o.hold["failures"] == ["G2"]
+    assert o.hold["diff"] == [f"cosign was not run: {VPC}@{new}"]
+
+
+def test_a_dstack_vpc_env_line_changed_without_its_image_line_is_held(tmp_path):
+    new = "sha256:" + "5" * 64
+    cand = _f571_with(env=new)
+    ok, _ = _fake_cosign(tmp_path, 0)
+    for cosign in (None, str(ok)):
+        o = bd.endorse(cand, "gateway", {sha(F571): F571}, NOW, cosign, {})
+        assert o.entry is None and o.hold["failures"] == ["G2"]
+        assert o.hold["diff"] == [f"digest changed outside an image: line: {new}"]
+
+
+def test_a_dstack_vpc_env_line_set_to_another_repos_verified_digest_is_held(tmp_path):
+    # dstack-vpc-client is bumped (and verified) to new; the dstack-vpc env
+    # line is set to that digest while the dstack-vpc image line keeps its own.
+    new = "sha256:" + "5" * 64
+    client = "nearaidev/dstack-vpc-client@sha256:dd570dee92901c6d9cf96909404bb5177294437e3642541225a85b06cefa3d9d"
+    assert F571.count(client) == 1
+    cand = _f571_with(env=new).replace(client, f"nearaidev/dstack-vpc-client@{new}")
+    assert bd.rules.evaluate(cand, "gateway", [F571]).passed
+    ok, log = _fake_cosign(tmp_path, 0)
+    o = bd.endorse(cand, "gateway", {sha(F571): F571}, NOW, str(ok), {})
+    assert o.entry is None and o.hold["failures"] == ["G2"]
+    assert o.hold["diff"] == [f"digest changed outside an image: line: {new}"]
+
+
+def test_a_non_image_line_needs_the_same_repo_on_an_image_line(tmp_path):
+    # The env-line exception names the repository of an image: line. A
+    # digest on a non-image line of a repository with no image line (or of
+    # another repository than the bumped image) is held even when both bump.
+    new = "sha256:" + "5" * 64
+    other = F571.replace(f"DSTACK_CONTAINER_IMAGE_ID={VPC}@{VPC_OLD}", f"DSTACK_CONTAINER_IMAGE_ID=nearaidev/other@{VPC_OLD}")
+    cand = other.replace(f"image: {VPC}@{VPC_OLD}", f"image: {VPC}@{new}").replace(
+        f"nearaidev/other@{VPC_OLD}", f"nearaidev/other@{new}")
+    assert bd.rules.evaluate(cand, "gateway", [other]).passed
+    ok, _ = _fake_cosign(tmp_path, 0)
+    o = bd.endorse(cand, "gateway", {sha(other): other}, NOW, str(ok), {})
+    assert o.entry is None and o.hold["diff"] == [f"digest changed outside an image: line: {new}"]
+
+    # Commented out, the line does not qualify either.
+    commented = F571.replace(f"- DSTACK_CONTAINER_IMAGE_ID={VPC}", f"# - DSTACK_CONTAINER_IMAGE_ID={VPC}")
+    cand = commented.replace(VPC_OLD, new)
+    assert bd.rules.evaluate(cand, "gateway", [commented]).passed
+    o = bd.endorse(cand, "gateway", {sha(commented): commented}, NOW, str(ok), {})
+    assert o.entry is None and o.hold["diff"] == [f"digest changed outside an image: line: {new}"]
+
+
 def test_two_same_repo_image_digests_swapped_are_held_without_cosign(tmp_path):
     obj = json.loads(GW)
     ingress = "nearaidev/cvm-ingress@sha256:9e9aacb7866a06aa6959fe1c6064f4c3ed62609af35e955df1b95e7325578435"
@@ -756,20 +836,26 @@ def test_two_different_new_digests_in_the_script_are_held(tmp_path):
 @pytest.mark.parametrize("token", [
     "nearaidev/compose-manager-otelcol@{}",
     "evilnearaidev/compose-manager@{}",
+    "evil_nearaidev/compose-manager@{}",
     "ghcr.io/nearaidev/compose-manager@{}",
     "nearaidev/compose-manager@{}0",
     "other/tool@{}",
 ])
 def test_a_script_digest_that_is_not_exactly_compose_manager_is_held(tmp_path, token):
-    # Baseline and candidate both carry the extra line; only its digest changes.
-    old, new = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+    # Baseline and candidate both carry an extra line naming the token. The
+    # candidate is otherwise a complete, consistent re-pin to CM_NEW, and the
+    # extra line moves to CM_NEW too: only the token's spelling holds it.
     def add(d):
         return lambda s: s + "\necho " + token.format(d) + "\n"
-    base = _bump(add(old), compose=CM_OLD)
+    base = _bump(add(CM_OLD), compose=CM_OLD)
     assert base != E390
-    cand = _bump(add(new), compose=CM_OLD)
+    cand = _bump(lambda s: s.replace(CM_OLD, CM_NEW), base=base)
+    assert cand.count(token.format(CM_NEW)) == 1
     diff = _held(cand, tmp_path, base)
-    assert any("pre_launch_script" in d for d in diff), diff
+    assert diff == [f"pre_launch_script digest changed outside {CM}@: {CM_NEW}"], diff
+    # The same re-pin without the extra line is endorsed.
+    ok, _ = _fake_cosign(tmp_path, 0)
+    assert _endorse_model(_bump(lambda s: s.replace(CM_OLD, CM_NEW)), str(ok)).entry is not None
 
 
 @pytest.mark.parametrize("change", ["extra line", "removed line"])

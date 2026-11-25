@@ -290,6 +290,34 @@ def _script_provenance(cand_script, base_script) -> tuple[list[str], str | None]
     return [], digest
 
 
+_REF_TAIL = re.compile(r"[A-Za-z0-9._/:-]+\Z", re.ASCII)
+
+
+def _image_digest_copy(cand_line: str, base_line: str, base_file: str) -> tuple[str, str] | None:
+    """(repo, new digest) when a changed non-image line only copies an image's
+    digest, else None (held). The line, uncommented, holds exactly one digest,
+    written repo@sha256:<new>; the baseline's line held repo@sha256:<old> at
+    that position, and <old> is the digest of an uncommented image: line of
+    repo in the baseline. The caller then requires an image: line of repo in
+    the candidate to have changed to <new>, which puts it through cosign."""
+    if rules._COMMENT_LINE.match(cand_line) or rules._COMMENT_LINE.match(base_line):
+        return None
+    cms, bms = list(_ANY_DIGEST.finditer(cand_line)), list(_ANY_DIGEST.finditer(base_line))
+    if len(cms) != 1 or len(bms) != 1:
+        return None
+    (cm,), (bm,) = cms, bms
+    tail = _REF_TAIL.search(cand_line, 0, cm.start())
+    if tail is None:
+        return None
+    repo = tail.group(0)
+    if not _bounded(cand_line, cm, repo) or not _bounded(base_line, bm, repo):
+        return None
+    base_digests = {r.digest for r in rules.image_refs(base_file) if r.repo == repo}
+    if bm.group(1) not in base_digests:
+        return None
+    return repo, cm.group(1)
+
+
 def _provenance(cand_file: str, base_file: str, role: str, cosign: str | None, cache: dict,
                 cand_script=None, base_script=None) -> list[str]:
     """G2/M2: why the digests that differ from this baseline are not
@@ -302,11 +330,16 @@ def _provenance(cand_file: str, base_file: str, role: str, cosign: str | None, c
     an uncommented image: line, and that (repo, digest) must pass cosign below,
     even when the baseline holds the same digest somewhere else.
 
+    One exception: a non-image line that copies an image's digest, such as
+    the gateway's `- DSTACK_CONTAINER_IMAGE_ID=nearaidev/dstack-vpc@sha256:...`
+    next to `image: nearaidev/dstack-vpc@sha256:...`. See _image_digest_copy.
+
     For a model, cand_script and base_script are the pre_launch_scripts, which
     C1 does not compare: see _script_provenance. Its one new compose-manager
     digest goes through cosign here like an image line's."""
     diff = []
     changed = set()
+    copies = []  # (repo, digest) of non-image lines that copy an image's digest
     if role == "model":
         script_diff, script_digest = _script_provenance(cand_script, base_script)
         diff += script_diff
@@ -326,9 +359,18 @@ def _provenance(cand_file: str, base_file: str, role: str, cosign: str | None, c
         if len(refs) == 1 and refs[0].digest is not None and cds == [refs[0].digest]:
             changed.add((refs[0].repo, refs[0].digest))
             continue
+        dup = None if refs else _image_digest_copy(cl, bl, base_file)
+        if dup is not None:
+            copies.append(dup)
+            continue
         for cd, bd_ in zip(cds, bds):
             if cd != bd_:
                 diff.append(f"digest changed outside an image: line: {cd}")
+    for repo, digest in copies:
+        # The image: line of this repository must carry the same new digest
+        # and so be in changed, which cosign verifies below.
+        if (repo, digest) not in changed:
+            diff.append(f"digest changed outside an image: line: {digest}")
     for repo, digest in sorted(changed):
         ref = f"{repo}@{digest}"
         if role == "gateway" and repo.startswith("nearaidev/"):
