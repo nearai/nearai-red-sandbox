@@ -350,6 +350,12 @@ Model (`rules:model-v1`):
   `OTELCOL_IMAGE_REPO`, `LAUNCHER_CHANNEL`, the capability grants and the
   `docker.sock` mounts. Any change to them holds the entry.
 
+"Changed" in G2 and M2 is relative to one baseline the candidate passes
+C1-C4 and G1/M1 against. Every such baseline is tried, and the entry is
+endorsed if any one of them leaves no unverified change. So a held compose
+merged verbatim into the baselines is signed by the next run, whichever
+baseline file sorts first.
+
 Whether `nearaidev/cloud-api` and `nearaidev/cvm-ingress` images carry cosign
 signatures has not been checked. That is the first task of the plan. If they
 are not signed, G2 holds every gateway digest change, and we decide then

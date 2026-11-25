@@ -367,6 +367,9 @@ class Verdict:
     failures: list[str]
     closest: str | None
     diff: list[str]
+    # Every attempt with no failures, as (match, baseline sha256), in
+    # preference order; closest and match are its first element.
+    passing: list[tuple[str, str]] = dataclasses.field(default_factory=list)
 
 
 def evaluate(raw: str, role: str, baselines: list[str]) -> Verdict:
@@ -404,10 +407,12 @@ def evaluate(raw: str, role: str, baselines: list[str]) -> Verdict:
             if bf is not None:
                 attempts.append((_failures(cand, base, role, cf, bf), MATCH_INSTANCE_LABEL, sha, base, cf, bf))
 
+    passing = [(a[1], a[2]) for a in attempts if not a[0]]
+    if passing:
+        match, sha = passing[0]
+        return Verdict(True, match, [], sha, [], passing)
     best = min(attempts, key=lambda a: len(a[0]))  # min keeps the first of equals
     failures, match, sha, base, cf, bf = best
-    if not failures:
-        return Verdict(True, match, [], sha, [])
     return Verdict(False, match, sorted(failures), sha, _diff(cand, base, cf, bf))
 
 

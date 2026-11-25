@@ -447,6 +447,54 @@ def test_a_changed_third_party_gateway_digest_is_held(tmp_path):
     assert any("alpine" in line for line in hold["diff"])
 
 
+def _model_with(repo, new_digest):
+    """E390 with the digest of one image repository replaced in docker_compose_file only."""
+    obj = json.loads(E390)
+    (digest,) = {r.digest for r in bd.rules.image_refs(obj["docker_compose_file"]) if r.repo == repo}
+    obj["docker_compose_file"] = obj["docker_compose_file"].replace(digest, f"sha256:{new_digest}")
+    return json.dumps(obj)
+
+
+def _sorting(make, anchor, before):
+    """make(digest) for the first digest whose compose sha256 sorts before (or
+    after) the anchor baseline's, so the test does not depend on hash luck."""
+    for i in range(4096):
+        cand = make(hashlib.sha256(str(i).encode()).hexdigest())
+        if (sha(cand) < sha(anchor)) == before:
+            return cand
+    raise AssertionError("no candidate on the wanted side of the anchor")
+
+
+@pytest.mark.parametrize("before", [True, False], ids=["sorts-before", "sorts-after"])
+@pytest.mark.parametrize("role", ["gateway", "model"])
+def test_a_held_compose_is_endorsed_once_merged_into_the_baselines(tmp_path, role, before):
+    # The approval path: a G2/M2 hold, then a reviewed PR adds the compose to
+    # the baselines, then the next run signs it, whichever baseline sorts first.
+    if role == "gateway":
+        anchor, cand = GW, _sorting(lambda d: _gateway_with("alpine", d), GW, before)
+    else:
+        anchor, cand = E390, _sorting(lambda d: _model_with("certbot/dns-cloudflare", d), E390, before)
+    ok, _ = _fake_cosign(tmp_path, 0)
+
+    held = tmp_path / "held"
+    held.mkdir()
+    r, out = reproduce(held, baselines(held, **{f"production_{role}": [anchor]}),
+                       candidates(held, cand), proposed(held, []), extra=["--cosign", ok])
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads((out / "document.json").read_text())["entries"] == []
+    (hold,) = json.loads((out / "holds.json").read_text())
+    assert hold["failures"] == ["G2" if role == "gateway" else "M2"]
+
+    merged = tmp_path / "merged"
+    merged.mkdir()
+    r, out = reproduce(merged, baselines(merged, **{f"production_{role}": [anchor, cand]}),
+                       candidates(merged, cand), proposed(merged, []), extra=["--cosign", ok])
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads((out / "holds.json").read_text()) == []
+    doc = json.loads((out / "document.json").read_text())
+    assert [(e["role"], e["match"], e["sha256"]) for e in doc["entries"]] == [(role, "exact", sha(cand))]
+
+
 def test_model_compose_manager_digests_use_the_launcher_anchor(tmp_path):
     (ref,) = {r for r in bd.rules.image_refs(json.loads(E390)["docker_compose_file"])
               if r.repo == "nearaidev/compose-manager"}

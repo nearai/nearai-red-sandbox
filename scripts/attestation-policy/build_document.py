@@ -222,22 +222,15 @@ def run_cosign(cosign: str, identity: str, ref: str) -> tuple[bool, str]:
     return p.returncode == 0, lines[-1] if lines else f"exit {p.returncode}"
 
 
-def endorse(raw: str, role: str, baselines: dict, now: str, cosign: str | None, cache: dict) -> Outcome:
-    """C1-C4 and G1/M1 against the role's baselines, then G2/M2 provenance of
-    every digest that differs from the baseline it passed against."""
-    v = rules.evaluate(raw, role, list(baselines.values()))
-    if not v.passed:
-        return _hold(raw, role, v.failures, v.closest, v.diff)
-    cand = json.loads(raw)
-    base = json.loads(baselines[v.closest])
-    have = {(r.repo, r.digest) for r in rules.image_refs(base["docker_compose_file"])}
-    changed = sorted({(r.repo, r.digest) for r in rules.image_refs(cand["docker_compose_file"])} - have)
-    rule = PROVENANCE_RULE[role]
+def _provenance(cand_file: str, base_file: str, role: str, cosign: str | None, cache: dict) -> list[str]:
+    """G2/M2: why the digests that differ from this baseline are not
+    provenance-verified; empty when every one of them is."""
+    have = {(r.repo, r.digest) for r in rules.image_refs(base_file)}
+    changed = sorted({(r.repo, r.digest) for r in rules.image_refs(cand_file)} - have)
     diff = []
     # digest_blind blinds every @sha256: in the file, not only image: lines.
     # A digest the baseline lacks must belong to an image reference checked below.
-    new_digests = set(_ANY_DIGEST.findall(cand["docker_compose_file"])) - set(
-        _ANY_DIGEST.findall(base["docker_compose_file"]))
+    new_digests = set(_ANY_DIGEST.findall(cand_file)) - set(_ANY_DIGEST.findall(base_file))
     for d in sorted(new_digests - {digest for _, digest in changed}):
         diff.append(f"digest changed outside an image: line: {d}")
     for repo, digest in changed:
@@ -260,12 +253,35 @@ def endorse(raw: str, role: str, baselines: dict, now: str, cosign: str | None, 
         ok, why = cache[(identity, ref)]
         if not ok:
             diff.append(f"cosign verify failed for {ref} (identity {identity}): {why}")
-    sha = rules.compose_sha256(raw) if v.match == rules.MATCH_EXACT else rules.instance_label_sha256(raw)
-    if diff:
-        o = _hold(raw, role, [rule], v.closest, diff)
-        o.held_key = (role, v.match, sha)
+    return diff
+
+
+def endorse(raw: str, role: str, baselines: dict, now: str, cosign: str | None, cache: dict) -> Outcome:
+    """C1-C4 and G1/M1 against the role's baselines, then G2/M2 provenance of
+    every digest that differs from a baseline it passed against. Every baseline
+    it passes against is tried, in rules.evaluate's preference order, so a
+    compose merged into the baselines verbatim is endorsed whichever baseline
+    sorts first. On a hold, the first passing baseline is reported."""
+    v = rules.evaluate(raw, role, list(baselines.values()))
+    if not v.passed:
+        return _hold(raw, role, v.failures, v.closest, v.diff)
+    cand = json.loads(raw)
+    first = None
+    for match, closest in v.passing:
+        base = json.loads(baselines[closest])
+        diff = _provenance(cand["docker_compose_file"], base["docker_compose_file"], role, cosign, cache)
+        if not diff:
+            break
+        if first is None:
+            first = (match, closest, diff)
+    else:
+        match, closest, diff = first
+        sha = rules.compose_sha256(raw) if match == rules.MATCH_EXACT else rules.instance_label_sha256(raw)
+        o = _hold(raw, role, [PROVENANCE_RULE[role]], closest, diff)
+        o.held_key = (role, match, sha)
         return o
-    return Outcome({"role": role, "match": v.match, "sha256": sha, "app_name": cand.get("name"),
+    sha = rules.compose_sha256(raw) if match == rules.MATCH_EXACT else rules.instance_label_sha256(raw)
+    return Outcome({"role": role, "match": match, "sha256": sha, "app_name": cand.get("name"),
                     "first_seen": now, "endorsed_by": ENDORSED_BY[role]}, None)
 
 
