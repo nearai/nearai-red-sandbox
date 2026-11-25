@@ -13,6 +13,7 @@ pub mod report;
 /// An explicit Cloud refusal, safe for the sponsored launch login path.
 const CREDENTIAL_REFUSED: &str = "attestation report refused the API credential";
 pub mod tdx;
+pub mod trusted;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
