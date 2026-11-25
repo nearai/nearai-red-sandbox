@@ -953,6 +953,20 @@ def test_evaluate_installs_the_same_cosign_as_sign():
     assert "uses: sigstore/cosign-installer@" in steps[0] and "cosign-release: v" in steps[0]
 
 
+def test_the_cosign_installer_can_verify_a_cosign_3_release():
+    # cosign 3 releases publish a .sigstore.json bundle and no detached .sig;
+    # installers before v4 fetch the .sig and fail (curl exit 56), so every
+    # run failed at "Install cosign".
+    wf = (REPO / ".github" / "workflows" / "attestation-policy.yml").read_text()
+    steps = re.findall(r"- name: Install cosign\n((?:        .*\n)+)", wf)
+    assert steps
+    for step in steps:
+        installer = re.search(r"uses: sigstore/cosign-installer@([0-9a-f]{40}) # v(\d+)\.", step)
+        assert installer, step
+        assert int(installer.group(2)) >= 4, step
+        assert re.search(r"cosign-release: v3\.", step), step
+
+
 # --- compose-manager bumps in a model's pre_launch_script ---------------------
 
 CM = "nearaidev/compose-manager"
