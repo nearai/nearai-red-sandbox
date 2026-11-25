@@ -79,9 +79,12 @@ GATEWAY_IDENTITY = r"^https://github\.com/nearai/[^/]+/\.github/workflows/"
 # M2: the launcher's own anchor for nearaidev/compose-manager*.
 MODEL_IDENTITY = r"^https://github\.com/nearai/compose-manager/\.github/workflows/"
 COSIGN_TIMEOUT_SECS = 120
+# GitHub refuses an issue body over 65536 characters.
+MAX_ISSUE_DIFF_CHARS = 50_000
 
 _HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
 _CANDIDATE = re.compile(r"([0-9a-f]{64})\.json", re.ASCII)
+_ANY_DIGEST = re.compile(r"@(sha256:[0-9a-f]{64})", re.ASCII)
 _REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", re.ASCII)
 
 
@@ -156,6 +159,8 @@ def already_covered(raw: str, current: dict | None) -> bool:
 class Outcome:
     entry: dict | None   # the endorsement, when every rule passed
     hold: dict | None    # {sha256, role, failures, closest, diff}, otherwise
+    # On a G2/M2 hold, the (role, match, sha256) the entry would have had.
+    held_key: tuple | None = None
 
 
 def _hold(raw, role, failures, closest, diff) -> Outcome:
@@ -186,6 +191,12 @@ def endorse(raw: str, role: str, baselines: dict, now: str, cosign: str | None, 
     changed = sorted({(r.repo, r.digest) for r in rules.image_refs(cand["docker_compose_file"])} - have)
     rule = PROVENANCE_RULE[role]
     diff = []
+    # digest_blind blinds every @sha256: in the file, not only image: lines.
+    # A digest the baseline lacks must belong to an image reference checked below.
+    new_digests = set(_ANY_DIGEST.findall(cand["docker_compose_file"])) - set(
+        _ANY_DIGEST.findall(base["docker_compose_file"]))
+    for d in sorted(new_digests - {digest for _, digest in changed}):
+        diff.append(f"digest changed outside an image: line: {d}")
     for repo, digest in changed:
         ref = f"{repo}@{digest}"
         if role == "gateway" and repo.startswith("nearaidev/"):
@@ -206,9 +217,11 @@ def endorse(raw: str, role: str, baselines: dict, now: str, cosign: str | None, 
         ok, why = cache[(identity, ref)]
         if not ok:
             diff.append(f"cosign verify failed for {ref} (identity {identity}): {why}")
-    if diff:
-        return _hold(raw, role, [rule], v.closest, diff)
     sha = rules.compose_sha256(raw) if v.match == rules.MATCH_EXACT else rules.instance_label_sha256(raw)
+    if diff:
+        o = _hold(raw, role, [rule], v.closest, diff)
+        o.held_key = (role, v.match, sha)
+        return o
     return Outcome({"role": role, "match": v.match, "sha256": sha, "app_name": cand.get("name"),
                     "first_seen": now, "endorsed_by": ENDORSED_BY[role]}, None)
 
@@ -353,7 +366,7 @@ def cmd_reproduce(a) -> int:
     cands = read_candidates(a.candidates)
     baselines = load_all_baselines(a.baselines, a.environment)
 
-    new, holds, cache = [], [], {}
+    new, holds, cache, held_keys = [], [], {}, set()
     for sha, raw in cands.items():
         if already_covered(raw, current):
             continue
@@ -370,6 +383,7 @@ def cmd_reproduce(a) -> int:
             new.append(o.entry)
         else:
             holds.append(o.hold)
+            held_keys.add(o.held_key)
 
     doc, added, publish = assemble(a.environment, current, new, now_unix)
     data = serialize(doc)
@@ -380,7 +394,9 @@ def cmd_reproduce(a) -> int:
             k = _key(e)
         except (TypeError, KeyError):
             raise Refused(f"proposed entry {e!r} is malformed")
-        if k not in have:
+        # Passed the rules here but not G2/M2 (cosign refused or unreachable):
+        # dropped and held, not a reason to publish nothing.
+        if k not in have and k not in held_keys:
             missing.append(k)
     if missing:
         raise Refused("proposed entries not reproduced: " + ", ".join(f"{r} {m} {s}" for r, m, s in missing))
@@ -407,6 +423,8 @@ def issue(hold: dict, environment: str, repo: str, run_id: str, artifact: str) -
     dest = f"opencode/attestation-baselines/{environment}/{role}/{sha}.json"
     tmp = f"\"${{TMPDIR:-/tmp}}/attestation-hold-{short}\""
     diff = "\n".join(str(x) for x in hold.get("diff") or []) or "(no diff)"
+    if len(diff) > MAX_ISSUE_DIFF_CHARS:
+        diff = diff[:MAX_ISSUE_DIFF_CHARS] + "\n... (cut: the diff is longer; compare the candidate with the baseline)"
     longest = max((len(m) for m in re.findall(r"~+", diff)), default=0)
     fence = "~" * max(3, longest + 1)
     title = f"Attestation hold: {environment} {role} {short}"
@@ -438,8 +456,8 @@ git push -u origin HEAD
 gh pr create --repo {repo} --base main --title "Add the {environment} {role} attestation baseline {short}" --body "Approves the compose held in {run_url}."
 ```
 
-To refuse it, close this issue. A later run updates this issue while NEAR AI
-still serves the compose.
+To refuse it, close this issue: later runs leave a closed issue alone. While
+it is open, each run that still sees the compose updates it.
 """
     return title, body
 

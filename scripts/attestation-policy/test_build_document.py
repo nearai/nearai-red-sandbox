@@ -399,21 +399,37 @@ def test_a_changed_nearaidev_digest_is_endorsed_only_when_cosign_verifies(tmp_pa
                     "--certificate-oidc-issuer https://token.actions.githubusercontent.com "
                     f"nearaidev/cloud-api@sha256:{'c' * 64}")
 
-    # cosign refuses: the entry is dropped and held, and a proposal naming it is refused.
+    # cosign refuses in sign although evaluate proposed the entry: the entry
+    # is dropped and held, and the rest of the document is still published.
     (tmp_path / "refusing").mkdir()
     bad, _ = _fake_cosign(tmp_path / "refusing", 1)
-    r, out = reproduce(tmp_path, base, cands, proposed(tmp_path, []), extra=["--cosign", bad])
+    r, out = reproduce(tmp_path, base, cands, proposed(tmp_path, [want]), extra=["--cosign", bad])
     assert r.returncode == 0, r.stdout + r.stderr
     assert json.loads((out / "document.json").read_text())["entries"] == []
     (hold,) = json.loads((out / "holds.json").read_text())
     assert hold["sha256"] == sha(cand) and hold["failures"] == ["G2"]
-    r, _ = reproduce(tmp_path, base, cands, proposed(tmp_path, [want]), extra=["--cosign", bad])
-    assert r.returncode == 1
 
     # No cosign at all: never endorsed.
-    r, out = reproduce(tmp_path, base, cands, proposed(tmp_path, []))
+    r, out = reproduce(tmp_path, base, cands, proposed(tmp_path, [want]))
     assert r.returncode == 0, r.stdout + r.stderr
     assert json.loads((out / "document.json").read_text())["entries"] == []
+
+
+def test_a_digest_outside_an_image_line_must_not_change(tmp_path):
+    obj = json.loads(GW)
+    obj["docker_compose_file"] += "\n# pinned elsewhere: tool@sha256:" + "1" * 64
+    base_raw = json.dumps(obj)
+    obj["docker_compose_file"] = obj["docker_compose_file"].replace("1" * 64, "2" * 64)
+    cand = json.dumps(obj)
+    base = baselines(tmp_path, production_gateway=[base_raw])
+    assert bd.rules.evaluate(cand, "gateway", [base_raw]).passed  # G1 blinds it
+    ok, log = _fake_cosign(tmp_path, 0)
+    r, out = reproduce(tmp_path, base, candidates(tmp_path, cand), proposed(tmp_path, []), extra=["--cosign", ok])
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads((out / "document.json").read_text())["entries"] == []
+    (hold,) = json.loads((out / "holds.json").read_text())
+    assert hold["failures"] == ["G2"]
+    assert hold["diff"] == [f"digest changed outside an image: line: sha256:{'2' * 64}"]
 
 
 def test_a_changed_third_party_gateway_digest_is_held(tmp_path):
@@ -515,3 +531,15 @@ def test_issues_name_the_rule_the_diff_and_the_baseline_pr_commands(tmp_path):
     assert "gh run download 1234 --repo nearai/nearai-red-sandbox --name attestation-policy-evaluation" in body
     assert f"opencode/attestation-baselines/production/model/{sha(AE66)}.json" in body
     assert "gh pr create" in body and "gh run download" in body
+
+
+def test_an_issue_body_stays_under_githubs_limit(tmp_path):
+    holds = tmp_path / "holds.json"
+    holds.write_text(json.dumps([{"sha256": A64, "role": "gateway", "failures": ["G1"], "closest": B64,
+                                  "diff": ["docker_compose_file: +" + "x" * 200] * 2000}]))
+    r = run("issues", "--environment", "staging", "--holds", holds, "--repo", "nearai/nearai-red-sandbox",
+            "--run-id", "1", "--artifact", "a", "--out", tmp_path / "issues")
+    assert r.returncode == 0, r.stdout + r.stderr
+    body = (tmp_path / "issues" / f"{A64}.md").read_text()
+    assert len(body) < 65_536
+    assert "cut: the diff is longer" in body
