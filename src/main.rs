@@ -582,7 +582,8 @@ mod tests {
     #[test]
     fn trust_forget_prints_a_hostile_store_warning_without_escapes() {
         let d = tempfile::tempdir().unwrap();
-        let path = d.path().join(attest::trusted::FILE);
+        let path = rts::install::trusted_composes_path(d.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, r#"{"version":1,"entries":[],"\u001b[2J":1}"#).unwrap();
         #[cfg(unix)]
         {

@@ -400,7 +400,7 @@ on this device. A trusted build is still fully checked: only the compose hash
 check is satisfied by your answer. `rts trust list` shows the builds you
 trusted, and `rts trust forget <hash-prefix>` (at least 8 hex characters)
 removes one; it does not affect a session that is already running. The store
-is `<rts home>/trusted-composes.json`.
+is `~/.local/share/nearai-red-sandbox/trusted-composes.json`.
 
 NEAR AI may redeploy a model or the gateway to a new TEE build mid-session,
 which changes its compose hash. When the forwarder re-attests, it accepts an

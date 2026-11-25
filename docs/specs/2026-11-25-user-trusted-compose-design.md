@@ -86,7 +86,7 @@ Gateway's live-attestation release gate can stop blocking on production pins
 
 ### The trust store
 
-- `<rts home>/trusted-composes.json`, beside the feed cache: a list of
+- `~/.local/share/nearai-red-sandbox/trusted-composes.json`, beside the feed cache: a list of
   `{environment, role, sha256, app_name, trusted_at}`. Created owner-only
   (0600, and the owner-only ACL on Windows, as the session directories are),
   written atomically.

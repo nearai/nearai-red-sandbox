@@ -1,5 +1,6 @@
-//! The user's own trusted compose hashes: an owner-only JSON file in the
-//! rts home. A build lands here only after the user answered `y` or `yes`
+//! The user's own trusted compose hashes: an owner-only JSON file at
+//! `~/.local/share/nearai-red-sandbox/trusted-composes.json`
+//! (`install::trusted_composes_path`), beside the feed cache. A build lands here only after the user answered `y` or `yes`
 //! at the launch prompt that showed it; `Policy::user_trusted` is built
 //! from it.
 
@@ -14,8 +15,6 @@ use std::io::Write;
 use serde::{Deserialize, Serialize};
 
 use crate::sys::fs::{self, Create};
-
-pub const FILE: &str = "trusted-composes.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustedEntry {
@@ -119,7 +118,7 @@ pub fn load(home: Option<&Path>) -> (TrustedComposes, Option<String>) {
     let Some(home) = home else {
         return (TrustedComposes::default(), None);
     };
-    let path = home.join(FILE);
+    let path = crate::install::trusted_composes_path(home);
     let meta = match std::fs::metadata(&path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -176,13 +175,18 @@ fn write(home: &Path, entries: &[TrustedEntry]) -> Result<(), String> {
             .collect(),
     };
     let json = serde_json::to_vec_pretty(&doc).map_err(|e| e.to_string())?;
-    fs::create_private_dir_all(home).map_err(|e| format!("create {}: {e}", home.display()))?;
-    let path = home.join(FILE);
+    let path = crate::install::trusted_composes_path(home);
+    let dir = path.parent().unwrap_or(home);
+    fs::create_private_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     // A name of its own, created new: two launches saving at once never
     // share (or truncate) one temp file, and an existing path, a link
     // included, is refused rather than followed. The last rename wins.
-    let tmp = home.join(format!(
-        ".{FILE}.{}.{}.tmp",
+    let tmp = dir.join(format!(
+        ".{name}.{}.{}.tmp",
         std::process::id(),
         crate::protocol::random_hex(8)
     ));
@@ -292,6 +296,25 @@ mod tests {
     }
 
     #[test]
+    fn the_store_lives_beside_the_feed_cache() {
+        let d = tempfile::tempdir().unwrap();
+        add(
+            d.path(),
+            entry(NearEnvironment::Production, Role::Gateway, 1, "2026-11-25"),
+        )
+        .unwrap();
+        let store = d
+            .path()
+            .join(".local/share/nearai-red-sandbox/trusted-composes.json");
+        assert!(store.is_file(), "{store:?}");
+        assert_eq!(
+            crate::install::trusted_composes_path(d.path()).parent(),
+            crate::install::attestation_policy_dir(d.path()).parent()
+        );
+        assert!(!d.path().join("trusted-composes.json").exists());
+    }
+
+    #[test]
     fn list_lines_formats_each_entry() {
         assert_eq!(
             list_lines(&TrustedComposes::default()),
@@ -337,7 +360,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(d.path().join(FILE))
+            let mode = std::fs::metadata(crate::install::trusted_composes_path(d.path()))
                 .unwrap()
                 .permissions()
                 .mode();
@@ -398,10 +421,11 @@ mod tests {
             assert_eq!(warn, None, "round {round}");
             assert!(!got.entries.is_empty(), "round {round}");
         }
-        let leftovers: Vec<_> = std::fs::read_dir(d.path())
+        let store = crate::install::trusted_composes_path(d.path());
+        let leftovers: Vec<_> = std::fs::read_dir(store.parent().unwrap())
             .unwrap()
             .map(|e| e.unwrap().file_name())
-            .filter(|n| n != FILE)
+            .filter(|n| n != store.file_name().unwrap())
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
@@ -451,7 +475,7 @@ mod tests {
         write_raw(d.path(), "{");
         let (got, warn) = load(Some(d.path()));
         assert!(got.entries.is_empty());
-        assert!(warn.unwrap().contains(FILE));
+        assert!(warn.unwrap().contains("trusted-composes.json"));
     }
 
     #[test]
@@ -479,7 +503,7 @@ mod tests {
             entry(NearEnvironment::Production, Role::Gateway, 1, "2026-11-25"),
         )
         .unwrap();
-        let p = d.path().join(FILE);
+        let p = crate::install::trusted_composes_path(d.path());
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
         let (got, warn) = load(Some(d.path()));
         assert!(got.entries.is_empty());
@@ -529,9 +553,12 @@ mod tests {
             e.sha256 = h;
             add(d.path(), e).unwrap();
         }
-        let before = std::fs::read(d.path().join(FILE)).unwrap();
+        let before = std::fs::read(crate::install::trusted_composes_path(d.path())).unwrap();
         assert!(forget(d.path(), "abababab").is_err());
-        assert_eq!(std::fs::read(d.path().join(FILE)).unwrap(), before);
+        assert_eq!(
+            std::fs::read(crate::install::trusted_composes_path(d.path())).unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -552,9 +579,9 @@ mod tests {
 
     fn write_raw(home: &Path, text: &str) {
         use std::io::Write;
-        let mut f =
-            crate::sys::fs::open_private(&home.join(FILE), crate::sys::fs::Create::Truncate)
-                .unwrap();
+        let path = crate::install::trusted_composes_path(home);
+        crate::sys::fs::create_private_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = crate::sys::fs::open_private(&path, crate::sys::fs::Create::Truncate).unwrap();
         f.write_all(text.as_bytes()).unwrap();
     }
 }

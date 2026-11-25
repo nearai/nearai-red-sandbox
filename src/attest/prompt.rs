@@ -620,7 +620,8 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
     #[test]
     fn the_launch_prints_a_hostile_store_warning_without_escapes() {
         let d = tempfile::tempdir().unwrap();
-        let path = d.path().join(trusted::FILE);
+        let path = crate::install::trusted_composes_path(d.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, r#"{"version":1,"entries":[],"\u001b[2J":1}"#).unwrap();
         #[cfg(unix)]
         {
@@ -839,7 +840,8 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
     #[test]
     fn a_hostile_store_key_cannot_reach_the_terminal_in_the_warning() {
         let d = tempfile::tempdir().unwrap();
-        let path = d.path().join(trusted::FILE);
+        let path = crate::install::trusted_composes_path(d.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, r#"{"version":1,"entries":[],"\u001b[2J":1}"#).unwrap();
         #[cfg(unix)]
         {

@@ -123,6 +123,12 @@ pub fn attestation_policy_dir(home: &Path) -> PathBuf {
     under(home, HOME_SHARE).join("attestation-policy")
 }
 
+/// The user's trusted compose hashes (`attest::trusted`), beside the
+/// attestation policy cache.
+pub fn trusted_composes_path(home: &Path) -> PathBuf {
+    under(home, HOME_SHARE).join("trusted-composes.json")
+}
+
 pub struct Lookup<'a> {
     /// `env!("CARGO_MANIFEST_DIR")`: the checkout a source build came from.
     pub source: &'a Path,
