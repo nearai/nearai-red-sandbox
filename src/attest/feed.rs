@@ -461,9 +461,13 @@ pub fn refresh_due(doc: Option<&FeedDocument>, loaded_at: u64, now: u64) -> bool
     doc.is_some_and(|d| now >= d.expires) || now.saturating_sub(loaded_at) > REFRESH_AFTER_SECS
 }
 
-/// Reloads `current` with `reload` when [`refresh_due`], keeping whatever it
-/// returns (it has already fallen back to the cache), records `now` as the
-/// load time, and returns its source.
+/// Reloads `current` with `reload` when [`refresh_due`], records `now` as the
+/// load time, and returns the source of the document now in use. The reload
+/// (which has already fallen back to the cache) replaces `current` unless
+/// `current` is unexpired and the reload found nothing or a lower version:
+/// the session never goes back to an older document, or drops a newer one's
+/// revocations, because the disk's copy or mark lags behind it (a failed
+/// cache write, a discarded cache file).
 fn refresh_with(
     current: &mut Option<FeedDocument>,
     loaded_at: &mut u64,
@@ -474,8 +478,21 @@ fn refresh_with(
         return None;
     }
     let (doc, source) = reload();
-    *current = doc;
     *loaded_at = now;
+    if let Some(held) = current.as_ref().filter(|c| now < c.expires) {
+        let found = match &doc {
+            None => Some("found none".to_string()),
+            Some(d) if d.version < held.version => Some(format!("found older v{}", d.version)),
+            Some(_) => None,
+        };
+        if let Some(found) = found {
+            return Some(FeedSource::Cached(
+                held.version,
+                format!("kept in memory; the reload {found}"),
+            ));
+        }
+    }
+    *current = doc;
     Some(source)
 }
 
@@ -1858,8 +1875,9 @@ mod tests {
         assert_eq!(src, None);
         assert!(current.is_some());
         assert_eq!(loaded_at, NOW);
-        // Due: the reload's result replaces it, even when it is nothing, and
-        // the attempt counts as a load so a failing one is not retried at once.
+        // Due and expired by then: the reload's result replaces it, even when
+        // it is nothing, and the attempt counts as a load so a failing one is
+        // not retried at once.
         let due = NOW + REFRESH_AFTER_SECS + 1;
         let src = refresh_with(&mut current, &mut loaded_at, due, || {
             (None, FeedSource::CompiledIn("gone".into()))
@@ -1968,5 +1986,135 @@ mod tests {
         assert_eq!(current.as_ref().map(|d| d.version), Some(ISSUED + 1));
         let err = admits(&current).unwrap_err();
         assert!(err.contains("revoked"), "{err}");
+    }
+
+    /// A launch fetched v2, which revokes a compose v1 endorsed, but its cache
+    /// write failed, so the disk still holds v1 under a v1 mark. An hour later
+    /// the network is down and the reload falls back to that v1. The session
+    /// must keep v2 and keep refusing the compose.
+    #[test]
+    fn a_reload_never_rolls_the_session_back_to_an_older_document() {
+        use crate::attest::ComposePolicy;
+        use crate::attest::report::check_compose;
+        use sha2::{Digest, Sha256};
+
+        let compose = "services: {revoked-in-v2}";
+        let hash: [u8; 32] = Sha256::digest(compose.as_bytes()).into();
+        let mut mr = [0u8; 48];
+        mr[0] = 1;
+        mr[1..33].copy_from_slice(&hash);
+        let entries = format!(
+            r#"[{{"role": "model", "match": "exact", "sha256": "{}", "app_name": "dstack-nvidia-0.5.11", "first_seen": "2026-11-20T09:14:40Z", "endorsed_by": "rules:model-v1"}}]"#,
+            hex::encode(hash)
+        );
+        let v1 = Doc {
+            entries: entries.clone(),
+            revoked: "[]".into(),
+            ..Doc::good()
+        }
+        .text();
+        let v2 = Doc {
+            version: ISSUED + 1,
+            entries,
+            revoked: format!(r#"["{}"]"#, hex::encode(hash)),
+            ..Doc::good()
+        }
+        .text();
+        let admits = |doc: &Option<FeedDocument>| {
+            let mut policy = Policy::default();
+            if let Some(d) = doc {
+                merge(&mut policy, d);
+            }
+            check_compose(
+                &mr,
+                compose,
+                &policy,
+                Role::Model,
+                ComposePolicy::Pinned,
+                false,
+            )
+        };
+
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        // An earlier launch cached v1.
+        let (_, src) = load(&serving(&v1, &v1), home, NOW);
+        assert_eq!(src, FeedSource::Fetched(ISSUED));
+        // This session fetched v2; its cache write failed, so the disk is
+        // unchanged.
+        let mut current = Some(check(&v2, NOW, 0).unwrap());
+        assert!(admits(&current).unwrap_err().contains("revoked"));
+
+        let later = NOW + REFRESH_AFTER_SECS + 1;
+        let reload = || {
+            load_feed_switched(
+                &Unavailable("offline".into()),
+                home,
+                NearEnvironment::Production,
+                later,
+                &keys(),
+                false,
+            )
+        };
+        let mut loaded_at = NOW;
+        let src = refresh_with(&mut current, &mut loaded_at, later, reload);
+        assert!(
+            matches!(&src, Some(FeedSource::Cached(v, why))
+                if *v == ISSUED + 1 && why.contains(&format!("older v{ISSUED}"))),
+            "{src:?}"
+        );
+        assert_eq!(loaded_at, later, "the attempt still counts as a load");
+        assert_eq!(current.as_ref().map(|d| d.version), Some(ISSUED + 1));
+        let err = admits(&current).unwrap_err();
+        assert!(err.contains("revoked"), "{err}");
+    }
+
+    #[test]
+    fn a_reload_that_finds_nothing_keeps_an_unexpired_document() {
+        let v2 = FeedDocument {
+            version: ISSUED + 1,
+            ..feed_doc(NOW + 2 * REFRESH_AFTER_SECS)
+        };
+        let mut current = Some(v2.clone());
+        let mut loaded_at = NOW;
+        let due = NOW + REFRESH_AFTER_SECS + 1;
+        let src = refresh_with(&mut current, &mut loaded_at, due, || {
+            (None, FeedSource::CompiledIn("cache discarded".into()))
+        });
+        assert!(
+            matches!(&src, Some(FeedSource::Cached(v, _)) if *v == ISSUED + 1),
+            "{src:?}"
+        );
+        assert_eq!(current, Some(v2));
+        assert_eq!(loaded_at, due);
+        // And the next retry is an hour away, not at once.
+        let src = refresh_with(&mut current, &mut loaded_at, due + 1, || panic!("reloaded"));
+        assert_eq!(src, None);
+    }
+
+    #[test]
+    fn an_expired_document_is_replaced_by_nothing_or_an_older_one() {
+        let v2 = FeedDocument {
+            version: ISSUED + 1,
+            ..feed_doc(NOW)
+        };
+        // Expired: replaced by nothing.
+        let mut current = Some(v2.clone());
+        let mut loaded_at = NOW;
+        let src = refresh_with(&mut current, &mut loaded_at, NOW, || {
+            (None, FeedSource::CompiledIn("gone".into()))
+        });
+        assert_eq!(src, Some(FeedSource::CompiledIn("gone".into())));
+        assert_eq!(current, None);
+        // Expired: replaced by a lower version.
+        let v1 = feed_doc(NOW + 100);
+        let mut current = Some(v2);
+        let mut loaded_at = NOW;
+        let one = v1.clone();
+        let src = refresh_with(&mut current, &mut loaded_at, NOW, move || {
+            (Some(one), FeedSource::Cached(ISSUED, "offline".into()))
+        });
+        assert_eq!(src, Some(FeedSource::Cached(ISSUED, "offline".into())));
+        assert_eq!(current, Some(v1));
     }
 }
