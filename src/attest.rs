@@ -3,6 +3,7 @@
 //! collateral, and its GPU evidence checked through NVIDIA NRAS. Every check
 //! fails closed.
 
+pub mod feed;
 pub mod http;
 pub mod normalize;
 pub mod nras;
