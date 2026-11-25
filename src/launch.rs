@@ -35,6 +35,10 @@ pub struct LaunchSpec {
     /// The NEAR AI deployment for attestation, its pinned compose list, and
     /// inference. Staging needs `CredentialSource::Supplied` with a staging key.
     pub near: inference::NearEnvironment,
+    /// The command the trust prompt names for forgetting a trusted build.
+    /// `None` is `rts trust forget`; an embedding app without `rts` on its
+    /// PATH names its own.
+    pub trust_forget_command: Option<String>,
 }
 
 /// Result of a completed session launch.
@@ -82,6 +86,7 @@ impl LaunchSpec {
             ironwire: IronWireSetup::default(),
             env: std::env::vars().collect(),
             near: inference::NearEnvironment::Production,
+            trust_forget_command: None,
         })
     }
 }
@@ -367,6 +372,7 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
         ironwire,
         env,
         near,
+        trust_forget_command,
     } = spec;
     if initial_prompt.is_some() {
         // A source-built launcher paired with an older installed plugin must
@@ -469,6 +475,9 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                         feed_home.as_deref(),
                         unix_now(),
                         &mut attest::prompt::TerminalAsk,
+                        trust_forget_command
+                            .as_deref()
+                            .unwrap_or(attest::prompt::DEFAULT_FORGET_COMMAND),
                         |trusted| {
                             attest::Attestor::real(
                                 near,
@@ -694,6 +703,7 @@ mod tests {
         assert!(spec.tool_command.is_none());
         // The CLI signs in natively, which is production only.
         assert_eq!(spec.near, inference::NearEnvironment::Production);
+        assert_eq!(spec.trust_forget_command, None);
 
         let no_net = LaunchSpec::from_cli(
             Some(&cfg_path),

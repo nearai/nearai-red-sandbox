@@ -124,6 +124,10 @@ The prompt and the per-launch line say only that the build is new and that
 the user trusted it. They never mention review: what the user decides on is
 the build, the checks that ran and the Compare link.
 
+An embedding app can name its own forget command
+(`LaunchSpec::trust_forget_command`); Gateway uses
+`near-ai red-team trust forget`, approved by the owner on 2026-11-25.
+
 The prompt, for a gateway build:
 
 ```

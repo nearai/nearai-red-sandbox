@@ -78,7 +78,17 @@ fn short(hash: &[u8; 32]) -> String {
     hex::encode(&hash[..4])
 }
 
-pub fn prompt_text(nt: &NotTrusted) -> String {
+/// The command the prompt names for forgetting a trusted build, unless the
+/// embedding app names its own.
+pub const DEFAULT_FORGET_COMMAND: &str = "rts trust forget";
+
+/// `forget_command` is displayed text from the embedding app, so it is
+/// filtered like any other; an empty result falls back to the default.
+pub fn prompt_text(nt: &NotTrusted, forget_command: &str) -> String {
+    let forget_command = match printable(forget_command, 64) {
+        f if f.is_empty() => DEFAULT_FORGET_COMMAND.to_string(),
+        f => f,
+    };
     let first = match nt.role {
         Role::Gateway => "NEAR AI moved its production gateway to a new build.".to_string(),
         Role::Model => format!("NEAR AI moved {} to a new build.", printable(&nt.model, 64)),
@@ -93,7 +103,7 @@ pub fn prompt_text(nt: &NotTrusted) -> String {
          \n  Checked  {checked}\
          \n  Compare  {compare}\n\
          \nTrust this build on this device? Red Sandbox will use it without asking\
-         \nagain until you run `rts trust forget {short}`. [y/N]",
+         \nagain until you run `{forget_command} {short}`. [y/N]",
         build = display_app_name(nt.app_name.as_deref()),
         hash = hex::encode(nt.hash),
         compare = compare_url(&nt.hash),
@@ -249,6 +259,7 @@ pub fn attest_with_consent(
     home: Option<&Path>,
     now: u64,
     ask: &mut dyn Ask,
+    forget_command: &str,
     mut attest: impl FnMut(&BTreeMap<[u8; 32], Role>) -> Result<Attested, AttestationFailure>,
 ) -> Result<Attested, AttestationFailure> {
     let (mut store, warning) = trusted::load(home);
@@ -273,7 +284,10 @@ pub fn attest_with_consent(
                     return Err(AttestationFailure::ComposeNotTrusted(nt));
                 }
                 prompts += 1;
-                if !ask.ask(&prompt_text(&nt)).is_some_and(|a| accepted(&a)) {
+                if !ask
+                    .ask(&prompt_text(&nt, forget_command))
+                    .is_some_and(|a| accepted(&a))
+                {
                     return Err(AttestationFailure::ComposeNotTrusted(nt));
                 }
                 let entry = TrustedEntry {
@@ -400,6 +414,7 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
             home,
             NOW,
             ask,
+            DEFAULT_FORGET_COMMAND,
             |trusted| {
                 maps.push(trusted.clone());
                 results.pop_front().expect("an attest result was queued")
@@ -424,13 +439,43 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
     }
 
     #[test]
+    fn the_prompt_names_the_configured_forget_command() {
+        let text = prompt_text(&gw(), "near-ai red-team trust forget");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[lines.len() - 2..],
+            [
+                "Trust this build on this device? Red Sandbox will use it without asking",
+                "again until you run `near-ai red-team trust forget f4a9b480`. [y/N]",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hostile_forget_command_is_filtered() {
+        let text = prompt_text(&gw(), "evil\x1b[2J\nforget");
+        assert!(!text.contains('\x1b'), "{text:?}");
+        assert_eq!(
+            text.lines().count(),
+            prompt_text(&gw(), DEFAULT_FORGET_COMMAND).lines().count()
+        );
+        assert!(text.contains("`evil[2Jforget f4a9b480`"), "{text:?}");
+    }
+
+    #[test]
+    fn an_empty_forget_command_falls_back_to_rts() {
+        assert_eq!(prompt_text(&gw(), ""), EXPECTED_GATEWAY);
+        assert_eq!(prompt_text(&gw(), "\x1b\n"), EXPECTED_GATEWAY);
+    }
+
+    #[test]
     fn the_gateway_prompt_matches_the_approved_wording() {
-        assert_eq!(prompt_text(&gw()), EXPECTED_GATEWAY);
+        assert_eq!(prompt_text(&gw(), DEFAULT_FORGET_COMMAND), EXPECTED_GATEWAY);
     }
 
     #[test]
     fn the_model_prompt_names_the_model() {
-        let text = prompt_text(&model_nt(7));
+        let text = prompt_text(&model_nt(7), DEFAULT_FORGET_COMMAND);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "NEAR AI moved zai-org/GLM-5 to a new build.");
         assert_eq!(lines[2], "  Build    vllm-glm");
@@ -450,7 +495,11 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
     #[test]
     fn the_prompt_never_mentions_review() {
         for nt in [gw(), model_nt(1)] {
-            assert!(!prompt_text(&nt).to_lowercase().contains("review"));
+            assert!(
+                !prompt_text(&nt, DEFAULT_FORGET_COMMAND)
+                    .to_lowercase()
+                    .contains("review")
+            );
         }
         for role in [Role::Gateway, Role::Model] {
             let line = trusted_line("m", role, &[1; 32], "2026-11-25");
@@ -482,7 +531,7 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
         let long = "A".repeat(200);
         let mut nt = gw();
         nt.app_name = Some(format!("\x1b[2Jevil\rname\nInjected  line{long}"));
-        let text = prompt_text(&nt);
+        let text = prompt_text(&nt, DEFAULT_FORGET_COMMAND);
         assert!(!text.contains('\x1b'), "{text:?}");
         assert!(!text.contains('\r'), "{text:?}");
         assert_eq!(text.lines().count(), EXPECTED_GATEWAY.lines().count());
@@ -498,7 +547,7 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
         assert_eq!(display_app_name(None), "unknown");
         assert_eq!(display_app_name(Some(&"b".repeat(200))), "b".repeat(64));
         nt.app_name = None;
-        assert!(prompt_text(&nt).contains("\n  Build    unknown\n"));
+        assert!(prompt_text(&nt, DEFAULT_FORGET_COMMAND).contains("\n  Build    unknown\n"));
     }
 
     #[test]
@@ -506,7 +555,7 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
         let long = "M".repeat(200);
         let mut nt = model_nt(7);
         nt.model = format!("\x1b[2Jevil\rmodel\n{long}");
-        let text = prompt_text(&nt);
+        let text = prompt_text(&nt, DEFAULT_FORGET_COMMAND);
         assert!(!text.contains('\x1b') && !text.contains('\r'), "{text:?}");
         assert_eq!(text.lines().count(), EXPECTED_GATEWAY.lines().count());
         let first = text.lines().next().unwrap();
@@ -637,6 +686,7 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
             Some(d.path()),
             NOW,
             &mut ScriptedAsk::default(),
+            DEFAULT_FORGET_COMMAND,
             |_| Ok(Attested::default()),
         );
         assert!(out.is_ok());
@@ -744,7 +794,10 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
         assert_eq!(out.unwrap(), ok_with(9));
         assert_eq!(
             ask.shown,
-            vec![prompt_text(&model_nt(1)), prompt_text(&model_nt(2))]
+            vec![
+                prompt_text(&model_nt(1), DEFAULT_FORGET_COMMAND),
+                prompt_text(&model_nt(2), DEFAULT_FORGET_COMMAND)
+            ]
         );
         assert_eq!(maps.len(), 3);
         assert_eq!(
@@ -821,6 +874,7 @@ again until you run `rts trust forget f4a9b480`. [y/N]";
             Some(&home),
             NOW,
             &mut ask,
+            DEFAULT_FORGET_COMMAND,
             |_| {
                 calls += 1;
                 not_trusted(gw())

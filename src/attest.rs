@@ -1432,6 +1432,7 @@ mod tests {
             Some(home.path()),
             1_795_608_000,
             &mut ask,
+            crate::attest::prompt::DEFAULT_FORGET_COMMAND,
             |trusted| {
                 let mut policy = base_policy.clone();
                 policy.user_trusted = trusted.clone();
