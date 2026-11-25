@@ -1,0 +1,383 @@
+# Publish the signed attestation policy feed: one document per NEAR AI
+# environment, as assets of the fixed release tag `attestation-policy`
+# (production.json, production.json.sig, staging.json, staging.json.sig).
+# See docs/specs/2026-11-24-signed-attestation-policy-feed-design.md, "CI: the
+# publisher".
+#
+# Two jobs, so the signing key never shares a job with network input or a
+# freshly built rts:
+#
+# - evaluate (macos-26, contents: read, issues: write, secret NEAR_AI_API_KEY
+#   only) runs rts's own live attestation test 8 times per environment with
+#   RTS_LIVE_COMPOSE_POLICY=mr-config-only, runs the content rules on every
+#   verified compose the current document does not already cover, uploads the
+#   raw composes and its proposed next document as the artifact
+#   attestation-policy-evaluation, and opens or updates one issue per held
+#   compose.
+# - sign (ubuntu-24.04, environment attestation-policy, contents: write)
+#   trusts only the raw composes in that artifact. It downloads and verifies
+#   the current documents itself, recomputes every entry with
+#   scripts/attestation-policy/build_document.py reproduce (hashes, rules for
+#   both roles, cosign for changed nearaidev/* digests), refuses if the
+#   proposal lists anything it did not reproduce, signs with
+#   scripts/attestation-policy/sign-policy.sh, uploads the document and then
+#   its signature, and commits both to the attestation-policy-log branch with
+#   createCommitOnBranch (a GitHub-signed commit).
+#
+# A held compose is approved only by merging a reviewed pull request that adds
+# it to opencode/attestation-baselines/; that push triggers a run that signs it.
+#
+# Configuration:
+# - Repository variable RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX: the keys
+#   compiled into rts, "CI,RECOVERY" (64 lowercase hex each). The first is
+#   the CI key, the one the environment secret must match. Either key may
+#   have signed the current document.
+# - Environment attestation-policy (restricted to main, no reviewers: it runs
+#   unattended) holds the secret RTS_ATTESTATION_POLICY_SIGNING_KEY_PEM_BASE64.
+# - Repository variable ATTESTATION_POLICY_DRY_RUN=1 skips the release upload,
+#   the log commit and the hold issues, and only logs what they would do.
+# - The release tag attestation-policy and the branch attestation-policy-log
+#   must exist before the first run.
+name: attestation-policy
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - "opencode/attestation-baselines/**"
+  workflow_dispatch:
+
+concurrency:
+  group: attestation-policy
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  ARTIFACT: attestation-policy-evaluation
+  DRY_RUN: ${{ vars.ATTESTATION_POLICY_DRY_RUN == '1' && '1' || '0' }}
+  FEED_BASE: https://github.com/${{ github.repository }}/releases/download/attestation-policy
+
+jobs:
+  evaluate:
+    name: collect, run the rules, propose
+    # macos-26, the release runner, not a retired label: a retired label queues forever.
+    runs-on: macos-26
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write
+    env:
+      RUSTFLAGS: "-D warnings"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install cosign
+        run: brew install cosign
+
+      - name: Build the live attestation test
+        run: cargo test --locked --test live_attest --no-run
+
+      # Each call lands on whichever instances the gateway picks, so each
+      # environment is sampled 8 times, each into its own record directory. A
+      # sample that does not verify writes no evidence and is only a warning.
+      - name: Collect verified composes
+        env:
+          RTS_LIVE_COMPOSE_POLICY: mr-config-only
+          RTS_LIVE_NEAR_API_KEY: ${{ secrets.NEAR_AI_API_KEY }}
+        run: |
+          set -euo pipefail
+          for environment in production staging; do
+            mkdir -p "$RUNNER_TEMP/evidence/$environment"
+            for i in 1 2 3 4 5 6 7 8; do
+              if ! RTS_LIVE_NEAR_ENVIRONMENT="$environment" \
+                RTS_LIVE_RECORD_DIR="$RUNNER_TEMP/evidence/$environment/run-$i" \
+                cargo test --locked --test live_attest attestation_verifies_for_every_model \
+                  -- --ignored --exact --test-threads=1; then
+                echo "::warning::$environment sample $i did not verify; it contributes no evidence"
+              fi
+            done
+          done
+
+      - name: Download the current documents
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/current"
+          for environment in production staging; do
+            status=$(curl -sS -L --max-filesize 262144 -o "$RUNNER_TEMP/current/$environment.json" \
+              -w '%{http_code}' "$FEED_BASE/$environment.json")
+            case "$status" in
+              200) echo "current $environment document downloaded" ;;
+              404) rm -f "$RUNNER_TEMP/current/$environment.json"; echo "no current $environment document" ;;
+              *) echo "refusing: $FEED_BASE/$environment.json answered $status" >&2; exit 1 ;;
+            esac
+          done
+
+      - name: Propose
+        run: |
+          set -euo pipefail
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          for environment in production staging; do
+            current=()
+            if [ -f "$RUNNER_TEMP/current/$environment.json" ]; then
+              current=(--current "$RUNNER_TEMP/current/$environment.json")
+            fi
+            python3 -I scripts/attestation-policy/build_document.py propose \
+              --environment "$environment" \
+              --evidence "$RUNNER_TEMP/evidence/$environment" \
+              "${current[@]}" \
+              --baselines opencode/attestation-baselines \
+              --now "$now" \
+              --out "$RUNNER_TEMP/proposal/$environment" \
+              --cosign "$(command -v cosign)"
+          done
+
+      - name: Upload the evaluation
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: ${{ runner.temp }}/proposal
+          if-no-files-found: error
+          retention-days: 30
+
+      # Titles are built only from the environment, the role and hex digests;
+      # bodies go through --body-file, never through the shell.
+      - name: Open or update hold issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for environment in production staging; do
+            out="$RUNNER_TEMP/issues/$environment"
+            python3 -I scripts/attestation-policy/build_document.py issues \
+              --environment "$environment" \
+              --holds "$RUNNER_TEMP/proposal/$environment/holds.json" \
+              --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --artifact "$ARTIFACT" \
+              --out "$out"
+            for t in "$out"/*.title; do
+              [ -e "$t" ] || continue
+              title=$(cat "$t")
+              body="${t%.title}.md"
+              if [ "$DRY_RUN" = 1 ]; then
+                echo "dry run: would open or update: $title"
+                continue
+              fi
+              number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" \
+                --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)
+              if [ -n "$number" ]; then
+                gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --body-file "$body"
+              else
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body"
+              fi
+            done
+          done
+
+  sign:
+    name: reproduce, sign, publish
+    needs: evaluate
+    runs-on: ubuntu-24.04
+    environment: attestation-policy
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      # A compose that cosign refuses here is dropped and gets a hold issue.
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The version checked against the nearaidev images in
+      # docs/plans/2026-11-24-cosign-check.md.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v3.1.4
+
+      - name: Download the evaluation
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: ${{ runner.temp }}/evaluation
+
+      - name: Check the public keys
+        env:
+          KEYS: ${{ vars.RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$KEYS" =~ ^[0-9a-f]{64}(,[0-9a-f]{64})?$ ]]; then
+            echo "refusing: repository variable RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX is not one or two comma-separated 64 lowercase hex keys" >&2
+            exit 1
+          fi
+          openssl version
+
+      # The release assets are not trusted: a current document is carried
+      # forward only if one of the compiled-in keys signed it.
+      - name: Download and verify the current documents
+        env:
+          KEYS: ${{ vars.RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX }}
+        run: |
+          set -euo pipefail
+          w="$RUNNER_TEMP/verify"
+          mkdir -p "$w" "$RUNNER_TEMP/current"
+          fetch() {
+            curl -sS -L --max-filesize "$2" -o "$3" -w '%{http_code}' "$1"
+          }
+          verify() {
+            python3 -I -c 'import base64, sys; sys.stdout.buffer.write(base64.b64decode(open(sys.argv[1], "rb").read().rstrip(b"\n"), validate=True))' "$2" > "$w/sig.bin"
+            local k
+            for k in ${KEYS//,/ }; do
+              python3 -I -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))' "302a300506032b6570032100$k" > "$w/pub.der"
+              openssl pkey -pubin -inform DER -in "$w/pub.der" -out "$w/pub.pem"
+              if openssl pkeyutl -verify -pubin -inkey "$w/pub.pem" -rawin -in "$1" -sigfile "$w/sig.bin" >/dev/null 2>&1; then
+                return 0
+              fi
+            done
+            return 1
+          }
+          for environment in production staging; do
+            doc="$RUNNER_TEMP/current/$environment.json"
+            doc_status=$(fetch "$FEED_BASE/$environment.json" 262144 "$doc")
+            sig_status=$(fetch "$FEED_BASE/$environment.json.sig" 1024 "$doc.sig")
+            if [ "$doc_status" = 404 ] && [ "$sig_status" = 404 ]; then
+              rm -f "$doc" "$doc.sig"
+              echo "no current $environment document"
+            elif [ "$doc_status" = 200 ] && [ "$sig_status" = 200 ]; then
+              verify "$doc" "$doc.sig" || { echo "refusing: the current $environment document does not verify with any compiled-in key" >&2; exit 1; }
+              echo "current $environment document verified"
+            else
+              echo "refusing: $environment.json answered $doc_status and $environment.json.sig answered $sig_status" >&2
+              exit 1
+            fi
+          done
+
+      - name: Reproduce
+        run: |
+          set -euo pipefail
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          for environment in production staging; do
+            eval_dir="$RUNNER_TEMP/evaluation/$environment"
+            # upload-artifact drops an empty directory.
+            mkdir -p "$eval_dir/candidates"
+            current=()
+            if [ -f "$RUNNER_TEMP/current/$environment.json" ]; then
+              current=(--current "$RUNNER_TEMP/current/$environment.json")
+            fi
+            python3 -I scripts/attestation-policy/build_document.py reproduce \
+              --environment "$environment" \
+              --candidates "$eval_dir/candidates" \
+              --proposed "$eval_dir/proposed.json" \
+              "${current[@]}" \
+              --baselines opencode/attestation-baselines \
+              --now "$now" \
+              --out "$RUNNER_TEMP/sign/$environment" \
+              --cosign "$(command -v cosign)"
+          done
+
+      # The only step that sees the private key.
+      - name: Sign
+        env:
+          KEYS: ${{ vars.RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX }}
+          RTS_ATTESTATION_POLICY_SIGNING_KEY_PEM_BASE64: ${{ secrets.RTS_ATTESTATION_POLICY_SIGNING_KEY_PEM_BASE64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/publish"
+          for environment in production staging; do
+            if [ -f "$RUNNER_TEMP/sign/$environment/document.json" ]; then
+              bash scripts/attestation-policy/sign-policy.sh \
+                --environment "$environment" \
+                --in "$RUNNER_TEMP/sign/$environment/document.json" \
+                --public-key-hex "${KEYS%%,*}" \
+                --dir "$RUNNER_TEMP/publish" \
+                --openssl "$(command -v openssl)"
+            fi
+          done
+
+      # Document first, then its signature: a client that fetches between the
+      # two sees a mismatch and falls back to its cache.
+      - name: Upload to the attestation-policy release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for environment in production staging; do
+            doc="$RUNNER_TEMP/publish/$environment.json"
+            [ -f "$doc" ] || continue
+            if [ "$DRY_RUN" = 1 ]; then
+              echo "dry run: would upload $environment.json and $environment.json.sig"
+              continue
+            fi
+            gh release upload attestation-policy --repo "$GITHUB_REPOSITORY" --clobber "$doc"
+            gh release upload attestation-policy --repo "$GITHUB_REPOSITORY" --clobber "$doc.sig"
+          done
+
+      - name: Commit to the attestation-policy-log branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for environment in production staging; do
+            doc="$RUNNER_TEMP/publish/$environment.json"
+            [ -f "$doc" ] || continue
+            if [ "$DRY_RUN" = 1 ]; then
+              echo "dry run: would commit $environment.json to attestation-policy-log"
+              continue
+            fi
+            head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/attestation-policy-log" --jq .object.sha)
+            python3 -I - "$GITHUB_REPOSITORY" "$head" "$environment" "$doc" > "$RUNNER_TEMP/commit-$environment.json" <<'EOF'
+          import base64, json, sys
+          repo, head, env, doc = sys.argv[1:]
+          data = open(doc, "rb").read()
+          version = json.loads(data)["version"]
+          files = [(f"{env}.json", data), (f"{env}.json.sig", open(doc + ".sig", "rb").read())]
+          print(json.dumps({
+              "query": "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid url } } }",
+              "variables": {"input": {
+                  "branch": {"repositoryNameWithOwner": repo, "branchName": "attestation-policy-log"},
+                  "message": {"headline": f"Publish the {env} attestation policy version {version}"},
+                  "expectedHeadOid": head,
+                  "fileChanges": {"additions": [
+                      {"path": p, "contents": base64.b64encode(b).decode()} for p, b in files]},
+              }},
+          }))
+          EOF
+            gh api graphql --input "$RUNNER_TEMP/commit-$environment.json" \
+              --jq '.data.createCommitOnBranch.commit.url'
+          done
+
+      - name: Open or update hold issues for refused provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for environment in production staging; do
+            out="$RUNNER_TEMP/issues/$environment"
+            python3 -I scripts/attestation-policy/build_document.py issues \
+              --environment "$environment" \
+              --holds "$RUNNER_TEMP/sign/$environment/holds.json" \
+              --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --artifact "$ARTIFACT" \
+              --out "$out"
+            for t in "$out"/*.title; do
+              [ -e "$t" ] || continue
+              title=$(cat "$t")
+              body="${t%.title}.md"
+              if [ "$DRY_RUN" = 1 ]; then
+                echo "dry run: would open or update: $title"
+                continue
+              fi
+              number=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" \
+                --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)
+              if [ -n "$number" ]; then
+                gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --body-file "$body"
+              else
+                gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body"
+              fi
+            done
+          done

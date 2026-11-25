@@ -2117,4 +2117,36 @@ mod tests {
         assert_eq!(src, Some(FeedSource::Cached(ISSUED, "offline".into())));
         assert_eq!(current, Some(v1));
     }
+
+    /// The publisher's round trip: `scripts/attestation-policy/test_build_document.py`
+    /// signs a document with `sign-policy.sh` and runs this to check that
+    /// `verify_document` accepts it, now, with no high-water mark. Reads
+    /// `RTS_FEED_VERIFY_DOC` and `RTS_FEED_VERIFY_SIG` (paths),
+    /// `RTS_FEED_VERIFY_KEY` (one or two comma-separated hex keys) and
+    /// `RTS_FEED_VERIFY_ENV` (`production` or `staging`).
+    #[test]
+    #[ignore = "run by scripts/attestation-policy/test_build_document.py"]
+    fn verify_document_from_env() {
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
+        let doc = std::fs::read(var("RTS_FEED_VERIFY_DOC")).unwrap();
+        let sig = std::fs::read(var("RTS_FEED_VERIFY_SIG")).unwrap();
+        let (k, n) = parse_feed_keys(&var("RTS_FEED_VERIFY_KEY"));
+        let env = match var("RTS_FEED_VERIFY_ENV").as_str() {
+            "production" => NearEnvironment::Production,
+            "staging" => NearEnvironment::Staging,
+            other => panic!("RTS_FEED_VERIFY_ENV {other:?} is not production or staging"),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let d = verify_document(&doc, &sig, &k[..n], env, now, 0)
+            .unwrap_or_else(|e| panic!("refused: {e}"));
+        println!(
+            "verified version {}: {} entries, {} revoked",
+            d.version,
+            d.entries.len(),
+            d.revoked.len()
+        );
+    }
 }
