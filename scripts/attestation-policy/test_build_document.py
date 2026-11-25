@@ -10,6 +10,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import textwrap
 import sys
 
 import pytest
@@ -294,6 +295,119 @@ def test_sign_policy_refuses_a_document_for_another_environment(tmp_path):
     assert s.returncode == 1
     assert "environment" in s.stderr
     assert not (signed / "staging.json").exists()
+
+
+KMS_VERSION = "projects/p-1/locations/us/keyRings/ring_1/cryptoKeys/ci-signing/cryptoKeyVersions/1"
+
+
+def _gcloud_stub(tmp_path, openssl, key_b64):
+    """A gcloud that signs --input-file with key_b64's key, as Cloud KMS signs
+    with an Ed25519 key (64 raw bytes over the exact bytes), and records its
+    arguments."""
+    bin_dir = tmp_path / "gcloud-bin"
+    bin_dir.mkdir(exist_ok=True)
+    pem = tmp_path / "kms-key.pem"
+    pem.write_bytes(base64.b64decode(key_b64))
+    calls = tmp_path / "gcloud-calls"
+    exe = bin_dir / "gcloud"
+    exe.write_text(textwrap.dedent(f"""\
+        #!/bin/bash
+        printf '%s\\n' "$*" >> "{calls}"
+        inp=; sig=
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --input-file) inp=$2; shift 2 ;;
+            --signature-file) sig=$2; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        exec "{openssl}" pkeyutl -sign -rawin -inkey "{pem}" -in "$inp" -out "$sig"
+        """))
+    exe.chmod(0o755)
+    return exe, calls
+
+
+def _sign_kms(tmp_path, openssl, doc, gcloud, pub_hex, kms_key=KMS_VERSION, pem_b64=None):
+    out = tmp_path / "signed"
+    out.mkdir(exist_ok=True)
+    env = {k: v for k, v in os.environ.items() if k != "RTS_ATTESTATION_POLICY_SIGNING_KEY_PEM_BASE64"}
+    if pem_b64 is not None:
+        env["RTS_ATTESTATION_POLICY_SIGNING_KEY_PEM_BASE64"] = pem_b64
+    return subprocess.run(["bash", str(SIGN), "--environment", "production", "--in", str(doc),
+                           "--public-key-hex", pub_hex, "--dir", str(out), "--openssl", openssl,
+                           "--kms-key", kms_key, "--gcloud", str(gcloud)],
+                          capture_output=True, text=True, env=env), out
+
+
+def test_sign_policy_signs_with_a_cloud_kms_key(tmp_path):
+    openssl = _openssl()
+    if openssl is None:
+        pytest.skip("OpenSSL 3 or later is not on PATH")
+    r, out = reproduce(tmp_path, baselines(tmp_path), candidates(tmp_path), proposed(tmp_path, []))
+    assert r.returncode == 0, r.stdout + r.stderr
+    key_b64, pub = _keypair(tmp_path, openssl)
+    gcloud, calls = _gcloud_stub(tmp_path, openssl, key_b64)
+    s, signed = _sign_kms(tmp_path, openssl, out / "document.json", gcloud, pub)
+    assert s.returncode == 0, s.stdout + s.stderr
+    assert (signed / "production.json").read_bytes() == (out / "document.json").read_bytes()
+    sig = base64.b64decode((signed / "production.json.sig").read_bytes(), validate=True)
+    assert len(sig) == 64
+    (call,) = calls.read_text().splitlines()
+    assert call.startswith("kms asymmetric-sign ")
+    for flag in ("--project p-1", "--location us", "--keyring ring_1", "--key ci-signing", "--version 1"):
+        assert flag in call, call
+
+
+def test_sign_policy_refuses_a_cloud_kms_key_that_does_not_match_the_public_key(tmp_path):
+    openssl = _openssl()
+    if openssl is None:
+        pytest.skip("OpenSSL 3 or later is not on PATH")
+    r, out = reproduce(tmp_path, baselines(tmp_path), candidates(tmp_path), proposed(tmp_path, []))
+    assert r.returncode == 0, r.stdout + r.stderr
+    key_b64, _ = _keypair(tmp_path, openssl)
+    _, other_pub = _keypair(tmp_path, openssl)
+    gcloud, _ = _gcloud_stub(tmp_path, openssl, key_b64)
+    s, signed = _sign_kms(tmp_path, openssl, out / "document.json", gcloud, other_pub)
+    assert s.returncode == 1
+    assert "does not verify with --public-key-hex" in s.stderr
+    assert not (signed / "production.json").exists()
+    assert not (signed / "production.json.sig").exists()
+
+
+@pytest.mark.parametrize("kms_key", [
+    "projects/p/locations/us/keyRings/r/cryptoKeys/k",
+    "projects/p/locations/us/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1 ",
+    "projects/p;rm/locations/us/keyRings/r/cryptoKeys/k/cryptoKeyVersions/1",
+    "projects/p/locations/us/keyRings/r/cryptoKeys/k/cryptoKeyVersions/x",
+])
+def test_sign_policy_refuses_a_malformed_cloud_kms_key_version(tmp_path, kms_key):
+    openssl = _openssl()
+    if openssl is None:
+        pytest.skip("OpenSSL 3 or later is not on PATH")
+    doc = tmp_path / "doc.json"
+    doc.write_text('{"schema":1,"environment":"production"}')
+    key_b64, pub = _keypair(tmp_path, openssl)
+    gcloud, calls = _gcloud_stub(tmp_path, openssl, key_b64)
+    s, signed = _sign_kms(tmp_path, openssl, doc, gcloud, pub, kms_key=kms_key)
+    assert s.returncode == 1
+    assert "--kms-key" in s.stderr
+    assert not calls.exists()
+    assert not (signed / "production.json").exists()
+
+
+def test_sign_policy_refuses_both_a_cloud_kms_key_and_a_pem(tmp_path):
+    openssl = _openssl()
+    if openssl is None:
+        pytest.skip("OpenSSL 3 or later is not on PATH")
+    doc = tmp_path / "doc.json"
+    doc.write_text('{"schema":1,"environment":"production"}')
+    key_b64, pub = _keypair(tmp_path, openssl)
+    gcloud, calls = _gcloud_stub(tmp_path, openssl, key_b64)
+    s, signed = _sign_kms(tmp_path, openssl, doc, gcloud, pub, pem_b64=key_b64)
+    assert s.returncode == 1
+    assert "not both" in s.stderr
+    assert not calls.exists()
+    assert not (signed / "production.json").exists()
 
 
 # --- propose ---------------------------------------------------------------

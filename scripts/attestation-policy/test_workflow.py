@@ -207,3 +207,28 @@ def test_any_other_status_refuses_even_with_a_logged_document(tmp_path, producti
                        {"production", "staging"})
     assert r.returncode != 0
     assert "refusing" in r.stderr
+
+
+# --- the CI key lives in Cloud KMS -------------------------------------------
+
+def test_the_sign_job_signs_through_cloud_kms_and_holds_no_key():
+    text = WORKFLOW.read_text()
+    assert "SIGNING_KEY_PEM" not in text
+    names = step_names("sign")
+    auth = "Authenticate to the Cloud KMS signer"
+    # Federation is the last thing before signing: no earlier step can reach the key.
+    assert names.index("Reproduce") < names.index(auth) == names.index("Sign") - 1
+    sign = run_block("sign", "Sign")
+    assert '--kms-key "$CI_KMS_KEY"' in sign
+    assert re.search(
+        r"^  CI_KMS_KEY: projects/[^/]+/locations/[^/]+/keyRings/[^/]+/cryptoKeys/[^/]+/cryptoKeyVersions/[1-9][0-9]*$",
+        text, re.M)
+    lines = text.splitlines()
+    start = lines.index("  sign:")
+    end = next((n for n in range(start + 1, len(lines)) if re.match(r"  \S", lines[n])), len(lines))
+    job = "\n".join(lines[start:end])
+    assert "secrets." not in job, "the sign job must not read any secret"
+    assert "      id-token: write" in job
+    # Only the sign job may mint an OIDC token.
+    assert text.count("id-token: write") == 1
+    assert re.search(r"uses: google-github-actions/auth@[0-9a-f]{40} # v", job)

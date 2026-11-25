@@ -40,10 +40,19 @@
 # Configuration:
 # - Repository variable RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX: the keys
 #   compiled into rts, "CI,RECOVERY" (64 lowercase hex each). The first is
-#   the CI key, the one the environment secret must match. Either key may
+#   the CI key, the one the Cloud KMS key below must match. Either key may
 #   have signed the current document.
-# - Environment attestation-policy (restricted to main, no reviewers: it runs
-#   unattended) holds the secret RTS_ATTESTATION_POLICY_SIGNING_KEY_PEM_BASE64.
+# - The CI key is the Cloud KMS EC_SIGN_ED25519 key version CI_KMS_KEY below;
+#   its private half never leaves KMS. The sign job reaches it through
+#   Workload Identity Federation as the service account CI_KMS_SIGNER, which
+#   holds roles/cloudkms.signer on that key alone. The pool provider admits
+#   only this repository's attestation-policy.yml on refs/heads/main in the
+#   attestation-policy environment, and the service account trusts only the
+#   subject repo:nearai/nearai-red-sandbox:environment:attestation-policy.
+#   The recovery key is a separate KMS key in a separate project, which this
+#   workflow cannot reach.
+# - Environment attestation-policy: restricted to main, no reviewers (it runs
+#   unattended). It holds no secret.
 # - Repository variable ATTESTATION_POLICY_DRY_RUN=1 skips the release upload,
 #   the log commit and the hold issues, and only logs what they would do.
 # - The release tag attestation-policy and the branch attestation-policy-log
@@ -70,6 +79,9 @@ env:
   ARTIFACT: attestation-policy-evaluation
   DRY_RUN: ${{ vars.ATTESTATION_POLICY_DRY_RUN == '1' && '1' || '0' }}
   FEED_BASE: https://github.com/${{ github.repository }}/releases/download/attestation-policy
+  CI_KMS_KEY: projects/nearai-red-sandbox/locations/us/keyRings/attestation-policy/cryptoKeys/ci-signing/cryptoKeyVersions/1
+  CI_KMS_PROVIDER: projects/519541856107/locations/global/workloadIdentityPools/github-actions/providers/nearai-red-sandbox
+  CI_KMS_SIGNER: attestation-policy-signer@nearai-red-sandbox.iam.gserviceaccount.com
 
 jobs:
   evaluate:
@@ -205,6 +217,8 @@ jobs:
       contents: write
       # A compose that cosign refuses here is dropped and gets a hold issue.
       issues: write
+      # The OIDC token Workload Identity Federation exchanges for the KMS signer.
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -369,11 +383,19 @@ jobs:
               --cosign "$(command -v cosign)"
           done
 
-      # The only step that sees the private key.
+      # Authenticated only after Reproduce, so nothing before signing holds a
+      # credential that can reach the key.
+      - name: Authenticate to the Cloud KMS signer
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.CI_KMS_PROVIDER }}
+          service_account: ${{ env.CI_KMS_SIGNER }}
+          create_credentials_file: true
+
+      # The only step that uses the signing key, through Cloud KMS.
       - name: Sign
         env:
           KEYS: ${{ vars.RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX }}
-          RTS_ATTESTATION_POLICY_SIGNING_KEY_PEM_BASE64: ${{ secrets.RTS_ATTESTATION_POLICY_SIGNING_KEY_PEM_BASE64 }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/publish"
@@ -384,7 +406,9 @@ jobs:
                 --in "$RUNNER_TEMP/sign/$environment/document.json" \
                 --public-key-hex "${KEYS%%,*}" \
                 --dir "$RUNNER_TEMP/publish" \
-                --openssl "$(command -v openssl)"
+                --openssl "$(command -v openssl)" \
+                --kms-key "$CI_KMS_KEY" \
+                --gcloud "$(command -v gcloud)"
             fi
           done
 

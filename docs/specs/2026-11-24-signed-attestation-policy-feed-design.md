@@ -228,9 +228,12 @@ New workflow `.github/workflows/attestation-policy.yml`:
     next document.
   - **`sign`**: in a new environment, `attestation-policy`, restricted to
     `main`. The environment cannot require reviewers, because it runs
-    unattended. It holds the only copy of the CI private key
-    (`RTS_ATTESTATION_POLICY_SIGNING_KEY_PEM_BASE64`), so the release workflow,
-    pull requests and forks never see it. `sign` does not trust the proposed
+    unattended. Only `sign` can reach the CI key, which is a Cloud KMS
+    `EC_SIGN_ED25519` key whose private half never leaves KMS: the job
+    federates its OIDC token (Workload Identity Federation, admitted only for
+    this workflow on `main` in this environment) to a service account that
+    holds `roles/cloudkms.signer` on that key alone. The release workflow,
+    pull requests and forks cannot reach it. `sign` does not trust the proposed
     document. It recomputes every new entry from the raw `app_compose` in the
     artifact: sha256 of the bytes, normalization, and the content rules in a
     stdlib-only Python script checked into the repository. It signs only
