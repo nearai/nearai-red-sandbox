@@ -460,10 +460,14 @@ verification commands, `--force`, and installation behavior.
 Ed25519 update public key:
 `9b4a81b8bd017898c36871c6bd1cb890faf95b6e378e72eb99b9c15841f02ac9`
 
-Ed25519 attestation policy feed public keys (the CI signing key, then the
-offline recovery key): not yet generated. This section is filled in with both
-keys once they exist, and the repository variable
-`RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX` must hold the same two values.
+Ed25519 attestation policy feed public keys. The repository variable
+`RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX` holds the same two values, in this
+order:
+
+- CI signing key (Cloud KMS, used only by the `attestation-policy` workflow):
+  `7b528575c138cd711ed863eb59a7a95d78d79d222a8a962ddb25196ccc14db5c`
+- Recovery key (Cloud KMS, in a separate project the workflow cannot reach):
+  `39982511b3d64da04fbb22cbec7e6040ae5c844ec750a428e6528f221ffd4d17`
 
 ## <img src="docs/assets/ramp.svg" alt="" height="16"> Project status
 
