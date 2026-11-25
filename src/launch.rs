@@ -437,8 +437,9 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
             )?;
             // Once per launch, before attestation and bounded to 5 s: a
             // sign-in retry attests again with the same document.
+            let feed_loaded_at = unix_now();
             let (feed_doc, feed_source) =
-                attest::feed::session_feed(feed_home.as_deref(), near, unix_now());
+                attest::feed::session_feed(feed_home.as_deref(), near, feed_loaded_at);
             brand::progress::message(&format!("[rts] {}", feed_source.line()));
             let sign_in = SignInHooks {
                 load_for_launch: &auth::load_for_launch,
@@ -482,19 +483,28 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                             let credentials = credentials.clone();
                             let models = cfg.provider.models.clone();
                             let options = attest_options;
-                            // The launch's document and line; reloaded once the
-                            // cached copy is over an hour old or it expires.
-                            let feed = Arc::new(Mutex::new((feed_doc.clone(), feed_source.line())));
+                            // The launch's document, when this session loaded it,
+                            // and its line; reloaded an hour after this session's
+                            // last load, or once it expires.
+                            let feed = Arc::new(Mutex::new((
+                                feed_doc.clone(),
+                                feed_loaded_at,
+                                feed_source.line(),
+                            )));
                             let feed_home = feed_home.clone();
                             Arc::new(move || {
                                 let snapshot = credentials.snapshot()?;
                                 let doc = {
                                     let mut state = feed.lock().unwrap_or_else(|e| e.into_inner());
-                                    let (doc, last) = &mut *state;
+                                    let (doc, loaded_at, last) = &mut *state;
                                     let now = unix_now();
-                                    if let Some(source) =
-                                        attest::feed::refresh(doc, feed_home.as_deref(), near, now)
-                                    {
+                                    if let Some(source) = attest::feed::refresh(
+                                        doc,
+                                        loaded_at,
+                                        feed_home.as_deref(),
+                                        near,
+                                        now,
+                                    ) {
                                         let line = source.line();
                                         if line != *last {
                                             brand::progress::message(&format!("[rts] {line}"));

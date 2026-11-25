@@ -169,8 +169,10 @@ people and the log. `rts` does not act on them.
    `compose_acceptance: "endorsed"`, the feed `version` and the match used,
    so every session's evidence names the document that admitted it.
 5. When fetched: at launch, before attestation, on a worker bounded by 5
-   seconds. And in the forwarder's re-attestation, when the cached document is
-   more than an hour old. Launch prints one line naming the source used:
+   seconds. And in the forwarder's re-attestation, when this session last
+   loaded its document more than an hour ago, or that document has expired.
+   The hour is the session's own, not the cache file's age, which another
+   session can keep fresh. Launch prints one line naming the source used:
    feed version, cached version, or compiled-in only.
 6. `RTS_ATTESTATION_POLICY_FEED=off` skips the fetch and uses only the
    compiled-in lists, for offline and reproducible runs.

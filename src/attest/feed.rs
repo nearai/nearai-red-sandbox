@@ -355,24 +355,12 @@ fn load_feed_switched(
     }
 }
 
-/// Seconds since the cached document for `env` was last fetched (its file's
-/// modification time), 0 if that is in the future; None with no cache.
-pub fn cached_age(home: &Path, env: NearEnvironment, now: u64) -> Option<u64> {
-    let modified = std::fs::metadata(Cache::new(home, env).doc)
-        .ok()?
-        .modified()
-        .ok()?;
-    let at = modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    Some(now.saturating_sub(at))
-}
-
 /// How long a launch, or a re-attestation's reload, waits for the fetch.
 pub const FETCH_BOUND: Duration = Duration::from_secs(5);
-/// A re-attestation reloads the feed once the cached document was last
-/// fetched longer ago than this.
+/// A re-attestation reloads the feed once this session last loaded its
+/// document longer ago than this. It is measured from the session's own
+/// load, not the cache file's age: another session, or this launch's late
+/// worker, can keep the file fresh while the document in use goes stale.
 pub const REFRESH_AFTER_SECS: u64 = 3600;
 
 /// Fails every request with its reason: the cache-only path.
@@ -465,40 +453,44 @@ pub fn session_feed(
     }
 }
 
-/// Whether a re-attestation reloads the feed: the cached document was
-/// fetched over an hour ago, or the document in use has expired. With no
-/// cache and no document in use (launch found none), it does not retry on
-/// every re-attestation.
-pub fn refresh_due(doc: Option<&FeedDocument>, cached_age: Option<u64>, now: u64) -> bool {
-    doc.is_some_and(|d| now >= d.expires) || cached_age.is_some_and(|a| a > REFRESH_AFTER_SECS)
+/// Whether a re-attestation reloads the feed: this session last loaded it
+/// (at launch or a reload, whatever that returned) over an hour before
+/// `now`, or the document in use has expired. A failed reload is retried an
+/// hour later, not on every re-attestation.
+pub fn refresh_due(doc: Option<&FeedDocument>, loaded_at: u64, now: u64) -> bool {
+    doc.is_some_and(|d| now >= d.expires) || now.saturating_sub(loaded_at) > REFRESH_AFTER_SECS
 }
 
 /// Reloads `current` with `reload` when [`refresh_due`], keeping whatever it
-/// returns (it has already fallen back to the cache), and returns its source.
+/// returns (it has already fallen back to the cache), records `now` as the
+/// load time, and returns its source.
 fn refresh_with(
     current: &mut Option<FeedDocument>,
-    cached_age: Option<u64>,
+    loaded_at: &mut u64,
     now: u64,
     reload: impl FnOnce() -> (Option<FeedDocument>, FeedSource),
 ) -> Option<FeedSource> {
-    if !refresh_due(current.as_ref(), cached_age, now) {
+    if !refresh_due(current.as_ref(), *loaded_at, now) {
         return None;
     }
     let (doc, source) = reload();
     *current = doc;
+    *loaded_at = now;
     Some(source)
 }
 
-/// Re-attestation's reload of `current` (see [`refresh_due`]); None when
-/// nothing was reloaded. A disabled feed is never reloaded.
+/// Re-attestation's reload of `current`, which this session last loaded at
+/// `loaded_at` (see [`refresh_due`]); None when nothing was reloaded. A
+/// disabled feed is never reloaded.
 pub fn refresh(
     current: &mut Option<FeedDocument>,
+    loaded_at: &mut u64,
     home: Option<&Path>,
     env: NearEnvironment,
     now: u64,
 ) -> Option<FeedSource> {
     let home = home.filter(|_| feed_enabled())?;
-    refresh_with(current, cached_age(home, env, now), now, || {
+    refresh_with(current, loaded_at, now, || {
         session_feed(Some(home), env, now)
     })
 }
@@ -1717,33 +1709,6 @@ mod tests {
         assert!(compiled_in_reason(src).contains("no cached"));
     }
 
-    #[test]
-    fn cached_age_is_the_time_since_the_last_fetch() {
-        let t = tempfile::tempdir().unwrap();
-        let home = t.path();
-        assert_eq!(cached_age(home, NearEnvironment::Production, NOW), None);
-        seed(home, ISSUED);
-        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(ISSUED);
-        std::fs::File::options()
-            .write(true)
-            .open(cached(home, "production.json"))
-            .unwrap()
-            .set_modified(at)
-            .unwrap();
-        assert_eq!(
-            cached_age(home, NearEnvironment::Production, ISSUED + 4000),
-            Some(4000)
-        );
-        assert_eq!(
-            cached_age(home, NearEnvironment::Production, ISSUED - 5),
-            Some(0)
-        );
-        assert_eq!(
-            cached_age(home, NearEnvironment::Staging, ISSUED + 4000),
-            None
-        );
-    }
-
     // ---- Launch bound and re-attestation refresh ----
 
     use std::sync::Arc;
@@ -1869,44 +1834,139 @@ mod tests {
     }
 
     #[test]
-    fn refresh_is_due_after_an_hour_or_at_expiry() {
+    fn refresh_is_due_an_hour_after_the_session_loaded_or_at_expiry() {
         let d = feed_doc(NOW + 10);
-        assert!(!refresh_due(Some(&d), Some(REFRESH_AFTER_SECS), NOW));
-        assert!(refresh_due(Some(&d), Some(REFRESH_AFTER_SECS + 1), NOW));
-        assert!(refresh_due(None, Some(REFRESH_AFTER_SECS + 1), NOW));
+        // Measured from this session's load, whatever the cache file says.
+        assert!(!refresh_due(Some(&d), NOW - REFRESH_AFTER_SECS, NOW));
+        assert!(refresh_due(Some(&d), NOW - REFRESH_AFTER_SECS - 1, NOW));
+        // A launch that found nothing still retries hourly, not every time.
+        assert!(!refresh_due(None, NOW, NOW));
+        assert!(!refresh_due(None, NOW - REFRESH_AFTER_SECS, NOW));
+        assert!(refresh_due(None, NOW - REFRESH_AFTER_SECS - 1, NOW));
         // An expired document in memory is never used again unreloaded.
-        assert!(refresh_due(Some(&d), Some(0), NOW + 10));
-        assert!(refresh_due(Some(&d), None, NOW + 10));
-        // No cache and no document: launch found none; do not retry every
-        // re-attestation.
-        assert!(!refresh_due(None, None, NOW));
-        assert!(!refresh_due(Some(&d), None, NOW));
+        assert!(refresh_due(Some(&d), NOW + 10, NOW + 10));
+        // A clock that went backwards does not force a reload.
+        assert!(!refresh_due(Some(&d), NOW + 5, NOW));
     }
 
     #[test]
     fn a_refresh_keeps_whatever_the_reload_returns() {
         let mut current = Some(feed_doc(NOW + 10));
-        // Not due: no reload.
-        let src = refresh_with(&mut current, Some(0), NOW, || panic!("reloaded"));
+        let mut loaded_at = NOW;
+        // Not due: no reload, load time unchanged.
+        let src = refresh_with(&mut current, &mut loaded_at, NOW + 1, || panic!("reloaded"));
         assert_eq!(src, None);
         assert!(current.is_some());
-        // Due: the reload's result replaces it, even when it is nothing.
-        let src = refresh_with(&mut current, Some(REFRESH_AFTER_SECS + 1), NOW, || {
+        assert_eq!(loaded_at, NOW);
+        // Due: the reload's result replaces it, even when it is nothing, and
+        // the attempt counts as a load so a failing one is not retried at once.
+        let due = NOW + REFRESH_AFTER_SECS + 1;
+        let src = refresh_with(&mut current, &mut loaded_at, due, || {
             (None, FeedSource::CompiledIn("gone".into()))
         });
         assert_eq!(src, Some(FeedSource::CompiledIn("gone".into())));
         assert!(current.is_none());
-        // Expired in memory: reloaded, and a newer document replaces it.
+        assert_eq!(loaded_at, due);
+        let src = refresh_with(&mut current, &mut loaded_at, due + 1, || panic!("reloaded"));
+        assert_eq!(src, None);
+        // Expired in memory: reloaded though loaded just now, and a newer
+        // document replaces it.
         let mut current = Some(feed_doc(NOW));
+        let mut loaded_at = NOW;
         let newer = FeedDocument {
             version: ISSUED + 1,
             ..feed_doc(NOW + 100)
         };
         let n = newer.clone();
-        let src = refresh_with(&mut current, Some(0), NOW, move || {
+        let src = refresh_with(&mut current, &mut loaded_at, NOW, move || {
             (Some(n), FeedSource::Fetched(ISSUED + 1))
         });
         assert_eq!(src, Some(FeedSource::Fetched(ISSUED + 1)));
         assert_eq!(current, Some(newer));
+    }
+
+    /// A session loaded a document that endorses a compose; an hour later a
+    /// newer document revoking it is already in a fresh cache file (another
+    /// session, or this launch's late worker, wrote it). Re-attestation must
+    /// adopt it and refuse the compose.
+    #[test]
+    fn a_fresh_cache_does_not_keep_a_stale_session_document() {
+        use crate::attest::ComposePolicy;
+        use crate::attest::report::{ComposeAcceptance, check_compose};
+        use sha2::{Digest, Sha256};
+
+        let compose = "services: {revoked-later}";
+        let hash: [u8; 32] = Sha256::digest(compose.as_bytes()).into();
+        let mut mr = [0u8; 48];
+        mr[0] = 1;
+        mr[1..33].copy_from_slice(&hash);
+        let entries = format!(
+            r#"[{{"role": "model", "match": "exact", "sha256": "{}", "app_name": "dstack-nvidia-0.5.11", "first_seen": "2026-11-20T09:14:40Z", "endorsed_by": "rules:model-v1"}}]"#,
+            hex::encode(hash)
+        );
+        let old = Doc {
+            entries: entries.clone(),
+            revoked: "[]".into(),
+            ..Doc::good()
+        }
+        .text();
+        let newer = Doc {
+            version: ISSUED + 1,
+            entries,
+            revoked: format!(r#"["{}"]"#, hex::encode(hash)),
+            ..Doc::good()
+        }
+        .text();
+        let admits = |doc: &Option<FeedDocument>| {
+            let mut policy = Policy::default();
+            if let Some(d) = doc {
+                merge(&mut policy, d);
+            }
+            check_compose(
+                &mr,
+                compose,
+                &policy,
+                Role::Model,
+                ComposePolicy::Pinned,
+                false,
+            )
+        };
+
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        // Launch at NOW loads the old document.
+        let (mut current, src) = load(&serving(&old, &old), home, NOW);
+        assert_eq!(src, FeedSource::Fetched(ISSUED));
+        assert_eq!(
+            admits(&current).unwrap().1,
+            ComposeAcceptance::Endorsed,
+            "the old document endorses the compose"
+        );
+        // The newer document lands in the cache; the file is fresh.
+        let (_, src) = load(&serving(&newer, &newer), home, NOW);
+        assert_eq!(src, FeedSource::Fetched(ISSUED + 1));
+
+        // Re-attestation over an hour after this session loaded its document;
+        // the network is down, so a reload falls back to the cache.
+        let later = NOW + REFRESH_AFTER_SECS + 1;
+        let reload = || {
+            load_feed_switched(
+                &Unavailable("offline".into()),
+                home,
+                NearEnvironment::Production,
+                later,
+                &keys(),
+                false,
+            )
+        };
+        let mut loaded_at = NOW;
+        let src = refresh_with(&mut current, &mut loaded_at, later, reload);
+        assert!(
+            matches!(src, Some(FeedSource::Cached(v, _)) if v == ISSUED + 1),
+            "{src:?}"
+        );
+        assert_eq!(current.as_ref().map(|d| d.version), Some(ISSUED + 1));
+        let err = admits(&current).unwrap_err();
+        assert!(err.contains("revoked"), "{err}");
     }
 }

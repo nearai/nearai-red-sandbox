@@ -37,7 +37,7 @@ test.
 - Feed URLs: `https://github.com/nearai/nearai-red-sandbox/releases/download/attestation-policy/{production,staging}.json` and the same path with `.json.sig`.
 - Caps: document 256 KiB (262144 bytes), signature 1 KiB (1024 bytes).
 - Validity: `expires` = `issued` + 72 h when signed. `rts` accepts `expires - issued` <= 7 days, and `issued` <= now + 300 s.
-- Fetch bound 5 s at launch. Re-fetch in re-attestation when the cached document is older than 3600 s.
+- Fetch bound 5 s at launch. Re-fetch in re-attestation when this session last loaded its document more than 3600 s ago, or the document in use has expired. Measure from the session's own load, not the cache file's age.
 - Build variable: `RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX`, one or two comma-separated 64-hex keys. Environment secret: `RTS_ATTESTATION_POLICY_SIGNING_KEY_PEM_BASE64` in environment `attestation-policy`.
 - Opt-out variable: `RTS_ATTESTATION_POLICY_FEED=off`.
 - Cache files: `~/.local/share/nearai-red-sandbox/attestation-policy/<environment>.json`, `.json.sig`, and `<environment>.version` (high-water), directory 0700.
@@ -333,7 +333,7 @@ Use the line regex from the spec, matched by hand with `str::lines` plus a byte 
   - `pub enum FeedSource { Fetched(u64), Cached(u64), CompiledIn(String /* reason */) }`
   - `pub fn load_feed(fetch: &dyn Fetch, home: &Path, env: NearEnvironment, now: u64, keys: &[[u8; 32]]) -> (Option<FeedDocument>, FeedSource)`. It never errors. On fetch or verify failure it uses the cache, then nothing.
   - `pub fn feed_enabled() -> bool`: false when `FEED_KEYS` is empty or `RTS_ATTESTATION_POLICY_FEED` is `off`.
-  - `pub fn cached_age(home: &Path, env: NearEnvironment, now: u64) -> Option<u64>`
+  - `pub fn refresh(current: &mut Option<FeedDocument>, loaded_at: &mut u64, home: Option<&Path>, env: NearEnvironment, now: u64) -> Option<FeedSource>`: reloads when `refresh_due(doc, loaded_at, now)`, then sets `loaded_at = now`. (An earlier draft used `cached_age`, the cache file's age. It was dropped because another session, or this launch's late worker, can keep the file fresh while the document in use goes stale.)
 
 - [ ] **Step 1: Write the failing tests** (a fake `Fetch` that serves fixed bodies, and `tempfile::tempdir()` as in `src/update.rs` tests)
 
@@ -398,7 +398,7 @@ At launch, call `load_feed` on a thread joined with a 5-second timeout, and prin
 - `Attestation policy: cached feed v<version> (<reason>)`
 - `Attestation policy: compiled-in only (<reason>)`
 
-In the re-attestation closure, reload when `cached_age` is over 3600 seconds.
+In the re-attestation closure, keep the time this session last loaded its document (launch, then each reload attempt, whatever it returned). Reload when that is over 3600 seconds ago, or when the document in use has expired. Do not use the cache file's age: the file can be fresh while this session's document is stale, which would delay a revocation by up to 72 hours.
 
 - [ ] **Step 4: Run the full crate tests through the test lock**
 
