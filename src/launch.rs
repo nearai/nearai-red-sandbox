@@ -94,7 +94,7 @@ pub fn private_git_config(prefix: &str) -> Result<(tempfile::TempDir, PathBuf), 
         .map_err(|_| "Cannot create a private temp directory")?;
     let empty_git_config = temp.path().join("empty.gitconfig");
     crate::sys::fs::open_private(&empty_git_config, crate::sys::fs::Create::New)
-    .map_err(|_| "Cannot create an empty Git configuration")?;
+        .map_err(|_| "Cannot create an empty Git configuration")?;
     Ok((temp, empty_git_config))
 }
 
@@ -277,8 +277,7 @@ fn resolve_and_attest(
                 let step = progress.step("sign-in", Live::Still);
                 step.ok("supplied NEAR AI key");
             }
-            let step = progress
-                .map(|p| p.step("attestation", Live::Decode(models.join(", "))));
+            let step = progress.map(|p| p.step("attestation", Live::Decode(models.join(", "))));
             let attested = attest_key(key.clone()).map_err(|error| refused(error.message()))?;
             let credentials = crate::sponsored::Credentials::new(
                 key.clone(),
@@ -305,8 +304,7 @@ fn resolve_and_attest(
                     "NEAR AI Cloud"
                 });
             }
-            let step = progress
-                .map(|p| p.step("attestation", Live::Decode(models.join(", "))));
+            let step = progress.map(|p| p.step("attestation", Live::Decode(models.join(", "))));
             let attested = match attest_key(credential.key.clone()) {
                 Ok(attested) => attested,
                 Err(attest::AttestationFailure::CredentialRefused { .. })
@@ -449,7 +447,10 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
             // both ends of the terminal are there.
             let ttys = {
                 use std::io::IsTerminal;
-                (std::io::stdin().is_terminal(), std::io::stderr().is_terminal())
+                (
+                    std::io::stdin().is_terminal(),
+                    std::io::stderr().is_terminal(),
+                )
             };
             let (attested, credentials) = resolve_and_attest(
                 &credential,
@@ -568,15 +569,19 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                                 };
                                 match attest(snapshot.key).map(warn) {
                                     Ok(attested) => Ok(attested),
-                                    Err(attest::AttestationFailure::CredentialRefused { .. })
-                                        if snapshot.sponsored =>
-                                    {
-                                        brand::progress::message("Your sponsored API key is no longer available. Sign in to NEAR AI Cloud to continue.");
+                                    Err(attest::AttestationFailure::CredentialRefused {
+                                        ..
+                                    }) if snapshot.sponsored => {
+                                        brand::progress::message(
+                                            "Your sponsored API key is no longer available. Sign in to NEAR AI Cloud to continue.",
+                                        );
                                         // Reattest runs on the forwarder's blocking pool;
                                         // share any login already pending on its runtime.
                                         let next = tokio::runtime::Handle::current()
                                             .block_on(credentials.recover(snapshot.generation))?;
-                                        attest(next.key).map(warn).map_err(attest::AttestationFailure::message)
+                                        attest(next.key)
+                                            .map(warn)
+                                            .map_err(attest::AttestationFailure::message)
                                     }
                                     Err(error) => Err(error.message()),
                                 }
@@ -1097,7 +1102,11 @@ mod tests {
         .unwrap();
         let snap = creds.snapshot().unwrap();
         assert!(!snap.sponsored);
-        let err = creds.recover(snap.generation).await.err().expect("recovery must fail");
+        let err = creds
+            .recover(snap.generation)
+            .await
+            .err()
+            .expect("recovery must fail");
         assert!(!err.is_empty());
     }
 }

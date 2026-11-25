@@ -11,9 +11,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use rts::{attest, auth, bridge, config, launch, setup};
 #[cfg(unix)]
 use rts::session;
+use rts::{attest, auth, bridge, config, launch, setup};
 
 /// `--allow-host` entries in the order given, and `--no-network`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -48,20 +48,33 @@ impl PromptSource {
                 // hanging before we can verify the opened object is a file.
                 let file = rts::sys::fs::open_read_nonblocking(path)
                     .map_err(|e| format!("cannot read prompt file {}: {e}", path.display()))?;
-                if !file.metadata().map_err(|e| format!("cannot inspect prompt file {}: {e}", path.display()))?.is_file() {
-                    return Err(format!("prompt file {} must be a regular file", path.display()));
+                if !file
+                    .metadata()
+                    .map_err(|e| format!("cannot inspect prompt file {}: {e}", path.display()))?
+                    .is_file()
+                {
+                    return Err(format!(
+                        "prompt file {} must be a regular file",
+                        path.display()
+                    ));
                 }
                 let mut bytes = Vec::new();
-                file.take((MAX_PROMPT_BYTES + 1) as u64).read_to_end(&mut bytes)
+                file.take((MAX_PROMPT_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)
                     .map_err(|e| format!("cannot read prompt file {}: {e}", path.display()))?;
                 if bytes.len() > MAX_PROMPT_BYTES {
-                    return Err(format!("initial prompt must be at most {MAX_PROMPT_BYTES} bytes"));
+                    return Err(format!(
+                        "initial prompt must be at most {MAX_PROMPT_BYTES} bytes"
+                    ));
                 }
-                String::from_utf8(bytes).map_err(|_| "prompt file must contain UTF-8 text".to_string())?
+                String::from_utf8(bytes)
+                    .map_err(|_| "prompt file must contain UTF-8 text".to_string())?
             }
         };
         if text.len() > MAX_PROMPT_BYTES {
-            return Err(format!("initial prompt must be at most {MAX_PROMPT_BYTES} bytes"));
+            return Err(format!(
+                "initial prompt must be at most {MAX_PROMPT_BYTES} bytes"
+            ));
         }
         if text.trim().is_empty() {
             return Err("initial prompt must not be empty or whitespace-only".into());
@@ -145,7 +158,9 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
     let mut seen = std::collections::HashSet::new();
     let mut flags = flags.iter();
     while let Some(&flag) = flags.next() {
-        if matches!(flag, "--help" | "-h") { return Ok(Action::Help); }
+        if matches!(flag, "--help" | "-h") {
+            return Ok(Action::Help);
+        }
         let launch_only = matches!(
             flag,
             "--config"
@@ -329,7 +344,9 @@ fn setup_command(o: &setup::SetupOptions) -> Result<i32, String> {
     let mut product_type = 0u32;
     // SAFETY: a plain query with a valid out-pointer.
     unsafe { GetProductInfo(10, 0, 0, 0, &mut product_type) };
-    let hyperv = rts::backend::hyperv::hcs::available().err().map(|e| e.to_string());
+    let hyperv = rts::backend::hyperv::hcs::available()
+        .err()
+        .map(|e| e.to_string());
     let fetch = setup::HttpsFetch::new()?;
     let home = rts::install::home_in(&env, true)
         .filter(|h| h.is_absolute())
@@ -371,16 +388,25 @@ fn setup_command(o: &setup::SetupOptions) -> Result<i32, String> {
     let defaults = config::Defaults::from_env();
     let explicit_mvmctl = env.iter().any(|(k, _)| k == "RTS_MVMCTL");
     let supervisor = session::supervisor_path(&env, rts::install::current_prefix().as_deref())?;
-    let rts_exe = std::env::current_exe().map_err(|e| format!("Cannot locate the running rts: {e}"))?;
+    let rts_exe =
+        std::env::current_exe().map_err(|e| format!("Cannot locate the running rts: {e}"))?;
     let (_temp, empty_git_config) = launch::private_git_config("rts-setup-")?;
     let fetch = setup::HttpsFetch::new()?;
     let mvm_plain = setup::plain_mvm_runner(&defaults.mvmctl, &empty_git_config, &env);
     let flavor = rts::backend::mvm::Flavor::host();
-    let shim_dir = empty_git_config.parent().map(|p| p.join("sudo-shim")).ok_or("the setup Git configuration has no parent directory")?;
+    let shim_dir = empty_git_config
+        .parent()
+        .map(|p| p.join("sudo-shim"))
+        .ok_or("the setup Git configuration has no parent directory")?;
     let mvm = rts::mvm::SpawnRunner {
         mvmctl: defaults.mvmctl.clone(),
         empty_git_config,
-        extra_env: rts::backend::mvm::MvmBackend::mvmctl_environment(flavor, &env, Some(&supervisor), &shim_dir)?,
+        extra_env: rts::backend::mvm::MvmBackend::mvmctl_environment(
+            flavor,
+            &env,
+            Some(&supervisor),
+            &shim_dir,
+        )?,
         remove_env: Vec::new(),
     };
     let lines = setup::run(
@@ -535,7 +561,10 @@ mod tests {
 
     #[test]
     fn parses_trust_list_and_forget() {
-        assert!(matches!(parse_args(&["trust", "list"]), Ok(Action::Trust(TrustCommand::List))));
+        assert!(matches!(
+            parse_args(&["trust", "list"]),
+            Ok(Action::Trust(TrustCommand::List))
+        ));
         assert!(matches!(
             parse_args(&["trust", "forget", "f4a9b480"]),
             Ok(Action::Trust(TrustCommand::Forget(p))) if p == "f4a9b480"
@@ -574,9 +603,21 @@ mod tests {
         ] {
             assert!(parse_args(&flags).is_err(), "accepted {flags:?}");
         }
-        let Action::Launch { prompt: Some(source), .. } = parse_args(&["launch", "--prompt", "- review /in"]).unwrap() else { panic!("missing prompt") };
+        let Action::Launch {
+            prompt: Some(source),
+            ..
+        } = parse_args(&["launch", "--prompt", "- review /in"]).unwrap()
+        else {
+            panic!("missing prompt")
+        };
         assert_eq!(source.read().unwrap(), "- review /in");
-        let Action::Launch { prompt: Some(source), .. } = parse_args(&["launch", "--prompt", "--help"]).unwrap() else { panic!("prompt was interpreted as a flag") };
+        let Action::Launch {
+            prompt: Some(source),
+            ..
+        } = parse_args(&["launch", "--prompt", "--help"]).unwrap()
+        else {
+            panic!("prompt was interpreted as a flag")
+        };
         assert_eq!(source.read().unwrap(), "--help");
     }
 
@@ -589,7 +630,20 @@ mod tests {
         assert_eq!(PromptSource::File(file.clone()).read().unwrap(), text);
         assert_eq!(PromptSource::Text(text.into()).read().unwrap(), text);
         // Keep relative CLI paths relative to the invoking directory, not --config.
-        let Action::Launch { prompt: Some(PromptSource::File(path)), .. } = parse_args(&["launch", "--config", "/elsewhere/session.json", "--prompt-file", "handoff.md"]).unwrap() else { panic!("missing prompt file") };
+        let Action::Launch {
+            prompt: Some(PromptSource::File(path)),
+            ..
+        } = parse_args(&[
+            "launch",
+            "--config",
+            "/elsewhere/session.json",
+            "--prompt-file",
+            "handoff.md",
+        ])
+        .unwrap()
+        else {
+            panic!("missing prompt file")
+        };
         assert_eq!(path, Path::new("handoff.md"));
     }
 
@@ -603,18 +657,53 @@ mod tests {
             std::fs::write(&file, text).unwrap();
             assert!(PromptSource::File(file.clone()).read().is_err());
         }
-        assert!(PromptSource::Text("x".repeat(MAX_PROMPT_BYTES + 1)).read().unwrap_err().contains("at most"));
-        assert_eq!(PromptSource::Text("x".repeat(MAX_PROMPT_BYTES)).read().unwrap().len(), MAX_PROMPT_BYTES);
+        assert!(
+            PromptSource::Text("x".repeat(MAX_PROMPT_BYTES + 1))
+                .read()
+                .unwrap_err()
+                .contains("at most")
+        );
+        assert_eq!(
+            PromptSource::Text("x".repeat(MAX_PROMPT_BYTES))
+                .read()
+                .unwrap()
+                .len(),
+            MAX_PROMPT_BYTES
+        );
         std::fs::write(&file, vec![b'x'; MAX_PROMPT_BYTES + 1]).unwrap();
-        assert!(PromptSource::File(file.clone()).read().unwrap_err().contains("at most"));
+        assert!(
+            PromptSource::File(file.clone())
+                .read()
+                .unwrap_err()
+                .contains("at most")
+        );
         std::fs::write(&file, [0xff]).unwrap();
-        assert!(PromptSource::File(file).read().unwrap_err().contains("UTF-8"));
-        assert!(PromptSource::File(dir.path().join("missing")).read().is_err());
-        assert!(PromptSource::File(dir.path().to_path_buf()).read().unwrap_err().contains("regular file"));
+        assert!(
+            PromptSource::File(file)
+                .read()
+                .unwrap_err()
+                .contains("UTF-8")
+        );
+        assert!(
+            PromptSource::File(dir.path().join("missing"))
+                .read()
+                .is_err()
+        );
+        assert!(
+            PromptSource::File(dir.path().to_path_buf())
+                .read()
+                .unwrap_err()
+                .contains("regular file")
+        );
         let fifo = dir.path().join("fifo");
         let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
-        assert!(PromptSource::File(fifo).read().unwrap_err().contains("regular file"));
+        assert!(
+            PromptSource::File(fifo)
+                .read()
+                .unwrap_err()
+                .contains("regular file")
+        );
     }
 
     #[test]
@@ -714,8 +803,9 @@ mod tests {
             panic!("not launch")
         };
         assert!(!no_splash);
-        let Action::Launch { no_splash, file, .. } =
-            parse_args(&["launch", "--no-splash", "--config", "c.json"]).unwrap()
+        let Action::Launch {
+            no_splash, file, ..
+        } = parse_args(&["launch", "--no-splash", "--config", "c.json"]).unwrap()
         else {
             panic!("not launch")
         };
@@ -742,7 +832,13 @@ mod tests {
         else {
             panic!("not launch")
         };
-        assert_eq!(vm, VmSize { cpus: Some(4), memory_mib: Some(8192) });
+        assert_eq!(
+            vm,
+            VmSize {
+                cpus: Some(4),
+                memory_mib: Some(8192)
+            }
+        );
         for args in [
             vec!["login", "--cpus", "2"],
             vec!["login", "--memory", "4G"],
@@ -879,11 +975,32 @@ mod tests {
         use rts::setup::SetupOptions;
         for (args, want) in [
             (vec!["setup"], SetupOptions::default()),
-            (vec!["setup", "--check"], SetupOptions { check: true, offline: false }),
-            (vec!["setup", "--check", "--offline"], SetupOptions { check: true, offline: true }),
-            (vec!["setup", "--offline", "--check"], SetupOptions { check: true, offline: true }),
+            (
+                vec!["setup", "--check"],
+                SetupOptions {
+                    check: true,
+                    offline: false,
+                },
+            ),
+            (
+                vec!["setup", "--check", "--offline"],
+                SetupOptions {
+                    check: true,
+                    offline: true,
+                },
+            ),
+            (
+                vec!["setup", "--offline", "--check"],
+                SetupOptions {
+                    check: true,
+                    offline: true,
+                },
+            ),
         ] {
-            assert!(matches!(parse_args(&args), Ok(Action::Setup(o)) if o == want), "{args:?}");
+            assert!(
+                matches!(parse_args(&args), Ok(Action::Setup(o)) if o == want),
+                "{args:?}"
+            );
         }
         for args in [vec!["--version"], vec!["-V"]] {
             assert!(matches!(parse_args(&args), Ok(Action::Version)), "{args:?}");
@@ -891,7 +1008,9 @@ mod tests {
         assert!(matches!(parse_args(&["setup", "--help"]), Ok(Action::Help)));
         let e = parse_args(&["setup", "--offline"]).unwrap_err();
         assert!(e.contains("--offline requires --check"), "{e}");
-        assert!(USAGE.contains("rts setup [--check [--offline]]") && USAGE.contains("rts --version"));
+        assert!(
+            USAGE.contains("rts setup [--check [--offline]]") && USAGE.contains("rts --version")
+        );
     }
 
     #[test]
@@ -917,20 +1036,47 @@ mod tests {
         use rts::update::apply::UpdateOptions;
         for (args, want) in [
             (vec!["update"], UpdateOptions::default()),
-            (vec!["update", "--check"], UpdateOptions { check: true, force: false }),
-            (vec!["update", "--force"], UpdateOptions { check: false, force: true }),
+            (
+                vec!["update", "--check"],
+                UpdateOptions {
+                    check: true,
+                    force: false,
+                },
+            ),
+            (
+                vec!["update", "--force"],
+                UpdateOptions {
+                    check: false,
+                    force: true,
+                },
+            ),
         ] {
-            assert!(matches!(parse_args(&args), Ok(Action::Update(o)) if o == want), "{args:?}");
+            assert!(
+                matches!(parse_args(&args), Ok(Action::Update(o)) if o == want),
+                "{args:?}"
+            );
         }
         for (args, want) in [
-            (vec!["update", "--check", "--force"], "--check and --force cannot be combined"),
-            (vec!["update", "--force", "--check"], "--check and --force cannot be combined"),
-            (vec!["update", "--check", "--check"], "Duplicate option: --check"),
+            (
+                vec!["update", "--check", "--force"],
+                "--check and --force cannot be combined",
+            ),
+            (
+                vec!["update", "--force", "--check"],
+                "--check and --force cannot be combined",
+            ),
+            (
+                vec!["update", "--check", "--check"],
+                "Duplicate option: --check",
+            ),
             (vec!["update", "--yes"], "Unknown option for update: --yes"),
         ] {
             assert_eq!(parse_args(&args).unwrap_err(), want, "{args:?}");
         }
-        assert!(matches!(parse_args(&["update", "--help"]), Ok(Action::Help)));
+        assert!(matches!(
+            parse_args(&["update", "--help"]),
+            Ok(Action::Help)
+        ));
         assert!(matches!(parse_args(&["update", "-h"]), Ok(Action::Help)));
         assert!(USAGE.contains("rts update [--check | --force]"));
     }

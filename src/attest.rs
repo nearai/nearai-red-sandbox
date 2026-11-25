@@ -1446,7 +1446,10 @@ mod tests {
         let cases: Vec<(&str, Mutate)> = vec![
             ("does not bind", Box::new(|c| c.gw.report_data[0] ^= 1)),
             ("nonce", Box::new(|c| c.gw.report_data[63] ^= 1)),
-            ("TDX quote", Box::new(|c| c.gw_quote_err = Some("bad".into()))),
+            (
+                "TDX quote",
+                Box::new(|c| c.gw_quote_err = Some("bad".into())),
+            ),
             ("Revoked", Box::new(|c| c.gw.tcb_status = "Revoked".into())),
             (
                 "does not match sha256(app_compose)",
@@ -1474,7 +1477,13 @@ mod tests {
                 hex::encode(sha(&[OTHER_COMPOSE.as_bytes()]))
             )]
         );
-        assert!(run_one(Case::good([1; 32])).result.unwrap().key_continuity().is_empty());
+        assert!(
+            run_one(Case::good([1; 32]))
+                .result
+                .unwrap()
+                .key_continuity()
+                .is_empty()
+        );
     }
 
     /// An ecdsa gateway attests no ed25519 key, so nothing can vouch for it.

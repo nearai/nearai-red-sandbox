@@ -17,7 +17,9 @@ use std::time::Duration;
 
 use super::{DEFBG, Depth, LIGHT, PEWTER, RED, RESET, Rgb, S1};
 
-const KANA: [char; 16] = ['ｱ', 'ｶ', 'ｻ', 'ﾀ', 'ﾅ', 'ﾊ', 'ﾏ', 'ﾔ', 'ﾗ', 'ﾜ', 'ｦ', 'ﾝ', 'ｷ', 'ｼ', 'ﾁ', 'ﾆ'];
+const KANA: [char; 16] = [
+    'ｱ', 'ｶ', 'ｻ', 'ﾀ', 'ﾅ', 'ﾊ', 'ﾏ', 'ﾔ', 'ﾗ', 'ﾜ', 'ｦ', 'ﾝ', 'ｷ', 'ｼ', 'ﾁ', 'ﾆ',
+];
 const DUNE: &str = "▁▁▂▃▄▅▄▃▂▁▁▁▂▂▃▃▂▁▁▁▁▂▃▄▅▆▅▄▃▂▁▁▁▂▃▃▂▂▁▁▁▂▃▄▃▂▁▁▁▁▂▂▃▄▅▄▃▂▁▁▁▂▂▃▄▅▄▃▂▁▁▂▃▄▃▂";
 const TICK: Duration = Duration::from_micros(1_000_000 / 14);
 /// Styled output needs room for a status line.
@@ -36,9 +38,10 @@ impl Mode {
     /// Styled only on a terminal of at least 60 columns with colour allowed.
     pub fn detect(stderr_tty: bool, cols: Option<usize>, env: &[(String, String)]) -> Self {
         match cols {
-            Some(c) if stderr_tty && c >= MIN_WIDTH && super::colour_allowed(env) => {
-                Mode::Styled { depth: Depth::from_env(env), width: c.min(80) }
-            }
+            Some(c) if stderr_tty && c >= MIN_WIDTH && super::colour_allowed(env) => Mode::Styled {
+                depth: Depth::from_env(env),
+                width: c.min(80),
+            },
             _ => Mode::Plain,
         }
     }
@@ -46,7 +49,11 @@ impl Mode {
     /// For stderr of this process.
     pub fn for_stderr(env: &[(String, String)]) -> Self {
         use std::io::IsTerminal;
-        Mode::detect(std::io::stderr().is_terminal(), super::window_size(2).map(|(cols, _)| cols), env)
+        Mode::detect(
+            std::io::stderr().is_terminal(),
+            super::window_size(2).map(|(cols, _)| cols),
+            env,
+        )
     }
 }
 
@@ -105,12 +112,23 @@ impl Painter {
     /// `net` is the session's network summary, `net=none` or `net=N hosts`.
     pub fn header(&self, session_id: &str, net: &str, results: &Path) -> Vec<String> {
         let net = format!("  ·  {net}");
-        let results = truncate(&results.display().to_string(), self.width.saturating_sub(17 + 9));
+        let results = truncate(
+            &results.display().to_string(),
+            self.width.saturating_sub(17 + 9),
+        );
         let right: [Vec<(&str, Option<Rgb>)>; 6] = [
-            vec![("near ", TEXT), ("AI Red", Some(RED)), ("  ·  SandBox", TEXT)],
+            vec![
+                ("near ", TEXT),
+                ("AI Red", Some(RED)),
+                ("  ·  SandBox", TEXT),
+            ],
             vec![("Cybersecurity Program", Some(PEWTER))],
             vec![],
-            vec![("session ", Some(PEWTER)), (session_id, TEXT), (net.as_str(), Some(PEWTER))],
+            vec![
+                ("session ", Some(PEWTER)),
+                (session_id, TEXT),
+                (net.as_str(), Some(PEWTER)),
+            ],
             vec![("results  ", Some(PEWTER)), (results.as_str(), TEXT)],
             vec![],
         ];
@@ -124,7 +142,10 @@ impl Painter {
             .map(|j| {
                 let mut cells = String::new();
                 for i in 0..12 {
-                    let (t, b) = (pick(mark[2 * j].as_bytes()[i]), pick(mark[2 * j + 1].as_bytes()[i]));
+                    let (t, b) = (
+                        pick(mark[2 * j].as_bytes()[i]),
+                        pick(mark[2 * j + 1].as_bytes()[i]),
+                    );
                     cells.push_str(&match (t, b) {
                         (Some(t), Some(b)) => self.depth.fg(Some(t)) + &self.depth.bg(b) + "▀",
                         (Some(t), None) => self.depth.fg(Some(t)) + DEFBG + "▀",
@@ -143,7 +164,10 @@ impl Painter {
     }
 
     pub fn heading(&self, word: &str) -> String {
-        self.emit(&[("  ░▒▓█ ", Some(S1)), (word, TEXT), (" █▓▒░", Some(S1))], 0)
+        self.emit(
+            &[("  ░▒▓█ ", Some(S1)), (word, TEXT), (" █▓▒░", Some(S1))],
+            0,
+        )
     }
 
     pub fn rule(&self, word: &str) -> String {
@@ -152,7 +176,11 @@ impl Painter {
         let left = (span.saturating_sub(chars(&inner)) / 2).max(2);
         let right = span.saturating_sub(left + chars(&inner)).max(2);
         self.emit(
-            &[(&format!("  {}", "═".repeat(left)), Some(PEWTER)), (&inner, TEXT), (&"═".repeat(right), Some(PEWTER))],
+            &[
+                (&format!("  {}", "═".repeat(left)), Some(PEWTER)),
+                (&inner, TEXT),
+                (&"═".repeat(right), Some(PEWTER)),
+            ],
             0,
         )
     }
@@ -220,7 +248,13 @@ fn decode(name: &str, f: usize) -> String {
     let n = f.saturating_sub(6) / 2;
     name.chars()
         .enumerate()
-        .map(|(i, ch)| if i < n { ch } else { KANA[(i * 7 + f * 13) % KANA.len()] })
+        .map(|(i, ch)| {
+            if i < n {
+                ch
+            } else {
+                KANA[(i * 7 + f * 13) % KANA.len()]
+            }
+        })
         .collect()
 }
 
@@ -273,7 +307,16 @@ pub struct Progress(Arc<Mutex<State>>, bool);
 impl Progress {
     /// `animate`: redraw running steps from a ticker thread (off in tests).
     pub fn new(mode: Mode, out: Box<dyn Write + Send>, animate: bool) -> Self {
-        Progress(Arc::new(Mutex::new(State { mode, out, live: None, frame: 0, handed_off: false })), animate)
+        Progress(
+            Arc::new(Mutex::new(State {
+                mode,
+                out,
+                live: None,
+                frame: 0,
+                handed_off: false,
+            })),
+            animate,
+        )
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -331,7 +374,11 @@ impl Progress {
             });
             (stop, handle)
         });
-        Step { progress: Some(self.clone()), label: label.to_string(), ticker }
+        Step {
+            progress: Some(self.clone()),
+            label: label.to_string(),
+            ticker,
+        }
     }
 
     /// Advance a running step's animation by one frame (the ticker's job).
@@ -347,12 +394,19 @@ impl Progress {
         s.live = None;
         match s.painter() {
             Some(p) => {
-                let (detail, status) = if ok { (detail, Status::Ok) } else { ("failed; the reason follows", Status::Fail) };
+                let (detail, status) = if ok {
+                    (detail, Status::Ok)
+                } else {
+                    ("failed; the reason follows", Status::Fail)
+                };
                 let line = p.status_line(label, detail, status, None);
                 s.line(&line);
             }
             None if s.handed_off => {}
-            None => s.line(&format!("[rts] {label}: {}", if ok { detail } else { "failed" })),
+            None => s.line(&format!(
+                "[rts] {label}: {}",
+                if ok { detail } else { "failed" }
+            )),
         }
     }
 
@@ -420,7 +474,11 @@ pub struct Step {
 impl Step {
     /// A step that draws nothing (no launch progress installed).
     pub fn inert() -> Self {
-        Step { progress: None, label: String::new(), ticker: None }
+        Step {
+            progress: None,
+            label: String::new(),
+            ticker: None,
+        }
     }
 
     fn stop(&mut self) {
@@ -523,21 +581,37 @@ mod tests {
     fn launch(p: &Progress) {
         p.header("3f9a1c2b7e04", "net=none", Path::new("/s/3f9a1c2b7e04/out"));
         p.heading("LAUNCH");
-        p.step("preflight", Live::Sweep).ok("mvm supervisor · opencode 2.2.2");
+        p.step("preflight", Live::Sweep)
+            .ok("mvm supervisor · opencode 2.2.2");
         let s = p.step("sign-in", Live::Still);
-        p.note("Opening your browser to sign in to NEAR AI Cloud…", "Opening your browser to sign in to NEAR AI Cloud…");
+        p.note(
+            "Opening your browser to sign in to NEAR AI Cloud…",
+            "Opening your browser to sign in to NEAR AI Cloud…",
+        );
         s.ok("NEAR AI Cloud");
-        let s = p.step("attestation", Live::Decode("deepseek-ai/DeepSeek-V4.1".into()));
+        let s = p.step(
+            "attestation",
+            Live::Decode("deepseek-ai/DeepSeek-V4.1".into()),
+        );
         for _ in 0..70 {
             p.tick();
         }
         s.ok("1 model verified · 2 TLS keys pinned");
-        p.note("[rts 3f9a1c2b7e04] created rts-3f9a1c2b7e04", "created rts-3f9a1c2b7e04");
+        p.note(
+            "[rts 3f9a1c2b7e04] created rts-3f9a1c2b7e04",
+            "created rts-3f9a1c2b7e04",
+        );
         drop(p.step("microVM", Live::Decode("rts-3f9a1c2b7e04".into())));
         p.hand_off();
-        p.note("[rts 3f9a1c2b7e04] plugin ready; session running", "plugin ready; session running");
+        p.note(
+            "[rts 3f9a1c2b7e04] plugin ready; session running",
+            "plugin ready; session running",
+        );
         p.teardown();
-        p.note("[rts 3f9a1c2b7e04] teardown: removed rts-3f9a1c2b7e04", "teardown: removed rts-3f9a1c2b7e04");
+        p.note(
+            "[rts 3f9a1c2b7e04] teardown: removed rts-3f9a1c2b7e04",
+            "teardown: removed rts-3f9a1c2b7e04",
+        );
     }
 
     #[test]
@@ -565,53 +639,94 @@ mod tests {
 
     fn styled(width: usize) -> (String, Vec<String>) {
         let buf = Buf::default();
-        launch(&Progress::new(Mode::Styled { depth: Depth::TrueColor, width }, Box::new(buf.clone()), false));
+        launch(&Progress::new(
+            Mode::Styled {
+                depth: Depth::TrueColor,
+                width,
+            },
+            Box::new(buf.clone()),
+            false,
+        ));
         let out = buf.text();
         // What the terminal ends up showing: each \r-overwritten line's last state.
-        let shown = strip_escapes(&out).split('\n').map(|l| l.rsplit('\r').next().unwrap().trim_end().to_string()).collect();
+        let shown = strip_escapes(&out)
+            .split('\n')
+            .map(|l| l.rsplit('\r').next().unwrap().trim_end().to_string())
+            .collect();
         (out, shown)
     }
 
     #[test]
     fn styled_output_has_headings_rules_and_status_lines() {
         let (out, shown) = styled(80);
-        let find = |needle: &str| shown.iter().find(|l| l.contains(needle)).cloned().unwrap_or_else(|| panic!("{needle:?} in {shown:#?}"));
-        assert!(find("near AI Red  ·  SandBox").starts_with("  ") && find("near AI Red").contains('▀'));
+        let find = |needle: &str| {
+            shown
+                .iter()
+                .find(|l| l.contains(needle))
+                .cloned()
+                .unwrap_or_else(|| panic!("{needle:?} in {shown:#?}"))
+        };
+        assert!(
+            find("near AI Red  ·  SandBox").starts_with("  ") && find("near AI Red").contains('▀')
+        );
         assert!(find("session 3f9a1c2b7e04  ·  net=none").contains("session"));
         assert!(find("results  /s/3f9a1c2b7e04/out").contains("results"));
         assert_eq!(find("LAUNCH"), "  ░▒▓█ LAUNCH █▓▒░");
         assert_eq!(find("TEARDOWN"), "  ░▒▓█ TEARDOWN █▓▒░");
         let ok = find("> preflight");
-        assert!(ok.starts_with("  > preflight   mvm supervisor · opencode 2.2.2 ...") && ok.ends_with("[ OK ]"), "{ok}");
+        assert!(
+            ok.starts_with("  > preflight   mvm supervisor · opencode 2.2.2 ...")
+                && ok.ends_with("[ OK ]"),
+            "{ok}"
+        );
         // As in the prototype: the dot leader ends one column past width - 12.
         assert_eq!(ok.chars().count(), 80 - 12 + 1 + 6);
         assert!(find("> attestation").contains("1 model verified · 2 TLS keys pinned"));
         let fail = find("> microVM");
-        assert!(fail.contains("failed; the reason follows") && fail.ends_with("[ FAIL ]"), "{fail}");
+        assert!(
+            fail.contains("failed; the reason follows") && fail.ends_with("[ FAIL ]"),
+            "{fail}"
+        );
         assert!(find("Opening your browser").starts_with("  · Opening your browser"));
         let rule = find("HANDING THE TERMINAL TO OPENCODE");
-        assert!(rule.starts_with("  ══") && rule.ends_with("══") && rule.contains('✦'), "{rule}");
+        assert!(
+            rule.starts_with("  ══") && rule.ends_with("══") && rule.contains('✦'),
+            "{rule}"
+        );
         // After the hand-off, opencode owns the screen: the plain line as before.
         assert!(shown.contains(&"[rts 3f9a1c2b7e04] plugin ready; session running".to_string()));
         assert!(find("teardown: removed").starts_with("  · teardown"));
         // Log lines, which carry session refusals, are not muted.
-        assert!(out.contains("\x1b[39mteardown: removed"), "log text in the default colour");
+        assert!(
+            out.contains("\x1b[39mteardown: removed"),
+            "log text in the default colour"
+        );
         // The decode line showed kana while verifying, and the model name once decoded.
         assert!(KANA.iter().any(|k| out.contains(*k)));
         assert!(strip_escapes(&out).contains("deepseek-ai/DeepSeek-V4.1 ▕"));
         // Every styled line ends with a reset; nothing styled is left open.
         for line in out.split('\n').filter(|l| l.contains('\x1b')) {
-            assert!(line.ends_with(RESET) || line.ends_with("\x1b[2K"), "{line:?}");
+            assert!(
+                line.ends_with(RESET) || line.ends_with("\x1b[2K"),
+                "{line:?}"
+            );
         }
         assert!(out.ends_with(&format!("{RESET}\n")));
     }
 
     /// The network part of a launch, as session_body drives it.
-    fn network_launch(p: &Progress, net: &str, allowlist: &str, probes: &str, pinned: Option<&str>) {
+    fn network_launch(
+        p: &Progress,
+        net: &str,
+        allowlist: &str,
+        probes: &str,
+        pinned: Option<&str>,
+    ) {
         p.header("3f9a1c2b7e04", net, Path::new("/s/3f9a1c2b7e04/out"));
         p.heading("LAUNCH");
         p.step("allowlist", Live::Sweep).ok(allowlist);
-        p.step("microVM", Live::Decode("rts-3f9a1c2b7e04".into())).ok(&format!("rts-3f9a1c2b7e04 · 4096 MiB · 2 vCPU · {net}"));
+        p.step("microVM", Live::Decode("rts-3f9a1c2b7e04".into()))
+            .ok(&format!("rts-3f9a1c2b7e04 · 4096 MiB · 2 vCPU · {net}"));
         p.step("probes", Live::Sweep).ok(probes);
         if let Some(pinned) = pinned {
             p.step("pinned IPs", Live::Sweep).ok(pinned);
@@ -622,12 +737,23 @@ mod tests {
         let buf = Buf::default();
         f(&Progress::new(mode, Box::new(buf.clone()), false));
         let out = buf.text();
-        let shown = strip_escapes(&out).split('\n').map(|l| l.rsplit('\r').next().unwrap().trim_end().to_string()).collect();
+        let shown = strip_escapes(&out)
+            .split('\n')
+            .map(|l| l.rsplit('\r').next().unwrap().trim_end().to_string())
+            .collect();
         (out, shown)
     }
 
-    const STYLED: Mode = Mode::Styled { depth: Depth::TrueColor, width: 80 };
-    const NONE: (&str, &str, &str, Option<&str>) = ("net=none", "none · the guest has no network", "deny-all held · 1.1.1.1:443 unreachable", None);
+    const STYLED: Mode = Mode::Styled {
+        depth: Depth::TrueColor,
+        width: 80,
+    };
+    const NONE: (&str, &str, &str, Option<&str>) = (
+        "net=none",
+        "none · the guest has no network",
+        "deny-all held · 1.1.1.1:443 unreachable",
+        None,
+    );
     const ALLOW: (&str, &str, &str, Option<&str>) = (
         "net=4 hosts",
         "4 hosts validated · 2 names resolved · TCP only",
@@ -637,7 +763,9 @@ mod tests {
 
     #[test]
     fn the_network_summary_is_shown_plain_for_none_and_an_allowlist() {
-        let (out, _) = render(Mode::Plain, |p| network_launch(p, NONE.0, NONE.1, NONE.2, NONE.3));
+        let (out, _) = render(Mode::Plain, |p| {
+            network_launch(p, NONE.0, NONE.1, NONE.2, NONE.3)
+        });
         assert_eq!(
             out.lines().collect::<Vec<_>>(),
             [
@@ -647,7 +775,9 @@ mod tests {
                 "[rts] probes: deny-all held · 1.1.1.1:443 unreachable",
             ]
         );
-        let (out, _) = render(Mode::Plain, |p| network_launch(p, ALLOW.0, ALLOW.1, ALLOW.2, ALLOW.3));
+        let (out, _) = render(Mode::Plain, |p| {
+            network_launch(p, ALLOW.0, ALLOW.1, ALLOW.2, ALLOW.3)
+        });
         assert!(!out.contains("net=none"), "{out}");
         assert_eq!(
             out.lines().collect::<Vec<_>>(),
@@ -663,33 +793,59 @@ mod tests {
 
     #[test]
     fn the_network_summary_is_shown_styled_for_none_and_an_allowlist() {
-        let find = |shown: &[String], needle: &str| shown.iter().find(|l| l.contains(needle)).cloned().unwrap_or_else(|| panic!("{needle:?} in {shown:#?}"));
-        let (out, shown) = render(STYLED, |p| network_launch(p, NONE.0, NONE.1, NONE.2, NONE.3));
+        let find = |shown: &[String], needle: &str| {
+            shown
+                .iter()
+                .find(|l| l.contains(needle))
+                .cloned()
+                .unwrap_or_else(|| panic!("{needle:?} in {shown:#?}"))
+        };
+        let (out, shown) = render(STYLED, |p| {
+            network_launch(p, NONE.0, NONE.1, NONE.2, NONE.3)
+        });
         assert!(find(&shown, "session 3f9a1c2b7e04  ·  net=none").contains("session"));
         assert!(find(&shown, "> allowlist").contains("none · the guest has no network"));
         assert!(find(&shown, "> microVM").contains("2 vCPU · net=none"));
         assert!(find(&shown, "> probes").contains("deny-all held"));
         assert!(!strip_escapes(&out).contains("pinned IPs"));
 
-        let (out, shown) = render(STYLED, |p| network_launch(p, ALLOW.0, ALLOW.1, ALLOW.2, ALLOW.3));
+        let (out, shown) = render(STYLED, |p| {
+            network_launch(p, ALLOW.0, ALLOW.1, ALLOW.2, ALLOW.3)
+        });
         assert!(!strip_escapes(&out).contains("net=none"), "{shown:#?}");
         assert!(find(&shown, "session 3f9a1c2b7e04  ·  net=4 hosts").contains("session"));
         let a = find(&shown, "> allowlist");
         // The whole detail fits at 80 columns: nothing is cut off.
-        assert!(a.starts_with("  > allowlist   4 hosts validated · 2 names resolved · TCP only .") && a.ends_with("[ OK ]"), "{a}");
+        assert!(
+            a.starts_with("  > allowlist   4 hosts validated · 2 names resolved · TCP only .")
+                && a.ends_with("[ OK ]"),
+            "{a}"
+        );
         assert!(find(&shown, "> microVM").contains("2 vCPU · net=4 hosts"));
         assert!(find(&shown, "> probes").contains("4 hosts reachable"));
-        assert!(find(&shown, "> pinned IPs").contains("2 names pinned only to validated addresses"));
+        assert!(
+            find(&shown, "> pinned IPs").contains("2 names pinned only to validated addresses")
+        );
     }
 
     #[test]
     fn a_failed_network_step_shows_fail_and_leaves_the_reason_to_the_caller() {
-        for (mode, want) in [(Mode::Plain, "[rts] pinned IPs: failed"), (STYLED, "failed; the reason follows")] {
+        for (mode, want) in [
+            (Mode::Plain, "[rts] pinned IPs: failed"),
+            (STYLED, "failed; the reason follows"),
+        ] {
             let (out, shown) = render(mode, |p| {
-                p.header("3f9a1c2b7e04", "net=1 host", Path::new("/s/3f9a1c2b7e04/out"));
+                p.header(
+                    "3f9a1c2b7e04",
+                    "net=1 host",
+                    Path::new("/s/3f9a1c2b7e04/out"),
+                );
                 drop(p.step("pinned IPs", Live::Sweep));
             });
-            let line = shown.iter().find(|l| l.contains("pinned IPs")).unwrap_or_else(|| panic!("{out}"));
+            let line = shown
+                .iter()
+                .find(|l| l.contains("pinned IPs"))
+                .unwrap_or_else(|| panic!("{out}"));
             assert!(line.contains(want), "{line}");
             assert!(mode == Mode::Plain || line.ends_with("[ FAIL ]"), "{line}");
         }
@@ -702,39 +858,84 @@ mod tests {
         for l in shown.iter().filter(|l| l.starts_with("  >")) {
             assert!(l.chars().count() <= 60, "{l:?}");
         }
-        assert!(shown.iter().any(|l| l.starts_with("  > attestation") && l.contains('…') && l.ends_with("[ OK ]")), "{shown:#?}");
+        assert!(
+            shown.iter().any(|l| l.starts_with("  > attestation")
+                && l.contains('…')
+                && l.ends_with("[ OK ]")),
+            "{shown:#?}"
+        );
     }
 
     #[test]
     fn mode_detection_needs_a_wide_enough_terminal_and_colour() {
-        let env = |p: &[(&str, &str)]| p.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+        let env = |p: &[(&str, &str)]| {
+            p.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
         let e = env(&[("TERM", "xterm-256color"), ("COLORTERM", "truecolor")]);
-        assert_eq!(Mode::detect(true, Some(120), &e), Mode::Styled { depth: Depth::TrueColor, width: 80 });
-        assert_eq!(Mode::detect(true, Some(70), &env(&[])), Mode::Styled { depth: Depth::Ansi256, width: 70 });
+        assert_eq!(
+            Mode::detect(true, Some(120), &e),
+            Mode::Styled {
+                depth: Depth::TrueColor,
+                width: 80
+            }
+        );
+        assert_eq!(
+            Mode::detect(true, Some(70), &env(&[])),
+            Mode::Styled {
+                depth: Depth::Ansi256,
+                width: 70
+            }
+        );
         assert_eq!(Mode::detect(false, Some(120), &e), Mode::Plain);
         assert_eq!(Mode::detect(true, Some(59), &e), Mode::Plain);
         assert_eq!(Mode::detect(true, None, &e), Mode::Plain);
-        assert_eq!(Mode::detect(true, Some(120), &env(&[("NO_COLOR", "1")])), Mode::Plain);
-        assert_eq!(Mode::detect(true, Some(120), &env(&[("TERM", "dumb")])), Mode::Plain);
+        assert_eq!(
+            Mode::detect(true, Some(120), &env(&[("NO_COLOR", "1")])),
+            Mode::Plain
+        );
+        assert_eq!(
+            Mode::detect(true, Some(120), &env(&[("TERM", "dumb")])),
+            Mode::Plain
+        );
     }
 
     #[test]
     fn the_ticker_animates_and_stops_with_the_step() {
         let buf = Buf::default();
-        let p = Progress::new(Mode::Styled { depth: Depth::TrueColor, width: 80 }, Box::new(buf.clone()), true);
+        let p = Progress::new(
+            Mode::Styled {
+                depth: Depth::TrueColor,
+                width: 80,
+            },
+            Box::new(buf.clone()),
+            true,
+        );
         let s = p.step("attestation", Live::Decode("abc".into()));
         thread::sleep(Duration::from_millis(400));
         s.ok("done");
         let n = buf.text().matches('\r').count();
         assert!(n >= 3, "{n}");
         thread::sleep(Duration::from_millis(200));
-        assert_eq!(buf.text().matches('\r').count(), n, "no redraw after the step ended");
+        assert_eq!(
+            buf.text().matches('\r').count(),
+            n,
+            "no redraw after the step ended"
+        );
     }
 
     #[test]
     fn paused_runs_the_closure_and_redraws() {
         let buf = Buf::default();
-        let p = Progress::new(Mode::Styled { depth: Depth::TrueColor, width: 80 }, Box::new(buf.clone()), false);
+        let p = Progress::new(
+            Mode::Styled {
+                depth: Depth::TrueColor,
+                width: 80,
+            },
+            Box::new(buf.clone()),
+            false,
+        );
         let s = p.step("attestation", Live::Decode("abc".into()));
         let before = buf.text().len();
         let mut out = buf.clone();
@@ -747,7 +948,10 @@ mod tests {
         let prompt = after.find("PROMPT\n").expect("the closure wrote");
         assert_eq!(&after[..prompt], "\r\x1b[2K", "erased before: {after:?}");
         let rest = &after[prompt + "PROMPT\n".len()..];
-        assert!(rest.starts_with('\r') && strip_escapes(rest).contains("attestation"), "redrawn after: {rest:?}");
+        assert!(
+            rest.starts_with('\r') && strip_escapes(rest).contains("attestation"),
+            "redrawn after: {rest:?}"
+        );
         s.ok("done");
     }
 
