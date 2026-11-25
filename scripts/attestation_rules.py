@@ -35,6 +35,15 @@ reproduce exactly, so both languages produce one hash:
   [-2**63, 2**64 - 1], refuses normalization, as does a string that is not
   valid Unicode (a lone surrogate). Unparseable input refuses too: `None`,
   never an exception.
+- Parsing refuses, at every level, and both normalization (`None`) and
+  `evaluate` (a PARSE hold) with it:
+  - duplicate keys in any object (`json.loads` keeps the last value and other
+    parsers may keep the first, so a rule could compare one value while a
+    consumer uses another; serde_json's `Value` does not refuse them on its
+    own, so the Rust side must check explicitly);
+  - the integer literal `-0`, which serde_json parses as the float -0.0;
+  - nesting deeper than 127 arrays or objects (the outer object counts as
+    one), serde_json's default recursion limit.
 """
 
 from __future__ import annotations
@@ -68,6 +77,9 @@ _PINNED_REF = re.compile(r"([^@\s$]+)@sha256:[0-9a-f]{64}", re.ASCII)
 
 _I64_MIN = -(2 ** 63)
 _U64_MAX = 2 ** 64 - 1
+# serde_json 1.0.154 (de.rs) starts remaining_depth at 128, decrements it on
+# entering each array or object and fails when it reaches 0: 127 levels parse.
+_MAX_DEPTH = 127
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BASELINES = REPO_ROOT / "opencode" / "attestation-baselines"
@@ -112,11 +124,44 @@ def canonical(obj) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _no_duplicate_keys(pairs):
+    obj = {}
+    for k, v in pairs:
+        if k in obj:
+            raise ValueError(f"duplicate key {k!r}")
+        obj[k] = v
+    return obj
+
+
+def _int_not_negative_zero(s: str) -> int:
+    # serde_json parses `-0` as the float -0.0; Python would read it as int 0.
+    if s == "-0":
+        raise ValueError("-0 is a float to serde_json")
+    return int(s)
+
+
+def _depth(obj) -> int:
+    """Nesting depth in containers: a scalar is 0, {} or [] is 1."""
+    deepest = 0
+    stack = [(obj, 1)]
+    while stack:
+        v, d = stack.pop()
+        if isinstance(v, dict):
+            v = list(v.values())
+        elif not isinstance(v, list):
+            continue
+        deepest = max(deepest, d)
+        stack.extend((x, d + 1) for x in v)
+    return deepest
+
+
 def _parse_compose(raw: str):
     """The app_compose as a dict with a string docker_compose_file, or None."""
     try:
-        obj = json.loads(raw)
+        obj = json.loads(raw, object_pairs_hook=_no_duplicate_keys, parse_int=_int_not_negative_zero)
     except (ValueError, RecursionError):
+        return None
+    if _depth(obj) > _MAX_DEPTH:
         return None
     if not isinstance(obj, dict) or not isinstance(obj.get("docker_compose_file"), str):
         return None

