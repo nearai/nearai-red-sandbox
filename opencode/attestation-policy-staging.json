@@ -24,6 +24,11 @@
       "sha256": "e4b83d924284eece9b972d8e18bd88dac4dd529031b00311ef5044eaa60ba8d9",
       "recorded": "2026-11-23",
       "source": "NEAR AI staging cloud-stg-api.near.ai: model_attestations[0] for Qwen/Qwen3.8-27B-abliterated, info.app_name dstack-nvidia-0.5.12 (mr-config-only, verified by rts)"
+    },
+    {
+      "sha256": "0cf678004e2d5995cd158d4e07af7e6cd014676f9139619805ada9c727d3b688",
+      "recorded": "2026-11-24",
+      "source": "NEAR AI staging cloud-stg-api.near.ai: gateway_attestation, info.app_name dstack-0.5.15 (mr-config-only, verified by rts)"
     }
   ]
 }
