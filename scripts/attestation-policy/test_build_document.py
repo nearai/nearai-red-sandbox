@@ -512,6 +512,21 @@ def test_a_dstack_vpc_image_bumped_without_its_env_line_is_held(tmp_path):
     assert o.hold["diff"] == [f"a line copying an image's digest did not follow its image: line: {VPC}@{VPC_OLD}"]
 
 
+def test_another_image_bumped_beside_an_unchanged_copy_line_is_endorsed(tmp_path):
+    # dstack-vpc and its env line are untouched; only dstack-vpc-client moves.
+    new = "sha256:" + "5" * 64
+    client = "nearaidev/dstack-vpc-client@sha256:dd570dee92901c6d9cf96909404bb5177294437e3642541225a85b06cefa3d9d"
+    assert F571.count(client) == 1
+    cand = F571.replace(client, f"nearaidev/dstack-vpc-client@{new}")
+    assert bd.rules.evaluate(cand, "gateway", [F571]).passed
+    ok, log = _fake_cosign(tmp_path, 0)
+    o = bd.endorse(cand, "gateway", {sha(F571): F571}, NOW, str(ok), {})
+    assert o.hold is None, o.hold
+    assert o.entry["sha256"] == sha(cand)
+    (line,) = log.read_text().splitlines()
+    assert line.endswith(f"nearaidev/dstack-vpc-client@{new}")
+
+
 def test_a_dstack_vpc_env_line_set_to_another_repos_verified_digest_is_held(tmp_path):
     # dstack-vpc-client is bumped (and verified) to new; the dstack-vpc env
     # line is set to that digest while the dstack-vpc image line keeps its own.
