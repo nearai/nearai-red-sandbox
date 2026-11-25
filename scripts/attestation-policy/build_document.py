@@ -252,9 +252,12 @@ def _script_provenance(cand_script, base_script) -> tuple[list[str], str | None]
     Lines and digests pair up by position, as in docker_compose_file. Every
     changed digest must be written exactly nearaidev/compose-manager@<digest>
     in both scripts, every changed one must be the same new digest, and once
-    one changes, every nearaidev/compose-manager reference in the candidate
-    script must carry it (the launcher's printf and echo re-pin the same
-    image). The caller verifies that digest with cosign."""
+    one changes, every reference in the candidate script written exactly
+    nearaidev/compose-manager@<digest> must carry it (the launcher's printf
+    and echo re-pin the same image). A longer reference ending in
+    nearaidev/compose-manager that keeps its baseline digest is not checked
+    here: that digest is unchanged. The caller verifies the new digest with
+    cosign."""
     if cand_script == base_script:
         return [], None
     if not isinstance(cand_script, str) or not isinstance(base_script, str):
@@ -262,6 +265,9 @@ def _script_provenance(cand_script, base_script) -> tuple[list[str], str | None]
     if rules.digest_blind(cand_script) != rules.digest_blind(base_script):
         return ["pre_launch_script differs from the baseline's outside its digests"], None
     cand_lines, base_lines = cand_script.split("\n"), base_script.split("\n")
+    # Unreachable while digest_blind keeps newlines (it rewrites only
+    # @sha256:<hex>): equal blinded scripts have equal line counts. It only
+    # guards the zip below against a future change to digest_blind.
     if len(cand_lines) != len(base_lines):
         return ["pre_launch_script lines do not pair up with the baseline's"], None
     diff, new = [], set()

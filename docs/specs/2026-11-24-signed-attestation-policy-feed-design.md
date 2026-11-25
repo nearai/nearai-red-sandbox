@@ -376,9 +376,12 @@ Model (`rules:model-v1`):
   passes only when it is written exactly `nearaidev/compose-manager@sha256:<hex>`
   in both scripts (not `nearaidev/compose-manager-otelcol`, nor any longer
   reference ending in `compose-manager`), every changed position carries the
-  same new digest, every `nearaidev/compose-manager@sha256:` reference in the
-  candidate script carries it, and that digest verifies with cosign as
-  above. Any other change to `pre_launch_script` holds the entry.
+  same new digest, every reference in the candidate script written exactly
+  `nearaidev/compose-manager@sha256:<hex>` carries it, and that digest
+  verifies with cosign as above. A longer reference that ends in
+  `nearaidev/compose-manager` (say `mirror.io/nearaidev/compose-manager`)
+  and keeps its baseline digest is left alone: that digest was reviewed.
+  Any other change to `pre_launch_script` holds the entry.
 - M1 covers the trust anchors without listing them: `GITHUB_REPO`,
   `LAUNCHER_COSIGN_IDENTITY_REGEXP`, `COMPOSE_MANAGER_IMAGE_REPO`,
   `OTELCOL_IMAGE_REPO`, `LAUNCHER_CHANNEL`, the capability grants and the
