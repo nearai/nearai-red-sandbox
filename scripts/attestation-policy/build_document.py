@@ -14,8 +14,12 @@ publisher". Stdlib only; run with `python3 -I`. The workflow
                candidates/: it hashes each one, runs the rules for both roles
                against the baselines and cosign, assembles the next document
                from the current one and what it reproduced, and refuses (exit
-               1) if proposed.json lists any entry it did not reproduce and
-               has not revoked. It writes OUT/document.json only when there
+               1) if proposed.json lists any entry it did not reproduce, has
+               not revoked and could not have endorsed. An entry whose
+               candidate passed the rules here against some baseline, under
+               that entry's match, is only dropped with a warning: evaluate
+               and sign may get different answers from cosign. It writes
+               OUT/document.json only when there
                is something to publish (a new entry, a new revocation or
                dropped entry, no current document, a base taken from the
                log, or a current document over 24 hours old), and
@@ -202,8 +206,10 @@ def already_covered(raw: str, current: dict | None, revoked=()) -> bool:
 class Outcome:
     entry: dict | None   # the endorsement, when every rule passed
     hold: dict | None    # {sha256, role, failures, closest, diff}, otherwise
-    # On a G2/M2 hold, the (role, match, sha256) the entry would have had.
-    held_key: tuple | None = None
+    # The (role, match, sha256) of every baseline the rules passed against,
+    # endorsed or not: the entries evaluate could have proposed for this
+    # compose, depending on what cosign answered there.
+    keys: set = dataclasses.field(default_factory=set)
 
 
 def _hold(raw, role, failures, closest, diff) -> Outcome:
@@ -279,10 +285,12 @@ def endorse(raw: str, role: str, baselines: dict, now: str, cosign: str | None, 
     every digest that differs from a baseline it passed against. Every baseline
     it passes against is tried, in rules.evaluate's preference order, so a
     compose merged into the baselines verbatim is endorsed whichever baseline
-    sorts first. On a hold, the first passing baseline is reported."""
+    sorts first. On a hold, the first passing baseline is reported. Either way
+    the outcome carries the entry key of every passing baseline."""
     v = rules.evaluate(raw, role, list(baselines.values()))
     if not v.passed:
         return _hold(raw, role, v.failures, v.closest, v.diff)
+    keys = {(role, match, _entry_sha(raw, match)) for match, _ in v.passing}
     cand = json.loads(raw)
     first = None
     for match, closest in v.passing:
@@ -294,13 +302,15 @@ def endorse(raw: str, role: str, baselines: dict, now: str, cosign: str | None, 
             first = (match, closest, diff)
     else:
         match, closest, diff = first
-        sha = rules.compose_sha256(raw) if match == rules.MATCH_EXACT else rules.instance_label_sha256(raw)
         o = _hold(raw, role, [PROVENANCE_RULE[role]], closest, diff)
-        o.held_key = (role, match, sha)
+        o.keys = keys
         return o
-    sha = rules.compose_sha256(raw) if match == rules.MATCH_EXACT else rules.instance_label_sha256(raw)
-    return Outcome({"role": role, "match": match, "sha256": sha, "app_name": cand.get("name"),
-                    "first_seen": now, "endorsed_by": ENDORSED_BY[role]}, None)
+    return Outcome({"role": role, "match": match, "sha256": _entry_sha(raw, match), "app_name": cand.get("name"),
+                    "first_seen": now, "endorsed_by": ENDORSED_BY[role]}, None, keys)
+
+
+def _entry_sha(raw: str, match: str) -> str:
+    return rules.compose_sha256(raw) if match == rules.MATCH_EXACT else rules.instance_label_sha256(raw)
 
 
 def load_all_baselines(root: Path, environment: str) -> dict:
@@ -459,7 +469,7 @@ def cmd_reproduce(a) -> int:
     cands = read_candidates(a.candidates)
     baselines = load_all_baselines(a.baselines, a.environment)
 
-    new, holds, cache, held_keys = [], [], {}, set()
+    new, holds, cache, possible = [], [], {}, set()
     for sha, raw in cands.items():
         if already_covered(raw, current, reviewed):
             continue
@@ -472,11 +482,11 @@ def cmd_reproduce(a) -> int:
         if not passing:
             continue
         o = endorse(raw, passing[0], baselines[passing[0]], a.now, a.cosign, cache)
+        possible |= o.keys
         if o.entry:
             new.append(o.entry)
         else:
             holds.append(o.hold)
-            held_keys.add(o.held_key)
 
     doc, added, publish = assemble(a.environment, current, new, now_unix, reviewed, from_log)
     data = serialize(doc)
@@ -492,17 +502,30 @@ def cmd_reproduce(a) -> int:
         label = rules.instance_label_sha256(raw)
         if label is not None:
             from_candidates.add(label)
-    missing, dropped = [], []
+    missing, dropped, disagreed = [], [], []
     for e in proposed["entries"]:
         try:
             k = _key(e)
         except (TypeError, KeyError):
             raise Refused(f"proposed entry {e!r} is malformed")
-        # Passed the rules here but not G2/M2 (cosign refused or unreachable):
-        # dropped and held, not a reason to publish nothing.
         # A revoked proposal (evaluate read a rolled-back asset) is dropped.
-        if k not in have and k not in held_keys and k[2] not in doc["revoked"]:
-            (dropped if untrusted_base and k[2] not in from_candidates else missing).append(k)
+        if k in have or k[2] in doc["revoked"]:
+            continue
+        if k in possible:
+            # Its candidate passed the rules here against a baseline under this
+            # match, but sign's G2/M2 answer differs from evaluate's: cosign
+            # refused or was unreachable, or verified a digest that pairs with
+            # another baseline, so the entry key differs. Dropped (and held
+            # when nothing passed), not a reason to publish nothing: a refusal
+            # would also hold back revocations and the refresh.
+            disagreed.append(k)
+        elif untrusted_base and k[2] not in from_candidates:
+            dropped.append(k)
+        else:
+            missing.append(k)
+    if disagreed:
+        print("::warning::proposed entries sign did not endorse (cosign answered differently), dropped: "
+              + ", ".join(f"{r} {m} {s}" for r, m, s in disagreed))
     if dropped:
         print("::warning::proposed entries carried from a base sign did not verify, dropped: "
               + ", ".join(f"{r} {m} {s}" for r, m, s in dropped))

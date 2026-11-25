@@ -561,6 +561,111 @@ def test_model_compose_manager_digests_use_the_launcher_anchor(tmp_path):
         ("instance-label-v1", bd.rules.instance_label_sha256(cand))]
 
 
+# --- evaluate and sign get different cosign answers ---------------------------
+
+def _cosign_allowing(tmp_path, name, *refs):
+    """A fake cosign that verifies only the given image references."""
+    d = tmp_path / name
+    d.mkdir()
+    exe = d / "cosign"
+    cases = "".join(f"  *' {r}') exit 0 ;;\n" for r in refs)
+    exe.write_text(f'#!/bin/sh\ncase " $*" in\n{cases}esac\nexit 1\n')
+    exe.chmod(0o755)
+    return str(exe)
+
+
+def _model_digest(obj, repo):
+    (digest,) = {r.digest for r in bd.rules.image_refs(obj["docker_compose_file"]) if r.repo == repo}
+    return digest
+
+
+def _two_way_model():
+    """A model candidate that passes exact against one baseline and
+    instance-label-v1 against another, with a different changed digest each.
+
+    The candidate is EDAB with a new compose-manager-launcher digest. Baseline
+    X is EDAB itself (exact, and instance-label-v1: the launcher changed).
+    Baseline Y is E390 (another INSTANCE_LABEL) carrying the candidate's
+    launcher digest and a different collector digest (instance-label-v1 only:
+    the collector changed)."""
+    launcher, otelcol = "nearaidev/compose-manager-launcher", "nearaidev/compose-manager-otelcol"
+    new_launcher, other_otelcol = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+    obj = json.loads(EDAB)
+    obj["docker_compose_file"] = obj["docker_compose_file"].replace(_model_digest(obj, launcher), new_launcher)
+    cand = json.dumps(obj)
+    y = json.loads(E390)
+    f = y["docker_compose_file"]
+    f = f.replace(_model_digest(y, launcher), new_launcher).replace(_model_digest(y, otelcol), other_otelcol)
+    y["docker_compose_file"] = f
+    base_y = json.dumps(y)
+    refs = {"launcher": f"{launcher}@{new_launcher}",
+            "otelcol": f"{otelcol}@{_model_digest(obj, otelcol)}"}
+    return cand, EDAB, base_y, refs
+
+
+def _evaluate_side(cand, bases, cosign):
+    """What propose would propose for cand: endorse with evaluate's cosign."""
+    o = bd.endorse(cand, "model", {sha(b): b for b in sorted(bases, key=sha)}, NOW, cosign, {})
+    assert o.entry is not None
+    return o.entry
+
+
+@pytest.mark.parametrize("case", ["cosign-down-in-sign", "evaluate-later-baseline-sign-holds",
+                                  "evaluate-first-baseline-sign-later"])
+def test_a_different_cosign_answer_in_sign_drops_the_entry_and_still_publishes(tmp_path, case):
+    cand, x, y, refs = _two_way_model()
+    assert bd.rules.evaluate(cand, "model", [x, y]).passed
+    all_ok = _cosign_allowing(tmp_path, "all", refs["launcher"], refs["otelcol"])
+    only_otelcol = _cosign_allowing(tmp_path, "otelcol", refs["otelcol"])
+    none_ok = _cosign_allowing(tmp_path, "none")
+    evaluate_cosign, sign_cosign, want_match, sign_match = {
+        "cosign-down-in-sign": (all_ok, none_ok, "exact", None),
+        "evaluate-later-baseline-sign-holds": (only_otelcol, none_ok, "instance-label-v1", None),
+        "evaluate-first-baseline-sign-later": (all_ok, only_otelcol, "exact", "instance-label-v1"),
+    }[case]
+    e = _evaluate_side(cand, [x, y], evaluate_cosign)
+    assert e["match"] == want_match
+
+    # A revocation sign must publish, which a refusal would hold back.
+    keep = entry("gateway", "exact", B64)
+    cur = current_doc(tmp_path, NOW_UNIX - HOUR, [keep])
+    base = baselines(tmp_path, revoked=[A64], production_model=[x, y])
+    r, out = reproduce(tmp_path, base, candidates(tmp_path, cand), proposed(tmp_path, [keep, e]),
+                       current=cur, extra=["--cosign", sign_cosign])
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "::warning::" in r.stdout and e["sha256"] in r.stdout
+    doc = json.loads((out / "document.json").read_text())
+    assert doc["revoked"] == [A64]
+    got = [(x_["role"], x_["match"], x_["sha256"]) for x_ in doc["entries"]]
+    assert (e["role"], e["match"], e["sha256"]) not in got
+    if sign_match is None:
+        assert got == [("gateway", "exact", B64)]
+        (hold,) = json.loads((out / "holds.json").read_text())
+        assert hold["failures"] == ["M2"]
+    else:
+        assert got == [("gateway", "exact", B64),
+                       ("model", sign_match, bd.rules.instance_label_sha256(cand))]
+
+
+def test_a_proposed_key_matching_no_passing_baseline_still_refuses(tmp_path):
+    # EDAB passes E390 only by instance-label-v1: an exact entry for it (or one
+    # under the other role) is not a cosign disagreement but a divergence.
+    base = baselines(tmp_path, production_model=[E390])
+    for bad in (entry("model", "exact", sha(EDAB)), entry("gateway", "instance-label-v1", LABEL_SHA)):
+        r, out = reproduce(tmp_path, base, candidates(tmp_path, EDAB), proposed(tmp_path, [bad]))
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "not reproduced" in r.stderr and bad["sha256"] in r.stderr
+        assert not (out / "document.json").exists()
+
+
+def test_evaluate_installs_the_same_cosign_as_sign():
+    wf = (REPO / ".github" / "workflows" / "attestation-policy.yml").read_text()
+    steps = re.findall(r"- name: Install cosign\n((?:        .*\n)+)", wf)
+    assert len(steps) == 2, steps
+    assert steps[0] == steps[1]
+    assert "uses: sigstore/cosign-installer@" in steps[0] and "cosign-release: v" in steps[0]
+
+
 def test_revoked_entries_are_dropped_and_revocations_carried(tmp_path):
     cur = current_doc(tmp_path, NOW_UNIX - 30 * HOUR,
                       [entry("model", "exact", A64), entry("gateway", "exact", B64)], revoked=[A64])

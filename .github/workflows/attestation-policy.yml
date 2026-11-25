@@ -88,8 +88,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # The same installer and version as the sign job: evaluate's cosign
+      # answers decide which entries it proposes, and sign drops (with a
+      # warning) any it does not endorse, so the two should agree.
       - name: Install cosign
-        run: brew install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v3.1.4
 
       - name: Build the live attestation test
         run: cargo test --locked --test live_attest --no-run
