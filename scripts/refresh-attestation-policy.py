@@ -45,16 +45,16 @@ HASH = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _entry(model, report, entry):
-    """(where, info) for an evidence entry, from the report rts verified."""
+    """(role, where, info) for an evidence entry, from the report rts verified."""
     parsed = json.loads(report)
     if entry.get("role") == "gateway":
-        where, info = "gateway_attestation", parsed["gateway_attestation"]["info"]
+        role, where, info = "gateway", "gateway_attestation", parsed["gateway_attestation"]["info"]
     else:
         i = entry.get("index", 0)
-        where, info = f"model_attestations[{i}] for {model}", parsed["model_attestations"][i]["info"]
+        role, where, info = "model", f"model_attestations[{i}] for {model}", parsed["model_attestations"][i]["info"]
     if not isinstance(info, dict):
         raise ValueError(f"{where}: info is not an object")
-    return where, info
+    return role, where, info
 
 
 def policy_path(environment):
@@ -93,7 +93,7 @@ def candidates(doc, policy, today, environment="production"):
                 if h in seen:
                     continue
                 try:
-                    where, info = _entry(ev.get("model"), ev.get("report"), entry)
+                    role, where, info = _entry(ev.get("model"), ev.get("report"), entry)
                     # As rts (report.rs app_compose): a JSON string or an object.
                     tcb = info["tcb_info"]
                     if isinstance(tcb, str):
@@ -110,6 +110,7 @@ def candidates(doc, policy, today, environment="production"):
                 app = info.get("app_name", "unknown app_name")
                 out.append({
                     "sha256": h,
+                    "role": role,
                     "recorded": today,
                     "source": f"NEAR AI {environment} {host}: {where}, info.app_name {app} ({how}, verified by rts)",
                     "app_compose": compose,
@@ -138,7 +139,7 @@ def main(argv=None):
     for c in found:
         print(f"== {c['sha256']}\n   {c['source']}\n-- app_compose (review before pinning):\n{c['app_compose']}\n")
     if args.write:
-        policy["composeHashes"].extend({k: c[k] for k in ("sha256", "recorded", "source")} for c in found)
+        policy["composeHashes"].extend({k: c[k] for k in ("sha256", "role", "recorded", "source")} for c in found)
         args.policy.write_text(json.dumps(policy, indent=2) + "\n")
         print(f"appended {len(found)} to {args.policy}; rebuild rts and review the diff", file=sys.stderr)
     return 0

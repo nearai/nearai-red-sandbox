@@ -162,7 +162,8 @@ pub fn check_compose(
     if mr_config_id[1..33] != hash {
         return Err("mr_config_id does not match sha256(app_compose)".into());
     }
-    let acceptance = if policy.compose_hashes.contains(&hash) {
+    // The role is not consulted yet: any pinned hash is accepted.
+    let acceptance = if policy.pinned.contains_key(&hash) {
         ComposeAcceptance::Pinned
     } else if mode == ComposePolicy::MrConfigOnly {
         ComposeAcceptance::MrConfigOnly
@@ -180,7 +181,8 @@ pub fn check_compose(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use crate::attest::Role;
+    use std::collections::BTreeMap;
 
     pub fn sha(parts: &[&[u8]]) -> [u8; 32] {
         let mut h = Sha256::new();
@@ -278,11 +280,10 @@ pub(crate) mod tests {
         mr[0] = 1;
         mr[1..33].copy_from_slice(&hash);
         let pinned = Policy {
-            compose_hashes: BTreeSet::from([hash]),
+            pinned: BTreeMap::from([(hash, Role::Model)]),
+            ..Policy::default()
         };
-        let empty = Policy {
-            compose_hashes: BTreeSet::new(),
-        };
+        let empty = Policy::default();
 
         use ComposeAcceptance as A;
         for continued in [false, true] {
