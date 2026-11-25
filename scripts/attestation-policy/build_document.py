@@ -340,6 +340,7 @@ def _provenance(cand_file: str, base_file: str, role: str, cosign: str | None, c
     diff = []
     changed = set()
     copies = []  # (repo, digest) of non-image lines that copy an image's digest
+    images = set()  # (repo, digest) of changed image: lines only, not the script's
     if role == "model":
         script_diff, script_digest = _script_provenance(cand_script, base_script)
         diff += script_diff
@@ -358,6 +359,7 @@ def _provenance(cand_file: str, base_file: str, role: str, cosign: str | None, c
         refs = rules.image_refs(cl)
         if len(refs) == 1 and refs[0].digest is not None and cds == [refs[0].digest]:
             changed.add((refs[0].repo, refs[0].digest))
+            images.add((refs[0].repo, refs[0].digest))
             continue
         dup = None if refs else _image_digest_copy(cl, bl, base_file)
         if dup is not None:
@@ -367,9 +369,10 @@ def _provenance(cand_file: str, base_file: str, role: str, cosign: str | None, c
             if cd != bd_:
                 diff.append(f"digest changed outside an image: line: {cd}")
     for repo, digest in copies:
-        # The image: line of this repository must carry the same new digest
-        # and so be in changed, which cosign verifies below.
-        if (repo, digest) not in changed:
+        # An image: line of this repository must have changed to the same
+        # digest (and so be in changed, which cosign verifies below). A
+        # pre_launch_script re-pin to it does not count.
+        if (repo, digest) not in images:
             diff.append(f"digest changed outside an image: line: {digest}")
     for repo, digest in sorted(changed):
         ref = f"{repo}@{digest}"

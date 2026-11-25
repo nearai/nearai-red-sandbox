@@ -364,7 +364,10 @@ Model (`rules:model-v1`):
   `digest-blind(pre_launch_script)`.
 - **M2** Each changed `nearaidev/compose-manager*` digest verifies with
   `cosign verify --certificate-identity-regexp 'https://github.com/nearai/compose-manager/.github/workflows/.*'`.
-  That includes a re-pin in `pre_launch_script`, whose launcher lines name
+  This is the same anchor the launcher uses. Since the launcher already
+  trusts that identity at runtime, this check adds nothing to the TEE's
+  guarantee. What it adds is that we notice an unsigned digest.
+  M2 also covers a re-pin in `pre_launch_script`, whose launcher lines name
   the compose-manager digest twice (`printf 'COMPOSE_MANAGER_IMAGE=%s\n'
   'nearaidev/compose-manager@sha256:...'` and `echo "[pre_launch] Re-pinned
   ... nearaidev/compose-manager@sha256:..."`). Its lines and digests pair up
@@ -376,9 +379,6 @@ Model (`rules:model-v1`):
   same new digest, every `nearaidev/compose-manager@sha256:` reference in the
   candidate script carries it, and that digest verifies with cosign as
   above. Any other change to `pre_launch_script` holds the entry.
-  This is the same anchor the launcher uses. Since the launcher already
-  trusts that identity at runtime, this check adds nothing to the TEE's
-  guarantee. What it adds is that we notice an unsigned digest.
 - M1 covers the trust anchors without listing them: `GITHUB_REPO`,
   `LAUNCHER_COSIGN_IDENTITY_REGEXP`, `COMPOSE_MANAGER_IMAGE_REPO`,
   `OTELCOL_IMAGE_REPO`, `LAUNCHER_CHANNEL`, the capability grants and the
@@ -401,9 +401,9 @@ uncommented and holds exactly one digest, written `<repo>@sha256:<new>`; the
 baseline's line held `<repo>@sha256:<old>` at that position, where `<old>` is
 the digest of an uncommented `image:` line of the same `<repo>` in the
 baseline; and an `image:` line of `<repo>` in the candidate changed to
-`<new>`, so `<repo>@<new>` goes through G2/M2. A digest moved onto that line
-from another repository, or a line changed without its `image:` line, is
-held.
+`<new>`, so `<repo>@<new>` goes through G2/M2 (a `pre_launch_script`
+re-pin to `<new>` does not count). A digest moved onto that line from another
+repository, or a line changed without its `image:` line, is held.
 
 Whether `nearaidev/cloud-api` and `nearaidev/cvm-ingress` images carry cosign
 signatures has not been checked. That is the first task of the plan. If they

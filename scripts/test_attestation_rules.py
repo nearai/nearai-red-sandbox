@@ -94,8 +94,8 @@ def test_load_baselines_reads_raw_bytes_sorted():
 
 @pytest.mark.parametrize("mutation", ["name=dstack-evil", "image tag :latest"])
 def test_load_baselines_refuses_a_baseline_that_fails_c2_or_c3(tmp_path, mutation):
-    # C2 and C3's pinning check only the candidate: a compose held on them
-    # would pass against itself if merged, so such a baseline refuses to load.
+    # C2 and C3's pinning check only the candidate: merging a compose held on
+    # them cannot clear the hold, so such a baseline is refused, not used.
     _, _, make, _ = MUTATIONS[mutation]
     bad = make()
     d = tmp_path / "production" / "gateway"

@@ -536,6 +536,33 @@ def test_a_non_image_line_needs_the_same_repo_on_an_image_line(tmp_path):
     assert o.entry is None and o.hold["diff"] == [f"digest changed outside an image: line: {new}"]
 
 
+def test_a_copied_digest_needs_its_image_line_not_the_script_to_change(tmp_path):
+    # A model baseline with a non-image line copying compose-manager's digest.
+    # The script's re-pin also verifies nearaidev/compose-manager@<new>, but
+    # only the image: line changing to <new> may carry the copy along.
+    env = "      - CM_IMAGE_ID=" + CM + "@{}"
+    obj = json.loads(E390)
+    obj["docker_compose_file"] += "\n" + env.format(CM_OLD)
+    base = json.dumps(obj)
+
+    def cand(image):
+        o = json.loads(base)
+        o["pre_launch_script"] = o["pre_launch_script"].replace(CM_OLD, CM_NEW)
+        lines = o["docker_compose_file"].split("\n")
+        lines[-1] = env.format(CM_NEW)
+        o["docker_compose_file"] = "\n".join(lines).replace(f"{CM}@{CM_OLD}", f"{CM}@{image}")
+        return json.dumps(o)
+
+    ok, _ = _fake_cosign(tmp_path, 0)
+    held = cand(CM_OLD)
+    assert json.loads(held)["docker_compose_file"].count(CM_OLD) == 1
+    diff = _held(held, tmp_path, base)
+    assert diff == [f"digest changed outside an image: line: {CM_NEW}"], diff
+    moved = cand(CM_NEW)
+    assert CM_OLD not in moved
+    assert _endorse_model(moved, str(ok), base).entry is not None
+
+
 def test_two_same_repo_image_digests_swapped_are_held_without_cosign(tmp_path):
     obj = json.loads(GW)
     ingress = "nearaidev/cvm-ingress@sha256:9e9aacb7866a06aa6959fe1c6064f4c3ed62609af35e955df1b95e7325578435"

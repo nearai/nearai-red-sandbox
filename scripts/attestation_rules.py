@@ -432,9 +432,9 @@ def load_baselines(root: Path, environment: str, role: str) -> list[str]:
     """Raw app_compose of every <root>/<environment>/<role>/<sha256>.json, by name.
 
     A baseline that is not an app_compose, or that fails C2 or C3 against
-    itself, refuses (ValueError): C2 and C3's digest pinning check only the
-    candidate, so a compose held on them would pass against itself once
-    merged into the baselines."""
+    itself, refuses (ValueError). C2 and C3's digest pinning check only the
+    candidate, so merging a compose held on them cannot clear the hold; such
+    a baseline is a mistake to catch, not an approval."""
     if not _SEGMENT.fullmatch(environment) or not _SEGMENT.fullmatch(role):
         raise ValueError(f"bad baseline path segment: {environment!r}/{role!r}")
     d = Path(root) / environment / role
