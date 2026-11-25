@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{ComposePolicy, Policy};
+use super::{ComposePolicy, Match, Policy, Role};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReportResponse {
@@ -124,6 +124,8 @@ pub fn app_compose(info: Option<&serde_json::Value>) -> Result<String, String> {
 pub enum ComposeAcceptance {
     /// Listed in `opencode/attestation-policy.json`.
     Pinned,
+    /// Endorsed for its role by the signed attestation policy feed.
+    Endorsed,
     /// `--compose-policy mr-config-only`: `mr_config_id` vouches for it.
     MrConfigOnly,
     /// Not pinned, but the entry's quote binds a signing key this session
@@ -135,6 +137,7 @@ impl ComposeAcceptance {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pinned => "pinned",
+            Self::Endorsed => "endorsed",
             Self::MrConfigOnly => "mr-config-only",
             Self::KeyContinuity => "key-continuity",
         }
@@ -142,16 +145,20 @@ impl ComposeAcceptance {
 }
 
 /// mr_config_id[0] == 0x01 and [1..33] == sha256(app_compose), then the
-/// compose policy. Under Pinned an unpinned hash is accepted only when
-/// `continued`: the entry's quote-bound signing key was already attested
-/// this session.
+/// policy in the spec's order: refused if the feed revokes the exact hash
+/// (whatever the mode or continuity); `Pinned` if pinned for `role`;
+/// `Endorsed` if the feed endorses it for `role` by exact hash, then by its
+/// `instance-label-v1` hash; then `--compose-policy`, and under Pinned key
+/// continuity: the entry's quote-bound signing key was already attested this
+/// session. Returns the hash, why it was accepted, and the endorsement's match.
 pub fn check_compose(
     mr_config_id: &[u8; 48],
     app_compose: &str,
     policy: &Policy,
+    role: Role,
     mode: ComposePolicy,
     continued: bool,
-) -> Result<([u8; 32], ComposeAcceptance), String> {
+) -> Result<([u8; 32], ComposeAcceptance, Option<Match>), String> {
     if mr_config_id[0] != 0x01 {
         return Err(format!(
             "mr_config_id starts with {:02x}, not 01 (compose hash)",
@@ -162,20 +169,50 @@ pub fn check_compose(
     if mr_config_id[1..33] != hash {
         return Err("mr_config_id does not match sha256(app_compose)".into());
     }
-    // The role is not consulted yet: any pinned hash is accepted.
-    let acceptance = if policy.pinned.contains_key(&hash) {
-        ComposeAcceptance::Pinned
-    } else if mode == ComposePolicy::MrConfigOnly {
+    if policy.revoked.contains(&hash) {
+        return Err(format!(
+            "{} compose hash {} is revoked by the attestation policy feed{}",
+            role.as_str(),
+            hex::encode(hash),
+            policy
+                .feed_version
+                .map(|v| format!(" (v{v})"))
+                .unwrap_or_default()
+        ));
+    }
+    if policy.pinned.get(&hash) == Some(&role) {
+        return Ok((hash, ComposeAcceptance::Pinned, None));
+    }
+    let endorsed = |m: Match, h: [u8; 32]| policy.endorsed.get(&(m, h)) == Some(&role);
+    if endorsed(Match::Exact, hash) {
+        return Ok((hash, ComposeAcceptance::Endorsed, Some(Match::Exact)));
+    }
+    // Normalize only when the feed endorses something that way.
+    if policy
+        .endorsed
+        .keys()
+        .any(|(m, _)| *m == Match::InstanceLabelV1)
+        && super::normalize::instance_label_v1(app_compose)
+            .is_some_and(|n| endorsed(Match::InstanceLabelV1, n))
+    {
+        return Ok((
+            hash,
+            ComposeAcceptance::Endorsed,
+            Some(Match::InstanceLabelV1),
+        ));
+    }
+    let acceptance = if mode == ComposePolicy::MrConfigOnly {
         ComposeAcceptance::MrConfigOnly
     } else if continued {
         ComposeAcceptance::KeyContinuity
     } else {
         return Err(format!(
-            "compose hash {} is not pinned in this NEAR AI environment's policy, opencode/attestation-policy.json or opencode/attestation-policy-staging.json (pass --compose-policy mr-config-only to accept it, or see scripts/refresh-attestation-policy.py)",
+            "{} compose hash {} is not pinned in this NEAR AI environment's policy, opencode/attestation-policy.json or opencode/attestation-policy-staging.json, nor endorsed for that role by the attestation policy feed (pass --compose-policy mr-config-only to accept it, or see scripts/refresh-attestation-policy.py)",
+            role.as_str(),
             hex::encode(hash)
         ));
     };
-    Ok((hash, acceptance))
+    Ok((hash, acceptance, None))
 }
 
 #[cfg(test)]
@@ -284,23 +321,31 @@ pub(crate) mod tests {
             ..Policy::default()
         };
         let empty = Policy::default();
+        let m = Role::Model;
 
         use ComposeAcceptance as A;
         for continued in [false, true] {
             assert_eq!(
-                check_compose(&mr, compose, &pinned, ComposePolicy::Pinned, continued),
-                Ok((hash, A::Pinned))
+                check_compose(&mr, compose, &pinned, m, ComposePolicy::Pinned, continued),
+                Ok((hash, A::Pinned, None))
             );
             assert_eq!(
-                check_compose(&mr, compose, &empty, ComposePolicy::MrConfigOnly, continued),
-                Ok((hash, A::MrConfigOnly))
+                check_compose(
+                    &mr,
+                    compose,
+                    &empty,
+                    m,
+                    ComposePolicy::MrConfigOnly,
+                    continued
+                ),
+                Ok((hash, A::MrConfigOnly, None))
             );
         }
-        let err = check_compose(&mr, compose, &empty, ComposePolicy::Pinned, false).unwrap_err();
+        let err = check_compose(&mr, compose, &empty, m, ComposePolicy::Pinned, false).unwrap_err();
         assert!(err.contains("attestation-policy.json"), "{err}");
         assert_eq!(
-            check_compose(&mr, compose, &empty, ComposePolicy::Pinned, true),
-            Ok((hash, A::KeyContinuity))
+            check_compose(&mr, compose, &empty, m, ComposePolicy::Pinned, true),
+            Ok((hash, A::KeyContinuity, None))
         );
 
         // Continuity never excuses a compose that mr_config_id does not commit to.
@@ -308,11 +353,312 @@ pub(crate) mod tests {
         mr2[0] = 2;
         for mode in [ComposePolicy::Pinned, ComposePolicy::MrConfigOnly] {
             for continued in [false, true] {
-                let err = check_compose(&mr2, compose, &pinned, mode, continued).unwrap_err();
+                let err = check_compose(&mr2, compose, &pinned, m, mode, continued).unwrap_err();
                 assert!(err.contains("mr_config_id"), "{err}");
-                assert!(check_compose(&mr, "services: {x: 1}", &pinned, mode, continued).is_err());
+                assert!(
+                    check_compose(&mr, "services: {x: 1}", &pinned, m, mode, continued).is_err()
+                );
             }
         }
+    }
+
+    // ---- Revocation, pins and feed endorsements ----
+
+    use crate::attest::Match;
+    use std::collections::BTreeSet;
+
+    const GPU04: &str = include_str!(
+        "../../tests/fixtures/compose-history/e3902667a26282dd8b4015a901848c521b20243a155a457148f88acf48a45959.json"
+    );
+    const GPU02: &str = include_str!(
+        "../../tests/fixtures/compose-history/edabf8039210336d90fe966dfc4e48216551dfd8b05d54e96d3f3f0e0da850d4.json"
+    );
+
+    /// The raw app_compose a compose-history fixture wraps as a JSON string.
+    fn raw(fixture: &str) -> String {
+        serde_json::from_str(fixture).unwrap()
+    }
+
+    /// The mr_config_id that commits to `compose`, and its hash.
+    fn committed(compose: &str) -> ([u8; 48], [u8; 32]) {
+        let hash = sha(&[compose.as_bytes()]);
+        let mut mr = [0u8; 48];
+        mr[0] = 1;
+        mr[1..33].copy_from_slice(&hash);
+        (mr, hash)
+    }
+
+    fn endorsing(m: Match, hash: [u8; 32], role: Role) -> Policy {
+        Policy {
+            endorsed: BTreeMap::from([((m, hash), role)]),
+            feed_version: Some(7),
+            ..Policy::default()
+        }
+    }
+
+    const MODES: [ComposePolicy; 2] = [ComposePolicy::Pinned, ComposePolicy::MrConfigOnly];
+
+    #[test]
+    fn revoked_beats_pinned() {
+        let compose = "services: {}";
+        let (mr, hash) = committed(compose);
+        let policy = Policy {
+            pinned: BTreeMap::from([(hash, Role::Model)]),
+            revoked: BTreeSet::from([hash]),
+            feed_version: Some(7),
+            ..Policy::default()
+        };
+        for mode in MODES {
+            for continued in [false, true] {
+                let err =
+                    check_compose(&mr, compose, &policy, Role::Model, mode, continued).unwrap_err();
+                assert!(err.contains("revoked"), "{err}");
+                assert!(err.contains(&hex::encode(hash)), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn revoked_beats_endorsed_and_mr_config_only() {
+        let compose = raw(GPU02);
+        let (mr, hash) = committed(&compose);
+        let normalized = crate::attest::normalize::instance_label_v1(&compose).unwrap();
+        for (m, h) in [(Match::Exact, hash), (Match::InstanceLabelV1, normalized)] {
+            let mut policy = endorsing(m, h, Role::Model);
+            policy.revoked.insert(hash);
+            for mode in MODES {
+                for continued in [false, true] {
+                    let err = check_compose(&mr, &compose, &policy, Role::Model, mode, continued)
+                        .unwrap_err();
+                    assert!(err.contains("revoked"), "{err}");
+                }
+            }
+        }
+        // Revocation is by exact hash: revoking the normalized hash alone
+        // does not refuse a compose that is endorsed exactly.
+        let mut policy = endorsing(Match::Exact, hash, Role::Model);
+        policy.revoked.insert(normalized);
+        assert_eq!(
+            check_compose(
+                &mr,
+                &compose,
+                &policy,
+                Role::Model,
+                ComposePolicy::Pinned,
+                false
+            ),
+            Ok((hash, ComposeAcceptance::Endorsed, Some(Match::Exact)))
+        );
+    }
+
+    #[test]
+    fn exact_endorsement_admits_as_endorsed() {
+        let compose = "services: {}";
+        let (mr, hash) = committed(compose);
+        for role in [Role::Gateway, Role::Model] {
+            let policy = endorsing(Match::Exact, hash, role);
+            for mode in MODES {
+                for continued in [false, true] {
+                    assert_eq!(
+                        check_compose(&mr, compose, &policy, role, mode, continued),
+                        Ok((hash, ComposeAcceptance::Endorsed, Some(Match::Exact)))
+                    );
+                }
+            }
+        }
+        assert_eq!(ComposeAcceptance::Endorsed.as_str(), "endorsed");
+        // A pin wins over an endorsement of the same hash.
+        let mut policy = endorsing(Match::Exact, hash, Role::Model);
+        policy.pinned.insert(hash, Role::Model);
+        assert_eq!(
+            check_compose(
+                &mr,
+                compose,
+                &policy,
+                Role::Model,
+                ComposePolicy::Pinned,
+                false
+            ),
+            Ok((hash, ComposeAcceptance::Pinned, None))
+        );
+    }
+
+    #[test]
+    fn instance_label_endorsement_admits_the_other_host() {
+        let gpu04 = raw(GPU04);
+        let gpu02 = raw(GPU02);
+        let (mr, hash) = committed(&gpu02);
+        let normalized = crate::attest::normalize::instance_label_v1(&gpu04).unwrap();
+        let policy = endorsing(Match::InstanceLabelV1, normalized, Role::Model);
+        assert_eq!(
+            check_compose(
+                &mr,
+                &gpu02,
+                &policy,
+                Role::Model,
+                ComposePolicy::Pinned,
+                false
+            ),
+            Ok((
+                hash,
+                ComposeAcceptance::Endorsed,
+                Some(Match::InstanceLabelV1)
+            ))
+        );
+        // An exact endorsement of gpu04's raw hash does not admit gpu02.
+        let exact = endorsing(Match::Exact, committed(&gpu04).1, Role::Model);
+        let err = check_compose(
+            &mr,
+            &gpu02,
+            &exact,
+            Role::Model,
+            ComposePolicy::Pinned,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("not pinned"), "{err}");
+        // The normalized hash endorsed as exact does not admit it either.
+        let wrong = endorsing(Match::Exact, normalized, Role::Model);
+        assert!(
+            check_compose(
+                &mr,
+                &gpu02,
+                &wrong,
+                Role::Model,
+                ComposePolicy::Pinned,
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_gateway_endorsement_does_not_admit_a_model_and_the_reverse() {
+        let compose = raw(GPU02);
+        let (mr, hash) = committed(&compose);
+        let normalized = crate::attest::normalize::instance_label_v1(&compose).unwrap();
+        for (endorsed_as, checked_as) in
+            [(Role::Gateway, Role::Model), (Role::Model, Role::Gateway)]
+        {
+            for (m, h) in [(Match::Exact, hash), (Match::InstanceLabelV1, normalized)] {
+                let policy = endorsing(m, h, endorsed_as);
+                let err = check_compose(
+                    &mr,
+                    &compose,
+                    &policy,
+                    checked_as,
+                    ComposePolicy::Pinned,
+                    false,
+                )
+                .unwrap_err();
+                assert!(err.contains("not pinned"), "{err}");
+                assert!(err.contains(checked_as.as_str()), "{err}");
+                assert_eq!(
+                    check_compose(
+                        &mr,
+                        &compose,
+                        &policy,
+                        endorsed_as,
+                        ComposePolicy::Pinned,
+                        false
+                    )
+                    .map(|r| r.1),
+                    Ok(ComposeAcceptance::Endorsed)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_gateway_pin_does_not_admit_a_model() {
+        let compose = "services: {}";
+        let (mr, hash) = committed(compose);
+        let policy = Policy {
+            pinned: BTreeMap::from([(hash, Role::Gateway)]),
+            ..Policy::default()
+        };
+        let err = check_compose(
+            &mr,
+            compose,
+            &policy,
+            Role::Model,
+            ComposePolicy::Pinned,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("not pinned"), "{err}");
+        assert_eq!(
+            check_compose(
+                &mr,
+                compose,
+                &policy,
+                Role::Gateway,
+                ComposePolicy::Pinned,
+                false
+            ),
+            Ok((hash, ComposeAcceptance::Pinned, None))
+        );
+        // A model pin does not admit a gateway.
+        let policy = Policy {
+            pinned: BTreeMap::from([(hash, Role::Model)]),
+            ..Policy::default()
+        };
+        assert!(
+            check_compose(
+                &mr,
+                compose,
+                &policy,
+                Role::Gateway,
+                ComposePolicy::Pinned,
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unendorsed_still_falls_through_to_key_continuity() {
+        let compose = raw(GPU02);
+        let (mr, hash) = committed(&compose);
+        // The feed endorses something else, for this role and the other.
+        let mut policy = endorsing(Match::Exact, [0xee; 32], Role::Model);
+        policy
+            .endorsed
+            .insert((Match::InstanceLabelV1, [0xef; 32]), Role::Model);
+        policy.endorsed.insert((Match::Exact, hash), Role::Gateway);
+        assert_eq!(
+            check_compose(
+                &mr,
+                &compose,
+                &policy,
+                Role::Model,
+                ComposePolicy::Pinned,
+                true
+            ),
+            Ok((hash, ComposeAcceptance::KeyContinuity, None))
+        );
+        assert_eq!(
+            check_compose(
+                &mr,
+                &compose,
+                &policy,
+                Role::Model,
+                ComposePolicy::MrConfigOnly,
+                false
+            ),
+            Ok((hash, ComposeAcceptance::MrConfigOnly, None))
+        );
+        assert!(
+            check_compose(
+                &mr,
+                &compose,
+                &policy,
+                Role::Model,
+                ComposePolicy::Pinned,
+                false
+            )
+            .is_err()
+        );
     }
 
     #[test]

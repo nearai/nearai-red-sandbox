@@ -3,7 +3,7 @@
 //! microVM session execution.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ironwire_proxy::embed::HostSecret;
 
@@ -348,6 +348,14 @@ fn resolve_and_attest(
     }
 }
 
+/// Seconds since the Unix epoch; 0 if the clock is before it.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Run one sandboxed session according to `spec`.
 pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
     let LaunchSpec {
@@ -405,6 +413,8 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
     }
     let preflight_env = deps.env.clone();
     let preflight_host = deps.host.clone();
+    // The attestation policy feed's cache sits next to the update cache.
+    let feed_home = crate::install::home_in(&deps.env, cfg!(windows));
     let exit_code = run_connected(
         &mut config,
         |cfg| {
@@ -425,6 +435,11 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                 &session_id,
                 &attest_options,
             )?;
+            // Once per launch, before attestation and bounded to 5 s: a
+            // sign-in retry attests again with the same document.
+            let (feed_doc, feed_source) =
+                attest::feed::session_feed(feed_home.as_deref(), near, unix_now());
+            brand::progress::message(&format!("[rts] {}", feed_source.line()));
             let sign_in = SignInHooks {
                 load_for_launch: &auth::load_for_launch,
                 login: &auth::login,
@@ -436,9 +451,15 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                 Some(&progress),
                 &sign_in,
                 |key| {
-                    attest::Attestor::real(near, Some(key), &cfg.provider.models, attest_options)
-                        .map_err(attest::AttestationFailure::Other)?
-                        .attest_for_launch()
+                    attest::Attestor::real(
+                        near,
+                        Some(key),
+                        &cfg.provider.models,
+                        attest_options,
+                        feed_doc.as_ref(),
+                    )
+                    .map_err(attest::AttestationFailure::Other)?
+                    .attest_for_launch()
                 },
             )?;
             let step = progress.step("inference", Live::Sweep);
@@ -461,13 +482,38 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                             let credentials = credentials.clone();
                             let models = cfg.provider.models.clone();
                             let options = attest_options;
+                            // The launch's document and line; reloaded once the
+                            // cached copy is over an hour old or it expires.
+                            let feed = Arc::new(Mutex::new((feed_doc.clone(), feed_source.line())));
+                            let feed_home = feed_home.clone();
                             Arc::new(move || {
                                 let snapshot = credentials.snapshot()?;
+                                let doc = {
+                                    let mut state = feed.lock().unwrap_or_else(|e| e.into_inner());
+                                    let (doc, last) = &mut *state;
+                                    let now = unix_now();
+                                    if let Some(source) =
+                                        attest::feed::refresh(doc, feed_home.as_deref(), near, now)
+                                    {
+                                        let line = source.line();
+                                        if line != *last {
+                                            brand::progress::message(&format!("[rts] {line}"));
+                                            *last = line;
+                                        }
+                                    }
+                                    doc.clone()
+                                };
                                 let attest = |key| {
-                                    attest::Attestor::real(near, Some(key), &models, options)
-                                        .map_err(attest::AttestationFailure::Other)?
-                                        .with_continuity(continuity.clone())
-                                        .attest_for_launch()
+                                    attest::Attestor::real(
+                                        near,
+                                        Some(key),
+                                        &models,
+                                        options,
+                                        doc.as_ref(),
+                                    )
+                                    .map_err(attest::AttestationFailure::Other)?
+                                    .with_continuity(continuity.clone())
+                                    .attest_for_launch()
                                 };
                                 let warn = |attested: attest::Attested| {
                                     for entry in attested.key_continuity() {

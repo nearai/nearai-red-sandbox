@@ -8,7 +8,10 @@
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -18,7 +21,7 @@ use serde::Deserialize;
 use crate::attest::{Match, Policy, Role};
 use crate::inference::NearEnvironment;
 use crate::install::attestation_policy_dir;
-use crate::setup::{Fetch, download};
+use crate::setup::{Fetch, Hop, HttpsFetch, download};
 use crate::sys::fs::{Create, create_private_dir_all, open_private, restrict_dir};
 
 /// `issued` may be at most this far ahead of the local clock.
@@ -111,7 +114,8 @@ struct RawEntry {
     sha256: String,
 }
 
-fn environment_name(env: NearEnvironment) -> &'static str {
+/// The environment's name in feed URLs, cache files and documents.
+pub(crate) fn environment_name(env: NearEnvironment) -> &'static str {
     match env {
         NearEnvironment::Production => "production",
         NearEnvironment::Staging => "staging",
@@ -261,6 +265,17 @@ pub enum FeedSource {
     CompiledIn(String),
 }
 
+impl FeedSource {
+    /// The one progress line a launch prints for it.
+    pub fn line(&self) -> String {
+        match self {
+            FeedSource::Fetched(v) => format!("Attestation policy: feed v{v}"),
+            FeedSource::Cached(v, why) => format!("Attestation policy: cached feed v{v} ({why})"),
+            FeedSource::CompiledIn(why) => format!("Attestation policy: compiled-in only ({why})"),
+        }
+    }
+}
+
 /// False when this build has no feed keys or `RTS_ATTESTATION_POLICY_FEED`
 /// is `off`.
 pub fn feed_enabled() -> bool {
@@ -352,6 +367,140 @@ pub fn cached_age(home: &Path, env: NearEnvironment, now: u64) -> Option<u64> {
         .ok()?
         .as_secs();
     Some(now.saturating_sub(at))
+}
+
+/// How long a launch, or a re-attestation's reload, waits for the fetch.
+pub const FETCH_BOUND: Duration = Duration::from_secs(5);
+/// A re-attestation reloads the feed once the cached document was last
+/// fetched longer ago than this.
+pub const REFRESH_AFTER_SECS: u64 = 3600;
+
+/// Fails every request with its reason: the cache-only path.
+struct Unavailable(String);
+impl Fetch for Unavailable {
+    fn get(&self, _: &url::Url) -> Result<Hop, String> {
+        Err(self.0.clone())
+    }
+}
+
+/// [`load_feed`] on a worker thread, waiting at most `bound`. If the
+/// fetch has not finished by then, the cached document is used as if the
+/// fetch had failed, so a hung network costs `bound` and not the cache. The
+/// worker finishes on its own; a late successful fetch still updates the
+/// cache by rename.
+pub fn load_feed_within(
+    fetch: Arc<dyn Fetch>,
+    home: &Path,
+    env: NearEnvironment,
+    now: u64,
+    keys: &[[u8; 32]],
+    bound: Duration,
+) -> (Option<FeedDocument>, FeedSource) {
+    let off = switched_off(std::env::var_os(FEED_SWITCH_ENV).as_deref());
+    load_feed_within_switched(fetch, home, env, now, keys, bound, off)
+}
+
+fn load_feed_within_switched(
+    fetch: Arc<dyn Fetch>,
+    home: &Path,
+    env: NearEnvironment,
+    now: u64,
+    keys: &[[u8; 32]],
+    bound: Duration,
+    off: bool,
+) -> (Option<FeedDocument>, FeedSource) {
+    if off || keys.is_empty() {
+        return load_feed_switched(&Unavailable(String::new()), home, env, now, keys, off);
+    }
+    let (tx, rx) = mpsc::channel();
+    let (worker_home, worker_keys) = (home.to_path_buf(), keys.to_vec());
+    let spawned = std::thread::Builder::new()
+        .name("rts-policy-feed".into())
+        .spawn(move || {
+            let _ = tx.send(load_feed_switched(
+                &*fetch,
+                &worker_home,
+                env,
+                now,
+                &worker_keys,
+                false,
+            ));
+        });
+    let why = match spawned {
+        Err(e) => format!("starting the feed fetch: {e}"),
+        Ok(_) => match rx.recv_timeout(bound) {
+            Ok(r) => return r,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                format!("the fetch timed out after {} s", bound.as_secs_f64())
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                "the feed fetch stopped without a result".into()
+            }
+        },
+    };
+    load_feed_switched(&Unavailable(why), home, env, now, keys, false)
+}
+
+/// The feed for a session in `env`, as launch and re-attestation load it:
+/// the compiled-in keys, a 5-second bound, and HTTPS clients bounded the
+/// same way. Never errors.
+pub fn session_feed(
+    home: Option<&Path>,
+    env: NearEnvironment,
+    now: u64,
+) -> (Option<FeedDocument>, FeedSource) {
+    let Some(home) = home else {
+        return (
+            None,
+            FeedSource::CompiledIn("no home directory for the feed cache".into()),
+        );
+    };
+    if !feed_enabled() {
+        // Off or keyless: no client, no request, no cache.
+        return load_feed(&Unavailable(String::new()), home, env, now, FEED_KEYS);
+    }
+    match HttpsFetch::with_timeouts(FETCH_BOUND, FETCH_BOUND) {
+        Ok(fetch) => load_feed_within(Arc::new(fetch), home, env, now, FEED_KEYS, FETCH_BOUND),
+        Err(e) => load_feed(&Unavailable(e), home, env, now, FEED_KEYS),
+    }
+}
+
+/// Whether a re-attestation reloads the feed: the cached document was
+/// fetched over an hour ago, or the document in use has expired. With no
+/// cache and no document in use (launch found none), it does not retry on
+/// every re-attestation.
+pub fn refresh_due(doc: Option<&FeedDocument>, cached_age: Option<u64>, now: u64) -> bool {
+    doc.is_some_and(|d| now >= d.expires) || cached_age.is_some_and(|a| a > REFRESH_AFTER_SECS)
+}
+
+/// Reloads `current` with `reload` when [`refresh_due`], keeping whatever it
+/// returns (it has already fallen back to the cache), and returns its source.
+fn refresh_with(
+    current: &mut Option<FeedDocument>,
+    cached_age: Option<u64>,
+    now: u64,
+    reload: impl FnOnce() -> (Option<FeedDocument>, FeedSource),
+) -> Option<FeedSource> {
+    if !refresh_due(current.as_ref(), cached_age, now) {
+        return None;
+    }
+    let (doc, source) = reload();
+    *current = doc;
+    Some(source)
+}
+
+/// Re-attestation's reload of `current` (see [`refresh_due`]); None when
+/// nothing was reloaded. A disabled feed is never reloaded.
+pub fn refresh(
+    current: &mut Option<FeedDocument>,
+    home: Option<&Path>,
+    env: NearEnvironment,
+    now: u64,
+) -> Option<FeedSource> {
+    let home = home.filter(|_| feed_enabled())?;
+    refresh_with(current, cached_age(home, env, now), now, || {
+        session_feed(Some(home), env, now)
+    })
 }
 
 fn fetch_pair(fetch: &dyn Fetch, env: NearEnvironment) -> Result<(Vec<u8>, Vec<u8>), String> {
@@ -1593,5 +1742,171 @@ mod tests {
             cached_age(home, NearEnvironment::Staging, ISSUED + 4000),
             None
         );
+    }
+
+    // ---- Launch bound and re-attestation refresh ----
+
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// Answers only after `delay`, then fails.
+    struct SlowFetch(Duration);
+    impl Fetch for SlowFetch {
+        fn get(&self, _: &url::Url) -> Result<Hop, String> {
+            std::thread::sleep(self.0);
+            Err("SlowFetch: too late".into())
+        }
+    }
+
+    fn within(
+        f: Arc<dyn Fetch>,
+        home: &Path,
+        timeout: Duration,
+        off: bool,
+    ) -> (Option<FeedDocument>, FeedSource) {
+        load_feed_within_switched(
+            f,
+            home,
+            NearEnvironment::Production,
+            NOW,
+            &keys(),
+            timeout,
+            off,
+        )
+    }
+
+    #[test]
+    fn a_prompt_fetch_within_the_bound_is_used() {
+        let t = tempfile::tempdir().unwrap();
+        let text = doc_v(ISSUED);
+        let (d, src) = within(
+            Arc::new(serving(&text, &text)),
+            t.path(),
+            Duration::from_secs(5),
+            false,
+        );
+        assert_eq!(src, FeedSource::Fetched(ISSUED));
+        assert!(d.is_some());
+    }
+
+    #[test]
+    fn a_hung_fetch_falls_back_to_the_cache_at_the_bound() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        seed(home, ISSUED);
+        let started = Instant::now();
+        let (d, src) = within(
+            Arc::new(SlowFetch(Duration::from_secs(3))),
+            home,
+            Duration::from_millis(200),
+            false,
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        match src {
+            FeedSource::Cached(v, why) => {
+                assert_eq!(v, ISSUED);
+                assert!(why.contains("timed out"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(d.unwrap().version, ISSUED);
+    }
+
+    #[test]
+    fn a_hung_fetch_without_a_cache_yields_compiled_in() {
+        let t = tempfile::tempdir().unwrap();
+        let (d, src) = within(
+            Arc::new(SlowFetch(Duration::from_secs(3))),
+            t.path(),
+            Duration::from_millis(200),
+            false,
+        );
+        assert!(d.is_none());
+        assert!(compiled_in_reason(src).contains("timed out"));
+    }
+
+    #[test]
+    fn the_bounded_load_makes_no_request_when_off() {
+        let t = tempfile::tempdir().unwrap();
+        let (d, src) = within(Arc::new(PanicFetch), t.path(), Duration::from_secs(5), true);
+        assert!(d.is_none());
+        assert!(compiled_in_reason(src).contains("RTS_ATTESTATION_POLICY_FEED=off"));
+    }
+
+    #[test]
+    fn the_launch_line_names_the_source() {
+        assert_eq!(
+            FeedSource::Fetched(12).line(),
+            "Attestation policy: feed v12"
+        );
+        assert_eq!(
+            FeedSource::Cached(11, "timed out after 5 s".into()).line(),
+            "Attestation policy: cached feed v11 (timed out after 5 s)"
+        );
+        assert_eq!(
+            FeedSource::CompiledIn("RTS_ATTESTATION_POLICY_FEED=off".into()).line(),
+            "Attestation policy: compiled-in only (RTS_ATTESTATION_POLICY_FEED=off)"
+        );
+        assert_eq!(
+            session_feed(None, NearEnvironment::Production, NOW).1,
+            FeedSource::CompiledIn("no home directory for the feed cache".into())
+        );
+    }
+
+    fn feed_doc(expires: u64) -> FeedDocument {
+        FeedDocument {
+            environment: NearEnvironment::Production,
+            version: ISSUED,
+            issued: ISSUED,
+            expires,
+            entries: vec![],
+            revoked: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn refresh_is_due_after_an_hour_or_at_expiry() {
+        let d = feed_doc(NOW + 10);
+        assert!(!refresh_due(Some(&d), Some(REFRESH_AFTER_SECS), NOW));
+        assert!(refresh_due(Some(&d), Some(REFRESH_AFTER_SECS + 1), NOW));
+        assert!(refresh_due(None, Some(REFRESH_AFTER_SECS + 1), NOW));
+        // An expired document in memory is never used again unreloaded.
+        assert!(refresh_due(Some(&d), Some(0), NOW + 10));
+        assert!(refresh_due(Some(&d), None, NOW + 10));
+        // No cache and no document: launch found none; do not retry every
+        // re-attestation.
+        assert!(!refresh_due(None, None, NOW));
+        assert!(!refresh_due(Some(&d), None, NOW));
+    }
+
+    #[test]
+    fn a_refresh_keeps_whatever_the_reload_returns() {
+        let mut current = Some(feed_doc(NOW + 10));
+        // Not due: no reload.
+        let src = refresh_with(&mut current, Some(0), NOW, || panic!("reloaded"));
+        assert_eq!(src, None);
+        assert!(current.is_some());
+        // Due: the reload's result replaces it, even when it is nothing.
+        let src = refresh_with(&mut current, Some(REFRESH_AFTER_SECS + 1), NOW, || {
+            (None, FeedSource::CompiledIn("gone".into()))
+        });
+        assert_eq!(src, Some(FeedSource::CompiledIn("gone".into())));
+        assert!(current.is_none());
+        // Expired in memory: reloaded, and a newer document replaces it.
+        let mut current = Some(feed_doc(NOW));
+        let newer = FeedDocument {
+            version: ISSUED + 1,
+            ..feed_doc(NOW + 100)
+        };
+        let n = newer.clone();
+        let src = refresh_with(&mut current, Some(0), NOW, move || {
+            (Some(n), FeedSource::Fetched(ISSUED + 1))
+        });
+        assert_eq!(src, Some(FeedSource::Fetched(ISSUED + 1)));
+        assert_eq!(current, Some(newer));
     }
 }

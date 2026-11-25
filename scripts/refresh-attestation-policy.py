@@ -20,7 +20,10 @@ production or the reverse.
 Only entries rts accepted after every check (TDX quote, TCB, report_data,
 mr_config_id == sha256(app_compose), and for models the GPU verdict) but
 without a pin are proposed: compose_acceptance "mr-config-only" or
-"key-continuity". Nothing is fetched from the network. The policy is compiled
+"key-continuity". A compose the signed attestation policy feed admitted
+("endorsed") is already accepted, so it is never proposed, even where a
+re-attestation later accepted it another way. Nothing is fetched from the
+network. The policy is compiled
 into rts, so rebuild after --write. Each candidate's app_compose is printed:
 review it (images, digests, mounts, logging) before pinning, because a pin
 makes every future launch trust that build.
@@ -41,6 +44,8 @@ ENVIRONMENTS = {
     "staging": ("https://cloud-stg-api.near.ai/v1", "attestation-policy-staging.json"),
 }
 UNPINNED = {"mr-config-only", "key-continuity"}
+# Admitted by the signed attestation policy feed: accepted, not a candidate.
+ENDORSED = "endorsed"
 HASH = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -76,7 +81,14 @@ def candidates(doc, policy, today, environment="production"):
         raise ValueError("attestation.json has no verified evidence")
     pinned = {e["sha256"] for e in policy["composeHashes"]}
     batches = [doc["evidence"]] + [r.get("evidence", []) for r in doc.get("reattestations", [])]
-    out, seen = [], set(pinned)
+    endorsed = {
+        entry.get("compose_hash")
+        for batch in batches
+        for ev in batch
+        for entry in ev.get("entries", [])
+        if entry.get("compose_acceptance") == ENDORSED
+    }
+    out, seen = [], set(pinned) | endorsed
     for batch in batches:
         for ev in batch:
             if ev.get("base_url") != base_url:
@@ -134,7 +146,7 @@ def main(argv=None):
         print(f"refresh-attestation-policy: {e}", file=sys.stderr)
         return 1
     if not found:
-        print("no new compose hashes: every verified entry is already pinned")
+        print("no new compose hashes: every verified entry is already pinned or endorsed")
         return 0
     for c in found:
         print(f"== {c['sha256']}\n   {c['source']}\n-- app_compose (review before pinning):\n{c['app_compose']}\n")

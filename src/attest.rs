@@ -79,6 +79,16 @@ pub enum Match {
     InstanceLabelV1,
 }
 
+impl Match {
+    /// The feed's name for it, recorded as `compose_match`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Match::Exact => "exact",
+            Match::InstanceLabelV1 => "instance-label-v1",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Policy {
     /// Compiled-in pins, each with its role.
@@ -266,7 +276,8 @@ fn urandom_nonce() -> [u8; 32] {
 impl Attestor {
     /// BlockingHttp, SystemClock, PcsQuoteVerifier, NrasGpuVerifier, and
     /// /dev/urandom nonces, with `near`'s API base and pinned policy (one
-    /// value, so the two cannot be mixed).
+    /// value, so the two cannot be mixed), and `feed`'s endorsements and
+    /// revocations merged in. `feed` must be a document verified for `near`.
     ///
     /// `BlockingHttp` must not run on a Tokio runtime thread: call `attest`
     /// from a plain thread.
@@ -275,7 +286,19 @@ impl Attestor {
         key: Option<HostSecret>,
         models: &[String],
         options: AttestOptions,
+        feed: Option<&feed::FeedDocument>,
     ) -> Result<Attestor, String> {
+        let mut policy = load_policy(policy_json(near))?;
+        if let Some(doc) = feed {
+            if doc.environment != near {
+                return Err(format!(
+                    "the attestation policy feed document is for {}, not {}",
+                    feed::environment_name(doc.environment),
+                    feed::environment_name(near)
+                ));
+            }
+            feed::merge(&mut policy, doc);
+        }
         let http: Arc<dyn Http> = Arc::new(BlockingHttp::new()?);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         Ok(Attestor {
@@ -290,7 +313,7 @@ impl Attestor {
             key,
             models: models.to_vec(),
             options,
-            policy: load_policy(policy_json(near))?,
+            policy,
             continuity: Continuity::default(),
             nonce: Arc::new(urandom_nonce),
         })
@@ -373,7 +396,7 @@ impl Attestor {
             && report::hex32(&gateway.signing_address)
                 .is_ok_and(|k| self.continuity.gateway_keys.contains(&k));
         let mut record = self
-            .check_quote(gateway, &nonce, gateway_continued)
+            .check_quote(gateway, &nonce, Role::Gateway, gateway_continued)
             .map_err(|e| format!("gateway: {e}"))?;
         // Only after every gateway check passed. NEAR AI production signs
         // receipts with an ed25519 gateway key; any other algorithm pins
@@ -406,7 +429,9 @@ impl Attestor {
             }
             let key = report::ed25519_key(entry).map_err(at)?;
             let continued = self.continuity.vouches_for_model(model, &key);
-            let mut record = self.check_quote(entry, &nonce, continued).map_err(at)?;
+            let mut record = self
+                .check_quote(entry, &nonce, Role::Model, continued)
+                .map_err(at)?;
             let payload = entry
                 .nvidia_payload
                 .as_deref()
@@ -446,13 +471,14 @@ impl Attestor {
     }
 
     /// The checks every entry carries: TDX quote, TCB policy, report_data,
-    /// and compose. `continued`: the entry's signing key is in
+    /// and compose for `role`. `continued`: the entry's signing key is in
     /// [`Continuity`]; it counts only once report_data has bound that key.
     /// Returns the entry's evidence record.
     fn check_quote(
         &self,
         e: &Evidence,
         nonce: &[u8; 32],
+        role: Role,
         continued: bool,
     ) -> Result<serde_json::Map<String, Value>, String> {
         let quote = hex::decode(&e.intel_quote)
@@ -464,10 +490,11 @@ impl Attestor {
         let acceptance = tcb_policy(&claims.tcb_status, self.options.allow_tcb_out_of_date)?;
         report::check_report_data(&claims.report_data, e, nonce)?;
         let compose = report::app_compose(e.info.as_ref())?;
-        let (hash, compose_acceptance) = report::check_compose(
+        let (hash, compose_acceptance, compose_match) = report::check_compose(
             &claims.mr_config_id,
             &compose,
             &self.policy,
+            role,
             self.options.compose_policy,
             continued,
         )?;
@@ -483,6 +510,13 @@ impl Attestor {
             "compose_acceptance".into(),
             compose_acceptance.as_str().into(),
         );
+        // The feed document that admitted or checked the entry, and how.
+        if let Some(m_) = compose_match {
+            m.insert("compose_match".into(), m_.as_str().into());
+        }
+        if let Some(v) = self.policy.feed_version {
+            m.insert("feed_version".into(), v.into());
+        }
         Ok(m)
     }
 }
@@ -502,6 +536,7 @@ mod tests {
     const DUMMY_KEY: &str = "rts-dummy-key-never-send-to-a-provider";
     const COMPOSE: &str = "services:\n  model: {}\n";
     const OTHER_COMPOSE: &str = "services:\n  other: {}\n";
+    const GW_COMPOSE: &str = "services:\n  gateway: {}\n";
     const KEY: [u8; 32] = [0x11; 32];
     const FP: [u8; 32] = [0x22; 32];
     const GW_ADDR: [u8; 20] = [0x33; 20];
@@ -580,7 +615,7 @@ mod tests {
                         "signing_address": format!("0x{}", hex::encode(GW_ADDR)),
                         "signing_algo": "ecdsa",
                         "tls_cert_fingerprint": hex::encode(FP),
-                        "info": info(COMPOSE),
+                        "info": info(GW_COMPOSE),
                     },
                     "model_attestations": [{
                         "intel_quote": hex::encode(b"m0"),
@@ -591,7 +626,7 @@ mod tests {
                         "model_name": "m",
                     }],
                 }),
-                gw: claims(sha(&[&GW_ADDR, &FP]), nonce, COMPOSE),
+                gw: claims(sha(&[&GW_ADDR, &FP]), nonce, GW_COMPOSE),
                 m0: claims(KEY, nonce, COMPOSE),
                 status: 200,
                 body: None,
@@ -603,7 +638,10 @@ mod tests {
                 }),
                 options: AttestOptions::default(),
                 policy: Policy {
-                    pinned: BTreeMap::from([(sha(&[COMPOSE.as_bytes()]), Role::Model)]),
+                    pinned: BTreeMap::from([
+                        (sha(&[COMPOSE.as_bytes()]), Role::Model),
+                        (sha(&[GW_COMPOSE.as_bytes()]), Role::Gateway),
+                    ]),
                     ..Policy::default()
                 },
                 keyless: false,
@@ -959,7 +997,7 @@ mod tests {
         let gw = case.report["gateway_attestation"].as_object_mut().unwrap();
         gw.insert("signing_address".into(), hex::encode(GW_KEY).into());
         gw.insert("signing_algo".into(), "ed25519".into());
-        case.gw = claims(sha(&[&GW_KEY, &FP]), nonce, COMPOSE);
+        case.gw = claims(sha(&[&GW_KEY, &FP]), nonce, GW_COMPOSE);
         case
     }
 
@@ -1008,7 +1046,7 @@ mod tests {
                 "signing_address",
                 Box::new(|c| {
                     // A 31-byte key the quote binds is still refused.
-                    c.gw = claims(sha(&[&[0x55; 31], &FP]), [1; 32], COMPOSE);
+                    c.gw = claims(sha(&[&[0x55; 31], &FP]), [1; 32], GW_COMPOSE);
                     c.report["gateway_attestation"]
                         .as_object_mut()
                         .unwrap()
@@ -1231,6 +1269,77 @@ mod tests {
         );
     }
 
+    /// An entry the feed admits records `endorsed`, the match used and the
+    /// feed version; every entry checked under a feed records its version.
+    #[test]
+    fn evidence_records_endorsed_with_feed_version_and_match() {
+        let mut case = redeployed_model(Case::good([1; 32]));
+        case.policy.endorsed.insert(
+            (Match::Exact, sha(&[OTHER_COMPOSE.as_bytes()])),
+            Role::Model,
+        );
+        case.policy.feed_version = Some(1_764_028_800);
+        let a = run_one(case).result.unwrap();
+        let entries = &a.evidence[0]["entries"];
+        assert_eq!(entries[1]["compose_acceptance"], "endorsed");
+        assert_eq!(entries[1]["compose_match"], "exact");
+        assert_eq!(entries[1]["feed_version"], 1_764_028_800u64);
+        assert_eq!(
+            entries[1]["compose_hash"],
+            hex::encode(sha(&[OTHER_COMPOSE.as_bytes()]))
+        );
+        assert_eq!(entries[0]["compose_acceptance"], "pinned");
+        assert_eq!(entries[0]["feed_version"], 1_764_028_800u64);
+        assert!(entries[0].get("compose_match").is_none(), "{entries}");
+        // Endorsed is reviewed, not key continuity: the operator is not warned.
+        assert!(a.key_continuity().is_empty());
+
+        // Without a feed, neither field is recorded.
+        let a = run_one(Case::good([1; 32])).result.unwrap();
+        for e in a.evidence[0]["entries"].as_array().unwrap() {
+            assert!(e.get("feed_version").is_none(), "{e}");
+            assert!(e.get("compose_match").is_none(), "{e}");
+        }
+    }
+
+    /// `Attestor::real` merges a verified feed document into the compiled-in
+    /// policy, and refuses one for the other environment.
+    #[test]
+    fn the_real_attestor_merges_the_feed() {
+        use crate::inference::NearEnvironment;
+        let models = vec!["m".to_string()];
+        let doc = feed::FeedDocument {
+            environment: NearEnvironment::Production,
+            version: 9,
+            issued: 1,
+            expires: 2,
+            entries: vec![(Role::Model, Match::InstanceLabelV1, [0xab; 32])],
+            revoked: BTreeSet::from([[0xcd; 32]]),
+        };
+        let a = Attestor::real(
+            NearEnvironment::Production,
+            None,
+            &models,
+            AttestOptions::default(),
+            Some(&doc),
+        )
+        .unwrap();
+        let mut expected = load_policy(POLICY_JSON).unwrap();
+        feed::merge(&mut expected, &doc);
+        assert_eq!(a.policy, expected);
+        assert_eq!(a.policy.feed_version, Some(9));
+        let err = Attestor::real(
+            NearEnvironment::Staging,
+            None,
+            &models,
+            AttestOptions::default(),
+            Some(&doc),
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("production"), "{err}");
+    }
+
     #[test]
     fn mr_config_only_records_its_acceptance() {
         let mut case = redeployed_model(Case::good([1; 32]));
@@ -1263,7 +1372,7 @@ mod tests {
             (NearEnvironment::Staging, POLICY_STAGING_JSON),
         ] {
             assert_eq!(policy_json(near), json);
-            let a = Attestor::real(near, None, &models, AttestOptions::default()).unwrap();
+            let a = Attestor::real(near, None, &models, AttestOptions::default(), None).unwrap();
             assert_eq!(a.base_url, near.base_url());
             assert_eq!(a.policy, load_policy(json).unwrap());
         }
