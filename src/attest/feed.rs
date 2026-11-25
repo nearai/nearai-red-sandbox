@@ -6,6 +6,9 @@
 //! before anything is parsed, as `latest.json` is.
 
 use std::collections::BTreeSet;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -14,6 +17,9 @@ use serde::Deserialize;
 
 use crate::attest::{Match, Policy, Role};
 use crate::inference::NearEnvironment;
+use crate::install::attestation_policy_dir;
+use crate::setup::{Fetch, download};
+use crate::sys::fs::{Create, create_private_dir_all, open_private, restrict_dir};
 
 /// `issued` may be at most this far ahead of the local clock.
 pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
@@ -232,6 +238,230 @@ fn parse_sha256(s: &str) -> Option<[u8; 32]> {
         return None;
     }
     hex::decode(s).ok()?.try_into().ok()
+}
+
+/// The opt-out: `off` skips the fetch and the cache, leaving compiled-in pins.
+pub const FEED_SWITCH_ENV: &str = "RTS_ATTESTATION_POLICY_FEED";
+/// The largest document `rts` fetches or reads from its cache.
+pub const MAX_DOCUMENT_BYTES: u64 = 262_144;
+/// The largest signature file `rts` fetches or reads from its cache.
+pub const MAX_SIGNATURE_BYTES: u64 = 1024;
+const FEED_BASE: &str =
+    "https://github.com/nearai/nearai-red-sandbox/releases/download/attestation-policy/";
+
+/// Where the document `load_feed` returned came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeedSource {
+    /// Fetched and verified now; the version.
+    Fetched(u64),
+    /// The fetch or its verification failed; the cached document's version,
+    /// and why the fetch was not used.
+    Cached(u64, String),
+    /// Neither a fetched nor a cached document; why.
+    CompiledIn(String),
+}
+
+/// False when this build has no feed keys or `RTS_ATTESTATION_POLICY_FEED`
+/// is `off`.
+pub fn feed_enabled() -> bool {
+    !FEED_KEYS.is_empty() && !switched_off(std::env::var_os(FEED_SWITCH_ENV).as_deref())
+}
+
+fn switched_off(v: Option<&std::ffi::OsStr>) -> bool {
+    v == Some(std::ffi::OsStr::new("off"))
+}
+
+/// Fetches and verifies `env`'s document and caches it, or falls back to the
+/// cached document if it still verifies (deleting it if it does not), or to
+/// nothing. Never errors: the reason rides in the `FeedSource`. Off or
+/// keyless, it makes no request and reads no cache. `now` is unix seconds.
+/// The caller bounds the time it takes.
+pub fn load_feed(
+    fetch: &dyn Fetch,
+    home: &Path,
+    env: NearEnvironment,
+    now: u64,
+    keys: &[[u8; 32]],
+) -> (Option<FeedDocument>, FeedSource) {
+    let off = switched_off(std::env::var_os(FEED_SWITCH_ENV).as_deref());
+    load_feed_switched(fetch, home, env, now, keys, off)
+}
+
+fn load_feed_switched(
+    fetch: &dyn Fetch,
+    home: &Path,
+    env: NearEnvironment,
+    now: u64,
+    keys: &[[u8; 32]],
+    off: bool,
+) -> (Option<FeedDocument>, FeedSource) {
+    if off {
+        return (
+            None,
+            FeedSource::CompiledIn(format!("{FEED_SWITCH_ENV}=off")),
+        );
+    }
+    if keys.is_empty() {
+        return (
+            None,
+            FeedSource::CompiledIn("this build has no feed keys".into()),
+        );
+    }
+    let cache = Cache::new(home, env);
+    let high_water = cache.high_water();
+    let fetched = fetch_pair(fetch, env).and_then(|(doc, sig)| {
+        verify_document(&doc, &sig, keys, env, now, high_water).map(|d| (d, doc, sig))
+    });
+    let why = match fetched {
+        Ok((d, doc, sig)) => {
+            // A cache that cannot be written costs only the next fallback.
+            let _ = cache.store(&doc, &sig, d.version);
+            let v = d.version;
+            return (Some(d), FeedSource::Fetched(v));
+        }
+        Err(e) => e,
+    };
+    match cache.load(keys, env, now, high_water) {
+        None => (
+            None,
+            FeedSource::CompiledIn(format!("{why}; no cached document")),
+        ),
+        Some(Ok(d)) => {
+            let v = d.version;
+            (Some(d), FeedSource::Cached(v, why))
+        }
+        Some(Err(e)) => {
+            cache.discard();
+            (
+                None,
+                FeedSource::CompiledIn(format!("{why}; cached document refused and deleted: {e}")),
+            )
+        }
+    }
+}
+
+/// Seconds since the cached document for `env` was last fetched (its file's
+/// modification time), 0 if that is in the future; None with no cache.
+pub fn cached_age(home: &Path, env: NearEnvironment, now: u64) -> Option<u64> {
+    let modified = std::fs::metadata(Cache::new(home, env).doc)
+        .ok()?
+        .modified()
+        .ok()?;
+    let at = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(now.saturating_sub(at))
+}
+
+fn fetch_pair(fetch: &dyn Fetch, env: NearEnvironment) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let url = format!("{FEED_BASE}{}.json", environment_name(env));
+    let mut doc = Vec::new();
+    download(fetch, &url, MAX_DOCUMENT_BYTES, &mut doc)?;
+    let mut sig = Vec::new();
+    download(fetch, &format!("{url}.sig"), MAX_SIGNATURE_BYTES, &mut sig)?;
+    Ok((doc, sig))
+}
+
+/// One environment's cache files. Each is replaced by writing a temporary
+/// file in the same directory and renaming it over the old one, so a reader
+/// never sees a partly written file.
+struct Cache {
+    dir: PathBuf,
+    doc: PathBuf,
+    sig: PathBuf,
+    version: PathBuf,
+}
+
+impl Cache {
+    fn new(home: &Path, env: NearEnvironment) -> Cache {
+        let dir = attestation_policy_dir(home);
+        let name = environment_name(env);
+        Cache {
+            doc: dir.join(format!("{name}.json")),
+            sig: dir.join(format!("{name}.json.sig")),
+            version: dir.join(format!("{name}.version")),
+            dir,
+        }
+    }
+
+    /// The highest version accepted so far; 0 when none is recorded.
+    fn high_water(&self) -> u64 {
+        std::fs::read_to_string(&self.version)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// None when either file is missing.
+    fn load(
+        &self,
+        keys: &[[u8; 32]],
+        env: NearEnvironment,
+        now: u64,
+        high_water: u64,
+    ) -> Option<Result<FeedDocument, String>> {
+        let doc = read_capped(&self.doc, MAX_DOCUMENT_BYTES)?;
+        let sig = read_capped(&self.sig, MAX_SIGNATURE_BYTES)?;
+        Some(doc.and_then(|doc| {
+            sig.and_then(|sig| verify_document(&doc, &sig, keys, env, now, high_water))
+        }))
+    }
+
+    fn store(&self, doc: &[u8], sig: &[u8], version: u64) -> std::io::Result<()> {
+        create_private_dir_all(&self.dir)?;
+        restrict_dir(&self.dir)?;
+        write_replacing(&self.doc, doc)?;
+        write_replacing(&self.sig, sig)?;
+        // Never lower the mark, even if another session raised it meanwhile.
+        let mark = version.max(self.high_water());
+        write_replacing(&self.version, format!("{mark}\n").as_bytes())
+    }
+
+    /// Deletes the document and signature. The high-water mark stays.
+    fn discard(&self) {
+        let _ = std::fs::remove_file(&self.doc);
+        let _ = std::fs::remove_file(&self.sig);
+    }
+}
+
+/// None if `path` does not exist; an error if it cannot be read or holds
+/// more than `max` bytes.
+fn read_capped(path: &Path, max: u64) -> Option<Result<Vec<u8>, String>> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(Err(format!("{}: {e}", path.display()))),
+    };
+    let mut bytes = Vec::new();
+    Some(match file.take(max + 1).read_to_end(&mut bytes) {
+        Err(e) => Err(format!("{}: {e}", path.display())),
+        Ok(_) if bytes.len() as u64 > max => Err(format!("{} exceeds {max} bytes", path.display())),
+        Ok(_) => Ok(bytes),
+    })
+}
+
+/// Writes `bytes` to a new owner-only temporary file next to `path`, then
+/// renames it over `path`.
+fn write_replacing(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("cache");
+    let tmp = path.with_file_name(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = (|| {
+        let mut f = open_private(&tmp, Create::New)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Adds the document's endorsements to `policy`, unions its revocations into
@@ -924,5 +1154,444 @@ mod tests {
         } else {
             assert!(matches!(FEED_KEYS.len(), 1 | 2));
         }
+    }
+
+    // ---- Fetch, cache and fallback ----
+
+    use crate::install::attestation_policy_dir;
+    use crate::setup::{FakeFetch, Fetch, Hop};
+    use std::path::{Path, PathBuf};
+
+    const PROD_DOC: &str = "https://github.com/nearai/nearai-red-sandbox/releases/download/attestation-policy/production.json";
+    const PROD_SIG: &str = "https://github.com/nearai/nearai-red-sandbox/releases/download/attestation-policy/production.json.sig";
+    const STAGING_DOC: &str = "https://github.com/nearai/nearai-red-sandbox/releases/download/attestation-policy/staging.json";
+    const STAGING_SIG: &str = "https://github.com/nearai/nearai-red-sandbox/releases/download/attestation-policy/staging.json.sig";
+    const NOW: u64 = ISSUED + 60;
+
+    struct PanicFetch;
+    impl Fetch for PanicFetch {
+        fn get(&self, url: &url::Url) -> Result<Hop, String> {
+            panic!("the feed was fetched: {url}")
+        }
+    }
+
+    fn doc_v(version: u64) -> String {
+        Doc {
+            version,
+            ..Doc::good()
+        }
+        .text()
+    }
+
+    /// Serves `text` with the CI key's signature over `signed`.
+    fn serving(text: &str, signed: &str) -> FakeFetch {
+        let f = FakeFetch::new();
+        f.body(PROD_DOC, text.as_bytes().to_vec());
+        f.body(PROD_SIG, sig(signed.as_bytes(), &ci()));
+        f
+    }
+
+    fn load(f: &dyn Fetch, home: &Path, now: u64) -> (Option<FeedDocument>, FeedSource) {
+        load_feed_switched(f, home, NearEnvironment::Production, now, &keys(), false)
+    }
+
+    fn cached(home: &Path, name: &str) -> PathBuf {
+        attestation_policy_dir(home).join(name)
+    }
+
+    fn version_file(home: &Path) -> String {
+        std::fs::read_to_string(cached(home, "production.version")).unwrap()
+    }
+
+    /// A good fetch of `version` into `home`'s cache.
+    fn seed(home: &Path, version: u64) -> String {
+        let text = doc_v(version);
+        let (_, src) = load(&serving(&text, &text), home, NOW);
+        assert_eq!(src, FeedSource::Fetched(version));
+        text
+    }
+
+    fn compiled_in_reason(src: FeedSource) -> String {
+        match src {
+            FeedSource::CompiledIn(r) => r,
+            other => panic!("expected compiled-in, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_cache_lives_next_to_the_update_cache() {
+        let home = Path::new("/h");
+        assert_eq!(
+            attestation_policy_dir(home),
+            Path::new("/h/.local/share/nearai-red-sandbox/attestation-policy")
+        );
+        assert_eq!(
+            attestation_policy_dir(home).parent(),
+            crate::install::update_cache(home).parent()
+        );
+    }
+
+    #[test]
+    fn a_good_fetch_is_cached_and_raises_the_high_water() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        let text = doc_v(ISSUED);
+        let f = serving(&text, &text);
+        let (d, src) = load(&f, home, NOW);
+        assert_eq!(src, FeedSource::Fetched(ISSUED));
+        assert_eq!(d.unwrap().entries.len(), 2);
+        assert_eq!(f.calls(), vec![PROD_DOC.to_string(), PROD_SIG.to_string()]);
+        assert_eq!(
+            std::fs::read(cached(home, "production.json")).unwrap(),
+            text.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(cached(home, "production.json.sig")).unwrap(),
+            sig(text.as_bytes(), &ci())
+        );
+        assert_eq!(version_file(home), format!("{ISSUED}\n"));
+
+        let newer = doc_v(ISSUED + 10);
+        let (_, src) = load(&serving(&newer, &newer), home, NOW);
+        assert_eq!(src, FeedSource::Fetched(ISSUED + 10));
+        assert_eq!(version_file(home), format!("{}\n", ISSUED + 10));
+        assert_eq!(
+            std::fs::read(cached(home, "production.json")).unwrap(),
+            newer.as_bytes()
+        );
+
+        // A validly signed older document is a rollback: the cache is used.
+        let (d, src) = load(&serving(&text, &text), home, NOW);
+        match src {
+            FeedSource::Cached(v, why) => {
+                assert_eq!(v, ISSUED + 10);
+                assert!(why.contains("below the last accepted version"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(d.unwrap().version, ISSUED + 10);
+        assert_eq!(version_file(home), format!("{}\n", ISSUED + 10));
+    }
+
+    #[test]
+    fn a_fetch_failure_uses_a_valid_cache() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        seed(home, ISSUED);
+        let (d, src) = load(&FakeFetch::new(), home, NOW + 3600);
+        match src {
+            FeedSource::Cached(v, why) => {
+                assert_eq!(v, ISSUED);
+                assert!(why.contains("FakeFetch: no response"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let d = d.unwrap();
+        assert_eq!(d.revoked, BTreeSet::from([hash(C64)]));
+        assert_eq!(d.entries[0], (Role::Gateway, Match::Exact, hash(A64)));
+    }
+
+    #[test]
+    fn a_new_document_with_the_old_signature_uses_the_cache() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        let old = seed(home, ISSUED);
+        // `gh release upload --clobber` replaced the document, not yet the signature.
+        let (d, src) = load(&serving(&doc_v(ISSUED + 100), &old), home, NOW);
+        match src {
+            FeedSource::Cached(v, why) => {
+                assert_eq!(v, ISSUED);
+                assert!(why.contains("does not verify"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(d.unwrap().version, ISSUED);
+        assert_eq!(
+            std::fs::read(cached(home, "production.json")).unwrap(),
+            old.as_bytes()
+        );
+        assert_eq!(version_file(home), format!("{ISSUED}\n"));
+    }
+
+    #[test]
+    fn an_expired_cache_yields_compiled_in_without_error() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        seed(home, ISSUED);
+        let (d, src) = load(&FakeFetch::new(), home, ISSUED + 3 * DAY);
+        assert!(d.is_none());
+        let why = compiled_in_reason(src);
+        assert!(
+            why.contains("FakeFetch: no response") && why.contains("expired"),
+            "{why}"
+        );
+        assert_eq!(version_file(home), format!("{ISSUED}\n"));
+    }
+
+    #[test]
+    fn no_fetch_and_no_cache_yields_compiled_in() {
+        let t = tempfile::tempdir().unwrap();
+        let (d, src) = load(&FakeFetch::new(), t.path(), NOW);
+        assert!(d.is_none());
+        let why = compiled_in_reason(src);
+        assert!(
+            why.contains("FakeFetch: no response") && why.contains("no cached"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_tampered_cache_is_deleted_and_ignored() {
+        for file in ["production.json", "production.json.sig"] {
+            let t = tempfile::tempdir().unwrap();
+            let home = t.path();
+            seed(home, ISSUED);
+            let path = cached(home, file);
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[10] ^= 1;
+            std::fs::write(&path, &bytes).unwrap();
+
+            let (d, src) = load(&FakeFetch::new(), home, NOW);
+            assert!(d.is_none(), "{file}");
+            let why = compiled_in_reason(src);
+            assert!(why.contains("cached"), "{file}: {why}");
+            assert!(!cached(home, "production.json").exists(), "{file}");
+            assert!(!cached(home, "production.json.sig").exists(), "{file}");
+            // The rollback mark survives a refused cache.
+            assert_eq!(version_file(home), format!("{ISSUED}\n"), "{file}");
+        }
+    }
+
+    #[test]
+    fn a_cached_document_below_the_high_water_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        seed(home, ISSUED);
+        std::fs::write(
+            cached(home, "production.version"),
+            format!("{}\n", ISSUED + 1),
+        )
+        .unwrap();
+        let (d, src) = load(&FakeFetch::new(), home, NOW);
+        assert!(d.is_none());
+        let why = compiled_in_reason(src);
+        assert!(why.contains("below the last accepted version"), "{why}");
+        assert!(!cached(home, "production.json").exists());
+        assert_eq!(version_file(home), format!("{}\n", ISSUED + 1));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_cache_is_written_by_rename() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        let old = seed(home, ISSUED);
+        let dir = attestation_policy_dir(home);
+        // A second name for the cached inode: an in-place write would change it too.
+        std::fs::hard_link(dir.join("production.json"), dir.join("keep")).unwrap();
+        std::fs::hard_link(dir.join("production.version"), dir.join("keep.version")).unwrap();
+
+        let new = doc_v(ISSUED + 10);
+        let (_, src) = load(&serving(&new, &new), home, NOW);
+        assert_eq!(src, FeedSource::Fetched(ISSUED + 10));
+        assert_eq!(std::fs::read(dir.join("keep")).unwrap(), old.as_bytes());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("keep.version")).unwrap(),
+            format!("{ISSUED}\n")
+        );
+        assert_eq!(
+            std::fs::read(dir.join("production.json")).unwrap(),
+            new.as_bytes()
+        );
+
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "keep",
+                "keep.version",
+                "production.json",
+                "production.json.sig",
+                "production.version"
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_cache_dir_is_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        seed(home, ISSUED);
+        let dir = attestation_policy_dir(home);
+        assert_eq!(mode(&dir), 0o700, "{:o}", mode(&dir));
+        for f in [
+            "production.json",
+            "production.json.sig",
+            "production.version",
+        ] {
+            assert_eq!(mode(&dir.join(f)), 0o600, "{f}");
+        }
+
+        // A directory that already exists, too open, is narrowed.
+        let t = tempfile::tempdir().unwrap();
+        let dir = attestation_policy_dir(t.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        seed(t.path(), ISSUED);
+        assert_eq!(mode(&dir), 0o700, "{:o}", mode(&dir));
+    }
+
+    #[test]
+    fn oversize_bodies_are_refused() {
+        let padded = |len: usize| {
+            let mut s = doc_v(ISSUED);
+            s.push_str(&" ".repeat(len - s.len()));
+            s
+        };
+
+        let t = tempfile::tempdir().unwrap();
+        let big = padded(262_145);
+        let (d, src) = load(&serving(&big, &big), t.path(), NOW);
+        assert!(d.is_none());
+        let why = compiled_in_reason(src);
+        assert!(why.contains("exceeds 262144 bytes"), "{why}");
+        assert!(!cached(t.path(), "production.json").exists());
+
+        let t = tempfile::tempdir().unwrap();
+        let text = doc_v(ISSUED);
+        let f = serving(&text, &text);
+        let mut s = sig(text.as_bytes(), &ci());
+        s.resize(1025, b'\n');
+        f.body(PROD_SIG, s);
+        let (d, src) = load(&f, t.path(), NOW);
+        assert!(d.is_none());
+        let why = compiled_in_reason(src);
+        assert!(why.contains("exceeds 1024 bytes"), "{why}");
+
+        // Exactly at the caps is fine.
+        let t = tempfile::tempdir().unwrap();
+        let max = padded(262_144);
+        let f = serving(&max, &max);
+        let mut s = sig(max.as_bytes(), &ci());
+        s.push(b'\n');
+        f.body(PROD_SIG, s);
+        let (_, src) = load(&f, t.path(), NOW);
+        assert_eq!(src, FeedSource::Fetched(ISSUED));
+    }
+
+    #[test]
+    fn feed_off_makes_no_request() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        seed(home, ISSUED);
+
+        // Off: no request, and the cache is not used either.
+        let (d, src) = load_feed_switched(
+            &PanicFetch,
+            home,
+            NearEnvironment::Production,
+            NOW,
+            &keys(),
+            true,
+        );
+        assert!(d.is_none());
+        assert!(compiled_in_reason(src).contains("RTS_ATTESTATION_POLICY_FEED=off"));
+
+        // A build without keys never fetches.
+        let (d, src) = load_feed_switched(
+            &PanicFetch,
+            home,
+            NearEnvironment::Production,
+            NOW,
+            &[],
+            false,
+        );
+        assert!(d.is_none());
+        assert!(compiled_in_reason(src).contains("no feed keys"));
+
+        assert_eq!(FEED_SWITCH_ENV, "RTS_ATTESTATION_POLICY_FEED");
+        assert!(switched_off(Some(std::ffi::OsStr::new("off"))));
+        for on in [None, Some(""), Some("on"), Some("OFF"), Some("off ")] {
+            assert!(!switched_off(on.map(std::ffi::OsStr::new)), "{on:?}");
+        }
+        if FEED_KEYS.is_empty() {
+            assert!(!feed_enabled());
+        }
+    }
+
+    #[test]
+    fn staging_uses_its_own_urls_and_cache() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        seed(home, ISSUED);
+
+        let text = Doc {
+            environment: "staging",
+            ..Doc::good()
+        }
+        .text();
+        let f = FakeFetch::new();
+        f.body(STAGING_DOC, text.as_bytes().to_vec());
+        f.body(STAGING_SIG, sig(text.as_bytes(), &ci()));
+        let (d, src) = load_feed_switched(&f, home, NearEnvironment::Staging, NOW, &keys(), false);
+        assert_eq!(src, FeedSource::Fetched(ISSUED));
+        assert_eq!(d.unwrap().environment, NearEnvironment::Staging);
+        assert_eq!(
+            f.calls(),
+            vec![STAGING_DOC.to_string(), STAGING_SIG.to_string()]
+        );
+        assert_eq!(
+            std::fs::read(cached(home, "staging.json")).unwrap(),
+            text.as_bytes()
+        );
+
+        // The production cache never stands in for staging.
+        let t = tempfile::tempdir().unwrap();
+        seed(t.path(), ISSUED);
+        let (d, src) = load_feed_switched(
+            &FakeFetch::new(),
+            t.path(),
+            NearEnvironment::Staging,
+            NOW,
+            &keys(),
+            false,
+        );
+        assert!(d.is_none());
+        assert!(compiled_in_reason(src).contains("no cached"));
+    }
+
+    #[test]
+    fn cached_age_is_the_time_since_the_last_fetch() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        assert_eq!(cached_age(home, NearEnvironment::Production, NOW), None);
+        seed(home, ISSUED);
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(ISSUED);
+        std::fs::File::options()
+            .write(true)
+            .open(cached(home, "production.json"))
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+        assert_eq!(
+            cached_age(home, NearEnvironment::Production, ISSUED + 4000),
+            Some(4000)
+        );
+        assert_eq!(
+            cached_age(home, NearEnvironment::Production, ISSUED - 5),
+            Some(0)
+        );
+        assert_eq!(
+            cached_age(home, NearEnvironment::Staging, ISSUED + 4000),
+            None
+        );
     }
 }
