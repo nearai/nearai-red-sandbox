@@ -187,6 +187,11 @@ models. `RTS_LIVE_NEAR_ENVIRONMENT=staging` selects staging
 relaxes only the compose pin, and `RTS_LIVE_RECORD_DIR` writes what verified as
 rts's own `live-<environment>/attestation.json` for
 `scripts/refresh-attestation-policy.py --environment <environment>`.
+`RTS_LIVE_POLICY_FEED=on` also loads the signed attestation policy feed
+(keys from `RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX` at build time), so the check
+accepts `endorsed` composes as well as `pinned` ones. The pins in
+`opencode/attestation-policy*.json` are the offline floor; the feed is
+documented in the top-level README.
 NEAR AI serves the attestation report without an API key, so none is needed;
 `RTS_LIVE_NEAR_API_KEY`, when set, is sent as the bearer. `RTS_LIVE_SAVE_DIR`
 saves every exchange (report, PCS, CRL, NRAS) as `live-run.json`, the source

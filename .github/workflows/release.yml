@@ -96,6 +96,20 @@ jobs:
             exit 1
           fi
 
+      # The attestation policy feed is verified against these keys: the CI
+      # signing key, and optionally an offline recovery key (comma separated).
+      # A release built without them could never use the feed.
+      - name: Confirm the attestation policy public keys are configured
+        if: github.event_name == 'push'
+        env:
+          RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX: ${{ vars.RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX" =~ ^[0-9a-f]{64}(,[0-9a-f]{64})?$ ]]; then
+            echo "refusing to release: repository variable RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX is unset or not one or two comma-separated 64 lowercase hex keys" >&2
+            exit 1
+          fi
+
   build:
     name: build, sign, notarize, package
     needs: release-config
@@ -162,11 +176,16 @@ jobs:
       - name: Build rts
         env:
           RTS_UPDATE_PUBLIC_KEY_HEX: ${{ vars.RTS_UPDATE_PUBLIC_KEY_HEX }}
+          RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX: ${{ vars.RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX }}
         run: cargo build --release --locked
 
       - name: Verify live NEAR AI attestation against the bundled policies
         env:
           RTS_LIVE_COMPOSE_POLICY: pinned
+          # Accept composes the signed policy feed endorses as well as pinned
+          # ones; the keys must match the ones compiled into the release build.
+          RTS_LIVE_POLICY_FEED: on
+          RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX: ${{ vars.RTS_ATTESTATION_POLICY_PUBLIC_KEYS_HEX }}
         run: |
           set -euo pipefail
           for environment in production staging; do
