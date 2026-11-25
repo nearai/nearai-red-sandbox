@@ -126,6 +126,9 @@ pub enum ComposeAcceptance {
     Pinned,
     /// Endorsed for its role by the signed attestation policy feed.
     Endorsed,
+    /// Trusted for its role by the user of this machine, at a launch
+    /// prompt. Not reviewed by anyone else.
+    UserTrusted,
     /// `--compose-policy mr-config-only`: `mr_config_id` vouches for it.
     MrConfigOnly,
     /// Not pinned, but the entry's quote binds a signing key this session
@@ -138,19 +141,45 @@ impl ComposeAcceptance {
         match self {
             Self::Pinned => "pinned",
             Self::Endorsed => "endorsed",
+            Self::UserTrusted => "user-trusted",
             Self::MrConfigOnly => "mr-config-only",
             Self::KeyContinuity => "key-continuity",
         }
     }
 }
 
+/// Why `check_compose` refused a compose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposeError {
+    /// Checked and committed to by mr_config_id, but nothing trusts it for
+    /// `role`: the one refusal a user may answer by trusting the hash.
+    /// `message` is the refusal's text.
+    NotTrusted {
+        role: Role,
+        hash: [u8; 32],
+        message: String,
+    },
+    /// Any other refusal, revocation included.
+    Other(String),
+}
+
+impl std::fmt::Display for ComposeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotTrusted { message, .. } | Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
 /// mr_config_id[0] == 0x01 and [1..33] == sha256(app_compose), then the
 /// policy in the spec's order: refused if the feed revokes the exact hash
-/// (whatever the mode or continuity); `Pinned` if pinned for `role`;
-/// `Endorsed` if the feed endorses it for `role` by exact hash, then by its
-/// `instance-label-v1` hash; then `--compose-policy`, and under Pinned key
+/// (whatever the mode, continuity or user trust); `Pinned` if pinned for
+/// `role`; `Endorsed` if the feed endorses it for `role` by exact hash, then
+/// by its `instance-label-v1` hash; `UserTrusted` if the user trusts the
+/// exact hash for `role`; then `--compose-policy`, and under Pinned key
 /// continuity: the entry's quote-bound signing key was already attested this
-/// session. Returns the hash, why it was accepted, and the endorsement's match.
+/// session. Otherwise `ComposeError::NotTrusted`. Returns the hash, why it
+/// was accepted, and the endorsement's match.
 pub fn check_compose(
     mr_config_id: &[u8; 48],
     app_compose: &str,
@@ -158,19 +187,21 @@ pub fn check_compose(
     role: Role,
     mode: ComposePolicy,
     continued: bool,
-) -> Result<([u8; 32], ComposeAcceptance, Option<Match>), String> {
+) -> Result<([u8; 32], ComposeAcceptance, Option<Match>), ComposeError> {
     if mr_config_id[0] != 0x01 {
-        return Err(format!(
+        return Err(ComposeError::Other(format!(
             "mr_config_id starts with {:02x}, not 01 (compose hash)",
             mr_config_id[0]
-        ));
+        )));
     }
     let hash: [u8; 32] = Sha256::digest(app_compose.as_bytes()).into();
     if mr_config_id[1..33] != hash {
-        return Err("mr_config_id does not match sha256(app_compose)".into());
+        return Err(ComposeError::Other(
+            "mr_config_id does not match sha256(app_compose)".into(),
+        ));
     }
     if policy.revoked.contains(&hash) {
-        return Err(format!(
+        return Err(ComposeError::Other(format!(
             "{} compose hash {} is revoked by the attestation policy feed{}",
             role.as_str(),
             hex::encode(hash),
@@ -178,7 +209,7 @@ pub fn check_compose(
                 .feed_version
                 .map(|v| format!(" (v{v})"))
                 .unwrap_or_default()
-        ));
+        )));
     }
     if policy.pinned.get(&hash) == Some(&role) {
         return Ok((hash, ComposeAcceptance::Pinned, None));
@@ -201,16 +232,23 @@ pub fn check_compose(
             Some(Match::InstanceLabelV1),
         ));
     }
+    if policy.user_trusted.get(&hash) == Some(&role) {
+        return Ok((hash, ComposeAcceptance::UserTrusted, None));
+    }
     let acceptance = if mode == ComposePolicy::MrConfigOnly {
         ComposeAcceptance::MrConfigOnly
     } else if continued {
         ComposeAcceptance::KeyContinuity
     } else {
-        return Err(format!(
-            "{} compose hash {} is not pinned in this NEAR AI environment's policy, opencode/attestation-policy.json or opencode/attestation-policy-staging.json, nor endorsed for that role by the attestation policy feed (pass --compose-policy mr-config-only to accept it, or see scripts/refresh-attestation-policy.py)",
-            role.as_str(),
-            hex::encode(hash)
-        ));
+        return Err(ComposeError::NotTrusted {
+            role,
+            hash,
+            message: format!(
+                "{} compose hash {} is not pinned in this NEAR AI environment's policy, opencode/attestation-policy.json or opencode/attestation-policy-staging.json, nor endorsed for that role by the attestation policy feed (pass --compose-policy mr-config-only to accept it, or see scripts/refresh-attestation-policy.py)",
+                role.as_str(),
+                hex::encode(hash)
+            ),
+        });
     };
     Ok((hash, acceptance, None))
 }
@@ -341,7 +379,9 @@ pub(crate) mod tests {
                 Ok((hash, A::MrConfigOnly, None))
             );
         }
-        let err = check_compose(&mr, compose, &empty, m, ComposePolicy::Pinned, false).unwrap_err();
+        let err = check_compose(&mr, compose, &empty, m, ComposePolicy::Pinned, false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("attestation-policy.json"), "{err}");
         assert_eq!(
             check_compose(&mr, compose, &empty, m, ComposePolicy::Pinned, true),
@@ -353,7 +393,9 @@ pub(crate) mod tests {
         mr2[0] = 2;
         for mode in [ComposePolicy::Pinned, ComposePolicy::MrConfigOnly] {
             for continued in [false, true] {
-                let err = check_compose(&mr2, compose, &pinned, m, mode, continued).unwrap_err();
+                let err = check_compose(&mr2, compose, &pinned, m, mode, continued)
+                    .unwrap_err()
+                    .to_string();
                 assert!(err.contains("mr_config_id"), "{err}");
                 assert!(
                     check_compose(&mr, "services: {x: 1}", &pinned, m, mode, continued).is_err()
@@ -410,8 +452,9 @@ pub(crate) mod tests {
         };
         for mode in MODES {
             for continued in [false, true] {
-                let err =
-                    check_compose(&mr, compose, &policy, Role::Model, mode, continued).unwrap_err();
+                let err = check_compose(&mr, compose, &policy, Role::Model, mode, continued)
+                    .unwrap_err()
+                    .to_string();
                 assert!(err.contains("revoked"), "{err}");
                 assert!(err.contains(&hex::encode(hash)), "{err}");
             }
@@ -429,7 +472,8 @@ pub(crate) mod tests {
             for mode in MODES {
                 for continued in [false, true] {
                     let err = check_compose(&mr, &compose, &policy, Role::Model, mode, continued)
-                        .unwrap_err();
+                        .unwrap_err()
+                        .to_string();
                     assert!(err.contains("revoked"), "{err}");
                 }
             }
@@ -515,7 +559,8 @@ pub(crate) mod tests {
             ComposePolicy::Pinned,
             false,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("not pinned"), "{err}");
         // The normalized hash endorsed as exact does not admit it either.
         let wrong = endorsing(Match::Exact, normalized, Role::Model);
@@ -550,7 +595,8 @@ pub(crate) mod tests {
                     ComposePolicy::Pinned,
                     false,
                 )
-                .unwrap_err();
+                .unwrap_err()
+                .to_string();
                 assert!(err.contains("not pinned"), "{err}");
                 assert!(err.contains(checked_as.as_str()), "{err}");
                 assert_eq!(
@@ -585,7 +631,8 @@ pub(crate) mod tests {
             ComposePolicy::Pinned,
             false,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("not pinned"), "{err}");
         assert_eq!(
             check_compose(
@@ -659,6 +706,143 @@ pub(crate) mod tests {
             )
             .is_err()
         );
+    }
+
+    // ---- User-trusted composes ----
+
+    fn user_trusting(hash: [u8; 32], role: Role) -> Policy {
+        Policy {
+            user_trusted: BTreeMap::from([(hash, role)]),
+            ..Policy::default()
+        }
+    }
+
+    /// Accepted for its role whatever the mode or continuity: user trust is
+    /// checked before `MrConfigOnly` and `KeyContinuity`.
+    #[test]
+    fn user_trusted_hash_is_accepted_as_user_trusted() {
+        let compose = "services: {}";
+        let (mr, hash) = committed(compose);
+        let policy = user_trusting(hash, Role::Gateway);
+        for mode in MODES {
+            for continued in [false, true] {
+                assert_eq!(
+                    check_compose(&mr, compose, &policy, Role::Gateway, mode, continued),
+                    Ok((hash, ComposeAcceptance::UserTrusted, None))
+                );
+            }
+        }
+        assert_eq!(ComposeAcceptance::UserTrusted.as_str(), "user-trusted");
+    }
+
+    #[test]
+    fn pinned_and_endorsed_beat_user_trusted() {
+        let compose = "services: {}";
+        let (mr, hash) = committed(compose);
+        let mut pinned = user_trusting(hash, Role::Model);
+        pinned.pinned.insert(hash, Role::Model);
+        let mut endorsed = endorsing(Match::Exact, hash, Role::Model);
+        endorsed.user_trusted.insert(hash, Role::Model);
+        for mode in MODES {
+            for continued in [false, true] {
+                assert_eq!(
+                    check_compose(&mr, compose, &pinned, Role::Model, mode, continued),
+                    Ok((hash, ComposeAcceptance::Pinned, None))
+                );
+                assert_eq!(
+                    check_compose(&mr, compose, &endorsed, Role::Model, mode, continued),
+                    Ok((hash, ComposeAcceptance::Endorsed, Some(Match::Exact)))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn revoked_beats_user_trusted() {
+        let compose = "services: {}";
+        let (mr, hash) = committed(compose);
+        let mut policy = user_trusting(hash, Role::Model);
+        policy.revoked.insert(hash);
+        for mode in MODES {
+            for continued in [false, true] {
+                match check_compose(&mr, compose, &policy, Role::Model, mode, continued) {
+                    Err(ComposeError::Other(s)) => {
+                        assert!(s.contains("is revoked"), "{s}");
+                        assert!(s.contains(&hex::encode(hash)), "{s}");
+                    }
+                    other => panic!("expected a revocation, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn user_trust_is_keyed_by_role() {
+        let compose = "services: {}";
+        let (mr, hash) = committed(compose);
+        let policy = user_trusting(hash, Role::Gateway);
+        match check_compose(
+            &mr,
+            compose,
+            &policy,
+            Role::Model,
+            ComposePolicy::Pinned,
+            false,
+        ) {
+            Err(ComposeError::NotTrusted { role, hash: h, .. }) => {
+                assert_eq!(role, Role::Model);
+                assert_eq!(h, hash);
+            }
+            other => panic!("expected NotTrusted, got {other:?}"),
+        }
+        // Trust for the other role leaves the modes below it as they were.
+        assert_eq!(
+            check_compose(
+                &mr,
+                compose,
+                &policy,
+                Role::Model,
+                ComposePolicy::Pinned,
+                true
+            ),
+            Ok((hash, ComposeAcceptance::KeyContinuity, None))
+        );
+        assert_eq!(
+            check_compose(
+                &mr,
+                compose,
+                &policy,
+                Role::Model,
+                ComposePolicy::MrConfigOnly,
+                false
+            ),
+            Ok((hash, ComposeAcceptance::MrConfigOnly, None))
+        );
+    }
+
+    #[test]
+    fn an_untrusted_compose_is_a_typed_refusal_with_todays_text() {
+        let compose = "services: {}";
+        let (mr, hash) = committed(compose);
+        let err = check_compose(
+            &mr,
+            compose,
+            &Policy::default(),
+            Role::Model,
+            ComposePolicy::Pinned,
+            false,
+        )
+        .unwrap_err();
+        let expected = "model compose hash d4fd3af6d6ccdaeefeec3b0c2fe3ae2d5dde874cc4ed1b7acbb2cec4dfdfe032 is not pinned in this NEAR AI environment's policy, opencode/attestation-policy.json or opencode/attestation-policy-staging.json, nor endorsed for that role by the attestation policy feed (pass --compose-policy mr-config-only to accept it, or see scripts/refresh-attestation-policy.py)";
+        assert_eq!(
+            err,
+            ComposeError::NotTrusted {
+                role: Role::Model,
+                hash,
+                message: expected.to_string(),
+            }
+        );
+        assert_eq!(err.to_string(), expected);
     }
 
     #[test]

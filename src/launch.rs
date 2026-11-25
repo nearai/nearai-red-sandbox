@@ -94,7 +94,7 @@ pub fn private_git_config(prefix: &str) -> Result<(tempfile::TempDir, PathBuf), 
         .map_err(|_| "Cannot create a private temp directory")?;
     let empty_git_config = temp.path().join("empty.gitconfig");
     crate::sys::fs::open_private(&empty_git_config, crate::sys::fs::Create::New)
-    .map_err(|_| "Cannot create an empty Git configuration")?;
+        .map_err(|_| "Cannot create an empty Git configuration")?;
     Ok((temp, empty_git_config))
 }
 
@@ -277,8 +277,7 @@ fn resolve_and_attest(
                 let step = progress.step("sign-in", Live::Still);
                 step.ok("supplied NEAR AI key");
             }
-            let step = progress
-                .map(|p| p.step("attestation", Live::Decode(models.join(", "))));
+            let step = progress.map(|p| p.step("attestation", Live::Decode(models.join(", "))));
             let attested = attest_key(key.clone()).map_err(|error| refused(error.message()))?;
             let credentials = crate::sponsored::Credentials::new(
                 key.clone(),
@@ -305,8 +304,7 @@ fn resolve_and_attest(
                     "NEAR AI Cloud"
                 });
             }
-            let step = progress
-                .map(|p| p.step("attestation", Live::Decode(models.join(", "))));
+            let step = progress.map(|p| p.step("attestation", Live::Decode(models.join(", "))));
             let attested = match attest_key(credential.key.clone()) {
                 Ok(attested) => attested,
                 Err(attest::AttestationFailure::CredentialRefused { .. })
@@ -445,6 +443,15 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                 load_for_launch: &auth::load_for_launch,
                 login: &auth::login,
             };
+            // The user may be asked to trust a new NEAR AI build only when
+            // both ends of the terminal are there.
+            let ttys = {
+                use std::io::IsTerminal;
+                (
+                    std::io::stdin().is_terminal(),
+                    std::io::stderr().is_terminal(),
+                )
+            };
             let (attested, credentials) = resolve_and_attest(
                 &credential,
                 &record,
@@ -452,15 +459,29 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                 Some(&progress),
                 &sign_in,
                 |key| {
-                    attest::Attestor::real(
+                    attest::prompt::attest_with_consent(
                         near,
-                        Some(key),
-                        &cfg.provider.models,
-                        attest_options,
-                        feed_doc.as_ref(),
+                        &attest_options,
+                        ttys,
+                        // Asking needs a verified feed document in force, so
+                        // a revoked build is never offered.
+                        feed_doc.is_some(),
+                        feed_home.as_deref(),
+                        unix_now(),
+                        &mut attest::prompt::TerminalAsk,
+                        |trusted| {
+                            attest::Attestor::real(
+                                near,
+                                Some(key.clone()),
+                                &cfg.provider.models,
+                                attest_options,
+                                feed_doc.as_ref(),
+                                trusted,
+                            )
+                            .map_err(attest::AttestationFailure::Other)?
+                            .attest_for_launch()
+                        },
                     )
-                    .map_err(attest::AttestationFailure::Other)?
-                    .attest_for_launch()
                 },
             )?;
             let step = progress.step("inference", Live::Sweep);
@@ -472,6 +493,9 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                     // policy: a re-attestation may accept a redeployed build
                     // holding one of them (issue #25). Launch stays pinned.
                     let continuity = attest::Continuity::from_attested(&seed);
+                    // The launch printed its trusted lines; re-attestation
+                    // prints them again only when the set changes.
+                    let printed = Mutex::new(attest::prompt::TrustedPrinted::from_attested(&seed));
                     forwarder::Forwarder::start(forwarder::ForwarderConfig {
                         credentials: Some(credentials.clone()),
                         upstream: near.base_url().into(),
@@ -513,6 +537,11 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                                     }
                                     doc.clone()
                                 };
+                                // Builds the user trusts, read again at each
+                                // re-attestation. Never prompts: no terminal
+                                // is the launcher's mid-session.
+                                let store = attest::trusted::load(feed_home.as_deref()).0;
+                                let trusted = store.for_environment(near);
                                 let attest = |key| {
                                     attest::Attestor::real(
                                         near,
@@ -520,6 +549,7 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                                         &models,
                                         options,
                                         doc.as_ref(),
+                                        &trusted,
                                     )
                                     .map_err(attest::AttestationFailure::Other)?
                                     .with_continuity(continuity.clone())
@@ -531,19 +561,30 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                                             "NEAR AI redeployed to a build that is not pinned; accepted because it holds this session's attested signing key: {entry}"
                                         ));
                                     }
+                                    let lines = printed
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .changed_lines(&attested, &store, near);
+                                    for line in lines {
+                                        brand::progress::message(&line);
+                                    }
                                     attested
                                 };
                                 match attest(snapshot.key).map(warn) {
                                     Ok(attested) => Ok(attested),
-                                    Err(attest::AttestationFailure::CredentialRefused { .. })
-                                        if snapshot.sponsored =>
-                                    {
-                                        brand::progress::message("Your sponsored API key is no longer available. Sign in to NEAR AI Cloud to continue.");
+                                    Err(attest::AttestationFailure::CredentialRefused {
+                                        ..
+                                    }) if snapshot.sponsored => {
+                                        brand::progress::message(
+                                            "Your sponsored API key is no longer available. Sign in to NEAR AI Cloud to continue.",
+                                        );
                                         // Reattest runs on the forwarder's blocking pool;
                                         // share any login already pending on its runtime.
                                         let next = tokio::runtime::Handle::current()
                                             .block_on(credentials.recover(snapshot.generation))?;
-                                        attest(next.key).map(warn).map_err(attest::AttestationFailure::message)
+                                        attest(next.key)
+                                            .map(warn)
+                                            .map_err(attest::AttestationFailure::message)
                                     }
                                     Err(error) => Err(error.message()),
                                 }
@@ -1064,7 +1105,11 @@ mod tests {
         .unwrap();
         let snap = creds.snapshot().unwrap();
         assert!(!snap.sponsored);
-        let err = creds.recover(snap.generation).await.err().expect("recovery must fail");
+        let err = creds
+            .recover(snap.generation)
+            .await
+            .err()
+            .expect("recovery must fail");
         assert!(!err.is_empty());
     }
 }

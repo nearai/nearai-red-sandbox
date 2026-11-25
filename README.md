@@ -392,14 +392,25 @@ never trusted for the other. `rts launch` always uses production; an embedder
 selects staging with `LaunchSpec.near = NearEnvironment::Staging` and must
 supply a staging key (`CredentialSource::Supplied`), because native sign-in is
 production only.
+A new production build of a model or the gateway that is neither pinned nor
+endorsed is not accepted silently. On a terminal, with a verified attestation
+policy feed document in force, `rts launch` shows the build and asks once per
+new build, up to three times per launch; answering yes trusts that exact build
+on this device. A trusted build is still fully checked: only the compose hash
+check is satisfied by your answer. `rts trust list` shows the builds you
+trusted, and `rts trust forget <hash-prefix>` (at least 8 hex characters)
+removes one; it does not affect a session that is already running. The store
+is `~/.local/share/nearai-red-sandbox/trusted-composes.json`.
+
 NEAR AI may redeploy a model or the gateway to a new TEE build mid-session,
 which changes its compose hash. When the forwarder re-attests, it accepts an
 unpinned compose only if that entry passes every other check and its quote
 binds a signing key the session already attested at launch: instances of a
 model share one signing key across builds. rts prints a warning naming each
-such entry, and `attestation.json` records each
-entry's `compose_acceptance` as `pinned`, `key-continuity`, or `mr-config-only`.
-A new launch against the new build is still refused until it is pinned. To pin
+such entry, and `attestation.json` records each entry's `compose_acceptance`
+as `pinned`, `endorsed`, `user-trusted`, `key-continuity`, or
+`mr-config-only`. A new launch against an unlisted production build is refused
+unless the user trusts it at the launch prompt. To pin
 it, run one session with `--compose-policy mr-config-only` (or use a session
 that continued by key), then run
 `scripts/refresh-attestation-policy.py <session>/attestation.json`, review

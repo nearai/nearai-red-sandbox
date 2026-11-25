@@ -1984,7 +1984,7 @@ mod tests {
             "{src:?}"
         );
         assert_eq!(current.as_ref().map(|d| d.version), Some(ISSUED + 1));
-        let err = admits(&current).unwrap_err();
+        let err = admits(&current).unwrap_err().to_string();
         assert!(err.contains("revoked"), "{err}");
     }
 
@@ -2043,7 +2043,12 @@ mod tests {
         // This session fetched v2; its cache write failed, so the disk is
         // unchanged.
         let mut current = Some(check(&v2, NOW, 0).unwrap());
-        assert!(admits(&current).unwrap_err().contains("revoked"));
+        assert!(
+            admits(&current)
+                .unwrap_err()
+                .to_string()
+                .contains("revoked")
+        );
 
         let later = NOW + REFRESH_AFTER_SECS + 1;
         let reload = || {
@@ -2065,7 +2070,7 @@ mod tests {
         );
         assert_eq!(loaded_at, later, "the attempt still counts as a load");
         assert_eq!(current.as_ref().map(|d| d.version), Some(ISSUED + 1));
-        let err = admits(&current).unwrap_err();
+        let err = admits(&current).unwrap_err().to_string();
         assert!(err.contains("revoked"), "{err}");
     }
 

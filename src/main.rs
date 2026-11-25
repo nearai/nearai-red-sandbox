@@ -11,9 +11,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use rts::{attest, auth, bridge, config, launch, setup};
 #[cfg(unix)]
 use rts::session;
+use rts::{attest, auth, bridge, config, launch, setup};
 
 /// `--allow-host` entries in the order given, and `--no-network`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -48,20 +48,33 @@ impl PromptSource {
                 // hanging before we can verify the opened object is a file.
                 let file = rts::sys::fs::open_read_nonblocking(path)
                     .map_err(|e| format!("cannot read prompt file {}: {e}", path.display()))?;
-                if !file.metadata().map_err(|e| format!("cannot inspect prompt file {}: {e}", path.display()))?.is_file() {
-                    return Err(format!("prompt file {} must be a regular file", path.display()));
+                if !file
+                    .metadata()
+                    .map_err(|e| format!("cannot inspect prompt file {}: {e}", path.display()))?
+                    .is_file()
+                {
+                    return Err(format!(
+                        "prompt file {} must be a regular file",
+                        path.display()
+                    ));
                 }
                 let mut bytes = Vec::new();
-                file.take((MAX_PROMPT_BYTES + 1) as u64).read_to_end(&mut bytes)
+                file.take((MAX_PROMPT_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)
                     .map_err(|e| format!("cannot read prompt file {}: {e}", path.display()))?;
                 if bytes.len() > MAX_PROMPT_BYTES {
-                    return Err(format!("initial prompt must be at most {MAX_PROMPT_BYTES} bytes"));
+                    return Err(format!(
+                        "initial prompt must be at most {MAX_PROMPT_BYTES} bytes"
+                    ));
                 }
-                String::from_utf8(bytes).map_err(|_| "prompt file must contain UTF-8 text".to_string())?
+                String::from_utf8(bytes)
+                    .map_err(|_| "prompt file must contain UTF-8 text".to_string())?
             }
         };
         if text.len() > MAX_PROMPT_BYTES {
-            return Err(format!("initial prompt must be at most {MAX_PROMPT_BYTES} bytes"));
+            return Err(format!(
+                "initial prompt must be at most {MAX_PROMPT_BYTES} bytes"
+            ));
         }
         if text.trim().is_empty() {
             return Err("initial prompt must not be empty or whitespace-only".into());
@@ -73,6 +86,12 @@ impl PromptSource {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TrustCommand {
+    List,
+    Forget(String),
+}
+
 #[derive(Debug)]
 enum Action {
     Help,
@@ -82,6 +101,7 @@ enum Action {
     Tool(String),
     Login(auth::LoginOptions),
     Trial(PathBuf),
+    Trust(TrustCommand),
     Launch {
         file: Option<PathBuf>,
         login: auth::LoginOptions,
@@ -106,6 +126,15 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
         }
         return Ok(Action::Trial(PathBuf::from(path)));
     }
+    if let ["trust", rest @ ..] = args {
+        return match rest {
+            ["list"] => Ok(Action::Trust(TrustCommand::List)),
+            ["forget", prefix] if !prefix.is_empty() && !prefix.starts_with('-') => {
+                Ok(Action::Trust(TrustCommand::Forget((*prefix).into())))
+            }
+            _ => Err("usage: rts trust list | rts trust forget <hash-prefix>".into()),
+        };
+    }
     if let ["setup", flags @ ..] = args {
         return parse_setup(flags);
     }
@@ -129,7 +158,9 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
     let mut seen = std::collections::HashSet::new();
     let mut flags = flags.iter();
     while let Some(&flag) = flags.next() {
-        if matches!(flag, "--help" | "-h") { return Ok(Action::Help); }
+        if matches!(flag, "--help" | "-h") {
+            return Ok(Action::Help);
+        }
         let launch_only = matches!(
             flag,
             "--config"
@@ -303,7 +334,7 @@ fn parse_update(flags: &[&str]) -> Result<Action, String> {
     Ok(Action::Update(o))
 }
 
-const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network] [--no-splash]\n                  [--cpus N] [--memory SIZE] [--prompt TEXT | --prompt-file PATH]\n       rts launch --prompt \"Review /in and save findings to /out/report.md\"\n       rts launch --prompt-file ./handoff.md       # submit a UTF-8 task file\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts launch --cpus 4 --memory 8G             # a bigger VM (default 2 vCPUs, 2048 MiB)\n       rts trial --key-file PATH   # import your individual sponsored allowance\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nThe guest has no network unless the session file's network.allow or --allow-host names entries\n(HOST, HOST:PORT, IP:PORT or [IPv6]:PORT, port 443 by default, or the preset packages);\n--no-network drops them all. TCP only, and every connection is logged. A session stops with\nsession-limit after limits.sessionHours (default 24), network-lost when the attached\nmvmctl machine run that keeps egress up exits, and network-mismatch when mvm pinned an address\nrts did not validate; /out is exported and the VM removed in every case.\n--cpus and --memory (MiB, or with an M or G suffix) override limits.cpus and limits.memoryMiB,\nup to this host's CPU count and RAM; the host RSS watchdog follows memory unless the session\nfile sets limits.hostRssCeilingMiB.\n--prompt or --prompt-file submits one initial task after the sandbox plugin is verified,\nthen leaves OpenCode interactive. Prompt files are relative to the invoking directory,\nmust be UTF-8 and at most 64 KiB; empty/whitespace-only or NUL-containing text is refused.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
+const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network] [--no-splash]\n                  [--cpus N] [--memory SIZE] [--prompt TEXT | --prompt-file PATH]\n       rts launch --prompt \"Review /in and save findings to /out/report.md\"\n       rts launch --prompt-file ./handoff.md       # submit a UTF-8 task file\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts launch --cpus 4 --memory 8G             # a bigger VM (default 2 vCPUs, 2048 MiB)\n       rts trial --key-file PATH   # import your individual sponsored allowance\n       rts trust list | rts trust forget <hash-prefix>   # builds you trusted at a launch prompt\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nThe guest has no network unless the session file's network.allow or --allow-host names entries\n(HOST, HOST:PORT, IP:PORT or [IPv6]:PORT, port 443 by default, or the preset packages);\n--no-network drops them all. TCP only, and every connection is logged. A session stops with\nsession-limit after limits.sessionHours (default 24), network-lost when the attached\nmvmctl machine run that keeps egress up exits, and network-mismatch when mvm pinned an address\nrts did not validate; /out is exported and the VM removed in every case.\n--cpus and --memory (MiB, or with an M or G suffix) override limits.cpus and limits.memoryMiB,\nup to this host's CPU count and RAM; the host RSS watchdog follows memory unless the session\nfile sets limits.hostRssCeilingMiB.\n--prompt or --prompt-file submits one initial task after the sandbox plugin is verified,\nthen leaves OpenCode interactive. Prompt files are relative to the invoking directory,\nmust be UTF-8 and at most 64 KiB; empty/whitespace-only or NUL-containing text is refused.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
 
 #[cfg(windows)]
 fn setup_command(o: &setup::SetupOptions) -> Result<i32, String> {
@@ -313,7 +344,9 @@ fn setup_command(o: &setup::SetupOptions) -> Result<i32, String> {
     let mut product_type = 0u32;
     // SAFETY: a plain query with a valid out-pointer.
     unsafe { GetProductInfo(10, 0, 0, 0, &mut product_type) };
-    let hyperv = rts::backend::hyperv::hcs::available().err().map(|e| e.to_string());
+    let hyperv = rts::backend::hyperv::hcs::available()
+        .err()
+        .map(|e| e.to_string());
     let fetch = setup::HttpsFetch::new()?;
     let home = rts::install::home_in(&env, true)
         .filter(|h| h.is_absolute())
@@ -355,16 +388,25 @@ fn setup_command(o: &setup::SetupOptions) -> Result<i32, String> {
     let defaults = config::Defaults::from_env();
     let explicit_mvmctl = env.iter().any(|(k, _)| k == "RTS_MVMCTL");
     let supervisor = session::supervisor_path(&env, rts::install::current_prefix().as_deref())?;
-    let rts_exe = std::env::current_exe().map_err(|e| format!("Cannot locate the running rts: {e}"))?;
+    let rts_exe =
+        std::env::current_exe().map_err(|e| format!("Cannot locate the running rts: {e}"))?;
     let (_temp, empty_git_config) = launch::private_git_config("rts-setup-")?;
     let fetch = setup::HttpsFetch::new()?;
     let mvm_plain = setup::plain_mvm_runner(&defaults.mvmctl, &empty_git_config, &env);
     let flavor = rts::backend::mvm::Flavor::host();
-    let shim_dir = empty_git_config.parent().map(|p| p.join("sudo-shim")).ok_or("the setup Git configuration has no parent directory")?;
+    let shim_dir = empty_git_config
+        .parent()
+        .map(|p| p.join("sudo-shim"))
+        .ok_or("the setup Git configuration has no parent directory")?;
     let mvm = rts::mvm::SpawnRunner {
         mvmctl: defaults.mvmctl.clone(),
         empty_git_config,
-        extra_env: rts::backend::mvm::MvmBackend::mvmctl_environment(flavor, &env, Some(&supervisor), &shim_dir)?,
+        extra_env: rts::backend::mvm::MvmBackend::mvmctl_environment(
+            flavor,
+            &env,
+            Some(&supervisor),
+            &shim_dir,
+        )?,
         remove_env: Vec::new(),
     };
     let lines = setup::run(
@@ -390,6 +432,61 @@ fn setup_command(o: &setup::SetupOptions) -> Result<i32, String> {
 
 fn code(c: i32) -> ExitCode {
     ExitCode::from(u8::try_from(c).unwrap_or(1))
+}
+
+fn trust_command(command: &TrustCommand) -> ExitCode {
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let Some(home) = rts::install::home_in(&env, cfg!(windows)) else {
+        eprintln!("[rts] cannot find the rts home (set HOME)");
+        return ExitCode::FAILURE;
+    };
+    match command {
+        TrustCommand::List => {
+            let (store, warning) = attest::trusted::load(Some(&home));
+            if let Some(w) = warning {
+                println!("{}", attest::prompt::store_warning_line(&w));
+            }
+            for line in attest::trusted::list_lines(&store) {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        TrustCommand::Forget(prefix) => match forget_output(attest::trusted::forget(&home, prefix))
+        {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(line) => {
+                eprintln!("{line}");
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+/// What `rts trust forget` prints: its stdout lines, or its one stderr line.
+/// An error can be the store's load warning, which quotes the file, so it
+/// goes through the same filter as the launch's warning.
+fn forget_output(
+    result: Result<Vec<attest::trusted::TrustedEntry>, String>,
+) -> Result<Vec<String>, String> {
+    match result {
+        Ok(removed) => Ok(removed
+            .iter()
+            .map(|e| {
+                format!(
+                    "forgot {} {} {}",
+                    attest::trusted::env_name(e.environment),
+                    e.role.as_str(),
+                    hex::encode(e.sha256)
+                )
+            })
+            .collect()),
+        Err(e) => Err(attest::prompt::store_warning_line(&e)),
+    }
 }
 
 fn main() -> ExitCode {
@@ -446,6 +543,7 @@ fn main() -> ExitCode {
             }
             return code(out.code);
         }
+        Action::Trust(command) => return trust_command(&command),
         Action::Setup(options) => setup_command(&options),
         Action::Update(options) => rts::update::apply::command(&options),
         Action::Version => {
@@ -479,6 +577,54 @@ mod tests {
         }
     }
 
+    /// `rts trust forget` on an ignored store prints the load warning, which
+    /// quotes the file; no ESC from it may reach the terminal.
+    #[test]
+    fn trust_forget_prints_a_hostile_store_warning_without_escapes() {
+        let d = tempfile::tempdir().unwrap();
+        let path = rts::install::trusted_composes_path(d.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"version":1,"entries":[],"\u001b[2J":1}"#).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let result = attest::trusted::forget(d.path(), "abcdabcd");
+        assert!(
+            result.as_ref().is_err_and(|e| e.contains('\x1b')),
+            "the probe reaches serde's text: {result:?}"
+        );
+        let line = forget_output(result).unwrap_err();
+        assert!(line.starts_with("[rts] ignoring "), "{line}");
+        assert!(!line.contains('\x1b'), "{line:?}");
+        assert!(line.bytes().all(|b| (0x20..=0x7e).contains(&b)), "{line:?}");
+    }
+
+    #[test]
+    fn parses_trust_list_and_forget() {
+        assert!(matches!(
+            parse_args(&["trust", "list"]),
+            Ok(Action::Trust(TrustCommand::List))
+        ));
+        assert!(matches!(
+            parse_args(&["trust", "forget", "f4a9b480"]),
+            Ok(Action::Trust(TrustCommand::Forget(p))) if p == "f4a9b480"
+        ));
+    }
+
+    #[test]
+    fn rejects_other_trust_forms() {
+        for args in [
+            vec!["trust"],
+            vec!["trust", "forget"],
+            vec!["trust", "list", "x"],
+            vec!["trust", "add", "x"],
+        ] {
+            assert!(parse_args(&args).is_err(), "{args:?}");
+        }
+    }
+
     #[test]
     fn launch_accepts_an_initial_prompt_or_prompt_file() {
         assert!(parse_args(&["launch", "--prompt", "Inspect /in and report in /out"]).is_ok());
@@ -499,9 +645,21 @@ mod tests {
         ] {
             assert!(parse_args(&flags).is_err(), "accepted {flags:?}");
         }
-        let Action::Launch { prompt: Some(source), .. } = parse_args(&["launch", "--prompt", "- review /in"]).unwrap() else { panic!("missing prompt") };
+        let Action::Launch {
+            prompt: Some(source),
+            ..
+        } = parse_args(&["launch", "--prompt", "- review /in"]).unwrap()
+        else {
+            panic!("missing prompt")
+        };
         assert_eq!(source.read().unwrap(), "- review /in");
-        let Action::Launch { prompt: Some(source), .. } = parse_args(&["launch", "--prompt", "--help"]).unwrap() else { panic!("prompt was interpreted as a flag") };
+        let Action::Launch {
+            prompt: Some(source),
+            ..
+        } = parse_args(&["launch", "--prompt", "--help"]).unwrap()
+        else {
+            panic!("prompt was interpreted as a flag")
+        };
         assert_eq!(source.read().unwrap(), "--help");
     }
 
@@ -514,7 +672,20 @@ mod tests {
         assert_eq!(PromptSource::File(file.clone()).read().unwrap(), text);
         assert_eq!(PromptSource::Text(text.into()).read().unwrap(), text);
         // Keep relative CLI paths relative to the invoking directory, not --config.
-        let Action::Launch { prompt: Some(PromptSource::File(path)), .. } = parse_args(&["launch", "--config", "/elsewhere/session.json", "--prompt-file", "handoff.md"]).unwrap() else { panic!("missing prompt file") };
+        let Action::Launch {
+            prompt: Some(PromptSource::File(path)),
+            ..
+        } = parse_args(&[
+            "launch",
+            "--config",
+            "/elsewhere/session.json",
+            "--prompt-file",
+            "handoff.md",
+        ])
+        .unwrap()
+        else {
+            panic!("missing prompt file")
+        };
         assert_eq!(path, Path::new("handoff.md"));
     }
 
@@ -528,18 +699,53 @@ mod tests {
             std::fs::write(&file, text).unwrap();
             assert!(PromptSource::File(file.clone()).read().is_err());
         }
-        assert!(PromptSource::Text("x".repeat(MAX_PROMPT_BYTES + 1)).read().unwrap_err().contains("at most"));
-        assert_eq!(PromptSource::Text("x".repeat(MAX_PROMPT_BYTES)).read().unwrap().len(), MAX_PROMPT_BYTES);
+        assert!(
+            PromptSource::Text("x".repeat(MAX_PROMPT_BYTES + 1))
+                .read()
+                .unwrap_err()
+                .contains("at most")
+        );
+        assert_eq!(
+            PromptSource::Text("x".repeat(MAX_PROMPT_BYTES))
+                .read()
+                .unwrap()
+                .len(),
+            MAX_PROMPT_BYTES
+        );
         std::fs::write(&file, vec![b'x'; MAX_PROMPT_BYTES + 1]).unwrap();
-        assert!(PromptSource::File(file.clone()).read().unwrap_err().contains("at most"));
+        assert!(
+            PromptSource::File(file.clone())
+                .read()
+                .unwrap_err()
+                .contains("at most")
+        );
         std::fs::write(&file, [0xff]).unwrap();
-        assert!(PromptSource::File(file).read().unwrap_err().contains("UTF-8"));
-        assert!(PromptSource::File(dir.path().join("missing")).read().is_err());
-        assert!(PromptSource::File(dir.path().to_path_buf()).read().unwrap_err().contains("regular file"));
+        assert!(
+            PromptSource::File(file)
+                .read()
+                .unwrap_err()
+                .contains("UTF-8")
+        );
+        assert!(
+            PromptSource::File(dir.path().join("missing"))
+                .read()
+                .is_err()
+        );
+        assert!(
+            PromptSource::File(dir.path().to_path_buf())
+                .read()
+                .unwrap_err()
+                .contains("regular file")
+        );
         let fifo = dir.path().join("fifo");
         let cpath = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
-        assert!(PromptSource::File(fifo).read().unwrap_err().contains("regular file"));
+        assert!(
+            PromptSource::File(fifo)
+                .read()
+                .unwrap_err()
+                .contains("regular file")
+        );
     }
 
     #[test]
@@ -639,8 +845,9 @@ mod tests {
             panic!("not launch")
         };
         assert!(!no_splash);
-        let Action::Launch { no_splash, file, .. } =
-            parse_args(&["launch", "--no-splash", "--config", "c.json"]).unwrap()
+        let Action::Launch {
+            no_splash, file, ..
+        } = parse_args(&["launch", "--no-splash", "--config", "c.json"]).unwrap()
         else {
             panic!("not launch")
         };
@@ -667,7 +874,13 @@ mod tests {
         else {
             panic!("not launch")
         };
-        assert_eq!(vm, VmSize { cpus: Some(4), memory_mib: Some(8192) });
+        assert_eq!(
+            vm,
+            VmSize {
+                cpus: Some(4),
+                memory_mib: Some(8192)
+            }
+        );
         for args in [
             vec!["login", "--cpus", "2"],
             vec!["login", "--memory", "4G"],
@@ -804,11 +1017,32 @@ mod tests {
         use rts::setup::SetupOptions;
         for (args, want) in [
             (vec!["setup"], SetupOptions::default()),
-            (vec!["setup", "--check"], SetupOptions { check: true, offline: false }),
-            (vec!["setup", "--check", "--offline"], SetupOptions { check: true, offline: true }),
-            (vec!["setup", "--offline", "--check"], SetupOptions { check: true, offline: true }),
+            (
+                vec!["setup", "--check"],
+                SetupOptions {
+                    check: true,
+                    offline: false,
+                },
+            ),
+            (
+                vec!["setup", "--check", "--offline"],
+                SetupOptions {
+                    check: true,
+                    offline: true,
+                },
+            ),
+            (
+                vec!["setup", "--offline", "--check"],
+                SetupOptions {
+                    check: true,
+                    offline: true,
+                },
+            ),
         ] {
-            assert!(matches!(parse_args(&args), Ok(Action::Setup(o)) if o == want), "{args:?}");
+            assert!(
+                matches!(parse_args(&args), Ok(Action::Setup(o)) if o == want),
+                "{args:?}"
+            );
         }
         for args in [vec!["--version"], vec!["-V"]] {
             assert!(matches!(parse_args(&args), Ok(Action::Version)), "{args:?}");
@@ -816,7 +1050,9 @@ mod tests {
         assert!(matches!(parse_args(&["setup", "--help"]), Ok(Action::Help)));
         let e = parse_args(&["setup", "--offline"]).unwrap_err();
         assert!(e.contains("--offline requires --check"), "{e}");
-        assert!(USAGE.contains("rts setup [--check [--offline]]") && USAGE.contains("rts --version"));
+        assert!(
+            USAGE.contains("rts setup [--check [--offline]]") && USAGE.contains("rts --version")
+        );
     }
 
     #[test]
@@ -842,20 +1078,47 @@ mod tests {
         use rts::update::apply::UpdateOptions;
         for (args, want) in [
             (vec!["update"], UpdateOptions::default()),
-            (vec!["update", "--check"], UpdateOptions { check: true, force: false }),
-            (vec!["update", "--force"], UpdateOptions { check: false, force: true }),
+            (
+                vec!["update", "--check"],
+                UpdateOptions {
+                    check: true,
+                    force: false,
+                },
+            ),
+            (
+                vec!["update", "--force"],
+                UpdateOptions {
+                    check: false,
+                    force: true,
+                },
+            ),
         ] {
-            assert!(matches!(parse_args(&args), Ok(Action::Update(o)) if o == want), "{args:?}");
+            assert!(
+                matches!(parse_args(&args), Ok(Action::Update(o)) if o == want),
+                "{args:?}"
+            );
         }
         for (args, want) in [
-            (vec!["update", "--check", "--force"], "--check and --force cannot be combined"),
-            (vec!["update", "--force", "--check"], "--check and --force cannot be combined"),
-            (vec!["update", "--check", "--check"], "Duplicate option: --check"),
+            (
+                vec!["update", "--check", "--force"],
+                "--check and --force cannot be combined",
+            ),
+            (
+                vec!["update", "--force", "--check"],
+                "--check and --force cannot be combined",
+            ),
+            (
+                vec!["update", "--check", "--check"],
+                "Duplicate option: --check",
+            ),
             (vec!["update", "--yes"], "Unknown option for update: --yes"),
         ] {
             assert_eq!(parse_args(&args).unwrap_err(), want, "{args:?}");
         }
-        assert!(matches!(parse_args(&["update", "--help"]), Ok(Action::Help)));
+        assert!(matches!(
+            parse_args(&["update", "--help"]),
+            Ok(Action::Help)
+        ));
         assert!(matches!(parse_args(&["update", "-h"]), Ok(Action::Help)));
         assert!(USAGE.contains("rts update [--check | --force]"));
     }

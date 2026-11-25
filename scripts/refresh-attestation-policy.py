@@ -43,7 +43,7 @@ ENVIRONMENTS = {
     "production": ("https://cloud-api.near.ai/v1", "attestation-policy.json"),
     "staging": ("https://cloud-stg-api.near.ai/v1", "attestation-policy-staging.json"),
 }
-UNPINNED = {"mr-config-only", "key-continuity"}
+UNPINNED = {"mr-config-only", "key-continuity", "user-trusted"}
 # Admitted by the signed attestation policy feed: accepted, not a candidate.
 ENDORSED = "endorsed"
 HASH = re.compile(r"^[0-9a-f]{64}$")
