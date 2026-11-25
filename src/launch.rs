@@ -445,6 +445,12 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                 load_for_launch: &auth::load_for_launch,
                 login: &auth::login,
             };
+            // The user may be asked to trust a new NEAR AI build only when
+            // both ends of the terminal are there.
+            let ttys = {
+                use std::io::IsTerminal;
+                (std::io::stdin().is_terminal(), std::io::stderr().is_terminal())
+            };
             let (attested, credentials) = resolve_and_attest(
                 &credential,
                 &record,
@@ -452,16 +458,26 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                 Some(&progress),
                 &sign_in,
                 |key| {
-                    attest::Attestor::real(
+                    attest::prompt::attest_with_consent(
                         near,
-                        Some(key),
-                        &cfg.provider.models,
-                        attest_options,
-                        feed_doc.as_ref(),
-                        &std::collections::BTreeMap::new(),
+                        &attest_options,
+                        ttys,
+                        feed_home.as_deref(),
+                        unix_now(),
+                        &mut attest::prompt::TerminalAsk,
+                        |trusted| {
+                            attest::Attestor::real(
+                                near,
+                                Some(key.clone()),
+                                &cfg.provider.models,
+                                attest_options,
+                                feed_doc.as_ref(),
+                                trusted,
+                            )
+                            .map_err(attest::AttestationFailure::Other)?
+                            .attest_for_launch()
+                        },
                     )
-                    .map_err(attest::AttestationFailure::Other)?
-                    .attest_for_launch()
                 },
             )?;
             let step = progress.step("inference", Live::Sweep);
@@ -514,6 +530,11 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                                     }
                                     doc.clone()
                                 };
+                                // Builds the user trusts, read again at each
+                                // re-attestation. Never prompts: no terminal
+                                // is the launcher's mid-session.
+                                let store = attest::trusted::load(feed_home.as_deref()).0;
+                                let trusted = store.for_environment(near);
                                 let attest = |key| {
                                     attest::Attestor::real(
                                         near,
@@ -521,7 +542,7 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                                         &models,
                                         options,
                                         doc.as_ref(),
-                                        &std::collections::BTreeMap::new(),
+                                        &trusted,
                                     )
                                     .map_err(attest::AttestationFailure::Other)?
                                     .with_continuity(continuity.clone())
@@ -532,6 +553,9 @@ pub fn run(spec: LaunchSpec) -> Result<Outcome, String> {
                                         brand::progress::message(&format!(
                                             "NEAR AI redeployed to a build that is not pinned; accepted because it holds this session's attested signing key: {entry}"
                                         ));
+                                    }
+                                    for line in attest::prompt::trusted_lines(&attested, &store, near) {
+                                        brand::progress::message(&line);
                                     }
                                     attested
                                 };

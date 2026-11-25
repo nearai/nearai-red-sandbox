@@ -370,6 +370,17 @@ impl Progress {
         }
     }
 
+    /// Run `f` with the running step's line erased and the ticker held off,
+    /// then draw the line again. `f` writes to the terminal itself and must
+    /// not call back into this progress (its lock is held).
+    pub fn paused<T>(&self, f: impl FnOnce() -> T) -> T {
+        let mut s = self.state();
+        s.clear_live();
+        let out = f();
+        s.draw_live();
+        out
+    }
+
     /// opencode takes the terminal: a closing rule, then plain lines only.
     pub fn hand_off(&self) {
         let mut s = self.state();
@@ -718,6 +729,26 @@ mod tests {
         assert!(n >= 3, "{n}");
         thread::sleep(Duration::from_millis(200));
         assert_eq!(buf.text().matches('\r').count(), n, "no redraw after the step ended");
+    }
+
+    #[test]
+    fn paused_runs_the_closure_and_redraws() {
+        let buf = Buf::default();
+        let p = Progress::new(Mode::Styled { depth: Depth::TrueColor, width: 80 }, Box::new(buf.clone()), false);
+        let s = p.step("attestation", Live::Decode("abc".into()));
+        let before = buf.text().len();
+        let mut out = buf.clone();
+        let v = p.paused(|| {
+            out.write_all(b"PROMPT\n").unwrap();
+            7
+        });
+        assert_eq!(v, 7);
+        let after = buf.text()[before..].to_string();
+        let prompt = after.find("PROMPT\n").expect("the closure wrote");
+        assert_eq!(&after[..prompt], "\r\x1b[2K", "erased before: {after:?}");
+        let rest = &after[prompt + "PROMPT\n".len()..];
+        assert!(rest.starts_with('\r') && strip_escapes(rest).contains("attestation"), "redrawn after: {rest:?}");
+        s.ok("done");
     }
 
     #[test]

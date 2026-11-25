@@ -7,6 +7,7 @@ pub mod feed;
 pub mod http;
 pub mod normalize;
 pub mod nras;
+pub mod prompt;
 pub mod record;
 pub mod report;
 
