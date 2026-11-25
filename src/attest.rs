@@ -4,6 +4,7 @@
 //! fails closed.
 
 pub mod http;
+pub mod normalize;
 pub mod nras;
 pub mod record;
 pub mod report;
