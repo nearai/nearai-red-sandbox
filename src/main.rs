@@ -73,6 +73,12 @@ impl PromptSource {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TrustCommand {
+    List,
+    Forget(String),
+}
+
 #[derive(Debug)]
 enum Action {
     Help,
@@ -82,6 +88,7 @@ enum Action {
     Tool(String),
     Login(auth::LoginOptions),
     Trial(PathBuf),
+    Trust(TrustCommand),
     Launch {
         file: Option<PathBuf>,
         login: auth::LoginOptions,
@@ -105,6 +112,15 @@ fn parse_args(args: &[&str]) -> Result<Action, String> {
             return Err("trial --key-file needs a path".into());
         }
         return Ok(Action::Trial(PathBuf::from(path)));
+    }
+    if let ["trust", rest @ ..] = args {
+        return match rest {
+            ["list"] => Ok(Action::Trust(TrustCommand::List)),
+            ["forget", prefix] if !prefix.is_empty() && !prefix.starts_with('-') => {
+                Ok(Action::Trust(TrustCommand::Forget((*prefix).into())))
+            }
+            _ => Err("usage: rts trust list | rts trust forget <hash-prefix>".into()),
+        };
     }
     if let ["setup", flags @ ..] = args {
         return parse_setup(flags);
@@ -303,7 +319,7 @@ fn parse_update(flags: &[&str]) -> Result<Action, String> {
     Ok(Action::Update(o))
 }
 
-const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network] [--no-splash]\n                  [--cpus N] [--memory SIZE] [--prompt TEXT | --prompt-file PATH]\n       rts launch --prompt \"Review /in and save findings to /out/report.md\"\n       rts launch --prompt-file ./handoff.md       # submit a UTF-8 task file\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts launch --cpus 4 --memory 8G             # a bigger VM (default 2 vCPUs, 2048 MiB)\n       rts trial --key-file PATH   # import your individual sponsored allowance\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nThe guest has no network unless the session file's network.allow or --allow-host names entries\n(HOST, HOST:PORT, IP:PORT or [IPv6]:PORT, port 443 by default, or the preset packages);\n--no-network drops them all. TCP only, and every connection is logged. A session stops with\nsession-limit after limits.sessionHours (default 24), network-lost when the attached\nmvmctl machine run that keeps egress up exits, and network-mismatch when mvm pinned an address\nrts did not validate; /out is exported and the VM removed in every case.\n--cpus and --memory (MiB, or with an M or G suffix) override limits.cpus and limits.memoryMiB,\nup to this host's CPU count and RAM; the host RSS watchdog follows memory unless the session\nfile sets limits.hostRssCeilingMiB.\n--prompt or --prompt-file submits one initial task after the sandbox plugin is verified,\nthen leaves OpenCode interactive. Prompt files are relative to the invoking directory,\nmust be UTF-8 and at most 64 KiB; empty/whitespace-only or NUL-containing text is refused.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
+const USAGE: &str = "usage: rts launch [--config PATH] [--provider github|google] [--organization ID] [--workspace ID]\n                  [--allow-tcb-out-of-date] [--compose-policy pinned|mr-config-only]\n                  [--allow-unattested-provider] [--allow-host ENTRY]... [--no-network] [--no-splash]\n                  [--cpus N] [--memory SIZE] [--prompt TEXT | --prompt-file PATH]\n       rts launch --prompt \"Review /in and save findings to /out/report.md\"\n       rts launch --prompt-file ./handoff.md       # submit a UTF-8 task file\n       rts launch --allow-host packages            # pip, npm, apk and cargo registries\n       rts launch --allow-host api.example-target.com   # one target, port 443\n       rts launch --allow-host 192.168.1.20:8080   # a service on this machine's LAN address\n       rts launch --cpus 4 --memory 8G             # a bigger VM (default 2 vCPUs, 2048 MiB)\n       rts trial --key-file PATH   # import your individual sponsored allowance\n       rts trust list | rts trust forget <hash-prefix>   # builds you trusted at a launch prompt\n       rts login [--provider github|google] [--organization ID] [--workspace ID]\n       rts setup [--check [--offline]]\n       rts update [--check | --force]\n       rts --version\n       rts tool <shell|read|write|edit|glob|grep>   (request JSON on stdin)\n\nrts launch signs in to NEAR AI Cloud when needed, verifies NEAR AI's attestation report for every\nallowed model (refusing the session otherwise), and starts a private inference proxy whose only\nroute to NEAR AI is a forwarder pinned to the attested TLS certificates.\nGitHub is the default sign-in provider. Explicit external provider configs bypass sign-in and\nattestation, and need --allow-unattested-provider. --no-splash skips the opening splash, which\nis drawn only on an interactive terminal without NO_COLOR or TERM=dumb; any key skips it too.\nThe guest has no network unless the session file's network.allow or --allow-host names entries\n(HOST, HOST:PORT, IP:PORT or [IPv6]:PORT, port 443 by default, or the preset packages);\n--no-network drops them all. TCP only, and every connection is logged. A session stops with\nsession-limit after limits.sessionHours (default 24), network-lost when the attached\nmvmctl machine run that keeps egress up exits, and network-mismatch when mvm pinned an address\nrts did not validate; /out is exported and the VM removed in every case.\n--cpus and --memory (MiB, or with an M or G suffix) override limits.cpus and limits.memoryMiB,\nup to this host's CPU count and RAM; the host RSS watchdog follows memory unless the session\nfile sets limits.hostRssCeilingMiB.\n--prompt or --prompt-file submits one initial task after the sandbox plugin is verified,\nthen leaves OpenCode interactive. Prompt files are relative to the invoking directory,\nmust be UTF-8 and at most 64 KiB; empty/whitespace-only or NUL-containing text is refused.\nrts setup installs mvm, opencode and the guest image, each pinned by digest, and checks them;\n--check downloads and changes nothing, and --check --offline checks only the installed rts.\nrts update installs the newest signed release over a curl install; --check only reports.";
 
 #[cfg(windows)]
 fn setup_command(o: &setup::SetupOptions) -> Result<i32, String> {
@@ -392,6 +408,43 @@ fn code(c: i32) -> ExitCode {
     ExitCode::from(u8::try_from(c).unwrap_or(1))
 }
 
+fn trust_command(command: &TrustCommand) -> ExitCode {
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let Some(home) = rts::install::home_in(&env, cfg!(windows)) else {
+        eprintln!("[rts] cannot find the rts home (set HOME)");
+        return ExitCode::FAILURE;
+    };
+    match command {
+        TrustCommand::List => {
+            let (store, warning) = attest::trusted::load(Some(&home));
+            if let Some(w) = warning {
+                println!("{}", attest::prompt::store_warning_line(&w));
+            }
+            for line in attest::trusted::list_lines(&store) {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        TrustCommand::Forget(prefix) => match attest::trusted::forget(&home, prefix) {
+            Ok(removed) => {
+                for e in removed {
+                    println!(
+                        "forgot {} {} {}",
+                        attest::trusted::env_name(e.environment),
+                        e.role.as_str(),
+                        hex::encode(e.sha256)
+                    );
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("[rts] {e}");
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -446,6 +499,7 @@ fn main() -> ExitCode {
             }
             return code(out.code);
         }
+        Action::Trust(command) => return trust_command(&command),
         Action::Setup(options) => setup_command(&options),
         Action::Update(options) => rts::update::apply::command(&options),
         Action::Version => {
@@ -476,6 +530,27 @@ mod tests {
         attest::AttestOptions {
             allow_unattested_provider: true,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn parses_trust_list_and_forget() {
+        assert!(matches!(parse_args(&["trust", "list"]), Ok(Action::Trust(TrustCommand::List))));
+        assert!(matches!(
+            parse_args(&["trust", "forget", "f4a9b480"]),
+            Ok(Action::Trust(TrustCommand::Forget(p))) if p == "f4a9b480"
+        ));
+    }
+
+    #[test]
+    fn rejects_other_trust_forms() {
+        for args in [
+            vec!["trust"],
+            vec!["trust", "forget"],
+            vec!["trust", "list", "x"],
+            vec!["trust", "add", "x"],
+        ] {
+            assert!(parse_args(&args).is_err(), "{args:?}");
         }
     }
 

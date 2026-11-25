@@ -41,7 +41,7 @@ pub fn compare_url(hash: &[u8; 32]) -> String {
 
 /// Printable ASCII only (no ESC, other controls or non-ASCII), at most `max`
 /// chars.
-fn printable(raw: &str, max: usize) -> String {
+pub(crate) fn printable(raw: &str, max: usize) -> String {
     raw.chars()
         .filter(|c| matches!(c, ' '..='~'))
         .take(max)
@@ -50,7 +50,7 @@ fn printable(raw: &str, max: usize) -> String {
 
 /// `app_name` as it may reach the terminal. No quote binds it and it also
 /// comes back from the store file, so it is filtered and capped here.
-fn display_app_name(raw: Option<&str>) -> String {
+pub(crate) fn display_app_name(raw: Option<&str>) -> String {
     let shown = raw.map(|r| printable(r, 64)).unwrap_or_default();
     if shown.is_empty() {
         "unknown".into()

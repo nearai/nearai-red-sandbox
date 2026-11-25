@@ -69,7 +69,7 @@ struct FileEntry {
     trusted_at: String,
 }
 
-fn env_name(e: NearEnvironment) -> &'static str {
+pub fn env_name(e: NearEnvironment) -> &'static str {
     match e {
         NearEnvironment::Production => "production",
         NearEnvironment::Staging => "staging",
@@ -240,6 +240,29 @@ pub fn forget(home: &Path, prefix: &str) -> Result<Vec<TrustedEntry>, String> {
 }
 
 /// `YYYY-MM-DD` of a Unix time, in UTC.
+/// One line per trusted build for `rts trust list`. The store file is
+/// untrusted text, so the app name and date go through the launch prompt's
+/// sanitizer.
+pub fn list_lines(store: &TrustedComposes) -> Vec<String> {
+    if store.entries.is_empty() {
+        return vec!["no trusted builds".into()];
+    }
+    store
+        .entries
+        .iter()
+        .map(|e| {
+            format!(
+                "{} {} {} {} trusted {}",
+                env_name(e.environment),
+                e.role.as_str(),
+                hex::encode(e.sha256),
+                crate::attest::prompt::display_app_name(e.app_name.as_deref()),
+                crate::attest::prompt::printable(&e.trusted_at, 10),
+            )
+        })
+        .collect()
+}
+
 pub fn today_utc(unix: u64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(unix as i64, 0)
         .map(|d| d.format("%Y-%m-%d").to_string())
@@ -258,6 +281,41 @@ mod tests {
             app_name: Some("dstack-0.5.15".into()),
             trusted_at: day.into(),
         }
+    }
+
+    #[test]
+    fn list_lines_formats_each_entry() {
+        assert_eq!(
+            list_lines(&TrustedComposes::default()),
+            vec!["no trusted builds"]
+        );
+        let store = TrustedComposes {
+            entries: vec![entry(
+                NearEnvironment::Production,
+                Role::Gateway,
+                0xab,
+                "2026-11-25",
+            )],
+        };
+        assert_eq!(
+            list_lines(&store),
+            vec![format!(
+                "production gateway {} dstack-0.5.15 trusted 2026-11-25",
+                "ab".repeat(32)
+            )]
+        );
+        let mut e = entry(
+            NearEnvironment::Staging,
+            Role::Model,
+            1,
+            "2026-11-2\x1b[2J5",
+        );
+        e.app_name = Some("evil\x1b[2J name".into());
+        let line = list_lines(&TrustedComposes { entries: vec![e] }).remove(0);
+        assert!(!line.contains('\x1b'), "{line:?}");
+        let mut e = entry(NearEnvironment::Staging, Role::Model, 1, "2026-11-25");
+        e.app_name = None;
+        assert!(list_lines(&TrustedComposes { entries: vec![e] })[0].contains(" unknown trusted "));
     }
 
     #[test]

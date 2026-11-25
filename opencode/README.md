@@ -170,6 +170,16 @@ That page was checked by NEAR AI against opencode 1.18.31 and uses the v1
 config shape. docs.near.ai itself was not reachable from the build
 environment, so the GitHub source of the page was read instead.
 
+## Trusted builds
+
+A new production build of a model or the gateway that is neither pinned nor
+endorsed is not accepted silently. On a terminal, `rts launch` shows the build
+and asks once; answering yes trusts that exact build on this device. A trusted
+build is still fully checked: only the compose hash check is satisfied by your
+answer. `rts trust list` shows the builds you trusted, and
+`rts trust forget <hash-prefix>` (at least 8 hex characters) removes one. The
+store is `<rts home>/trusted-composes.json`.
+
 ## Live attestation test against NEAR AI production
 
 `tests/live_attest.rs` is opt-in (every test `#[ignore]`) and reaches NEAR
