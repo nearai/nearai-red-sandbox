@@ -245,9 +245,8 @@ fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
 pub struct SessionPaths {
     pub id: String,
     pub machine: String,
-    /// Runtime state lives under the system temp dir, outside the
-    /// operator's home and this repo: opencode walks up from its cwd loading
-    /// opencode.json, .opencode/, .claude/ and .agents/ from every ancestor.
+    /// Private runtime state. On Windows this can live above the user's
+    /// temp directory when OpenCode would discover a profile's config there.
     pub runtime: PathBuf,
     pub home: PathBuf,
     pub xdg_config: PathBuf,
@@ -1057,10 +1056,56 @@ pub fn run_session(cfg: &OperatorConfig, deps: Deps) -> i32 {
     run_session_with_prompt(cfg, deps, None)
 }
 
+#[cfg(windows)]
+fn create_windows_session_runtime(id: &str, user_temp: &Path) -> Result<PathBuf, String> {
+    if !user_temp.is_absolute() || !user_temp.is_dir() {
+        return Err("Windows temp directory must be an existing absolute path".into());
+    }
+    let resolved_temp = user_temp
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve the Windows temp directory: {e}"))?;
+    let directory_name = format!("rts-{id}-{}", random_hex(4));
+
+    // If the default temp is below a profile's config, use a writable
+    // ancestor above it. Never introduce a new searched ancestor. Checking
+    // the resolved path as well prevents junctions from hiding config.
+    for base in user_temp.ancestors().filter(|path| path.is_absolute()) {
+        if !ancestor_config(base).is_empty() {
+            continue;
+        }
+        let resolved = base.canonicalize().map_err(|e| {
+            format!("cannot resolve runtime directory parent {}: {e}", base.display())
+        })?;
+        if !resolved_temp.starts_with(&resolved) || !ancestor_config(&resolved).is_empty() {
+            continue;
+        }
+
+        // Set the owner-only ACL at creation and refuse an existing path.
+        let runtime = base.join(&directory_name);
+        match crate::sys::fs::create_private_dir(&runtime) {
+            Ok(()) => return Ok(runtime),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => continue,
+            Err(e) => {
+                return Err(format!("cannot create private runtime directory in {}: {e}", base.display()));
+            }
+        }
+    }
+    Err("No writable Windows runtime directory is available outside OpenCode configuration paths".into())
+}
+
 /// Submit operator task text only after the sandbox plugin has authenticated.
 /// Prompt text stays out of process arguments and durable session metadata.
 pub fn run_session_with_prompt(cfg: &OperatorConfig, deps: Deps, initial_prompt: Option<&str>) -> i32 {
     let id = deps.session_id.clone().unwrap_or_else(new_session_id);
+    #[cfg(windows)]
+    let runtime = match create_windows_session_runtime(&id, &std::env::temp_dir()) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("[rts] {error}");
+            return 1;
+        }
+    };
+    #[cfg(not(windows))]
     let runtime = std::env::temp_dir().join(format!("rts-{id}-{}", random_hex(4)));
     let p = session_paths(&id, &cfg.sessions_dir, &runtime);
     let log = Logger { id: id.clone(), file: p.log_file.clone() };
@@ -1314,6 +1359,15 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, backend: &dyn Backend, operat
         return Err(format!("work directory is not empty: {}", p.work.display()));
     }
     let found = ancestor_config(&p.work);
+    #[cfg(windows)]
+    let found = if found.is_empty() {
+        let resolved_work = p.work.canonicalize().map_err(|e| {
+            format!("cannot resolve OpenCode working directory {}: {e}", p.work.display())
+        })?;
+        ancestor_config(&resolved_work)
+    } else {
+        found
+    };
     if !found.is_empty() {
         return Err(format!("opencode would load config from: {}", join_paths(&found)));
     }
@@ -1391,6 +1445,27 @@ fn session_body(cfg: &OperatorConfig, deps: &Deps, backend: &dyn Backend, operat
 #[cfg(all(test, windows))]
 mod windows_launch_tests {
     use std::path::Path;
+
+    #[test]
+    fn windows_runtime_uses_a_private_ancestor_when_profile_temp_contains_config() {
+        let machine_data = std::env::var_os("ProgramData").expect("Windows ProgramData directory");
+        let scratch = tempfile::tempdir_in(machine_data).unwrap();
+        let profile = scratch.path().join("profile");
+        let user_temp = profile.join("AppData/Local/Temp");
+        std::fs::create_dir_all(&user_temp).unwrap();
+
+        let id = "0123456789ab";
+        let normal = super::create_windows_session_runtime(id, &user_temp).unwrap();
+        assert_eq!(normal.parent(), Some(user_temp.as_path()));
+
+        std::fs::create_dir(profile.join(".claude")).unwrap();
+        let isolated = super::create_windows_session_runtime(id, &user_temp).unwrap();
+        assert_eq!(isolated.parent(), Some(scratch.path()));
+        assert!(super::ancestor_config(&isolated.join("work")).is_empty());
+        crate::sys::fs::check_owner_only_dir(&isolated).unwrap();
+
+        assert!(super::create_windows_session_runtime(id, &user_temp.join("missing")).is_err());
+    }
 
     #[test]
     fn opencode_on_windows_gets_the_system_variables_and_no_host_token() {
