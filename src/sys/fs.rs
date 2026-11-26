@@ -87,6 +87,12 @@ pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Create a new owner-only directory without accepting an existing path.
+#[cfg(windows)]
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
+    win::create_dir(path)
+}
+
 /// The current user's SID ("S-1-5-21-..."), which owner-only DACLs and
 /// the Hyper-V backend's hvsocket descriptors name.
 #[cfg(windows)]
@@ -473,17 +479,22 @@ mod win {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             create_dir_all(parent)?;
         }
+        match create_dir(path) {
+            Err(e) if e.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) && path.is_dir() => {
+                // Lost a race to another creator, as with recursive mkdir on Unix.
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    pub(super) fn create_dir(path: &Path) -> io::Result<()> {
         let sd = Descriptor::owner_only(true)?;
         let sa = sd.attributes();
         let name = wide(path)?;
         // SAFETY: `name` is NUL-terminated; `sa` outlives the call.
         if unsafe { CreateDirectoryW(name.as_ptr(), &sa) } == 0 {
-            let e = io::Error::last_os_error();
-            // Lost a race to another creator: fine if it is a directory, as on Unix.
-            if e.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) && path.is_dir() {
-                return Ok(());
-            }
-            return Err(e);
+            return Err(io::Error::last_os_error());
         }
         Ok(())
     }
