@@ -1,9 +1,9 @@
 {
   "schema": 1,
   "environment": "staging",
-  "version": 1795627707,
-  "issued": "2026-11-25T17:28:27Z",
-  "expires": "2026-11-28T17:28:27Z",
+  "version": 1795717841,
+  "issued": "2026-11-26T18:30:41Z",
+  "expires": "2026-11-29T18:30:41Z",
   "entries": [],
   "revoked": []
 }
